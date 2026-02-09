@@ -473,17 +473,51 @@ echo "---"
 ls -la /pgdata/pgdata/ 2>&1 || true
 echo "---"
 
-VERSION=$(cat /pgdata/.postgres-version 2>/dev/null || cat /pgdata/pgdata/PG_VERSION 2>/dev/null || true)
-if [ -z "$VERSION" ]; then
+# If the pgdata symlink already exists, just read the version
+if [ -L /pgdata/pgdata ] && [ -f /pgdata/pgdata/PG_VERSION ]; then
+  VERSION=$(cat /pgdata/pgdata/PG_VERSION)
+  echo "Detected postgres version: $VERSION"
+  echo -n "$VERSION" > /dev/termination-log
+  exit 0
+fi
+
+# Otherwise locate PGDATA and recreate the symlink
+echo "pgdata symlink missing, locating PGDATA directory..."
+PGDATA_DIR=""
+
+# Prefer 'current' symlink (org convention)
+if [ -L /pgdata/postgres/current ]; then
+  LINK_TARGET=$(readlink /pgdata/postgres/current)
+  RELATIVE=$(echo "$LINK_TARGET" | sed 's|.*/\([0-9]\{1,\}/\)|/pgdata/postgres/\1|')
+  if [ -f "$RELATIVE/PG_VERSION" ]; then
+    PGDATA_DIR="$RELATIVE"
+    echo "Found PGDATA via 'current' symlink: $PGDATA_DIR"
+  fi
+fi
+
+# Fallback: pick the highest version directory containing PG_VERSION
+if [ -z "$PGDATA_DIR" ]; then
+  PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | sort -t/ -k4 -rn | head -1)
+fi
+
+# Last resort: search anywhere under /pgdata
+if [ -z "$PGDATA_DIR" ]; then
   echo "Searching for PG_VERSION recursively..."
   find /pgdata -name "PG_VERSION" 2>/dev/null || true
-  VERSION=$(find /pgdata -name "PG_VERSION" -exec cat {} \; 2>/dev/null | head -1)
+  PGDATA_DIR=$(find /pgdata -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | sort -t/ -k4 -rn | head -1)
 fi
-if [ -z "$VERSION" ]; then
+
+if [ -z "$PGDATA_DIR" ]; then
   echo "ERROR: Could not detect postgres version from PVC"
   exit 1
 fi
+
+echo "Found PGDATA at: $PGDATA_DIR"
+ln -sfn "$PGDATA_DIR" /pgdata/pgdata
+
+VERSION=$(cat /pgdata/pgdata/PG_VERSION)
 echo "Detected postgres version: $VERSION"
+echo "$VERSION" > /pgdata/.postgres-version
 echo -n "$VERSION" > /dev/termination-log
 "#;
 
@@ -526,7 +560,6 @@ echo -n "$VERSION" > /dev/termination-log
 						volume_mounts: Some(vec![VolumeMount {
 							name: "pgdata".to_string(),
 							mount_path: "/pgdata".to_string(),
-							read_only: Some(true),
 							..Default::default()
 						}]),
 						resources: Some(ResourceRequirements {
@@ -547,7 +580,7 @@ echo -n "$VERSION" > /dev/termination-log
 						persistent_volume_claim: Some(
 							k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
 								claim_name: pvc_name.to_string(),
-								read_only: Some(true),
+								read_only: Some(false),
 							},
 						),
 						..Default::default()
@@ -624,7 +657,25 @@ echo "Restore complete"
 ls -la /pgdata/
 
 echo "Locating PGDATA directory..."
-PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | head -1)
+
+# Prefer the 'current' symlink if it exists (org convention)
+if [ -L /pgdata/postgres/current ]; then
+  # The symlink target is an absolute path from the original host, resolve it
+  # relative to /pgdata/postgres by extracting the version/cluster part.
+  LINK_TARGET=$(readlink /pgdata/postgres/current)
+  # e.g. /var/lib/postgresql/16/main -> try /pgdata/postgres/16/main
+  RELATIVE=$(echo "$LINK_TARGET" | sed 's|.*/\([0-9]\{1,\}/\)|/pgdata/postgres/\1|')
+  if [ -f "$RELATIVE/PG_VERSION" ]; then
+    PGDATA_DIR="$RELATIVE"
+    echo "Found PGDATA via 'current' symlink: $PGDATA_DIR"
+  fi
+fi
+
+# Fallback: pick the highest version directory containing PG_VERSION
+if [ -z "$PGDATA_DIR" ]; then
+  PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | sort -t/ -k4 -rn | head -1)
+fi
+
 if [ -z "$PGDATA_DIR" ]; then
   echo "ERROR: Could not find PG_VERSION in restored data"
   exit 1
