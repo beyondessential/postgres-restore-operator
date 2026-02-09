@@ -585,9 +585,17 @@ host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
-echo "Creating analytics user setup script..."
-mkdir -p /docker-entrypoint-initdb.d
-cat > /docker-entrypoint-initdb.d/01-setup-analytics.sql << SQLEOF
+if [ "{read_only}" = "true" ]; then
+  echo "Enabling read-only mode..."
+  # Remove any existing setting to avoid duplicates across restarts
+  sed -i '/^default_transaction_read_only/d' "$PGDATA/postgresql.conf"
+  echo "default_transaction_read_only = on" >> "$PGDATA/postgresql.conf"
+fi
+
+echo "Starting temporary postgres to configure analytics user..."
+pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
+
+psql -U postgres -d postgres << SQLEOF
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${{ANALYTICS_USERNAME}}') THEN
@@ -603,10 +611,8 @@ GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${{ANALYTICS_USERNAME}};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${{ANALYTICS_USERNAME}};
 SQLEOF
 
-if [ "{read_only}" = "true" ]; then
-  echo "Enabling read-only mode..."
-  echo "default_transaction_read_only = on" >> "$PGDATA/postgresql.conf"
-fi
+echo "Stopping temporary postgres..."
+pg_ctl -D "$PGDATA" -w stop
 
 echo "Auth setup complete"
 "#
@@ -719,18 +725,11 @@ echo "Auth setup complete"
                                 ..Default::default()
                             },
                         ]),
-                        volume_mounts: Some(vec![
-                            VolumeMount {
-                                name: "pgdata".to_string(),
-                                mount_path: "/pgdata".to_string(),
-                                ..Default::default()
-                            },
-                            VolumeMount {
-                                name: "initdb".to_string(),
-                                mount_path: "/docker-entrypoint-initdb.d".to_string(),
-                                ..Default::default()
-                            },
-                        ]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "pgdata".to_string(),
+                            mount_path: "/pgdata".to_string(),
+                            ..Default::default()
+                        }]),
                         resources: Some(ResourceRequirements {
                             requests: Some(BTreeMap::from([
                                 ("cpu".to_string(), Quantity("100m".to_string())),
@@ -770,18 +769,11 @@ echo "Auth setup complete"
                             protocol: Some("TCP".to_string()),
                             ..Default::default()
                         }]),
-                        volume_mounts: Some(vec![
-                            VolumeMount {
-                                name: "pgdata".to_string(),
-                                mount_path: "/pgdata".to_string(),
-                                ..Default::default()
-                            },
-                            VolumeMount {
-                                name: "initdb".to_string(),
-                                mount_path: "/docker-entrypoint-initdb.d".to_string(),
-                                ..Default::default()
-                            },
-                        ]),
+                        volume_mounts: Some(vec![VolumeMount {
+                            name: "pgdata".to_string(),
+                            mount_path: "/pgdata".to_string(),
+                            ..Default::default()
+                        }]),
                         readiness_probe: Some(Probe {
                             exec: Some(ExecAction {
                                 command: Some(vec![
@@ -817,23 +809,16 @@ echo "Auth setup complete"
                         resources: container_resources,
                         ..Default::default()
                     }],
-                    volumes: Some(vec![
-                        Volume {
-                            name: "pgdata".to_string(),
-                            persistent_volume_claim: Some(
-                                k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-                                    claim_name: pvc_name,
-                                    read_only: Some(false),
-                                },
-                            ),
-                            ..Default::default()
-                        },
-                        Volume {
-                            name: "initdb".to_string(),
-                            empty_dir: Some(Default::default()),
-                            ..Default::default()
-                        },
-                    ]),
+                    volumes: Some(vec![Volume {
+                        name: "pgdata".to_string(),
+                        persistent_volume_claim: Some(
+                            k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+                                claim_name: pvc_name,
+                                read_only: Some(false),
+                            },
+                        ),
+                        ..Default::default()
+                    }]),
                     node_selector: if node_selector.is_empty() {
                         None
                     } else {
