@@ -541,7 +541,7 @@ SNAPSHOTS=$(kopia snapshot list --json --all 2>/dev/null || echo "[]")
 
 if [ -n "$FILTER_HOST_PATTERN" ]; then
   REGEX=$(printf '%s' "$FILTER_HOST_PATTERN" | sed 's/\./\\./g; s/\*/\.\*/g; s/\?/\./g')
-  SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg pat "^${REGEX}$" '[.[] | select(.hostname != null and (.hostname | test($pat)))]')
+  SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg pat "^${REGEX}$" '[.[] | select(.source.host != null and (.source.host | test($pat)))]')
 fi
 
 if [ -n "$FILTER_TAGS" ]; then
@@ -551,7 +551,7 @@ EOF
   for tag in $TAG_LIST; do
     KEY="${tag%%=*}"
     VALUE="${tag#*=}"
-    SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v)]')
+    SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v or .tags["tag:" + $k] == $v)]')
   done
 fi
 
@@ -563,7 +563,7 @@ if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
 fi
 
 ID=$(echo "$LATEST" | jq -r '.id')
-SIZE=$(echo "$LATEST" | jq -r '.summary.size // 0')
+SIZE=$(echo "$LATEST" | jq -r '.stats.totalSize // 0')
 echo "Latest snapshot: id=$ID size=$SIZE"
 printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 "#;

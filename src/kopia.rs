@@ -15,32 +15,48 @@ pub struct KopiaCredentials {
 
 /// A kopia snapshot, as returned by `kopia snapshot list --json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
 	pub id: String,
 	#[serde(default)]
 	pub description: String,
 	#[serde(default)]
-	pub hostname: String,
-	#[serde(default)]
-	pub username: String,
+	pub source: SnapshotSource,
 	#[serde(default)]
 	pub tags: std::collections::HashMap<String, String>,
 	#[serde(default)]
 	pub start_time: String,
-	#[serde(default, rename = "summary")]
-	pub summary: Option<SnapshotSummary>,
+	#[serde(default)]
+	pub stats: Option<SnapshotStats>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotSource {
+	#[serde(default)]
+	pub host: String,
+	#[serde(default)]
+	pub user_name: String,
+	#[serde(default)]
+	pub path: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotSummary {
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotStats {
 	#[serde(default)]
-	pub size: u64,
+	pub total_size: u64,
 }
 
 impl Snapshot {
+	/// Returns the hostname from the source field.
+	pub fn hostname(&self) -> &str {
+		&self.source.host
+	}
+
 	/// Returns the total size in bytes, or 0 if unknown.
 	pub fn total_size_bytes(&self) -> u64 {
-		self.summary.as_ref().map(|s| s.size).unwrap_or(0)
+		self.stats.as_ref().map(|s| s.total_size).unwrap_or(0)
 	}
 }
 
@@ -102,16 +118,19 @@ pub fn filter_snapshots(snapshots: &[Snapshot], filter: Option<&SnapshotFilter>)
 			// Tag filtering
 			if let Some(required_tags) = &filter.tags {
 				for (k, v) in required_tags {
-					match snap.tags.get(k) {
-						Some(sv) if sv == v => {}
-						_ => return false,
+					// Try both bare key and tag:-prefixed key, since kopia
+					// stores user tags with a "tag:" prefix.
+					let matched = snap.tags.get(k).map(String::as_str) == Some(v)
+						|| snap.tags.get(&format!("tag:{k}")).map(String::as_str) == Some(v);
+					if !matched {
+						return false;
 					}
 				}
 			}
 
 			// Host pattern filtering
 			if let Some(pattern) = &filter.host_pattern
-				&& !glob_matches(pattern, &snap.hostname)
+				&& !glob_matches(pattern, snap.hostname())
 			{
 				return false;
 			}
@@ -221,7 +240,10 @@ mod tests {
 	) -> Snapshot {
 		Snapshot {
 			id: id.into(),
-			hostname: hostname.into(),
+			source: SnapshotSource {
+				host: hostname.into(),
+				..Default::default()
+			},
 			start_time: start_time.into(),
 			tags,
 			..Default::default()
@@ -277,7 +299,11 @@ mod tests {
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 2);
-		assert!(result.iter().all(|s| s.hostname.starts_with("fiji-prod-")));
+		assert!(
+			result
+				.iter()
+				.all(|s| s.hostname().starts_with("fiji-prod-"))
+		);
 	}
 
 	#[test]
@@ -328,23 +354,80 @@ mod tests {
 	}
 
 	#[test]
-	fn snapshot_total_size_bytes_with_summary() {
+	fn snapshot_total_size_bytes_with_stats() {
 		let snap = Snapshot {
 			id: "s1".into(),
-			summary: Some(SnapshotSummary { size: 1024 }),
+			stats: Some(SnapshotStats { total_size: 1024 }),
 			..Default::default()
 		};
 		assert_eq!(snap.total_size_bytes(), 1024);
 	}
 
 	#[test]
-	fn snapshot_total_size_bytes_without_summary() {
+	fn snapshot_total_size_bytes_without_stats() {
 		let snap = Snapshot {
 			id: "s1".into(),
-			summary: None,
+			stats: None,
 			..Default::default()
 		};
 		assert_eq!(snap.total_size_bytes(), 0);
+	}
+
+	#[test]
+	fn snapshot_hostname() {
+		let snap = make_snapshot("id", "myhost", "t1", HashMap::new());
+		assert_eq!(snap.hostname(), "myhost");
+	}
+
+	#[test]
+	fn filter_snapshots_by_tags_with_tag_prefix() {
+		let snaps = vec![
+			make_snapshot(
+				"a",
+				"h",
+				"t1",
+				HashMap::from([("tag:area".into(), "postgres".into())]),
+			),
+			make_snapshot("b", "h", "t2", HashMap::new()),
+		];
+		let filter = SnapshotFilter {
+			tags: Some(HashMap::from([("area".into(), "postgres".into())])),
+			host_pattern: None,
+		};
+		let result = filter_snapshots(&snaps, Some(&filter));
+		assert_eq!(result.len(), 1);
+		assert_eq!(result[0].id, "a");
+	}
+
+	#[test]
+	fn deserialize_real_kopia_snapshot() {
+		let json = r#"{
+			"id": "ff90452158616878e80a04257b720488",
+			"source": {
+				"host": "central",
+				"userName": "kopia",
+				"path": "/var/lib/kopia/mnt-postgres-86"
+			},
+			"description": "some description",
+			"startTime": "2026-02-09T13:19:38.332518746Z",
+			"endTime": "2026-02-09T13:19:47.146358895Z",
+			"stats": {
+				"totalSize": 1590817547,
+				"fileCount": 2473
+			},
+			"tags": {
+				"tag:area": "postgres",
+				"tag:snapper": "86"
+			},
+			"retentionReason": ["latest-1"]
+		}"#;
+		let snap: Snapshot = serde_json::from_str(json).unwrap();
+		assert_eq!(snap.id, "ff90452158616878e80a04257b720488");
+		assert_eq!(snap.hostname(), "central");
+		assert_eq!(snap.source.user_name, "kopia");
+		assert_eq!(snap.start_time, "2026-02-09T13:19:38.332518746Z");
+		assert_eq!(snap.total_size_bytes(), 1590817547);
+		assert_eq!(snap.tags.get("tag:area").unwrap(), "postgres");
 	}
 
 	#[test]
