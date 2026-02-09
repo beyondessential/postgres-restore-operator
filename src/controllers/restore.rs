@@ -856,10 +856,16 @@ fi
 
 {extra_config_block}
 
+if [ ! -f "$PGDATA/pg_ident.conf" ]; then
+  echo "Creating empty pg_ident.conf..."
+  touch "$PGDATA/pg_ident.conf"
+fi
+
 echo "Configuring pg_hba.conf..."
 cat > "$PGDATA/pg_hba.conf" << 'HBAEOF'
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
-local   all             postgres                                peer
+# trust for local: pod runs as UID 999 which has no passwd entry, so peer auth cannot resolve it
+local   all             all                                     trust
 host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
@@ -1325,6 +1331,39 @@ mod tests {
 		assert!(
 			extra_pos > conf_fi,
 			"extra config block must appear after the minimal-config if/fi block"
+		);
+	}
+
+	#[test]
+	fn pg_ident_conf_created_when_missing() {
+		let replica = make_replica(None);
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			script.contains(r#"if [ ! -f "$PGDATA/pg_ident.conf" ]"#),
+			"script must create pg_ident.conf when missing"
+		);
+		assert!(
+			script.contains(r#"touch "$PGDATA/pg_ident.conf""#),
+			"script must touch pg_ident.conf"
+		);
+	}
+
+	#[test]
+	fn local_auth_uses_trust() {
+		let replica = make_replica(None);
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			script
+				.contains("local   all             all                                     trust"),
+			"local connections must use trust auth (peer fails with UID 999)"
+		);
+		assert!(
+			!script.contains("peer\n"),
+			"pg_hba.conf must not use peer as an auth method"
 		);
 	}
 
