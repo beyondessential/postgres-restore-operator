@@ -1,6 +1,9 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::Duration;
 
+use axum::extract::State;
+use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::ConfigMap;
@@ -84,6 +87,18 @@ async fn main() -> anyhow::Result<()> {
 
 	let ctx = Arc::new(Context::new(client.clone(), max_concurrent_restores));
 
+	// Heartbeat: a background task updates this timestamp every 5s.
+	// If the runtime is deadlocked, the timestamp goes stale and /livez fails.
+	let heartbeat = Arc::new(AtomicI64::new(chrono::Utc::now().timestamp()));
+	let heartbeat_writer = heartbeat.clone();
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(Duration::from_secs(5));
+		loop {
+			interval.tick().await;
+			heartbeat_writer.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+		}
+	});
+
 	// Watch the operator ConfigMap for dynamic config updates
 	let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
 	let config_watcher_config =
@@ -128,6 +143,10 @@ async fn main() -> anyhow::Result<()> {
 	// Start metrics server
 	let metrics_registry = ctx.metrics.registry.clone();
 	let metrics_addr_clone = metrics_addr.clone();
+	let probe_state = ProbeState {
+		client: client.clone(),
+		heartbeat,
+	};
 	tokio::spawn(async move {
 		let app = Router::new()
 			.route(
@@ -143,20 +162,9 @@ async fn main() -> anyhow::Result<()> {
 					}
 				}),
 			)
-			.route(
-				"/livez",
-				get(|| async {
-					tracing::trace!("GET /livez");
-					"ok"
-				}),
-			)
-			.route(
-				"/readyz",
-				get(|| async {
-					tracing::trace!("GET /readyz");
-					"ok"
-				}),
-			);
+			.route("/livez", get(livez))
+			.route("/readyz", get(readyz))
+			.with_state(probe_state);
 
 		let listener = tokio::net::TcpListener::bind(&metrics_addr_clone)
 			.await
@@ -220,4 +228,41 @@ async fn main() -> anyhow::Result<()> {
 	}
 
 	Ok(())
+}
+
+#[derive(Clone)]
+struct ProbeState {
+	client: Client,
+	heartbeat: Arc<AtomicI64>,
+}
+
+/// Liveness: checks that the async runtime isn't deadlocked by verifying
+/// a background heartbeat was updated within the last 30 seconds.
+async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
+	let last = state.heartbeat.load(Ordering::Relaxed);
+	let age = chrono::Utc::now().timestamp() - last;
+	tracing::trace!(heartbeat_age_secs = age, "GET /livez");
+	if age <= 30 {
+		(StatusCode::OK, "ok")
+	} else {
+		tracing::warn!(
+			heartbeat_age_secs = age,
+			"liveness check failed: heartbeat stale"
+		);
+		(StatusCode::INTERNAL_SERVER_ERROR, "heartbeat stale")
+	}
+}
+
+/// Readiness: checks that the Kubernetes API server is reachable.
+async fn readyz(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
+	match state.client.apiserver_version().await {
+		Ok(_) => {
+			tracing::trace!("GET /readyz");
+			(StatusCode::OK, "ok")
+		}
+		Err(e) => {
+			tracing::warn!(error = %e, "readiness check failed: API server unreachable");
+			(StatusCode::SERVICE_UNAVAILABLE, "API server unreachable")
+		}
+	}
 }
