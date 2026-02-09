@@ -1,0 +1,134 @@
+name: CD
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: write # to update the release
+  packages: write # to pull and push images
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+jobs:
+  build-binaries:
+    name: Build ${{ matrix.arch }} binaries
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+    steps:
+      - name: Free up space
+        run: sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Configure toolchain
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.arch }}-release
+
+      - name: Build binaries
+        run: cargo build --locked --target ${{ matrix.target }} --release --bin operator
+        env:
+          RUSTFLAGS: "-C target-feature=+crt-static"
+
+      - name: Prepare artifacts
+        run: |
+          mkdir -p artifacts/${{ matrix.arch }}
+          cp target/${{ matrix.target }}/release/operator artifacts/${{ matrix.arch }}/
+
+      - uses: actions/upload-artifact@v5
+        with:
+          name: binaries-${{ matrix.arch }}
+          path: artifacts/${{ matrix.arch }}/
+          retention-days: 1
+
+  build-images:
+    name: Build container images
+    runs-on: ubuntu-24.04
+    needs: [build-binaries]
+    steps:
+      - name: Login to ghcr.io
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Extract version
+        id: version
+        run: echo "version=$(cargo pkgid | cut -d# -f2)" >> "$GITHUB_OUTPUT"
+
+      - name: Download AMD64 binaries
+        uses: actions/download-artifact@v6
+        with:
+          name: binaries-amd64
+          path: .github/build-context/amd64/
+
+      - name: Download ARM64 binaries
+        uses: actions/download-artifact@v6
+        with:
+          name: binaries-arm64
+          path: .github/build-context/arm64/
+
+      - name: Debug build context structure
+        run: |
+          echo "=== Build context structure ==="
+          ls -laR .github/build-context/
+          echo "=== AMD64 binaries ==="
+          ls -lh .github/build-context/amd64/
+          echo "=== ARM64 binaries ==="
+          ls -lh .github/build-context/arm64/
+
+      - name: Setup buildkit
+        uses: docker/setup-buildx-action@v3
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ghcr.io/beyondessential/postgres-restore-operator
+          tags: |
+            type=semver,value=v${{ steps.version.outputs.version }},pattern={{version}}
+            type=semver,value=v${{ steps.version.outputs.version }},pattern={{major}}.{{minor}}
+            type=semver,value=v${{ steps.version.outputs.version }},pattern={{major}}
+          labels: |
+            org.opencontainers.image.vendor=BES
+            org.opencontainers.image.title=Postgres Restore Operator
+            org.opencontainers.image.url=https://github.com/beyondessential/postgres-restore-operator/
+            org.opencontainers.image.source=https://github.com/beyondessential/postgres-restore-operator/
+            org.opencontainers.image.version=${{ steps.version.outputs.version }}
+            org.opencontainers.image.licenses=GPL-3.0-or-later
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .github/build-context
+          file: .github/Dockerfile.native
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ steps.meta.outputs.tags }}
