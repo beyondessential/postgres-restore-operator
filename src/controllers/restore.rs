@@ -349,8 +349,8 @@ async fn reconcile_ready(
 		}
 
 		// Check for timeout (10 minutes)
-		if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref()) {
-			if let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>() {
+		if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref())
+			&& let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>() {
 				let elapsed = Utc::now().signed_duration_since(created);
 				if elapsed > chrono::Duration::minutes(10) {
 					warn!(
@@ -383,7 +383,6 @@ async fn reconcile_ready(
 					return Ok(Action::requeue(Duration::from_secs(300)));
 				}
 			}
-		}
 
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
