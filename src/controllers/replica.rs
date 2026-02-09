@@ -279,7 +279,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
     if should_restore {
         // Check concurrent restore limit
         let mut queue = ctx.restore_queue.write().await;
-        if !queue.can_start(ctx.max_concurrent_restores) {
+        if !queue.can_start(ctx.max_concurrent_restores()) {
             let restore_name = format!("{name}-pending");
             queue.enqueue(restore_name);
             let position = queue.position(&format!("{name}-pending"));

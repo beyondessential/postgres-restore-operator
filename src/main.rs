@@ -1,11 +1,12 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
 use axum::{Router, routing::get};
 use futures::StreamExt;
 use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Api, Client,
-    runtime::{controller::Controller, watcher::Config},
+    runtime::{controller::Controller, watcher, watcher::Config},
 };
 use prometheus::Encoder;
 use tracing::{info, warn};
@@ -30,18 +31,23 @@ fn operator_namespace() -> String {
         .unwrap_or_else(|_| "postgres-restore-operator".to_string())
 }
 
+fn extract_max_concurrent_restores(cm: &ConfigMap) -> usize {
+    cm.data
+        .as_ref()
+        .and_then(|d| d.get("maxConcurrentRestores"))
+        .and_then(|v| {
+            v.parse::<usize>().map_err(|e| {
+                warn!(value = v, error = %e, "invalid maxConcurrentRestores in ConfigMap, using default");
+                e
+            }).ok()
+        })
+        .unwrap_or(DEFAULT_MAX_CONCURRENT_RESTORES)
+}
+
 async fn read_max_concurrent_restores(client: &Client, namespace: &str) -> usize {
     let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
     match api.get(CONFIGMAP_NAME).await {
-        Ok(cm) => cm
-            .data
-            .as_ref()
-            .and_then(|d| d.get("maxConcurrentRestores"))
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or_else(|| {
-                info!("maxConcurrentRestores not set in ConfigMap, defaulting to {DEFAULT_MAX_CONCURRENT_RESTORES}");
-                DEFAULT_MAX_CONCURRENT_RESTORES
-            }),
+        Ok(cm) => extract_max_concurrent_restores(&cm),
         Err(e) => {
             warn!(error = %e, "failed to read ConfigMap {CONFIGMAP_NAME}, defaulting to {DEFAULT_MAX_CONCURRENT_RESTORES}");
             DEFAULT_MAX_CONCURRENT_RESTORES
@@ -75,6 +81,47 @@ async fn main() -> anyhow::Result<()> {
     );
 
     let ctx = Arc::new(Context::new(client.clone(), max_concurrent_restores));
+
+    // Watch the operator ConfigMap for dynamic config updates
+    let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
+    let config_watcher_config =
+        Config::default().fields(&format!("metadata.name={CONFIGMAP_NAME}"));
+    let max_concurrent_ref = ctx.max_concurrent_restores.clone();
+    tokio::spawn(async move {
+        let stream = watcher::watcher(config_api, config_watcher_config);
+        futures::pin_mut!(stream);
+        while let Some(event) = stream.next().await {
+            match event {
+                Ok(watcher::Event::Apply(cm) | watcher::Event::InitApply(cm)) => {
+                    let new_val = extract_max_concurrent_restores(&cm);
+                    let old_val = max_concurrent_ref.swap(new_val, Ordering::Relaxed);
+                    if old_val != new_val {
+                        info!(
+                            old = old_val,
+                            new = new_val,
+                            "max_concurrent_restores updated from ConfigMap"
+                        );
+                    }
+                }
+                Ok(watcher::Event::Delete(_)) => {
+                    let old_val =
+                        max_concurrent_ref.swap(DEFAULT_MAX_CONCURRENT_RESTORES, Ordering::Relaxed);
+                    if old_val != DEFAULT_MAX_CONCURRENT_RESTORES {
+                        info!(
+                            old = old_val,
+                            new = DEFAULT_MAX_CONCURRENT_RESTORES,
+                            "ConfigMap deleted, reverted max_concurrent_restores to default"
+                        );
+                    }
+                }
+                Ok(watcher::Event::Init | watcher::Event::InitDone) => {}
+                Err(e) => {
+                    warn!(error = %e, "ConfigMap watcher error, will retry");
+                }
+            }
+        }
+        warn!("ConfigMap watcher stream ended unexpectedly");
+    });
 
     // Start metrics server
     let metrics_registry = ctx.metrics.registry.clone();

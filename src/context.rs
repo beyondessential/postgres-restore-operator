@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use kube::Client;
@@ -10,7 +11,7 @@ pub struct Context {
     pub client: Client,
     pub metrics: Metrics,
     pub restore_queue: Arc<RwLock<RestoreQueue>>,
-    pub max_concurrent_restores: usize,
+    pub max_concurrent_restores: Arc<AtomicUsize>,
     pub http_client: reqwest::Client,
 }
 
@@ -20,9 +21,13 @@ impl Context {
             client,
             metrics: Metrics::new(),
             restore_queue: Arc::new(RwLock::new(RestoreQueue::default())),
-            max_concurrent_restores,
+            max_concurrent_restores: Arc::new(AtomicUsize::new(max_concurrent_restores)),
             http_client: reqwest::Client::new(),
         }
+    }
+
+    pub fn max_concurrent_restores(&self) -> usize {
+        self.max_concurrent_restores.load(Ordering::Relaxed)
     }
 }
 
