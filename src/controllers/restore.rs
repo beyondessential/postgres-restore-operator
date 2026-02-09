@@ -606,13 +606,6 @@ host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
-if [ "{read_only}" = "true" ]; then
-  echo "Enabling read-only mode..."
-  # Remove any existing setting to avoid duplicates across restarts
-  sed -i '/^default_transaction_read_only/d' "$PGDATA/postgresql.conf"
-  echo "default_transaction_read_only = on" >> "$PGDATA/postgresql.conf"
-fi
-
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
 
@@ -634,6 +627,13 @@ SQLEOF
 
 echo "Stopping temporary postgres..."
 pg_ctl -D "$PGDATA" -w stop
+
+if [ "{read_only}" = "true" ]; then
+  echo "Enabling read-only mode..."
+  # Remove any existing setting to avoid duplicates across restarts
+  sed -i '/^default_transaction_read_only/d' "$PGDATA/postgresql.conf"
+  echo "default_transaction_read_only = on" >> "$PGDATA/postgresql.conf"
+fi
 
 echo "Auth setup complete"
 "#
