@@ -72,9 +72,12 @@ impl JsonSchema for HeaderValue {
 	}
 
 	fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
-		// Kubernetes structural schemas forbid `type` inside `anyOf` items,
-		// so we emit the branches without top-level `type`.
+		// Kubernetes structural schemas require `type` on `additionalProperties`,
+		// but HeaderValue is a string-or-object union so no single type works.
+		// `x-kubernetes-preserve-unknown-fields` exempts us from that requirement.
+		// The `anyOf` items must not set `type` (structural schema rule).
 		json_schema!({
+			"x-kubernetes-preserve-unknown-fields": true,
 			"anyOf": [
 				{},
 				{
