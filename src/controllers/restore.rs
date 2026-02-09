@@ -390,71 +390,75 @@ async fn reconcile_ready(
 		}
 	}
 
-	// Create Deployment if it doesn't exist
-	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-
-	if let Some(deploy) = deployments.get_opt(name).await? {
-		// Deployment exists, check if ready
-		let ready_replicas = deploy
-			.status
-			.as_ref()
-			.and_then(|s| s.ready_replicas)
-			.unwrap_or(0);
-
-		if ready_replicas > 0 {
-			info!(
-				restore = name,
-				"deployment ready, transitioning to Switching"
-			);
-			update_restore_status(
-				client,
-				namespace,
-				name,
-				serde_json::json!({
-					"phase": "Switching",
-					"deployment": name,
-				}),
-			)
-			.await?;
-
-			if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
-				info!(promoted = %promoted_name, "promoted queued restore after switchover");
-			}
-
-			return Ok(Action::requeue(Duration::from_secs(5)));
-		}
-
-		// Check for timeout (10 minutes)
-		if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref())
-			&& let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>()
-		{
-			let elapsed = Utc::now().signed_duration_since(created);
-			if elapsed > chrono::Duration::minutes(10) {
-				warn!(
-					restore = name,
-					"deployment not ready after 10 minutes, marking as Failed"
-				);
-				return fail_restore(
-					ctx,
-					namespace,
-					name,
-					replica_name,
-					serde_json::json!({ "phase": "Failed" }),
-				)
-				.await;
-			}
-		}
-
-		return Ok(Action::requeue(Duration::from_secs(10)));
-	}
-
 	// Look up the parent replica for config
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 	let replica = replicas.get(&restore.spec.replica).await?;
 
-	info!(restore = name, "creating deployment");
-	let deploy = build_deployment(restore, name, namespace, &replica)?;
-	deployments.create(&PostParams::default(), &deploy).await?;
+	// Apply desired deployment (creates or updates to converge on operator upgrades)
+	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+	let desired = build_deployment(restore, name, namespace, &replica)?;
+	let mut patch_value = serde_json::to_value(&desired)?;
+	patch_value["apiVersion"] = serde_json::json!("apps/v1");
+	patch_value["kind"] = serde_json::json!("Deployment");
+
+	let deploy = deployments
+		.patch(
+			name,
+			&PatchParams::apply("postgres-restore-operator").force(),
+			&Patch::Apply(&patch_value),
+		)
+		.await?;
+
+	// Check if ready
+	let ready_replicas = deploy
+		.status
+		.as_ref()
+		.and_then(|s| s.ready_replicas)
+		.unwrap_or(0);
+
+	if ready_replicas > 0 {
+		info!(
+			restore = name,
+			"deployment ready, transitioning to Switching"
+		);
+		update_restore_status(
+			client,
+			namespace,
+			name,
+			serde_json::json!({
+				"phase": "Switching",
+				"deployment": name,
+			}),
+		)
+		.await?;
+
+		if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
+			info!(promoted = %promoted_name, "promoted queued restore after switchover");
+		}
+
+		return Ok(Action::requeue(Duration::from_secs(5)));
+	}
+
+	// Check for timeout (10 minutes)
+	if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref())
+		&& let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>()
+	{
+		let elapsed = Utc::now().signed_duration_since(created);
+		if elapsed > chrono::Duration::minutes(10) {
+			warn!(
+				restore = name,
+				"deployment not ready after 10 minutes, marking as Failed"
+			);
+			return fail_restore(
+				ctx,
+				namespace,
+				name,
+				replica_name,
+				serde_json::json!({ "phase": "Failed" }),
+			)
+			.await;
+		}
+	}
 
 	Ok(Action::requeue(Duration::from_secs(10)))
 }
