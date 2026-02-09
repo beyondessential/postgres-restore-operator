@@ -7,7 +7,7 @@ use k8s_openapi::{
         batch::v1::{Job, JobSpec},
         core::v1::{
             Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, PersistentVolumeClaim,
-            PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
+            PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
             SecretKeySelector, Volume, VolumeMount, VolumeResourceRequirements,
         },
     },
@@ -197,10 +197,20 @@ async fn reconcile_restoring(
     if succeeded > 0 {
         info!(restore = name, "restore job succeeded");
 
-        // We can't directly read the postgres version from the PVC here.
-        // The Job wrote it to /pgdata/.postgres-version.
-        // The Deployment's init container will handle auth setup.
-        // For now, we'll track the job completion and move to Ready.
+        let pg_version = read_pg_version_from_job_pod(client, namespace, &job_name).await;
+        if let Some(ref v) = pg_version {
+            info!(
+                restore = name,
+                postgres_version = v,
+                "detected postgres version from restore job"
+            );
+        } else {
+            warn!(
+                restore = name,
+                "could not read postgres version from job pod termination message"
+            );
+        }
+
         let now = Utc::now().to_rfc3339();
         let completed_at = job_status
             .as_ref()
@@ -208,21 +218,20 @@ async fn reconcile_restoring(
             .map(|t| t.0.to_string())
             .unwrap_or_else(|| now.clone());
 
-        update_restore_status(
-            client,
-            namespace,
-            name,
-            serde_json::json!({
-                "phase": "Ready",
-                "restoredAt": now,
-                "restoreJob": {
-                    "name": job_name,
-                    "phase": "Succeeded",
-                    "completedAt": completed_at,
-                },
-            }),
-        )
-        .await?;
+        let mut status_patch = serde_json::json!({
+            "phase": "Ready",
+            "restoredAt": now,
+            "restoreJob": {
+                "name": job_name,
+                "phase": "Succeeded",
+                "completedAt": completed_at,
+            },
+        });
+        if let Some(v) = pg_version {
+            status_patch["postgresVersion"] = serde_json::Value::String(v);
+        }
+
+        update_restore_status(client, namespace, name, status_patch).await?;
 
         ctx.metrics.restores_completed_total.inc();
 
@@ -409,7 +418,7 @@ fn build_restore_job(
     let kopia_secret = &replica.spec.kopia_secret_ref;
     let pvc_name = format!("{}-data", restore.name_any());
 
-    let script = r#"set -e
+    let restore_script = r#"set -e
 
 echo "Connecting to kopia repository..."
 kopia repository connect s3 \
@@ -438,6 +447,7 @@ fi
 
 echo "Detected postgres version: $VERSION"
 echo "$VERSION" > /pgdata/.postgres-version
+echo -n "$VERSION" > /dev/termination-log
 
 echo "Starting restore..."
 kopia snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
@@ -480,7 +490,7 @@ ls -la /pgdata/
                         name: "restore".to_string(),
                         image: Some("kopia/kopia:latest".to_string()),
                         command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-                        args: Some(vec![script.to_string()]),
+                        args: Some(vec![restore_script.to_string()]),
                         env: Some(vec![
                             EnvVar {
                                 name: "SNAPSHOT_ID".to_string(),
@@ -543,15 +553,12 @@ fn build_deployment(
     let pvc_name = format!("{name}-data");
     let creds_secret = format!("{}-creds", restore.spec.replica);
 
-    // Use a placeholder version — the init container reads .postgres-version
-    // and the actual image tag will be set. For now, default to "16".
-    // TODO: Read from restore status once the Job writes it.
     let pg_version = restore
         .status
         .as_ref()
         .and_then(|s| s.postgres_version.as_ref())
         .cloned()
-        .unwrap_or_else(|| "16".to_string());
+        .ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
     let pg_image = format!("postgres:{pg_version}");
     let pg_alpine_image = format!("postgres:{pg_version}-alpine");
@@ -857,6 +864,33 @@ fn env_from_secret(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
         }),
         ..Default::default()
     }
+}
+
+async fn read_pg_version_from_job_pod(
+    client: &Client,
+    namespace: &str,
+    job_name: &str,
+) -> Option<String> {
+    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+    let pod_list = pods
+        .list(&kube::api::ListParams::default().labels(&format!("job-name={job_name}")))
+        .await
+        .ok()?;
+
+    for pod in &pod_list.items {
+        let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+        for cs in statuses {
+            if cs.name == "restore" {
+                let terminated = cs.state.as_ref()?.terminated.as_ref()?;
+                let msg = terminated.message.as_ref()?.trim().to_string();
+                if !msg.is_empty() {
+                    return Some(msg);
+                }
+            }
+        }
+    }
+
+    None
 }
 
 fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference {
