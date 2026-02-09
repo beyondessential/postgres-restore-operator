@@ -87,9 +87,32 @@ jobs:
       - name: Set up test kopia repository
         run: |
           kubectl apply -f tests/fixtures/setup-kopia-repo.yaml
-          kubectl wait --for=condition=Complete job/setup-kopia-repo --timeout=300s
+          for i in $(seq 1 60); do
+            STATUS=$(kubectl get job/setup-kopia-repo -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)
+            FAILED=$(kubectl get job/setup-kopia-repo -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+            if [ "$STATUS" = "True" ]; then
+              echo "Setup job completed successfully"
+              break
+            fi
+            if [ "$FAILED" = "True" ]; then
+              echo "Setup job failed!"
+              kubectl describe job/setup-kopia-repo
+              kubectl get pods -l job-name=setup-kopia-repo -o wide
+              kubectl logs job/setup-kopia-repo --all-containers --prefix
+              exit 1
+            fi
+            if [ "$i" = "60" ]; then
+              echo "Setup job timed out after 300s"
+              kubectl describe job/setup-kopia-repo
+              kubectl get pods -l job-name=setup-kopia-repo -o wide
+              kubectl describe pods -l job-name=setup-kopia-repo
+              kubectl logs job/setup-kopia-repo --all-containers --prefix 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
           echo "--- Setup job logs ---"
-          kubectl logs job/setup-kopia-repo --all-containers
+          kubectl logs job/setup-kopia-repo --all-containers --prefix
           echo "--- Kopia repository ready ---"
 
       - name: Start operator (out-of-cluster)

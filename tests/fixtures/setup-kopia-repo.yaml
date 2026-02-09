@@ -2,80 +2,83 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: setup-kopia-repo
-  namespace: default
+    name: setup-kopia-repo
+    namespace: default
 spec:
-  backoffLimit: 3
-  template:
-    spec:
-      initContainers:
-        - name: create-bucket
-          image: minio/mc:latest
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -e
-              mc alias set minio http://minio.minio.svc:9000 minioadmin minioadmin
-              mc mb minio/test-bucket --ignore-existing
-              echo "Bucket created"
-        - name: init-pgdata
-          image: postgres:16
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -e
-              echo "Initializing PostgreSQL data directory..."
-              initdb -D /pgdata/16/main --no-locale --encoding=UTF8 --auth=trust
-              echo "PostgreSQL data directory initialized"
-              ls -la /pgdata/16/main/
-              cat /pgdata/16/main/PG_VERSION
-          env:
-            - name: POSTGRES_HOST_AUTH_METHOD
-              value: trust
-          volumeMounts:
-            - name: pgdata
-              mountPath: /pgdata
-      containers:
-        - name: create-snapshot
-          image: kopia/kopia:latest
-          command: ["/bin/sh", "-c"]
-          args:
-            - |
-              set -e
+    backoffLimit: 3
+    template:
+        spec:
+            initContainers:
+                - name: create-bucket
+                  image: minio/mc:latest
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+                          mc alias set minio http://minio.minio.svc:9000 minioadmin minioadmin
+                          mc mb minio/test-bucket --ignore-existing
+                          echo "Bucket created"
+                - name: init-pgdata
+                  image: postgres:16
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+                          echo "Initializing PostgreSQL data directory..."
+                          initdb -D /pgdata/16/main --no-locale --encoding=UTF8 --auth=trust
+                          echo "PostgreSQL data directory initialized"
+                          ls -la /pgdata/16/main/
+                          cat /pgdata/16/main/PG_VERSION
+                  env:
+                      - name: POSTGRES_HOST_AUTH_METHOD
+                        value: trust
+                  volumeMounts:
+                      - name: pgdata
+                        mountPath: /pgdata
+            containers:
+                - name: create-snapshot
+                  image: kopia/kopia:latest
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
 
-              mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
+                          mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
 
-              echo "Creating kopia repository..."
-              kopia repository create s3 \
-                --bucket=test-bucket \
-                --endpoint=minio.minio.svc:9000 \
-                --region=us-east-1 \
-                --access-key=minioadmin \
-                --secret-access-key=minioadmin \
-                --password=test-repo-password \
-                --disable-tls \
-                --disable-tls-verification
+                          echo "Creating kopia repository..."
+                          kopia repository create s3 \
+                            --bucket=test-bucket \
+                            --endpoint=minio.minio.svc:9000 \
+                            --region=us-east-1 \
+                            --access-key=minioadmin \
+                            --secret-access-key=minioadmin \
+                            --password=test-repo-password \
+                            --disable-tls \
+                            --disable-tls-verification
 
-              echo "Creating snapshot..."
-              kopia snapshot create /pgdata
+                          echo "Creating snapshot..."
+                          kopia snapshot create /pgdata
 
-              echo "Verifying snapshot..."
-              kopia snapshot list --json --all
+                          echo "Verifying snapshot..."
+                          kopia snapshot list --json --all
 
-              echo "Done"
-          env:
-            - name: KOPIA_CONFIG_PATH
-              value: /tmp/kopia/config/repository.config
-            - name: KOPIA_LOG_DIR
-              value: /tmp/kopia/logs
-            - name: KOPIA_CACHE_DIRECTORY
-              value: /tmp/kopia/cache
-            - name: USER
-              value: kopia
-          volumeMounts:
-            - name: pgdata
-              mountPath: /pgdata
-      volumes:
-        - name: pgdata
-          emptyDir: {}
-      restartPolicy: Never
+                          echo "Done"
+                  env:
+                      - name: KOPIA_CONFIG_PATH
+                        value: /tmp/kopia/config/repository.config
+                      - name: KOPIA_LOG_DIR
+                        value: /tmp/kopia/logs
+                      - name: KOPIA_CACHE_DIRECTORY
+                        value: /tmp/kopia/cache
+                      - name: USER
+                        value: kopia
+                  volumeMounts:
+                      - name: pgdata
+                        mountPath: /pgdata
+            volumes:
+                - name: pgdata
+                  emptyDir: {}
+            restartPolicy: Never
