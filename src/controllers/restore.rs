@@ -309,9 +309,8 @@ async fn reconcile_ready(
     // Create Deployment if it doesn't exist
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
 
-    if deployments.get_opt(name).await?.is_some() {
+    if let Some(deploy) = deployments.get_opt(name).await? {
         // Deployment exists, check if ready
-        let deploy = deployments.get(name).await?;
         let ready_replicas = deploy
             .status
             .as_ref()
