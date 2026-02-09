@@ -36,8 +36,8 @@ pub struct PostgresPhysicalReplicaSpec {
 	pub schedule_jitter: String,
 
 	/// Don't restore a new snapshot within this duration of the last restore completing
-	#[serde(default = "default_minimum_ttl")]
-	pub minimum_ttl: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub minimum_ttl: Option<String>,
 
 	/// Wait before deleting old restore after switchover
 	#[serde(default = "default_switchover_grace_period")]
@@ -83,9 +83,7 @@ fn default_read_only() -> bool {
 fn default_switchover_grace_period() -> String {
 	"5m".to_string()
 }
-fn default_minimum_ttl() -> String {
-	"6h".to_string()
-}
+
 fn default_schedule_jitter() -> String {
 	"10m".to_string()
 }

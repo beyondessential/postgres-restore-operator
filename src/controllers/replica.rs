@@ -716,15 +716,25 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
 
 	let status = replica.status.as_ref();
 
-	// Check minimumTTL
-	if let Some(last_completed) = status.and_then(|s| s.last_restore_completed_at.as_ref())
+	// Check minimumTTL (only if configured)
+	if let Some(ref ttl_str) = replica.spec.minimum_ttl
+		&& let Some(last_completed) = status.and_then(|s| s.last_restore_completed_at.as_ref())
 		&& let Ok(last_completed) = last_completed.parse::<chrono::DateTime<Utc>>()
 	{
-		let minimum_ttl =
-			parse_duration(&replica.spec.minimum_ttl).unwrap_or(Duration::from_secs(6 * 3600));
-		let elapsed = Utc::now().signed_duration_since(last_completed);
-		if elapsed.to_std().unwrap_or_default() < minimum_ttl {
-			return false;
+		if let Ok(minimum_ttl) = parse_duration(ttl_str) {
+			let elapsed = Utc::now().signed_duration_since(last_completed);
+			if elapsed.to_std().unwrap_or_default() < minimum_ttl {
+				let remaining = minimum_ttl - elapsed.to_std().unwrap_or_default();
+				info!(
+					replica = %name,
+					minimum_ttl_secs = minimum_ttl.as_secs(),
+					remaining_secs = remaining.as_secs(),
+					"minimum TTL not elapsed since last restore, skipping"
+				);
+				return false;
+			}
+		} else {
+			warn!(replica = %name, minimum_ttl = ttl_str, "invalid minimumTTL value, ignoring");
 		}
 	}
 
