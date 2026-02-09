@@ -643,10 +643,26 @@ async fn create_restore_for_snapshot(
 	let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
 	let restore_name = format!("{replica_name}-{timestamp}");
 
+	const MAX_PVC_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024; // 2 TiB
+
 	let snapshot_size = format_bytes(snapshot.size);
 	let storage_size = match &replica.spec.storage_size_override {
 		Some(override_size) => override_size.clone(),
-		None => format_bytes((snapshot.size as f64 * 1.1) as u64),
+		None => {
+			let computed = (snapshot.size as f64 * 1.1) as u64;
+			if computed > MAX_PVC_BYTES {
+				warn!(
+					replica = replica.name_any(),
+					snapshot = snapshot.id,
+					computed_bytes = computed,
+					max_bytes = MAX_PVC_BYTES,
+					"computed PVC size exceeds 2TiB ceiling, capping"
+				);
+				format_bytes(MAX_PVC_BYTES)
+			} else {
+				format_bytes(computed)
+			}
+		}
 	};
 
 	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
