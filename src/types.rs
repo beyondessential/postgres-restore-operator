@@ -1,8 +1,8 @@
 //! Common types shared across CRDs
 
-use std::collections::HashMap;
+use std::{borrow::Cow, collections::HashMap};
 
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 pub use self::{replica::*, restore::*};
@@ -52,7 +52,7 @@ pub struct SecretKeySelector {
 	pub key: String,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum HeaderValue {
 	Plain(String),
@@ -60,4 +60,37 @@ pub enum HeaderValue {
 	Secret {
 		secret_key_ref: SecretKeySelector,
 	},
+}
+
+impl JsonSchema for HeaderValue {
+	fn inline_schema() -> bool {
+		true
+	}
+
+	fn schema_name() -> Cow<'static, str> {
+		"HeaderValue".into()
+	}
+
+	fn json_schema(_generator: &mut SchemaGenerator) -> Schema {
+		// Kubernetes structural schemas forbid `type` inside `anyOf` items,
+		// so we emit the branches without top-level `type`.
+		json_schema!({
+			"anyOf": [
+				{},
+				{
+					"required": ["secretKeyRef"],
+					"properties": {
+						"secretKeyRef": {
+							"type": "object",
+							"properties": {
+								"name": { "type": "string" },
+								"key": { "type": "string" }
+							},
+							"required": ["name", "key"]
+						}
+					}
+				}
+			]
+		})
+	}
 }
