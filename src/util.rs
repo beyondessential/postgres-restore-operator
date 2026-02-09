@@ -3,44 +3,30 @@ use std::time::Duration;
 use crate::error::Error;
 
 /// Parses a human-friendly duration string like "6h", "15m", "5m30s", "2h30m".
+/// Falls back to treating a bare number as seconds.
 pub fn parse_duration(s: &str) -> Result<Duration, Error> {
     let s = s.trim();
     if s.is_empty() {
         return Err(Error::InvalidDuration(s.to_string()));
     }
 
-    let mut total_secs: u64 = 0;
-    let mut current_num = String::new();
-
-    for c in s.chars() {
-        if c.is_ascii_digit() {
-            current_num.push(c);
-        } else {
-            if current_num.is_empty() {
-                return Err(Error::InvalidDuration(s.to_string()));
-            }
-            let n: u64 = current_num
-                .parse()
-                .map_err(|_| Error::InvalidDuration(s.to_string()))?;
-            current_num.clear();
-
-            match c {
-                'd' => total_secs += n * 86400,
-                'h' => total_secs += n * 3600,
-                'm' => total_secs += n * 60,
-                's' => total_secs += n,
-                _ => return Err(Error::InvalidDuration(s.to_string())),
-            }
-        }
-    }
-
     // Bare number without unit is treated as seconds
-    if !current_num.is_empty() {
-        let n: u64 = current_num
-            .parse()
-            .map_err(|_| Error::InvalidDuration(s.to_string()))?;
-        total_secs += n;
+    if let Ok(n) = s.parse::<u64>() {
+        return if n == 0 {
+            Err(Error::InvalidDuration(s.to_string()))
+        } else {
+            Ok(Duration::from_secs(n))
+        };
     }
+
+    let span: jiff::Span = jiff::fmt::friendly::SpanParser::new()
+        .parse_span(s)
+        .map_err(|_| Error::InvalidDuration(s.to_string()))?;
+
+    let total_secs = span.get_days() as u64 * 86400
+        + span.get_hours() as u64 * 3600
+        + span.get_minutes() as u64 * 60
+        + span.get_seconds() as u64;
 
     if total_secs == 0 {
         return Err(Error::InvalidDuration(s.to_string()));
@@ -49,22 +35,15 @@ pub fn parse_duration(s: &str) -> Result<Duration, Error> {
     Ok(Duration::from_secs(total_secs))
 }
 
-/// Converts a glob pattern to a regex string.
-pub fn glob_to_regex(glob: &str) -> String {
-    let mut regex = String::from("^");
-    for c in glob.chars() {
-        match c {
-            '*' => regex.push_str(".*"),
-            '?' => regex.push('.'),
-            '.' | '+' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|' | '\\' => {
-                regex.push('\\');
-                regex.push(c);
-            }
-            _ => regex.push(c),
-        }
-    }
-    regex.push('$');
-    regex
+/// Tests whether a string matches a glob pattern.
+pub fn glob_matches(pattern: &str, value: &str) -> bool {
+    let Ok(glob) = globset::GlobBuilder::new(pattern)
+        .literal_separator(false)
+        .build()
+    else {
+        return false;
+    };
+    glob.compile_matcher().is_match(value)
 }
 
 #[cfg(test)]
@@ -117,36 +96,36 @@ mod tests {
     }
 
     #[test]
-    fn test_glob_to_regex() {
-        assert_eq!(glob_to_regex("fiji-prod-*"), "^fiji-prod-.*$");
-        assert_eq!(glob_to_regex("*.example.com"), "^.*\\.example\\.com$");
-        assert_eq!(glob_to_regex("host-?"), "^host-.$");
+    fn test_glob_matches_wildcard() {
+        assert!(glob_matches("fiji-prod-*", "fiji-prod-01"));
+        assert!(glob_matches("fiji-prod-*", "fiji-prod-abc"));
+        assert!(!glob_matches("fiji-prod-*", "fiji-dev-01"));
     }
 
     #[test]
-    fn glob_to_regex_special_chars() {
-        assert_eq!(glob_to_regex("a+b"), "^a\\+b$");
-        assert_eq!(glob_to_regex("a[b]c"), "^a\\[b\\]c$");
-        assert_eq!(glob_to_regex("a{b}c"), "^a\\{b\\}c$");
-        assert_eq!(glob_to_regex("a^b$c"), "^a\\^b\\$c$");
-        assert_eq!(glob_to_regex("a|b"), "^a\\|b$");
-        assert_eq!(glob_to_regex("a(b)c"), "^a\\(b\\)c$");
+    fn test_glob_matches_question_mark() {
+        assert!(glob_matches("ab?d", "abcd"));
+        assert!(glob_matches("ab?d", "abxd"));
+        assert!(!glob_matches("ab?d", "abd"));
+        assert!(!glob_matches("ab?d", "abccd"));
     }
 
     #[test]
-    fn glob_to_regex_exact_match() {
-        let re = regex::Regex::new(&glob_to_regex("exact")).unwrap();
-        assert!(re.is_match("exact"));
-        assert!(!re.is_match("not-exact"));
-        assert!(!re.is_match("exactnot"));
+    fn test_glob_matches_exact() {
+        assert!(glob_matches("exact", "exact"));
+        assert!(!glob_matches("exact", "not-exact"));
+        assert!(!glob_matches("exact", "exactnot"));
     }
 
     #[test]
-    fn glob_to_regex_question_mark() {
-        let re = regex::Regex::new(&glob_to_regex("ab?d")).unwrap();
-        assert!(re.is_match("abcd"));
-        assert!(re.is_match("abxd"));
-        assert!(!re.is_match("abd"));
-        assert!(!re.is_match("abccd"));
+    fn test_glob_matches_dots() {
+        assert!(glob_matches("*.example.com", "foo.example.com"));
+        assert!(!glob_matches("*.example.com", "foo.other.com"));
+    }
+
+    #[test]
+    fn test_glob_matches_special_chars() {
+        assert!(glob_matches("a+b", "a+b"));
+        assert!(!glob_matches("a+b", "aab"));
     }
 }

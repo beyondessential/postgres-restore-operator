@@ -1,7 +1,7 @@
 use k8s_openapi::api::core::v1::Secret;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::Error, types::SnapshotFilter, util::glob_to_regex};
+use crate::{error::Error, types::SnapshotFilter, util::glob_matches};
 
 /// Credentials extracted from a kopia Kubernetes Secret.
 #[derive(Debug, Clone)]
@@ -111,11 +111,8 @@ pub fn filter_snapshots(snapshots: &[Snapshot], filter: Option<&SnapshotFilter>)
 
             // Host pattern filtering
             if let Some(pattern) = &filter.host_pattern {
-                let regex_str = glob_to_regex(pattern);
-                if let Ok(re) = regex::Regex::new(&regex_str) {
-                    if !re.is_match(&snap.hostname) {
-                        return false;
-                    }
+                if !glob_matches(pattern, &snap.hostname) {
+                    return false;
                 }
             }
 

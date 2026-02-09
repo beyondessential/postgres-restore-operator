@@ -3,29 +3,25 @@ name = "postgres-restore-operator"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "gen-crds"
-path = "src/gen_crds.rs"
-
 [dependencies]
-kube = { version = "3.0.1", features = ["runtime", "derive"] }
-k8s-openapi = { version = "0.27.0", features = ["latest"] }
-tokio = { version = "1.49.0", features = ["full"] }
-serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
-schemars = "1.2.1"
-tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }
 anyhow = "1.0.101"
-thiserror = "2.0.18"
-prometheus = "0.14.0"
 axum = "0.8.8"
 chrono = { version = "0.4.43", features = ["serde"] }
-reqwest = { version = "0.13.2", features = ["json"] }
 cron = "0.15.0"
-regex = "1.12.3"
-serde_yaml = "0.9.34"
-clap = { version = "4.5.57", features = ["derive"] }
-handlebars = "6.4.0"
-rand = "0.10.0"
 futures = "0.3.31"
+globset = "0.4.18"
+handlebars = "6.4.0"
+jiff = "0.2.19"
+k8s-openapi = { version = "0.27.0", features = ["latest"] }
+kube = { version = "3.0.1", features = ["runtime", "derive"] }
+prometheus = "0.14.0"
+rand = "0.10.0"
+reqwest = { version = "0.13.2", features = ["json"] }
+schemars = "1.2.1"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+serde_yaml = "0.9.34"
+thiserror = "2.0.18"
+tokio = { version = "1.49.0", features = ["full"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["json", "env-filter"] }

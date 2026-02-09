@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
 use axum::{Router, routing::get};
-use clap::Parser;
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::ConfigMap;
 use kube::{
     Api, Client,
     runtime::{controller::Controller, watcher::Config},
 };
 use prometheus::Encoder;
-use tracing::info;
+use tracing::{info, warn};
 
 use postgres_restore_operator::{
     context::Context,
@@ -16,22 +16,41 @@ use postgres_restore_operator::{
     types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
 
-#[derive(Parser)]
-#[command(name = "postgres-restore-operator")]
-#[command(about = "Kubernetes operator for managing PostgreSQL restores from Kopia snapshots")]
-struct Args {
-    /// Maximum number of concurrent restores
-    #[arg(long, default_value = "2")]
-    max_concurrent_restores: usize,
+const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 2;
+const DEFAULT_METRICS_ADDR: &str = "0.0.0.0:8080";
+const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
 
-    /// Metrics server bind address
-    #[arg(long, default_value = "0.0.0.0:8080")]
-    metrics_addr: String,
+fn operator_namespace() -> String {
+    if let Ok(ns) = std::env::var("OPERATOR_NAMESPACE") {
+        return ns;
+    }
+
+    std::fs::read_to_string("/var/run/secrets/kubernetes.io/serviceaccount/namespace")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "postgres-restore-operator".to_string())
+}
+
+async fn read_max_concurrent_restores(client: &Client, namespace: &str) -> usize {
+    let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
+    match api.get(CONFIGMAP_NAME).await {
+        Ok(cm) => cm
+            .data
+            .as_ref()
+            .and_then(|d| d.get("maxConcurrentRestores"))
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or_else(|| {
+                info!("maxConcurrentRestores not set in ConfigMap, defaulting to {DEFAULT_MAX_CONCURRENT_RESTORES}");
+                DEFAULT_MAX_CONCURRENT_RESTORES
+            }),
+        Err(e) => {
+            warn!(error = %e, "failed to read ConfigMap {CONFIGMAP_NAME}, defaulting to {DEFAULT_MAX_CONCURRENT_RESTORES}");
+            DEFAULT_MAX_CONCURRENT_RESTORES
+        }
+    }
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Structured JSON logging
     tracing_subscriber::fmt()
         .json()
         .with_env_filter(
@@ -40,20 +59,26 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let args = Args::parse();
+    let metrics_addr =
+        std::env::var("METRICS_ADDR").unwrap_or_else(|_| DEFAULT_METRICS_ADDR.to_string());
+
+    let client = Client::try_default().await?;
+
+    let namespace = operator_namespace();
+    let max_concurrent_restores = read_max_concurrent_restores(&client, &namespace).await;
 
     info!(
-        max_concurrent_restores = args.max_concurrent_restores,
-        metrics_addr = args.metrics_addr,
+        max_concurrent_restores,
+        metrics_addr,
+        operator_namespace = namespace,
         "starting postgres-restore-operator"
     );
 
-    let client = Client::try_default().await?;
-    let ctx = Arc::new(Context::new(client.clone(), args.max_concurrent_restores));
+    let ctx = Arc::new(Context::new(client.clone(), max_concurrent_restores));
 
     // Start metrics server
     let metrics_registry = ctx.metrics.registry.clone();
-    let metrics_addr = args.metrics_addr.clone();
+    let metrics_addr_clone = metrics_addr.clone();
     tokio::spawn(async move {
         let app = Router::new()
             .route(
@@ -72,10 +97,10 @@ async fn main() -> anyhow::Result<()> {
             .route("/healthz", get(|| async { "ok" }))
             .route("/readyz", get(|| async { "ok" }));
 
-        let listener = tokio::net::TcpListener::bind(&metrics_addr)
+        let listener = tokio::net::TcpListener::bind(&metrics_addr_clone)
             .await
             .expect("failed to bind metrics server");
-        info!(addr = metrics_addr, "metrics server listening");
+        info!(addr = metrics_addr_clone, "metrics server listening");
         axum::serve(listener, app).await.unwrap();
     });
 
@@ -91,7 +116,6 @@ async fn main() -> anyhow::Result<()> {
             Api::<PostgresPhysicalRestore>::all(client.clone()),
             Config::default(),
             |restore| {
-                // Map restore events to the parent replica
                 let replica_name = restore.spec.replica.clone();
                 let namespace = restore.metadata.namespace.clone();
                 namespace
@@ -125,7 +149,6 @@ async fn main() -> anyhow::Result<()> {
 
     info!("controllers started");
 
-    // Run both controllers concurrently
     tokio::select! {
         _ = replica_controller => {
             tracing::error!("replica controller exited unexpectedly");
