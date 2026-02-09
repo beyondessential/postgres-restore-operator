@@ -23,10 +23,7 @@ use rand::RngExt;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{
-	env_from_secret, jq_init_container, kopia_writable_env, read_job_termination_message,
-	tools_volume, tools_volume_mount,
-};
+use super::{env_from_secret, read_job_termination_message};
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -510,17 +507,13 @@ fn build_snapshot_list_job(
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let replica_name = replica.name_any();
 
-	let mut env_vars = [
-		kopia_writable_env(),
-		vec![
-			env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
-			env_from_secret("KOPIA_REGION", kopia_secret, "region"),
-			env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
-			env_from_secret("AWS_SECRET_ACCESS_KEY", kopia_secret, "secretAccessKey"),
-			env_from_secret("KOPIA_PASSWORD", kopia_secret, "repositoryPassword"),
-		],
-	]
-	.concat();
+	let mut env_vars = vec![
+		env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
+		env_from_secret("KOPIA_REGION", kopia_secret, "region"),
+		env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
+		env_from_secret("AWS_SECRET_ACCESS_KEY", kopia_secret, "secretAccessKey"),
+		env_from_secret("KOPIA_PASSWORD", kopia_secret, "repositoryPassword"),
+	];
 
 	if let Some(ref filter) = replica.spec.snapshot_filter {
 		if let Some(ref pattern) = filter.host_pattern {
@@ -546,7 +539,7 @@ fn build_snapshot_list_job(
 
 	let script = r#"set -e
 
-mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
+apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1
 
 kopia repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
@@ -559,7 +552,7 @@ SNAPSHOTS=$(kopia snapshot list --json --all 2>/dev/null || echo "[]")
 
 if [ -n "$FILTER_HOST_PATTERN" ]; then
   REGEX=$(printf '%s' "$FILTER_HOST_PATTERN" | sed 's/\./\\./g; s/\*/\.\*/g; s/\?/\./g')
-  SNAPSHOTS=$(echo "$SNAPSHOTS" | /tools/jq -c --arg pat "^${REGEX}$" '[.[] | select(.source.host != null and (.source.host | test($pat)))]')
+  SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg pat "^${REGEX}$" '[.[] | select(.source.host != null and (.source.host | test($pat)))]')
 fi
 
 if [ -n "$FILTER_TAGS" ]; then
@@ -569,11 +562,11 @@ EOF
   for tag in $TAG_LIST; do
     KEY="${tag%%=*}"
     VALUE="${tag#*=}"
-    SNAPSHOTS=$(echo "$SNAPSHOTS" | /tools/jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v or .tags["tag:" + $k] == $v)]')
+    SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v or .tags["tag:" + $k] == $v)]')
   done
 fi
 
-LATEST=$(echo "$SNAPSHOTS" | /tools/jq -c 'sort_by(.startTime) | last // empty')
+LATEST=$(echo "$SNAPSHOTS" | jq -c 'sort_by(.startTime) | last // empty')
 
 if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
   echo "No matching snapshots found"
@@ -581,8 +574,8 @@ if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
   exit 0
 fi
 
-ID=$(echo "$LATEST" | /tools/jq -r '.id')
-SIZE=$(echo "$LATEST" | /tools/jq -r '.stats.totalSize // 0')
+ID=$(echo "$LATEST" | jq -r '.id')
+SIZE=$(echo "$LATEST" | jq -r '.stats.totalSize // 0')
 echo "Latest snapshot: id=$ID size=$SIZE"
 printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 "#;
@@ -612,14 +605,12 @@ printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 				}),
 				spec: Some(PodSpec {
 					restart_policy: Some("Never".to_string()),
-					init_containers: Some(vec![jq_init_container()]),
 					containers: vec![Container {
 						name: "snapshot-list".to_string(),
 						image: Some("kopia/kopia:latest".to_string()),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![script.to_string()]),
 						env: Some(env_vars),
-						volume_mounts: Some(vec![tools_volume_mount()]),
 						resources: Some(ResourceRequirements {
 							requests: Some(BTreeMap::from([
 								("cpu".to_string(), Quantity("50m".to_string())),
@@ -633,7 +624,6 @@ printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 						}),
 						..Default::default()
 					}],
-					volumes: Some(vec![tools_volume()]),
 					..Default::default()
 				}),
 			},

@@ -71,11 +71,11 @@ pub fn jq_init_container() -> Container {
 		resources: Some(ResourceRequirements {
 			requests: Some(BTreeMap::from([
 				("cpu".to_string(), Quantity("10m".to_string())),
-				("memory".to_string(), Quantity("16Mi".to_string())),
+				("memory".to_string(), Quantity("64Mi".to_string())),
 			])),
 			limits: Some(BTreeMap::from([
 				("cpu".to_string(), Quantity("100m".to_string())),
-				("memory".to_string(), Quantity("32Mi".to_string())),
+				("memory".to_string(), Quantity("128Mi".to_string())),
 			])),
 			..Default::default()
 		}),
