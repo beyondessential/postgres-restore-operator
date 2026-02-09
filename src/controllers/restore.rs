@@ -856,6 +856,13 @@ fi
 
 {extra_config_block}
 
+echo "Stripping source-host config overrides from postgresql.conf..."
+sed -i \
+  -e '/^[[:space:]]*hba_file[[:space:]]*=/d' \
+  -e '/^[[:space:]]*ident_file[[:space:]]*=/d' \
+  -e '/^[[:space:]]*data_directory[[:space:]]*=/d' \
+  "$PGDATA/postgresql.conf"
+
 if [ ! -f "$PGDATA/pg_ident.conf" ]; then
   echo "Creating empty pg_ident.conf..."
   touch "$PGDATA/pg_ident.conf"
@@ -1365,6 +1372,24 @@ mod tests {
 			!script.contains("peer\n"),
 			"pg_hba.conf must not use peer as an auth method"
 		);
+	}
+
+	#[test]
+	fn strips_source_host_config_overrides() {
+		let replica = make_replica(None);
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			script.contains("Stripping source-host config overrides"),
+			"script must strip source-host overrides"
+		);
+		for directive in ["hba_file", "ident_file", "data_directory"] {
+			assert!(
+				script.contains(directive),
+				"script must strip {directive} from postgresql.conf"
+			);
+		}
 	}
 
 	#[test]
