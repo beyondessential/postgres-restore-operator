@@ -158,8 +158,8 @@ spec:
                 - name: controller
                   image: ghcr.io/beyondessential/postgres-restore-operator:latest
                   env:
-                      - name: RUST_LOG
-                        value: "info,tower_http=debug"
+                      # - name: RUST_LOG
+                      #   value: "info,tower_http=debug"
                       - name: METRICS_ADDR
                         value: "[::]:8080"
                       - name: OPERATOR_NAMESPACE
