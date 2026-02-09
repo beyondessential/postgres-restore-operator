@@ -470,10 +470,10 @@ fn build_version_detect_job(
 echo "PVC contents:"
 ls -la /pgdata/ 2>&1 || true
 echo "---"
-ls -la /pgdata/postgres/ 2>&1 || true
+ls -la /pgdata/pgdata/ 2>&1 || true
 echo "---"
 
-VERSION=$(cat /pgdata/.postgres-version 2>/dev/null || cat /pgdata/postgres/PG_VERSION 2>/dev/null || true)
+VERSION=$(cat /pgdata/.postgres-version 2>/dev/null || cat /pgdata/pgdata/PG_VERSION 2>/dev/null || true)
 if [ -z "$VERSION" ]; then
   echo "Searching for PG_VERSION recursively..."
   find /pgdata -name "PG_VERSION" 2>/dev/null || true
@@ -623,18 +623,16 @@ kopia snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
 echo "Restore complete"
 ls -la /pgdata/
 
-echo "Detecting postgres version..."
-VERSION=$(cat /pgdata/postgres/PG_VERSION 2>/dev/null || true)
-
-if [ -z "$VERSION" ]; then
-  VERSION=$(find /pgdata/postgres -name "PG_VERSION" -exec cat {} \; 2>/dev/null | head -1)
-fi
-
-if [ -z "$VERSION" ]; then
-  echo "ERROR: Could not detect postgres version"
+echo "Locating PGDATA directory..."
+PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | head -1)
+if [ -z "$PGDATA_DIR" ]; then
+  echo "ERROR: Could not find PG_VERSION in restored data"
   exit 1
 fi
+echo "Found PGDATA at: $PGDATA_DIR"
+ln -sfn "$PGDATA_DIR" /pgdata/pgdata
 
+VERSION=$(cat /pgdata/pgdata/PG_VERSION)
 echo "Detected postgres version: $VERSION"
 echo "$VERSION" > /pgdata/.postgres-version
 echo -n "$VERSION" > /dev/termination-log
@@ -770,7 +768,7 @@ fn build_deployment(
 
 	let init_script = format!(
 		r#"set -e
-PGDATA=/pgdata/postgres
+PGDATA=/pgdata/pgdata
 
 echo "Configuring pg_hba.conf..."
 cat > "$PGDATA/pg_hba.conf" << 'HBAEOF'
@@ -944,12 +942,12 @@ echo "Auth setup complete"
 						args: Some(vec![
 							"postgres".to_string(),
 							"-D".to_string(),
-							"/pgdata/postgres".to_string(),
+							"/pgdata/pgdata".to_string(),
 						]),
 						env: Some(vec![
 							EnvVar {
 								name: "PGDATA".to_string(),
-								value: Some("/pgdata/postgres".to_string()),
+								value: Some("/pgdata/pgdata".to_string()),
 								..Default::default()
 							},
 							EnvVar {
