@@ -373,52 +373,63 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 					)
 					.await;
 
+					let Some(ref raw) = msg else {
+						// Termination message not yet available (pod status
+						// may not have propagated). Retry shortly instead of
+						// deleting the job and losing the result.
+						info!(
+							replica = name,
+							job = snapshot_job_name,
+							"snapshot list job succeeded but termination message not yet available, retrying"
+						);
+						return Ok(Action::requeue(Duration::from_secs(5)));
+					};
+
+					// We have the message — safe to delete the job now.
 					if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
 						warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
 					}
 
-					if let Some(ref raw) = msg {
-						if let Ok(snap) = serde_json::from_str::<SnapshotInfo>(raw) {
-							update_replica_status_field(
-								client,
-								&namespace,
-								&name,
-								"latestAvailableSnapshot",
-								&snap.id,
-							)
-							.await?;
-
-							let current_snapshot_id =
-								active_restore.map(|r| r.spec.snapshot.as_str());
-
-							if current_snapshot_id == Some(&snap.id) {
-								info!(
-									replica = name,
-									snapshot = snap.id,
-									"latest snapshot already active, skipping"
-								);
-							} else {
-								info!(
-									replica = name,
-									snapshot = snap.id,
-									size = snap.size,
-									"new snapshot available, creating restore"
-								);
-								create_restore_for_snapshot(client, &namespace, &replica, &snap)
-									.await?;
-								ctx.metrics.restores_started_total.inc();
-							}
-						} else {
-							warn!(
-								replica = name,
-								raw = raw,
-								"failed to parse snapshot list job output"
-							);
-						}
-					} else {
+					// "{}" means no matching snapshots were found
+					if raw == "{}" {
 						info!(
 							replica = name,
 							"snapshot list job returned no matching snapshots"
+						);
+					} else if let Ok(snap) = serde_json::from_str::<SnapshotInfo>(raw) {
+						update_replica_status_field(
+							client,
+							&namespace,
+							&name,
+							"latestAvailableSnapshot",
+							&snap.id,
+						)
+						.await?;
+
+						let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
+
+						if current_snapshot_id == Some(&snap.id) {
+							info!(
+								replica = name,
+								snapshot = snap.id,
+								"latest snapshot already active, skipping"
+							);
+						} else {
+							info!(
+								replica = name,
+								snapshot = snap.id,
+								size = snap.size,
+								"new snapshot available, creating restore"
+							);
+							create_restore_for_snapshot(client, &namespace, &replica, &snap)
+								.await?;
+							ctx.metrics.restores_started_total.inc();
+						}
+					} else {
+						warn!(
+							replica = name,
+							raw = raw,
+							"failed to parse snapshot list job output"
 						);
 					}
 				} else if failed > backoff_limit {
@@ -559,6 +570,7 @@ LATEST=$(echo "$SNAPSHOTS" | jq -c 'sort_by(.startTime) | last // empty')
 
 if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
   echo "No matching snapshots found"
+  printf '{}' > /dev/termination-log
   exit 0
 fi
 

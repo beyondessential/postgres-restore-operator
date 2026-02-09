@@ -37,14 +37,27 @@ pub async fn read_job_termination_message(
 		.ok()?;
 
 	for pod in &pod_list.items {
-		let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
+		let Some(statuses) = pod
+			.status
+			.as_ref()
+			.and_then(|s| s.container_statuses.as_ref())
+		else {
+			continue;
+		};
 		for cs in statuses {
-			if cs.name == container_name {
-				let terminated = cs.state.as_ref()?.terminated.as_ref()?;
-				let msg = terminated.message.as_ref()?.trim().to_string();
-				if !msg.is_empty() {
-					return Some(msg);
-				}
+			if cs.name != container_name {
+				continue;
+			}
+			let msg = cs
+				.state
+				.as_ref()
+				.and_then(|s| s.terminated.as_ref())
+				.and_then(|t| t.message.as_ref())
+				.map(|m| m.trim().to_string());
+			if let Some(ref m) = msg
+				&& !m.is_empty()
+			{
+				return msg;
 			}
 		}
 	}
