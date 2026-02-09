@@ -822,6 +822,8 @@ fn build_deployment(
 		r#"set -e
 PGDATA=/pgdata/pgdata
 
+chmod 0750 "$PGDATA"
+
 if [ ! -f "$PGDATA/postgresql.conf" ]; then
   echo "Creating minimal postgresql.conf (Debian-style installs keep config in /etc)..."
   cat > "$PGDATA/postgresql.conf" << 'CONFEOF'
