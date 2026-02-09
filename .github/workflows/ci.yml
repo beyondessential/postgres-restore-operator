@@ -82,7 +82,12 @@ jobs:
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
             | tar xz -C /usr/local/bin kubeconform
-      - run: kubeconform -strict -summary operator.yaml crds.yaml
+      - name: Lint manifests
+        run: |
+          kubeconform -strict -summary \
+            -schema-location default \
+            -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json' \
+            operator.yaml crds.yaml
 
   tests-pass:
     if: always()
