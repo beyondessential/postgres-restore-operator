@@ -12,6 +12,7 @@ use kube::{
 	runtime::{controller::Controller, watcher, watcher::Config},
 };
 use prometheus::Encoder;
+use tower_http::trace::TraceLayer;
 use tracing::{info, warn};
 
 use postgres_restore_operator::{
@@ -143,10 +144,7 @@ async fn main() -> anyhow::Result<()> {
 	// Start metrics server
 	let metrics_registry = ctx.metrics.registry.clone();
 	let metrics_addr_clone = metrics_addr.clone();
-	let probe_state = ProbeState {
-		client: client.clone(),
-		heartbeat,
-	};
+	let probe_state = ProbeState { heartbeat };
 	tokio::spawn(async move {
 		let app = Router::new()
 			.route(
@@ -164,7 +162,8 @@ async fn main() -> anyhow::Result<()> {
 			)
 			.route("/livez", get(livez))
 			.route("/readyz", get(readyz))
-			.with_state(probe_state);
+			.with_state(probe_state)
+			.layer(TraceLayer::new_for_http());
 
 		let listener = tokio::net::TcpListener::bind(&metrics_addr_clone)
 			.await
@@ -232,7 +231,6 @@ async fn main() -> anyhow::Result<()> {
 
 #[derive(Clone)]
 struct ProbeState {
-	client: Client,
 	heartbeat: Arc<AtomicI64>,
 }
 
@@ -241,7 +239,6 @@ struct ProbeState {
 async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
 	let age = chrono::Utc::now().timestamp() - last;
-	tracing::trace!(heartbeat_age_secs = age, "GET /livez");
 	if age <= 30 {
 		(StatusCode::OK, "ok")
 	} else {
@@ -253,16 +250,17 @@ async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	}
 }
 
-/// Readiness: checks that the Kubernetes API server is reachable.
+/// Readiness: checks that the heartbeat is fresh (runtime is responsive).
 async fn readyz(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
-	match state.client.apiserver_version().await {
-		Ok(_) => {
-			tracing::trace!("GET /readyz");
-			(StatusCode::OK, "ok")
-		}
-		Err(e) => {
-			tracing::warn!(error = %e, "readiness check failed: API server unreachable");
-			(StatusCode::SERVICE_UNAVAILABLE, "API server unreachable")
-		}
+	let last = state.heartbeat.load(Ordering::Relaxed);
+	let age = chrono::Utc::now().timestamp() - last;
+	if age <= 30 {
+		(StatusCode::OK, "ok")
+	} else {
+		tracing::warn!(
+			heartbeat_age_secs = age,
+			"readiness check failed: heartbeat stale"
+		);
+		(StatusCode::SERVICE_UNAVAILABLE, "not ready")
 	}
 }
