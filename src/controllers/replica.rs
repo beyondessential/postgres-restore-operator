@@ -957,7 +957,7 @@ async fn update_replica_status_field(
     let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
     let patch = serde_json::json!({
         "status": {
-            field: value,
+            (field): value,
         }
     });
     replicas
