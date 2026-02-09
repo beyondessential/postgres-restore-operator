@@ -89,6 +89,7 @@ async fn reconcile_pending(
     namespace: &str,
 ) -> Result<Action> {
     let client = &ctx.client;
+    let replica_name = &restore.spec.replica;
 
     // Set created_at if not set
     if restore
@@ -154,9 +155,9 @@ async fn reconcile_pending(
     )
     .await?;
 
-    // Mark as active in the queue
+    // Mark as active in the queue (keyed by replica name to match enqueue in replica controller)
     let mut queue = ctx.restore_queue.write().await;
-    queue.mark_active(name);
+    queue.mark_active(replica_name);
     ctx.metrics.active_restores.set(queue.active.len() as i64);
     ctx.metrics.queue_depth.set(queue.pending.len() as i64);
     drop(queue);
@@ -173,6 +174,7 @@ async fn reconcile_restoring(
     namespace: &str,
 ) -> Result<Action> {
     let client = &ctx.client;
+    let replica_name = &restore.spec.replica;
 
     // Create or check restore Job
     let job_name = format!("{name}-restore");
@@ -263,14 +265,14 @@ async fn reconcile_restoring(
 
         // Remove from active queue and promote next pending restore
         let mut queue = ctx.restore_queue.write().await;
-        queue.remove(name);
+        queue.remove(replica_name);
         let promoted = queue.try_promote(ctx.max_concurrent_restores());
         ctx.metrics.active_restores.set(queue.active.len() as i64);
         ctx.metrics.queue_depth.set(queue.pending.len() as i64);
         drop(queue);
 
         if let Some(promoted_name) = promoted {
-            info!(restore = %promoted_name, "promoted queued restore after failure");
+            info!(promoted = %promoted_name, "promoted queued restore after failure");
         }
 
         ctx.metrics.restores_failed_total.inc();
@@ -302,6 +304,7 @@ async fn reconcile_ready(
     namespace: &str,
 ) -> Result<Action> {
     let client = &ctx.client;
+    let replica_name = &restore.spec.replica;
 
     // Create Deployment if it doesn't exist
     let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -333,14 +336,14 @@ async fn reconcile_ready(
 
             // Remove from active queue and promote next pending restore
             let mut queue = ctx.restore_queue.write().await;
-            queue.remove(name);
+            queue.remove(replica_name);
             let promoted = queue.try_promote(ctx.max_concurrent_restores());
             ctx.metrics.active_restores.set(queue.active.len() as i64);
             ctx.metrics.queue_depth.set(queue.pending.len() as i64);
             drop(queue);
 
             if let Some(promoted_name) = promoted {
-                info!(restore = %promoted_name, "promoted queued restore after switchover");
+                info!(promoted = %promoted_name, "promoted queued restore after switchover");
             }
 
             return Ok(Action::requeue(Duration::from_secs(5)));
@@ -366,14 +369,14 @@ async fn reconcile_ready(
                     .await?;
 
                     let mut queue = ctx.restore_queue.write().await;
-                    queue.remove(name);
+                    queue.remove(replica_name);
                     let promoted = queue.try_promote(ctx.max_concurrent_restores());
                     ctx.metrics.active_restores.set(queue.active.len() as i64);
                     ctx.metrics.queue_depth.set(queue.pending.len() as i64);
                     drop(queue);
 
                     if let Some(promoted_name) = promoted {
-                        info!(restore = %promoted_name, "promoted queued restore after timeout failure");
+                        info!(promoted = %promoted_name, "promoted queued restore after timeout failure");
                     }
 
                     ctx.metrics.restores_failed_total.inc();
