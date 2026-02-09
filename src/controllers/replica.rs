@@ -225,6 +225,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
             &switching,
             &conn_info,
             &creds_secret_name,
+            &ctx.metrics,
         )
         .await;
 
@@ -1044,6 +1045,7 @@ async fn send_restore_notifications(
     restore: &PostgresPhysicalRestore,
     conn_info: &ConnectionInfo,
     creds_secret_name: &str,
+    metrics: &crate::metrics::Metrics,
 ) {
     let replica_name = replica.name_any();
 
@@ -1098,6 +1100,18 @@ async fn send_restore_notifications(
             &payload,
         )
         .await;
+
+        if status.success {
+            metrics
+                .notifications_sent_total
+                .with_label_values(&[&notif_config.name, &payload.event])
+                .inc();
+        } else {
+            metrics
+                .notifications_failed_total
+                .with_label_values(&[&notif_config.name, &payload.event])
+                .inc();
+        }
 
         statuses.push(status);
     }
