@@ -22,7 +22,7 @@ struct Args {
     max_concurrent_restores: usize,
 
     /// Metrics server bind address
-    #[arg(long, default_value = "0.0.0.0:9090")]
+    #[arg(long, default_value = "0.0.0.0:8080")]
     metrics_addr: String,
 }
 
