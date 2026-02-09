@@ -14,6 +14,7 @@ use super::{Condition, HeaderValue, ResourceRequirements, Toleration};
 	namespaced,
 	status = "PostgresPhysicalReplicaStatus",
 	shortname = "ppr",
+	category = "all",
 	printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
 	printcolumn = r#"{"name":"Service","type":"string","jsonPath":".status.serviceName"}"#,
 	printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#

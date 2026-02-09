@@ -12,6 +12,7 @@ use super::Condition;
 	namespaced,
 	status = "PostgresPhysicalRestoreStatus",
 	shortname = "pprestore",
+	category = "all",
 	printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
 	printcolumn = r#"{"name":"Replica","type":"string","jsonPath":".spec.replica"}"#,
 	printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
