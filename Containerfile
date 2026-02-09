@@ -3,7 +3,7 @@ FROM busybox:glibc
 ARG TARGETPLATFORM
 
 # Create user and group
-RUN addgroup -g 1000 operator && adduser -D -u 1000 -G operator operator
+# RUN addgroup -g 1000 operator && adduser -D -u 1000 -G operator operator
 
 # Copy all binaries from both architectures
 COPY --chmod=0755 amd64/ /tmp/bins/amd64/
