@@ -290,6 +290,103 @@ async fn reconcile_ready(
 	let client = &ctx.client;
 	let replica_name = &restore.spec.replica;
 
+	// If postgresVersion is missing (e.g. restore job pod was evicted before
+	// we could read the termination message), recover by launching a small job
+	// that reads PG_VERSION from the PVC.
+	if restore
+		.status
+		.as_ref()
+		.and_then(|s| s.postgres_version.as_ref())
+		.is_none()
+	{
+		let detect_job_name = format!("{name}-version-detect");
+		let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+
+		match jobs.get_opt(&detect_job_name).await? {
+			None => {
+				info!(
+					restore = name,
+					job = detect_job_name,
+					"postgresVersion missing from status, creating version detection job"
+				);
+				let pvc_name = format!("{name}-data");
+				let job = build_version_detect_job(restore, &detect_job_name, namespace, &pvc_name);
+				jobs.create(&PostParams::default(), &job).await?;
+				return Ok(Action::requeue(Duration::from_secs(5)));
+			}
+			Some(job) => {
+				let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
+				let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+
+				if succeeded > 0 {
+					let version = read_job_termination_message(
+						client,
+						namespace,
+						&detect_job_name,
+						"version-detect",
+					)
+					.await;
+
+					if let Err(e) = jobs.delete(&detect_job_name, &Default::default()).await {
+						warn!(job = detect_job_name, error = %e, "failed to delete version detect job");
+					}
+
+					if let Some(v) = version
+						&& !v.is_empty()
+					{
+						info!(
+							restore = name,
+							postgres_version = v,
+							"recovered postgres version from PVC"
+						);
+						update_restore_status(
+							client,
+							namespace,
+							name,
+							serde_json::json!({ "postgresVersion": v }),
+						)
+						.await?;
+						return Ok(Action::requeue(Duration::from_secs(1)));
+					}
+
+					warn!(
+						restore = name,
+						"version detection job succeeded but returned no version, marking as Failed"
+					);
+					update_restore_status(
+						client,
+						namespace,
+						name,
+						serde_json::json!({ "phase": "Failed" }),
+					)
+					.await?;
+					return Ok(Action::requeue(Duration::from_secs(300)));
+				}
+
+				let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
+				if failed > backoff_limit {
+					warn!(
+						restore = name,
+						"version detection job failed, marking restore as Failed"
+					);
+					if let Err(e) = jobs.delete(&detect_job_name, &Default::default()).await {
+						warn!(job = detect_job_name, error = %e, "failed to delete version detect job");
+					}
+					update_restore_status(
+						client,
+						namespace,
+						name,
+						serde_json::json!({ "phase": "Failed" }),
+					)
+					.await?;
+					return Ok(Action::requeue(Duration::from_secs(300)));
+				}
+
+				return Ok(Action::requeue(Duration::from_secs(5)));
+			}
+		}
+	}
+
 	// Create Deployment if it doesn't exist
 	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
 
@@ -381,6 +478,100 @@ async fn reconcile_ready(
 	deployments.create(&PostParams::default(), &deploy).await?;
 
 	Ok(Action::requeue(Duration::from_secs(10)))
+}
+
+fn build_version_detect_job(
+	restore: &PostgresPhysicalRestore,
+	job_name: &str,
+	namespace: &str,
+	pvc_name: &str,
+) -> Job {
+	let script = r#"set -e
+VERSION=$(cat /pgdata/.postgres-version 2>/dev/null || cat /pgdata/postgres/PG_VERSION 2>/dev/null || true)
+if [ -z "$VERSION" ]; then
+  VERSION=$(find /pgdata -name "PG_VERSION" -exec cat {} \; 2>/dev/null | head -1)
+fi
+if [ -z "$VERSION" ]; then
+  echo "ERROR: Could not detect postgres version from PVC"
+  exit 1
+fi
+echo "Detected postgres version: $VERSION"
+echo -n "$VERSION" > /dev/termination-log
+"#;
+
+	Job {
+		metadata: ObjectMeta {
+			name: Some(job_name.to_string()),
+			namespace: Some(namespace.to_string()),
+			labels: Some(BTreeMap::from([
+				("bes.au/replica".to_string(), restore.spec.replica.clone()),
+				("bes.au/restore".to_string(), restore.name_any()),
+				("bes.au/job-type".to_string(), "version-detect".to_string()),
+			])),
+			owner_references: Some(vec![restore_owner_reference(restore)]),
+			..Default::default()
+		},
+		spec: Some(JobSpec {
+			backoff_limit: Some(2),
+			active_deadline_seconds: Some(120),
+			ttl_seconds_after_finished: Some(60),
+			template: PodTemplateSpec {
+				metadata: Some(ObjectMeta {
+					labels: Some(BTreeMap::from([
+						("bes.au/replica".to_string(), restore.spec.replica.clone()),
+						("bes.au/restore".to_string(), restore.name_any()),
+					])),
+					..Default::default()
+				}),
+				spec: Some(PodSpec {
+					restart_policy: Some("Never".to_string()),
+					security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
+						run_as_user: Some(999),
+						run_as_group: Some(999),
+						fs_group: Some(999),
+						..Default::default()
+					}),
+					containers: vec![Container {
+						name: "version-detect".to_string(),
+						image: Some("busybox:latest".to_string()),
+						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+						args: Some(vec![script.to_string()]),
+						volume_mounts: Some(vec![VolumeMount {
+							name: "pgdata".to_string(),
+							mount_path: "/pgdata".to_string(),
+							read_only: Some(true),
+							..Default::default()
+						}]),
+						resources: Some(ResourceRequirements {
+							requests: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("10m".to_string())),
+								("memory".to_string(), Quantity("16Mi".to_string())),
+							])),
+							limits: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("50m".to_string())),
+								("memory".to_string(), Quantity("32Mi".to_string())),
+							])),
+							..Default::default()
+						}),
+						..Default::default()
+					}],
+					volumes: Some(vec![Volume {
+						name: "pgdata".to_string(),
+						persistent_volume_claim: Some(
+							k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+								claim_name: pvc_name.to_string(),
+								read_only: Some(true),
+							},
+						),
+						..Default::default()
+					}]),
+					..Default::default()
+				}),
+			},
+			..Default::default()
+		}),
+		..Default::default()
+	}
 }
 
 // ─── Resource builders ──────────────────────────────────────────────────────
