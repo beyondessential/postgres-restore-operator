@@ -841,6 +841,7 @@ if [ ! -f "$PGDATA/postgresql.conf" ]; then
 listen_addresses = '*'
 port = 5432
 max_connections = 100
+max_prepared_transactions = 16
 shared_buffers = 128MB
 dynamic_shared_memory_type = posix
 log_timezone = 'UTC'
