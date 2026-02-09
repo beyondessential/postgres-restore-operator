@@ -527,7 +527,7 @@ SNAPSHOTS=$(kopia snapshot list --json --all 2>/dev/null || echo "[]")
 
 if [ -n "$FILTER_HOST_PATTERN" ]; then
   REGEX=$(printf '%s' "$FILTER_HOST_PATTERN" | sed 's/\./\\./g; s/\*/\.\*/g; s/\?/\./g')
-  SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg pat "^${REGEX}$" '[.[] | select(.hostname | test($pat))]')
+  SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg pat "^${REGEX}$" '[.[] | select(.hostname != null and (.hostname | test($pat)))]')
 fi
 
 if [ -n "$FILTER_TAGS" ]; then
