@@ -52,21 +52,42 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features
 
-  kubeconform:
-    name: Lint Kubernetes manifests
-    runs-on: ubuntu-slim
+  gen-crds:
+    name: Generate CRDs
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Configure toolchain
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Generate CRDs
+        run: cargo run --bin gen-crds > crds.yaml
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crds
+          path: crds.yaml
+
+  kubeconform:
+    name: Lint Kubernetes manifests
+    needs: [gen-crds]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/download-artifact@v4
+        with:
+          name: crds
       - name: Install kubeconform
         run: |
           curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
             | tar xz -C /usr/local/bin kubeconform
-      - run: kubeconform -strict -summary operator.yaml
+      - run: kubeconform -strict -summary operator.yaml crds.yaml
 
   tests-pass:
     if: always()
     name: Tests pass
-    needs: [test, clippy, kubeconform]
+    needs: [test, clippy, gen-crds, kubeconform]
     runs-on: ubuntu-latest
     steps:
       - uses: re-actors/alls-green@release/v1
