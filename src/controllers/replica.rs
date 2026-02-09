@@ -1047,6 +1047,8 @@ async fn send_restore_notifications(
 ) {
     let replica_name = replica.name_any();
 
+    let mut statuses: Vec<NotificationStatus> = Vec::new();
+
     for notif_config in &replica.spec.notifications {
         if !notif_config
             .events
@@ -1097,11 +1099,14 @@ async fn send_restore_notifications(
         )
         .await;
 
-        // Update notification status on the replica
+        statuses.push(status);
+    }
+
+    if !statuses.is_empty() {
         let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
         let patch = serde_json::json!({
             "status": {
-                "notifications": [status],
+                "notifications": statuses,
             }
         });
         if let Err(e) = replicas
