@@ -1,6 +1,6 @@
 use k8s_openapi::api::core::v1::{
 	Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, Pod, ResourceRequirements,
-	SecretKeySelector, Volume, VolumeMount,
+	SecretKeySelector, SecurityContext, Volume, VolumeMount,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use std::collections::BTreeMap;
@@ -68,6 +68,11 @@ pub fn jq_init_container() -> Container {
 			mount_path: "/tools".to_string(),
 			..Default::default()
 		}]),
+		security_context: Some(SecurityContext {
+			run_as_user: Some(0),
+			run_as_group: Some(0),
+			..Default::default()
+		}),
 		resources: Some(ResourceRequirements {
 			requests: Some(BTreeMap::from([
 				("cpu".to_string(), Quantity("10m".to_string())),
