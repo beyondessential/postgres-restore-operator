@@ -303,7 +303,21 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(30)));
 	}
 
-	let should_restore = should_trigger_scheduled_restore(&replica);
+	let never_restored = active_restore.is_none()
+		&& replica
+			.status
+			.as_ref()
+			.and_then(|s| s.last_restore_completed_at.as_ref())
+			.is_none();
+
+	if never_restored {
+		info!(
+			replica = name,
+			"no successful restore yet, triggering immediately"
+		);
+	}
+
+	let should_restore = never_restored || should_trigger_scheduled_restore(&replica);
 
 	if should_restore {
 		// Check concurrent restore limit
