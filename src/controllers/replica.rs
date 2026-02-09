@@ -228,6 +228,20 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
         )
         .await;
 
+        // Recompute next scheduled restore in case schedule changed while restore was in flight
+        if let Some(schedule) = &replica.spec.schedule {
+            if let Some(next) = compute_next_scheduled_restore(schedule) {
+                update_replica_status_field(
+                    client,
+                    &namespace,
+                    &name,
+                    "nextScheduledRestore",
+                    &next.to_rfc3339(),
+                )
+                .await?;
+            }
+        }
+
         return Ok(Action::requeue(Duration::from_secs(10)));
     }
 
@@ -394,6 +408,21 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
                 } else {
                     return Ok(Action::requeue(Duration::from_secs(10)));
                 }
+            }
+        }
+
+        // Whether a restore was created or skipped, advance nextScheduledRestore
+        // so we don't re-trigger on the next reconciliation.
+        if let Some(schedule) = &replica.spec.schedule {
+            if let Some(next) = compute_next_scheduled_restore(schedule) {
+                update_replica_status_field(
+                    client,
+                    &namespace,
+                    &name,
+                    "nextScheduledRestore",
+                    &next.to_rfc3339(),
+                )
+                .await?;
             }
         }
     }
@@ -650,6 +679,12 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
+/// Returns the next cron occurrence after `now`.
+fn compute_next_scheduled_restore(schedule: &str) -> Option<chrono::DateTime<Utc>> {
+    let cron_schedule = schedule.parse::<cron::Schedule>().ok()?;
+    cron_schedule.upcoming(Utc).next()
+}
+
 fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
     let Some(schedule) = &replica.spec.schedule else {
         return false;
@@ -680,9 +715,7 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
         parse_duration(&replica.spec.schedule_jitter).unwrap_or(Duration::from_secs(600)),
     );
 
-    // Find the last scheduled time before now
     let now = Utc::now();
-    let jittered_now = now - chrono::Duration::from_std(jitter).unwrap_or_default();
 
     if let Some(next_scheduled) = status.and_then(|s| s.next_scheduled_restore.as_ref()) {
         if let Ok(next) = next_scheduled.parse::<chrono::DateTime<Utc>>() {
@@ -692,8 +725,9 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
         }
     }
 
-    // No next_scheduled set — check if cron says we're due
-    // Look at the previous occurrence from the cron schedule
+    // Initial seed: nextScheduledRestore not yet set (first reconciliation or field was cleared).
+    // Fall back to checking whether a cron occurrence falls within a 24h lookback window.
+    let jittered_now = now - chrono::Duration::from_std(jitter).unwrap_or_default();
     for prev in cron_schedule.after(&(jittered_now - chrono::Duration::hours(24))) {
         if prev <= now {
             return true;
