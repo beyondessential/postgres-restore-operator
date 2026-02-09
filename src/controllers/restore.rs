@@ -125,25 +125,9 @@ async fn reconcile_pending(
 		pvcs.create(&PostParams::default(), &pvc).await?;
 	}
 
-	// Check if PVC is bound
-	let pvc = pvcs.get(&pvc_name).await?;
-	let pvc_phase = pvc
-		.status
-		.as_ref()
-		.and_then(|s| s.phase.as_deref())
-		.unwrap_or("Unknown");
-
-	if pvc_phase != "Bound" {
-		info!(
-			restore = name,
-			pvc = pvc_name,
-			phase = pvc_phase,
-			"waiting for PVC to bind"
-		);
-		return Ok(Action::requeue(Duration::from_secs(5)));
-	}
-
-	// Update status and transition to Restoring
+	// Transition to Restoring immediately — don't wait for PVC to bind.
+	// With WaitForFirstConsumer storage classes the PVC stays Pending until
+	// a pod referencing it is scheduled, so gating on Bound would deadlock.
 	update_restore_status(
 		client,
 		namespace,
