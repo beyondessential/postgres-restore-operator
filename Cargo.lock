@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "postgres-restore-operator"
-version = "0.0.19"
+version = "0.0.20"
 dependencies = [
  "anyhow",
  "axum",
