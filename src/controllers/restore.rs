@@ -822,6 +822,24 @@ fn build_deployment(
 		r#"set -e
 PGDATA=/pgdata/pgdata
 
+if [ ! -f "$PGDATA/postgresql.conf" ]; then
+  echo "Creating minimal postgresql.conf (Debian-style installs keep config in /etc)..."
+  cat > "$PGDATA/postgresql.conf" << 'CONFEOF'
+listen_addresses = '*'
+port = 5432
+max_connections = 100
+shared_buffers = 128MB
+dynamic_shared_memory_type = posix
+log_timezone = 'UTC'
+datestyle = 'iso, mdy'
+timezone = 'UTC'
+lc_messages = 'C'
+lc_monetary = 'C'
+lc_numeric = 'C'
+lc_time = 'C'
+CONFEOF
+fi
+
 echo "Configuring pg_hba.conf..."
 cat > "$PGDATA/pg_hba.conf" << 'HBAEOF'
 # TYPE  DATABASE        USER            ADDRESS                 METHOD
