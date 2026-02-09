@@ -143,8 +143,20 @@ async fn main() -> anyhow::Result<()> {
 					}
 				}),
 			)
-			.route("/healthz", get(|| async { "ok" }))
-			.route("/readyz", get(|| async { "ok" }));
+			.route(
+				"/livez",
+				get(|| async {
+					tracing::trace!("GET /livez");
+					"ok"
+				}),
+			)
+			.route(
+				"/readyz",
+				get(|| async {
+					tracing::trace!("GET /readyz");
+					"ok"
+				}),
+			);
 
 		let listener = tokio::net::TcpListener::bind(&metrics_addr_clone)
 			.await

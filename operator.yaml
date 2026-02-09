@@ -80,7 +80,7 @@ rules:
     - apiGroups: [""]
       resources: ["configmaps"]
       resourceNames: ["postgres-restore-operator-config"]
-      verbs: ["get", "watch"]
+      verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -170,13 +170,13 @@ spec:
                         protocol: TCP
                   readinessProbe:
                       httpGet:
-                          path: /healthz
+                          path: /readyz
                           port: metrics
                       initialDelaySeconds: 5
                       periodSeconds: 10
                   livenessProbe:
                       httpGet:
-                          path: /healthz
+                          path: /livez
                           port: metrics
                       initialDelaySeconds: 15
                       periodSeconds: 20
