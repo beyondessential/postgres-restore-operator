@@ -579,11 +579,11 @@ async fn create_restore_for_snapshot(
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
     let restore_name = format!("{replica_name}-{timestamp}");
 
-    let snapshot_size_bytes = snapshot.size;
-    let storage_bytes = (snapshot_size_bytes as f64 * 1.1) as u64;
-
-    let snapshot_size = format_bytes(snapshot_size_bytes);
-    let storage_size = format_bytes(storage_bytes);
+    let snapshot_size = format_bytes(snapshot.size);
+    let storage_size = match &replica.spec.storage_size_override {
+        Some(override_size) => override_size.clone(),
+        None => format_bytes((snapshot.size as f64 * 1.1) as u64),
+    };
 
     let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
     let restore = PostgresPhysicalRestore::new(
