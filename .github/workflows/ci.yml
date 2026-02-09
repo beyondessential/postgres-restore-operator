@@ -52,10 +52,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets --all-features
 
+  kubeconform:
+    name: Lint Kubernetes manifests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install kubeconform
+        run: |
+          curl -fsSL https://github.com/yannh/kubeconform/releases/latest/download/kubeconform-linux-amd64.tar.gz \
+            | tar xz -C /usr/local/bin kubeconform
+      - run: kubeconform -strict -summary operator.yaml
+
   tests-pass:
     if: always()
     name: Tests pass
-    needs: [test]
+    needs: [test, clippy, kubeconform]
     runs-on: ubuntu-latest
     steps:
       - uses: re-actors/alls-green@release/v1
