@@ -1,27 +1,23 @@
-FROM rust:1.92-bookworm AS builder
+FROM busybox:glibc
 
-WORKDIR /build
+ARG TARGETPLATFORM
 
-# Cache dependencies by building a dummy project first
-COPY Cargo.toml Cargo.lock ./
-RUN mkdir src && echo "fn main() {}" > src/main.rs && echo "" > src/lib.rs
-RUN cargo build --release 2>/dev/null || true
-RUN rm -rf src
+# Create user and group
+RUN addgroup -g 1000 operator && adduser -D -u 1000 -G operator operator
 
-# Build the actual project
-COPY src/ src/
-RUN touch src/main.rs src/lib.rs && cargo build --release --bin postgres-restore-operator
+# Copy all binaries from both architectures
+COPY --chmod=0755 amd64/ /tmp/bins/amd64/
+COPY --chmod=0755 arm64/ /tmp/bins/arm64/
 
-FROM debian:bookworm-slim
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-RUN groupadd -r operator && useradd -r -g operator -s /sbin/nologin operator
-
-COPY --from=builder /build/target/release/postgres-restore-operator /usr/local/bin/
+# Select and copy the correct binaries based on target platform
+RUN if [ "$TARGETPLATFORM" = "linux/amd64" ]; then \
+	cp /tmp/bins/amd64/* /usr/bin/; \
+	elif [ "$TARGETPLATFORM" = "linux/arm64" ]; then \
+	cp /tmp/bins/arm64/* /usr/bin/; \
+	else \
+	echo "Unknown platform: $TARGETPLATFORM"; exit 1; \
+	fi && \
+	rm -rf /tmp/bins
 
 USER operator
-
-ENTRYPOINT ["postgres-restore-operator"]
+ENTRYPOINT ["operator"]
