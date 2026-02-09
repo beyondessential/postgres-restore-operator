@@ -502,7 +502,6 @@ echo -n "$VERSION" > /dev/termination-log
 		spec: Some(JobSpec {
 			backoff_limit: Some(2),
 			active_deadline_seconds: Some(120),
-			ttl_seconds_after_finished: Some(60),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(BTreeMap::from([
