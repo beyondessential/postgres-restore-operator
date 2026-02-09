@@ -30,6 +30,24 @@ use crate::{
 	types::*,
 };
 
+async fn fail_restore(
+	ctx: &Context,
+	namespace: &str,
+	name: &str,
+	replica_name: &str,
+	status_patch: serde_json::Value,
+) -> Result<Action> {
+	update_restore_status(&ctx.client, namespace, name, status_patch).await?;
+
+	if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
+		info!(promoted = %promoted_name, "promoted queued restore after failure");
+	}
+
+	ctx.metrics.restores_failed_total.inc();
+
+	Ok(Action::requeue(Duration::from_secs(300)))
+}
+
 pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>) -> Result<Action> {
 	let name = restore.name_any();
 	let namespace = restore
@@ -233,10 +251,11 @@ async fn reconcile_restoring(
 	if failed > backoff_limit {
 		warn!(restore = name, failed = failed, "restore job failed");
 
-		update_restore_status(
-			client,
+		return fail_restore(
+			ctx,
 			namespace,
 			name,
+			replica_name,
 			serde_json::json!({
 				"phase": "Failed",
 				"restoreJob": {
@@ -245,23 +264,7 @@ async fn reconcile_restoring(
 				},
 			}),
 		)
-		.await?;
-
-		// Remove from active queue and promote next pending restore
-		let mut queue = ctx.restore_queue.write().await;
-		queue.remove(replica_name);
-		let promoted = queue.try_promote(ctx.max_concurrent_restores());
-		ctx.metrics.active_restores.set(queue.active.len() as i64);
-		ctx.metrics.queue_depth.set(queue.pending.len() as i64);
-		drop(queue);
-
-		if let Some(promoted_name) = promoted {
-			info!(promoted = %promoted_name, "promoted queued restore after failure");
-		}
-
-		ctx.metrics.restores_failed_total.inc();
-
-		return Ok(Action::requeue(Duration::from_secs(300)));
+		.await;
 	}
 
 	// Still running
@@ -353,14 +356,14 @@ async fn reconcile_ready(
 						restore = name,
 						"version detection job succeeded but returned no version, marking as Failed"
 					);
-					update_restore_status(
-						client,
+					return fail_restore(
+						ctx,
 						namespace,
 						name,
+						replica_name,
 						serde_json::json!({ "phase": "Failed" }),
 					)
-					.await?;
-					return Ok(Action::requeue(Duration::from_secs(300)));
+					.await;
 				}
 
 				let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
@@ -372,14 +375,14 @@ async fn reconcile_ready(
 					if let Err(e) = jobs.delete(&detect_job_name, &Default::default()).await {
 						warn!(job = detect_job_name, error = %e, "failed to delete version detect job");
 					}
-					update_restore_status(
-						client,
+					return fail_restore(
+						ctx,
 						namespace,
 						name,
+						replica_name,
 						serde_json::json!({ "phase": "Failed" }),
 					)
-					.await?;
-					return Ok(Action::requeue(Duration::from_secs(300)));
+					.await;
 				}
 
 				return Ok(Action::requeue(Duration::from_secs(5)));
@@ -414,15 +417,7 @@ async fn reconcile_ready(
 			)
 			.await?;
 
-			// Remove from active queue and promote next pending restore
-			let mut queue = ctx.restore_queue.write().await;
-			queue.remove(replica_name);
-			let promoted = queue.try_promote(ctx.max_concurrent_restores());
-			ctx.metrics.active_restores.set(queue.active.len() as i64);
-			ctx.metrics.queue_depth.set(queue.pending.len() as i64);
-			drop(queue);
-
-			if let Some(promoted_name) = promoted {
+			if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
 				info!(promoted = %promoted_name, "promoted queued restore after switchover");
 			}
 
@@ -439,30 +434,14 @@ async fn reconcile_ready(
 					restore = name,
 					"deployment not ready after 10 minutes, marking as Failed"
 				);
-				update_restore_status(
-					client,
+				return fail_restore(
+					ctx,
 					namespace,
 					name,
-					serde_json::json!({
-						"phase": "Failed",
-					}),
+					replica_name,
+					serde_json::json!({ "phase": "Failed" }),
 				)
-				.await?;
-
-				let mut queue = ctx.restore_queue.write().await;
-				queue.remove(replica_name);
-				let promoted = queue.try_promote(ctx.max_concurrent_restores());
-				ctx.metrics.active_restores.set(queue.active.len() as i64);
-				ctx.metrics.queue_depth.set(queue.pending.len() as i64);
-				drop(queue);
-
-				if let Some(promoted_name) = promoted {
-					info!(promoted = %promoted_name, "promoted queued restore after timeout failure");
-				}
-
-				ctx.metrics.restores_failed_total.inc();
-
-				return Ok(Action::requeue(Duration::from_secs(300)));
+				.await;
 			}
 		}
 

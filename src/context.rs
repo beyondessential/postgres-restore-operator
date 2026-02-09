@@ -29,6 +29,18 @@ impl Context {
 	pub fn max_concurrent_restores(&self) -> usize {
 		self.max_concurrent_restores.load(Ordering::Relaxed)
 	}
+
+	/// Remove a restore from the queue, promote the next pending one if there
+	/// is capacity, and update the related gauges. Returns the name of the
+	/// promoted restore, if any.
+	pub async fn release_restore_slot(&self, replica_name: &str) -> Option<String> {
+		let mut queue = self.restore_queue.write().await;
+		queue.remove(replica_name);
+		let promoted = queue.try_promote(self.max_concurrent_restores());
+		self.metrics.active_restores.set(queue.active.len() as i64);
+		self.metrics.queue_depth.set(queue.pending.len() as i64);
+		promoted
+	}
 }
 
 #[derive(Default)]
