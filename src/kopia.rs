@@ -11,6 +11,10 @@ pub struct KopiaCredentials {
 	pub access_key_id: String,
 	pub secret_access_key: String,
 	pub repository_password: String,
+	/// Custom S3-compatible endpoint (host:port), e.g. `minio.default.svc:9000`.
+	pub endpoint: Option<String>,
+	/// Disable TLS verification when connecting to the endpoint.
+	pub disable_tls: bool,
 }
 
 /// A kopia snapshot, as returned by `kopia snapshot list --json`.
@@ -97,12 +101,34 @@ pub fn validate_kopia_secret(secret: &Secret) -> Result<KopiaCredentials, Error>
 		})
 	};
 
+	let endpoint = data
+		.get("endpoint")
+		.map(|bs| String::from_utf8(bs.0.clone()))
+		.transpose()
+		.map_err(|_| Error::InvalidKopiaSecret {
+			secret: secret_name.to_string(),
+			reason: "key endpoint is not valid UTF-8".to_string(),
+		})?;
+
+	let disable_tls = data
+		.get("disableTls")
+		.map(|bs| String::from_utf8(bs.0.clone()))
+		.transpose()
+		.map_err(|_| Error::InvalidKopiaSecret {
+			secret: secret_name.to_string(),
+			reason: "key disableTls is not valid UTF-8".to_string(),
+		})?
+		.map(|v| v == "true")
+		.unwrap_or(false);
+
 	Ok(KopiaCredentials {
 		bucket: get_string("bucket")?,
 		region: get_string("region")?,
 		access_key_id: get_string("accessKeyId")?,
 		secret_access_key: get_string("secretAccessKey")?,
 		repository_password: get_string("repositoryPassword")?,
+		endpoint,
+		disable_tls,
 	})
 }
 
@@ -151,7 +177,7 @@ pub fn latest_snapshot(snapshots: &[Snapshot]) -> Option<&Snapshot> {
 /// Builds the kopia CLI args for connecting to a repository.
 /// Used when constructing Job commands.
 pub fn kopia_connect_args(creds: &KopiaCredentials) -> Vec<String> {
-	vec![
+	let mut args = vec![
 		"repository".to_string(),
 		"connect".to_string(),
 		"s3".to_string(),
@@ -160,7 +186,15 @@ pub fn kopia_connect_args(creds: &KopiaCredentials) -> Vec<String> {
 		format!("--access-key={}", creds.access_key_id),
 		format!("--secret-access-key={}", creds.secret_access_key),
 		format!("--password={}", creds.repository_password),
-	]
+	];
+	if let Some(ref endpoint) = creds.endpoint {
+		args.push(format!("--endpoint={endpoint}"));
+	}
+	if creds.disable_tls {
+		args.push("--disable-tls-verification".to_string());
+		args.push("--disable-tls".to_string());
+	}
+	args
 }
 
 #[cfg(test)]
@@ -438,6 +472,8 @@ mod tests {
 			access_key_id: "ak".into(),
 			secret_access_key: "sk".into(),
 			repository_password: "rp".into(),
+			endpoint: None,
+			disable_tls: false,
 		};
 		let args = kopia_connect_args(&creds);
 		assert_eq!(args[0], "repository");
@@ -448,5 +484,43 @@ mod tests {
 		assert!(args.contains(&"--access-key=ak".to_string()));
 		assert!(args.contains(&"--secret-access-key=sk".to_string()));
 		assert!(args.contains(&"--password=rp".to_string()));
+		assert!(!args.iter().any(|a| a.starts_with("--endpoint")));
+		assert!(!args.contains(&"--disable-tls".to_string()));
+	}
+
+	#[test]
+	fn kopia_connect_args_with_endpoint() {
+		let creds = KopiaCredentials {
+			bucket: "b".into(),
+			region: "r".into(),
+			access_key_id: "ak".into(),
+			secret_access_key: "sk".into(),
+			repository_password: "rp".into(),
+			endpoint: Some("minio.default.svc:9000".into()),
+			disable_tls: true,
+		};
+		let args = kopia_connect_args(&creds);
+		assert!(args.contains(&"--endpoint=minio.default.svc:9000".to_string()));
+		assert!(args.contains(&"--disable-tls".to_string()));
+		assert!(args.contains(&"--disable-tls-verification".to_string()));
+	}
+
+	#[test]
+	fn validate_kopia_secret_with_endpoint() {
+		let mut data = valid_secret_data();
+		data.insert("endpoint".into(), ByteString("minio:9000".into()));
+		data.insert("disableTls".into(), ByteString("true".into()));
+		let secret = make_secret(data);
+		let creds = validate_kopia_secret(&secret).unwrap();
+		assert_eq!(creds.endpoint.as_deref(), Some("minio:9000"));
+		assert!(creds.disable_tls);
+	}
+
+	#[test]
+	fn validate_kopia_secret_without_endpoint() {
+		let secret = make_secret(valid_secret_data());
+		let creds = validate_kopia_secret(&secret).unwrap();
+		assert_eq!(creds.endpoint, None);
+		assert!(!creds.disable_tls);
 	}
 }

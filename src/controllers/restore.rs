@@ -23,7 +23,9 @@ use kube::{
 };
 use tracing::{info, warn};
 
-use super::{env_from_secret, kopia_writable_env, read_job_termination_message};
+use super::{
+	env_from_secret, env_from_secret_optional, kopia_writable_env, read_job_termination_message,
+};
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -646,13 +648,22 @@ fn build_restore_job(
 
 mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
 
+ENDPOINT_ARGS=""
+if [ -n "$KOPIA_ENDPOINT" ]; then
+  ENDPOINT_ARGS="--endpoint=$KOPIA_ENDPOINT"
+fi
+if [ "$KOPIA_DISABLE_TLS" = "true" ]; then
+  ENDPOINT_ARGS="$ENDPOINT_ARGS --disable-tls --disable-tls-verification"
+fi
+
 echo "Connecting to kopia repository..."
 kopia repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
   --region="$KOPIA_REGION" \
   --access-key="$AWS_ACCESS_KEY_ID" \
   --secret-access-key="$AWS_SECRET_ACCESS_KEY" \
-  --password="$KOPIA_PASSWORD"
+  --password="$KOPIA_PASSWORD" \
+  $ENDPOINT_ARGS
 
 echo "Starting restore..."
 kopia snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
@@ -755,6 +766,16 @@ echo -n "$VERSION" > /dev/termination-log
 										"KOPIA_PASSWORD",
 										kopia_secret,
 										"repositoryPassword",
+									),
+									env_from_secret_optional(
+										"KOPIA_ENDPOINT",
+										kopia_secret,
+										"endpoint",
+									),
+									env_from_secret_optional(
+										"KOPIA_DISABLE_TLS",
+										kopia_secret,
+										"disableTls",
 									),
 								],
 							]

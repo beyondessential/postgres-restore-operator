@@ -1,0 +1,163 @@
+name: Integration
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches:
+      - main
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref || github.run_id }}
+  cancel-in-progress: true
+
+jobs:
+  integration:
+    name: Integration tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure toolchain
+        run: |
+          rustup toolchain install --profile minimal --no-self-update stable
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build operator
+        run: cargo build --bin operator
+
+      - name: Generate CRDs
+        run: cargo run --bin gen-crds > crds.yaml
+
+      - name: Install kind
+        run: |
+          curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
+          chmod +x ./kind
+          sudo mv ./kind /usr/local/bin/kind
+
+      - name: Create kind cluster
+        run: |
+          cat <<EOF | kind create cluster --config=-
+          kind: Cluster
+          apiVersion: kind.x-k8s.io/v1alpha4
+          nodes:
+            - role: control-plane
+          EOF
+          kubectl cluster-info
+          kubectl wait --for=condition=Ready nodes --all --timeout=120s
+
+      - name: Apply CRDs
+        run: kubectl apply -f crds.yaml
+
+      - name: Create operator namespace and config
+        run: |
+          kubectl create namespace pgro-system
+          kubectl apply -f - <<'EOF'
+          apiVersion: v1
+          kind: ConfigMap
+          metadata:
+            name: postgres-restore-operator-config
+            namespace: pgro-system
+          data:
+            maxConcurrentRestores: "2"
+          EOF
+
+      - name: Pre-pull images on kind node
+        run: |
+          docker pull minio/minio:latest
+          docker pull minio/mc:latest
+          docker pull kopia/kopia:latest
+          docker pull postgres:16
+          docker pull alpine:latest
+          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:latest postgres:16 alpine:latest
+
+      - name: Deploy MinIO
+        run: |
+          kubectl apply -f tests/fixtures/minio.yaml
+          kubectl wait --namespace minio --for=condition=Available deployment/minio --timeout=120s
+          echo "MinIO is ready"
+
+      - name: Set up test kopia repository
+        run: |
+          kubectl apply -f tests/fixtures/setup-kopia-repo.yaml
+          kubectl wait --for=condition=Complete job/setup-kopia-repo --timeout=300s
+          echo "--- Setup job logs ---"
+          kubectl logs job/setup-kopia-repo --all-containers
+          echo "--- Kopia repository ready ---"
+
+      - name: Start operator (out-of-cluster)
+        run: |
+          RUST_LOG=info,tower_http=debug \
+          OPERATOR_NAMESPACE=pgro-system \
+          KUBECONFIG="${HOME}/.kube/config" \
+            ./target/debug/operator > /tmp/operator.log 2>&1 &
+          echo $! > /tmp/operator.pid
+
+          # Wait for operator to be ready
+          for i in $(seq 1 30); do
+            if curl -sf http://[::1]:8080/readyz > /dev/null 2>&1; then
+              echo "Operator is ready"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "Operator failed to become ready"
+              cat /tmp/operator.log
+              exit 1
+            fi
+            sleep 1
+          done
+
+      - name: Run integration tests
+        run: cargo test --test integration -- --ignored --nocapture
+        env:
+          RUST_LOG: info
+
+      - name: Operator logs
+        if: always()
+        run: |
+          echo "--- Operator logs ---"
+          cat /tmp/operator.log || true
+
+      - name: Cluster state on failure
+        if: failure()
+        run: |
+          echo "=== Namespaces ==="
+          kubectl get ns
+
+          echo "=== All resources in integration-test namespace ==="
+          kubectl get all -n integration-test 2>/dev/null || true
+
+          echo "=== PostgresPhysicalReplicas ==="
+          kubectl get postgresphysicalreplicas -A -o yaml 2>/dev/null || true
+
+          echo "=== PostgresPhysicalRestores ==="
+          kubectl get postgresphysicalrestores -A -o yaml 2>/dev/null || true
+
+          echo "=== Jobs ==="
+          kubectl get jobs -A -o wide 2>/dev/null || true
+
+          echo "=== Pods ==="
+          kubectl get pods -A -o wide 2>/dev/null || true
+
+          echo "=== Events in integration-test ==="
+          kubectl get events -n integration-test --sort-by=.lastTimestamp 2>/dev/null || true
+
+          echo "=== Failed pod logs ==="
+          for pod in $(kubectl get pods -n integration-test --no-headers -o custom-columns=":metadata.name" 2>/dev/null); do
+            echo "--- Pod: $pod ---"
+            kubectl logs -n integration-test "$pod" --all-containers 2>/dev/null || true
+          done
+
+      - name: Stop operator
+        if: always()
+        run: |
+          if [ -f /tmp/operator.pid ]; then
+            kill "$(cat /tmp/operator.pid)" 2>/dev/null || true
+          fi

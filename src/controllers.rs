@@ -21,6 +21,25 @@ pub fn env_from_secret(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
 	}
 }
 
+/// Build an EnvVar that references an optional key in a Kubernetes Secret.
+///
+/// If the key does not exist in the Secret, the env var is simply not set
+/// (the pod will not fail to start).
+pub fn env_from_secret_optional(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
+	EnvVar {
+		name: env_name.to_string(),
+		value_from: Some(EnvVarSource {
+			secret_key_ref: Some(SecretKeySelector {
+				name: secret_name.to_string(),
+				key: key.to_string(),
+				optional: Some(true),
+			}),
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
 /// Env vars that redirect kopia's config, cache, and log directories to
 /// `/tmp/kopia` so the container doesn't need write access to `/app`.
 pub fn kopia_writable_env() -> Vec<EnvVar> {
@@ -115,5 +134,15 @@ mod tests {
 		let skr = env.value_from.unwrap().secret_key_ref.unwrap();
 		assert_eq!(skr.name, "conn-secret");
 		assert_eq!(skr.key, "host");
+	}
+
+	#[test]
+	fn env_from_secret_optional_is_optional() {
+		let env = env_from_secret_optional("ENDPOINT", "my-secret", "endpoint");
+		assert_eq!(env.name, "ENDPOINT");
+		let skr = env.value_from.unwrap().secret_key_ref.unwrap();
+		assert_eq!(skr.name, "my-secret");
+		assert_eq!(skr.key, "endpoint");
+		assert_eq!(skr.optional, Some(true));
 	}
 }

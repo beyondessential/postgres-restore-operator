@@ -23,7 +23,7 @@ use rand::RngExt;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{env_from_secret, read_job_termination_message};
+use super::{env_from_secret, env_from_secret_optional, read_job_termination_message};
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -542,6 +542,8 @@ fn build_snapshot_list_job(
 		env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
 		env_from_secret("AWS_SECRET_ACCESS_KEY", kopia_secret, "secretAccessKey"),
 		env_from_secret("KOPIA_PASSWORD", kopia_secret, "repositoryPassword"),
+		env_from_secret_optional("KOPIA_ENDPOINT", kopia_secret, "endpoint"),
+		env_from_secret_optional("KOPIA_DISABLE_TLS", kopia_secret, "disableTls"),
 	];
 
 	if let Some(ref filter) = replica.spec.snapshot_filter {
@@ -570,12 +572,21 @@ fn build_snapshot_list_job(
 
 apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1
 
+ENDPOINT_ARGS=""
+if [ -n "$KOPIA_ENDPOINT" ]; then
+  ENDPOINT_ARGS="--endpoint=$KOPIA_ENDPOINT"
+fi
+if [ "$KOPIA_DISABLE_TLS" = "true" ]; then
+  ENDPOINT_ARGS="$ENDPOINT_ARGS --disable-tls --disable-tls-verification"
+fi
+
 kopia repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
   --region="$KOPIA_REGION" \
   --access-key="$AWS_ACCESS_KEY_ID" \
   --secret-access-key="$AWS_SECRET_ACCESS_KEY" \
-  --password="$KOPIA_PASSWORD"
+  --password="$KOPIA_PASSWORD" \
+  $ENDPOINT_ARGS
 
 SNAPSHOTS=$(kopia snapshot list --json --all 2>/dev/null || echo "[]")
 
