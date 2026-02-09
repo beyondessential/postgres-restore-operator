@@ -350,39 +350,40 @@ async fn reconcile_ready(
 
 		// Check for timeout (10 minutes)
 		if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref())
-			&& let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>() {
-				let elapsed = Utc::now().signed_duration_since(created);
-				if elapsed > chrono::Duration::minutes(10) {
-					warn!(
-						restore = name,
-						"deployment not ready after 10 minutes, marking as Failed"
-					);
-					update_restore_status(
-						client,
-						namespace,
-						name,
-						serde_json::json!({
-							"phase": "Failed",
-						}),
-					)
-					.await?;
+			&& let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>()
+		{
+			let elapsed = Utc::now().signed_duration_since(created);
+			if elapsed > chrono::Duration::minutes(10) {
+				warn!(
+					restore = name,
+					"deployment not ready after 10 minutes, marking as Failed"
+				);
+				update_restore_status(
+					client,
+					namespace,
+					name,
+					serde_json::json!({
+						"phase": "Failed",
+					}),
+				)
+				.await?;
 
-					let mut queue = ctx.restore_queue.write().await;
-					queue.remove(replica_name);
-					let promoted = queue.try_promote(ctx.max_concurrent_restores());
-					ctx.metrics.active_restores.set(queue.active.len() as i64);
-					ctx.metrics.queue_depth.set(queue.pending.len() as i64);
-					drop(queue);
+				let mut queue = ctx.restore_queue.write().await;
+				queue.remove(replica_name);
+				let promoted = queue.try_promote(ctx.max_concurrent_restores());
+				ctx.metrics.active_restores.set(queue.active.len() as i64);
+				ctx.metrics.queue_depth.set(queue.pending.len() as i64);
+				drop(queue);
 
-					if let Some(promoted_name) = promoted {
-						info!(promoted = %promoted_name, "promoted queued restore after timeout failure");
-					}
-
-					ctx.metrics.restores_failed_total.inc();
-
-					return Ok(Action::requeue(Duration::from_secs(300)));
+				if let Some(promoted_name) = promoted {
+					info!(promoted = %promoted_name, "promoted queued restore after timeout failure");
 				}
+
+				ctx.metrics.restores_failed_total.inc();
+
+				return Ok(Action::requeue(Duration::from_secs(300)));
 			}
+		}
 
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}

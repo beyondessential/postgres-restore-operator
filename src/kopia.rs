@@ -111,9 +111,10 @@ pub fn filter_snapshots(snapshots: &[Snapshot], filter: Option<&SnapshotFilter>)
 
 			// Host pattern filtering
 			if let Some(pattern) = &filter.host_pattern
-				&& !glob_matches(pattern, &snap.hostname) {
-					return false;
-				}
+				&& !glob_matches(pattern, &snap.hostname)
+			{
+				return false;
+			}
 
 			true
 		})
