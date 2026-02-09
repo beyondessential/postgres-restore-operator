@@ -1,0 +1,24 @@
+## LLM Rules to follow
+- For tests, set the env var `DATABASE_URL=postgresql://localhost/tamanu_meta`.
+- NEVER hardcode database credentials. Always use the environment variable or existing client.
+- When adding or changing features, or when fixing bugs, add tests whenever possible.
+- Never write documentation files or readmes.
+- Always run `cargo clippy` and `cargo fmt` before committing changes.
+- Use conventional commit messages.
+- Never write useless comments that only repeat the code.
+- Never print summaries or unnecessary information.
+- Don't use emojis unless absolutely necessary.
+- When removing code that has already been committed, delete it unless explicitly requested that it be commented out.
+- Prefer using small dependencies instead of reimplementing the wheel. Ask the user to pick a dependency if there is no obvious choice.
+- Use `--no-pager` with `git log`, `git diff`, etc commands. The option goes before the subcommand, e.g. `git --no-pager log`. NEVER use any interactive commands, including commands that require an editor. You can't use those and they'll just block you.
+- Imports: merge them and group them by std, then third-party/workspace, then local (crate, super, self).
+- Ask the user instead of making an assumption if there's a major detail missing from instructions that could affect code quality or implementation design.
+- For tests, set the env var `DATABASE_URL=postgresql://localhost/tamanu_meta`. ENSURE YOU DO THIS INSTEAD OF SKIPPING DATABASE TESTS.
+- When writing parsers, unless very trivial, implement them using winnow or chumsky.
+- Use the newer `foo.rs` / `foo/sub.rs` style of modules.
+- `use` statements always go before `mod` statements.
+- ALWAYS use the edit tool to edit or write file, NEVER use "cat >> EOF". YOU WILL LOSE DATA.
+- Never write long summaries at the end of responses. Maximum 50 words if absolutely necessary.
+- To silence a warning, use `#[expect(..., reason = "...")]` instead of `#[allow(...)]`.
+- When changing Windows-specific code, run `cargo check` with a Windows GNU target (unless currently running on Windows).
+<!-- end rules -->
