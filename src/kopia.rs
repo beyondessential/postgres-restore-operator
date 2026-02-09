@@ -1,9 +1,7 @@
 use k8s_openapi::api::core::v1::Secret;
 use serde::{Deserialize, Serialize};
 
-use crate::error::Error;
-use crate::types::SnapshotFilter;
-use crate::util::glob_to_regex;
+use crate::{error::Error, types::SnapshotFilter, util::glob_to_regex};
 
 /// Credentials extracted from a kopia Kubernetes Secret.
 #[derive(Debug, Clone)]
@@ -56,11 +54,7 @@ const REQUIRED_KEYS: &[&str] = &[
 
 /// Validates a Kubernetes Secret has all required kopia keys.
 pub fn validate_kopia_secret(secret: &Secret) -> Result<KopiaCredentials, Error> {
-    let secret_name = secret
-        .metadata
-        .name
-        .as_deref()
-        .unwrap_or("<unnamed>");
+    let secret_name = secret.metadata.name.as_deref().unwrap_or("<unnamed>");
 
     let data = secret
         .data
@@ -133,7 +127,9 @@ pub fn filter_snapshots(snapshots: &[Snapshot], filter: Option<&SnapshotFilter>)
 
 /// Returns the latest snapshot from a list, sorted by start_time descending.
 pub fn latest_snapshot(snapshots: &[Snapshot]) -> Option<&Snapshot> {
-    snapshots.iter().max_by(|a, b| a.start_time.cmp(&b.start_time))
+    snapshots
+        .iter()
+        .max_by(|a, b| a.start_time.cmp(&b.start_time))
 }
 
 /// Builds the kopia CLI args for connecting to a repository.
@@ -220,7 +216,12 @@ mod tests {
         assert!(err.to_string().contains("not valid UTF-8"));
     }
 
-    fn make_snapshot(id: &str, hostname: &str, start_time: &str, tags: HashMap<String, String>) -> Snapshot {
+    fn make_snapshot(
+        id: &str,
+        hostname: &str,
+        start_time: &str,
+        tags: HashMap<String, String>,
+    ) -> Snapshot {
         Snapshot {
             id: id.into(),
             hostname: hostname.into(),
@@ -243,8 +244,18 @@ mod tests {
     #[test]
     fn filter_snapshots_by_tags() {
         let snaps = vec![
-            make_snapshot("a", "h", "t1", HashMap::from([("env".into(), "prod".into())])),
-            make_snapshot("b", "h", "t2", HashMap::from([("env".into(), "dev".into())])),
+            make_snapshot(
+                "a",
+                "h",
+                "t1",
+                HashMap::from([("env".into(), "prod".into())]),
+            ),
+            make_snapshot(
+                "b",
+                "h",
+                "t2",
+                HashMap::from([("env".into(), "dev".into())]),
+            ),
             make_snapshot("c", "h", "t3", HashMap::new()),
         ];
         let filter = SnapshotFilter {
@@ -275,9 +286,24 @@ mod tests {
     #[test]
     fn filter_snapshots_combined_tag_and_host() {
         let snaps = vec![
-            make_snapshot("a", "fiji-prod-01", "t1", HashMap::from([("env".into(), "prod".into())])),
-            make_snapshot("b", "fiji-prod-02", "t2", HashMap::from([("env".into(), "dev".into())])),
-            make_snapshot("c", "fiji-dev-01", "t3", HashMap::from([("env".into(), "prod".into())])),
+            make_snapshot(
+                "a",
+                "fiji-prod-01",
+                "t1",
+                HashMap::from([("env".into(), "prod".into())]),
+            ),
+            make_snapshot(
+                "b",
+                "fiji-prod-02",
+                "t2",
+                HashMap::from([("env".into(), "dev".into())]),
+            ),
+            make_snapshot(
+                "c",
+                "fiji-dev-01",
+                "t3",
+                HashMap::from([("env".into(), "prod".into())]),
+            ),
         ];
         let filter = SnapshotFilter {
             tags: Some(HashMap::from([("env".into(), "prod".into())])),

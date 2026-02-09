@@ -3,19 +3,22 @@ use std::sync::Arc;
 use axum::{Router, routing::get};
 use clap::Parser;
 use futures::StreamExt;
-use kube::runtime::controller::Controller;
-use kube::runtime::watcher::Config;
-use kube::{Api, Client};
+use kube::{
+    Api, Client,
+    runtime::{controller::Controller, watcher::Config},
+};
 use prometheus::Encoder;
 use tracing::info;
 
-use postgres_restore_operator::context::Context;
-use postgres_restore_operator::controllers;
-use postgres_restore_operator::types::{PostgresPhysicalReplica, PostgresPhysicalRestore};
+use postgres_restore_operator::{
+    context::Context,
+    controllers,
+    types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
+};
 
 #[derive(Parser)]
 #[command(name = "postgres-restore-operator")]
-#[command(about = "Kubernetes operator for managing PostgreSQL restores from kopia snapshots")]
+#[command(about = "Kubernetes operator for managing PostgreSQL restores from Kopia snapshots")]
 struct Args {
     /// Maximum number of concurrent restores
     #[arg(long, default_value = "2")]
@@ -53,16 +56,19 @@ async fn main() -> anyhow::Result<()> {
     let metrics_addr = args.metrics_addr.clone();
     tokio::spawn(async move {
         let app = Router::new()
-            .route("/metrics", get(move || {
-                let registry = metrics_registry.clone();
-                async move {
-                    let mut buffer = Vec::new();
-                    let encoder = prometheus::TextEncoder::new();
-                    let metric_families = registry.gather();
-                    encoder.encode(&metric_families, &mut buffer).unwrap();
-                    String::from_utf8(buffer).unwrap()
-                }
-            }))
+            .route(
+                "/metrics",
+                get(move || {
+                    let registry = metrics_registry.clone();
+                    async move {
+                        let mut buffer = Vec::new();
+                        let encoder = prometheus::TextEncoder::new();
+                        let metric_families = registry.gather();
+                        encoder.encode(&metric_families, &mut buffer).unwrap();
+                        String::from_utf8(buffer).unwrap()
+                    }
+                }),
+            )
             .route("/healthz", get(|| async { "ok" }))
             .route("/readyz", get(|| async { "ok" }));
 
@@ -88,9 +94,8 @@ async fn main() -> anyhow::Result<()> {
                 // Map restore events to the parent replica
                 let replica_name = restore.spec.replica.clone();
                 let namespace = restore.metadata.namespace.clone();
-                namespace.map(|ns| {
-                    kube::runtime::reflector::ObjectRef::new(&replica_name).within(&ns)
-                })
+                namespace
+                    .map(|ns| kube::runtime::reflector::ObjectRef::new(&replica_name).within(&ns))
             },
         )
         .run(

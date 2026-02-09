@@ -1,30 +1,35 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::Utc;
-use k8s_openapi::api::apps::v1::{Deployment, DeploymentSpec};
-use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::{
-    Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, PersistentVolumeClaim,
-    PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements, SecretKeySelector,
-    Volume, VolumeMount, VolumeResourceRequirements,
+use k8s_openapi::{
+    api::{
+        apps::v1::{Deployment, DeploymentSpec},
+        batch::v1::{Job, JobSpec},
+        core::v1::{
+            Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, PersistentVolumeClaim,
+            PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
+            SecretKeySelector, Volume, VolumeMount, VolumeResourceRequirements,
+        },
+    },
+    apimachinery::pkg::{
+        api::resource::Quantity,
+        apis::meta::v1::{LabelSelector, OwnerReference},
+    },
 };
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{LabelSelector, OwnerReference};
-use kube::api::{ObjectMeta, Patch, PatchParams, PostParams};
-use kube::runtime::controller::Action;
-use kube::{Api, Client, ResourceExt};
+use kube::{
+    Api, Client, ResourceExt,
+    api::{ObjectMeta, Patch, PatchParams, PostParams},
+    runtime::controller::Action,
+};
 use tracing::{info, warn};
 
-use crate::context::Context;
-use crate::error::{Error, Result};
-use crate::types::*;
+use crate::{
+    context::Context,
+    error::{Error, Result},
+    types::*,
+};
 
-pub async fn reconcile(
-    restore: Arc<PostgresPhysicalRestore>,
-    ctx: Arc<Context>,
-) -> Result<Action> {
+pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>) -> Result<Action> {
     let name = restore.name_any();
     let namespace = restore
         .namespace()
@@ -38,8 +43,12 @@ pub async fn reconcile(
     let phase = restore.status.as_ref().and_then(|s| s.phase.clone());
 
     match phase {
-        None | Some(RestorePhase::Pending) => reconcile_pending(&restore, &ctx, &name, &namespace).await,
-        Some(RestorePhase::Restoring) => reconcile_restoring(&restore, &ctx, &name, &namespace).await,
+        None | Some(RestorePhase::Pending) => {
+            reconcile_pending(&restore, &ctx, &name, &namespace).await
+        }
+        Some(RestorePhase::Restoring) => {
+            reconcile_restoring(&restore, &ctx, &name, &namespace).await
+        }
         Some(RestorePhase::Ready) => reconcile_ready(&restore, &ctx, &name, &namespace).await,
         Some(RestorePhase::Switching) => {
             // Parent (replica) controller handles service update.
@@ -81,12 +90,22 @@ async fn reconcile_pending(
     let client = &ctx.client;
 
     // Set created_at if not set
-    if restore.status.as_ref().and_then(|s| s.created_at.as_ref()).is_none() {
+    if restore
+        .status
+        .as_ref()
+        .and_then(|s| s.created_at.as_ref())
+        .is_none()
+    {
         let now = Utc::now().to_rfc3339();
-        update_restore_status(client, namespace, name, serde_json::json!({
-            "createdAt": now,
-            "phase": "Pending",
-        }))
+        update_restore_status(
+            client,
+            namespace,
+            name,
+            serde_json::json!({
+                "createdAt": now,
+                "phase": "Pending",
+            }),
+        )
         .await?;
     }
 
@@ -111,15 +130,25 @@ async fn reconcile_pending(
         .unwrap_or("Unknown");
 
     if pvc_phase != "Bound" {
-        info!(restore = name, pvc = pvc_name, phase = pvc_phase, "waiting for PVC to bind");
+        info!(
+            restore = name,
+            pvc = pvc_name,
+            phase = pvc_phase,
+            "waiting for PVC to bind"
+        );
         return Ok(Action::requeue(Duration::from_secs(5)));
     }
 
     // Update status and transition to Restoring
-    update_restore_status(client, namespace, name, serde_json::json!({
-        "phase": "Restoring",
-        "pvc": pvc_name,
-    }))
+    update_restore_status(
+        client,
+        namespace,
+        name,
+        serde_json::json!({
+            "phase": "Restoring",
+            "pvc": pvc_name,
+        }),
+    )
     .await?;
 
     // Mark as active in the queue
@@ -152,8 +181,7 @@ async fn reconcile_restoring(
             info!(restore = name, job = job_name, "creating restore job");
 
             // Look up the parent replica to get the kopia secret ref
-            let replicas: Api<PostgresPhysicalReplica> =
-                Api::namespaced(client.clone(), namespace);
+            let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
             let replica = replicas.get(&restore.spec.replica).await?;
 
             let job = build_restore_job(restore, &job_name, namespace, &replica)?;
@@ -163,14 +191,8 @@ async fn reconcile_restoring(
 
     // Check job status
     let job_status = &job.status;
-    let succeeded = job_status
-        .as_ref()
-        .and_then(|s| s.succeeded)
-        .unwrap_or(0);
-    let failed = job_status
-        .as_ref()
-        .and_then(|s| s.failed)
-        .unwrap_or(0);
+    let succeeded = job_status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
+    let failed = job_status.as_ref().and_then(|s| s.failed).unwrap_or(0);
 
     if succeeded > 0 {
         info!(restore = name, "restore job succeeded");
@@ -186,15 +208,20 @@ async fn reconcile_restoring(
             .map(|t| t.0.to_string())
             .unwrap_or_else(|| now.clone());
 
-        update_restore_status(client, namespace, name, serde_json::json!({
-            "phase": "Ready",
-            "restoredAt": now,
-            "restoreJob": {
-                "name": job_name,
-                "phase": "Succeeded",
-                "completedAt": completed_at,
-            },
-        }))
+        update_restore_status(
+            client,
+            namespace,
+            name,
+            serde_json::json!({
+                "phase": "Ready",
+                "restoredAt": now,
+                "restoreJob": {
+                    "name": job_name,
+                    "phase": "Succeeded",
+                    "completedAt": completed_at,
+                },
+            }),
+        )
         .await?;
 
         ctx.metrics.restores_completed_total.inc();
@@ -207,13 +234,18 @@ async fn reconcile_restoring(
     if failed > backoff_limit {
         warn!(restore = name, failed = failed, "restore job failed");
 
-        update_restore_status(client, namespace, name, serde_json::json!({
-            "phase": "Failed",
-            "restoreJob": {
-                "name": job_name,
+        update_restore_status(
+            client,
+            namespace,
+            name,
+            serde_json::json!({
                 "phase": "Failed",
-            },
-        }))
+                "restoreJob": {
+                    "name": job_name,
+                    "phase": "Failed",
+                },
+            }),
+        )
         .await?;
 
         // Remove from active queue
@@ -229,12 +261,17 @@ async fn reconcile_restoring(
     }
 
     // Still running
-    update_restore_status(client, namespace, name, serde_json::json!({
-        "restoreJob": {
-            "name": job_name,
-            "phase": "Running",
-        },
-    }))
+    update_restore_status(
+        client,
+        namespace,
+        name,
+        serde_json::json!({
+            "restoreJob": {
+                "name": job_name,
+                "phase": "Running",
+            },
+        }),
+    )
     .await?;
 
     Ok(Action::requeue(Duration::from_secs(15)))
@@ -261,11 +298,19 @@ async fn reconcile_ready(
             .unwrap_or(0);
 
         if ready_replicas > 0 {
-            info!(restore = name, "deployment ready, transitioning to Switching");
-            update_restore_status(client, namespace, name, serde_json::json!({
-                "phase": "Switching",
-                "deployment": name,
-            }))
+            info!(
+                restore = name,
+                "deployment ready, transitioning to Switching"
+            );
+            update_restore_status(
+                client,
+                namespace,
+                name,
+                serde_json::json!({
+                    "phase": "Switching",
+                    "deployment": name,
+                }),
+            )
             .await?;
 
             // Remove from active queue — restore is done
@@ -282,10 +327,18 @@ async fn reconcile_ready(
             if let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>() {
                 let elapsed = Utc::now().signed_duration_since(created);
                 if elapsed > chrono::Duration::minutes(10) {
-                    warn!(restore = name, "deployment not ready after 10 minutes, marking as Failed");
-                    update_restore_status(client, namespace, name, serde_json::json!({
-                        "phase": "Failed",
-                    }))
+                    warn!(
+                        restore = name,
+                        "deployment not ready after 10 minutes, marking as Failed"
+                    );
+                    update_restore_status(
+                        client,
+                        namespace,
+                        name,
+                        serde_json::json!({
+                            "phase": "Failed",
+                        }),
+                    )
                     .await?;
 
                     let mut queue = ctx.restore_queue.write().await;
@@ -442,11 +495,7 @@ ls -la /pgdata/
                                 kopia_secret,
                                 "secretAccessKey",
                             ),
-                            env_from_secret(
-                                "KOPIA_PASSWORD",
-                                kopia_secret,
-                                "repositoryPassword",
-                            ),
+                            env_from_secret("KOPIA_PASSWORD", kopia_secret, "repositoryPassword"),
                         ]),
                         volume_mounts: Some(vec![VolumeMount {
                             name: "pgdata".to_string(),
@@ -507,7 +556,11 @@ fn build_deployment(
     let pg_image = format!("postgres:{pg_version}");
     let pg_alpine_image = format!("postgres:{pg_version}-alpine");
 
-    let read_only = if replica.spec.read_only { "true" } else { "false" };
+    let read_only = if replica.spec.read_only {
+        "true"
+    } else {
+        "false"
+    };
 
     let init_script = format!(
         r#"set -e
@@ -554,8 +607,11 @@ echo "Auth setup complete"
     ]);
 
     // Build resource requirements from replica spec
-    let container_resources = replica.spec.resources.as_ref().map(|r| {
-        ResourceRequirements {
+    let container_resources = replica
+        .spec
+        .resources
+        .as_ref()
+        .map(|r| ResourceRequirements {
             requests: r.requests.as_ref().map(|reqs| {
                 reqs.iter()
                     .map(|(k, v)| (k.clone(), Quantity(v.clone())))
@@ -567,8 +623,7 @@ echo "Auth setup complete"
                     .collect()
             }),
             ..Default::default()
-        }
-    });
+        });
 
     let mut pod_annotations = BTreeMap::new();
     if let Some(pa) = &replica.spec.pod_annotations {
@@ -646,11 +701,7 @@ echo "Auth setup complete"
                                 value: Some(replica.spec.analytics_username.clone()),
                                 ..Default::default()
                             },
-                            env_from_secret(
-                                "ANALYTICS_PASSWORD",
-                                &creds_secret,
-                                "password",
-                            ),
+                            env_from_secret("ANALYTICS_PASSWORD", &creds_secret, "password"),
                             EnvVar {
                                 name: "READ_ONLY".to_string(),
                                 value: Some(read_only.to_string()),
@@ -872,10 +923,7 @@ async fn cleanup_previous_jobs(
 ) -> Result<()> {
     let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
     let job_list = jobs
-        .list(
-            &kube::api::ListParams::default()
-                .labels(&format!("bes.au/replica={replica_name}")),
-        )
+        .list(&kube::api::ListParams::default().labels(&format!("bes.au/replica={replica_name}")))
         .await?;
 
     for job in &job_list.items {

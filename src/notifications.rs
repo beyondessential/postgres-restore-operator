@@ -6,10 +6,12 @@ use kube::{Api, Client};
 use serde_json::json;
 use tracing::{info, warn};
 
-use crate::error::Error;
-use crate::types::{
-    ConnectionInfo, GraphQLConfig, HeaderValue, NotificationConfig, NotificationEvent,
-    NotificationStatus, WebhookConfig,
+use crate::{
+    error::Error,
+    types::{
+        ConnectionInfo, GraphQLConfig, HeaderValue, NotificationConfig, NotificationEvent,
+        NotificationStatus, WebhookConfig,
+    },
 };
 
 /// Payload sent with notifications.
@@ -144,14 +146,12 @@ async fn resolve_headers(
                     .data
                     .as_ref()
                     .ok_or_else(|| Error::Notification("secret has no data".to_string()))?;
-                let bytes = data
-                    .get(&secret_key_ref.key)
-                    .ok_or_else(|| {
-                        Error::Notification(format!(
-                            "secret {} missing key {}",
-                            secret_key_ref.name, secret_key_ref.key
-                        ))
-                    })?;
+                let bytes = data.get(&secret_key_ref.key).ok_or_else(|| {
+                    Error::Notification(format!(
+                        "secret {} missing key {}",
+                        secret_key_ref.name, secret_key_ref.key
+                    ))
+                })?;
                 String::from_utf8(bytes.0.clone())
                     .map_err(|_| Error::Notification("secret value not UTF-8".to_string()))?
             }
@@ -321,8 +321,15 @@ mod tests {
         let payload = NotificationPayload {
             event: "RestoreComplete".into(),
             timestamp: "t".into(),
-            replica: ReplicaRef { name: "r".into(), namespace: "ns".into() },
-            restore: RestoreRef { name: "x".into(), snapshot: "s".into(), postgres_version: "16".into() },
+            replica: ReplicaRef {
+                name: "r".into(),
+                namespace: "ns".into(),
+            },
+            restore: RestoreRef {
+                name: "x".into(),
+                snapshot: "s".into(),
+                postgres_version: "16".into(),
+            },
             connection_info: ConnectionInfoPayload {
                 host: "h".into(),
                 port: 5432,

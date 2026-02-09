@@ -1,26 +1,27 @@
-use std::collections::BTreeMap;
-use std::sync::Arc;
-use std::time::Duration;
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use chrono::Utc;
-use k8s_openapi::api::core::v1::{Secret, Service, ServicePort, ServiceSpec};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
-use k8s_openapi::apimachinery::pkg::util::intstr::IntOrString;
-use k8s_openapi::ByteString;
-use kube::api::{ObjectMeta, Patch, PatchParams, PostParams};
-use kube::runtime::controller::Action;
-use kube::{Api, Client, ResourceExt};
+use k8s_openapi::{
+    ByteString,
+    api::core::v1::{Secret, Service, ServicePort, ServiceSpec},
+    apimachinery::pkg::{apis::meta::v1::OwnerReference, util::intstr::IntOrString},
+};
+use kube::{
+    Api, Client, ResourceExt,
+    api::{ObjectMeta, Patch, PatchParams, PostParams},
+    runtime::controller::Action,
+};
 use rand::RngExt;
 use tracing::{info, warn};
 
-use crate::context::Context;
-use crate::error::{Error, Result};
-use crate::kopia;
-use crate::notifications::{
-    self, ConnectionInfoPayload, NotificationPayload, ReplicaRef, RestoreRef,
+use crate::{
+    context::Context,
+    error::{Error, Result},
+    kopia,
+    notifications::{self, ConnectionInfoPayload, NotificationPayload, ReplicaRef, RestoreRef},
+    types::*,
+    util::parse_duration,
 };
-use crate::types::*;
-use crate::util::parse_duration;
 
 /// Calculate stable jitter for a replica name.
 fn calculate_jitter(replica_name: &str, max_jitter: Duration) -> Duration {
@@ -44,13 +45,12 @@ fn generate_password() -> String {
     let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
         .chars()
         .collect();
-    (0..32).map(|_| chars[rng.random_range(0..chars.len())]).collect()
+    (0..32)
+        .map(|_| chars[rng.random_range(0..chars.len())])
+        .collect()
 }
 
-pub async fn reconcile(
-    replica: Arc<PostgresPhysicalReplica>,
-    ctx: Arc<Context>,
-) -> Result<Action> {
+pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>) -> Result<Action> {
     let name = replica.name_any();
     let namespace = replica
         .namespace()
@@ -145,17 +145,12 @@ pub async fn reconcile(
         .await?;
 
     // Find current active restore and any in-progress restores
-    let active_restore = restore_list.items.iter().find(|r| {
-        r.status
-            .as_ref()
-            .and_then(|s| s.phase.as_ref())
-            == Some(&RestorePhase::Active)
-    });
+    let active_restore = restore_list
+        .items
+        .iter()
+        .find(|r| r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Active));
     let switching_restore = restore_list.items.iter().find(|r| {
-        r.status
-            .as_ref()
-            .and_then(|s| s.phase.as_ref())
-            == Some(&RestorePhase::Switching)
+        r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Switching)
     });
     let in_progress_restore = restore_list.items.iter().find(|r| {
         matches!(
@@ -196,7 +191,11 @@ pub async fn reconcile(
             }
         });
         replicas
-            .patch_status(&name, &PatchParams::apply("postgres-restore-operator"), &Patch::Merge(&patch))
+            .patch_status(
+                &name,
+                &PatchParams::apply("postgres-restore-operator"),
+                &Patch::Merge(&patch),
+            )
             .await?;
 
         ctx.metrics.switchovers_total.inc();
@@ -217,7 +216,11 @@ pub async fn reconcile(
     }
 
     // 8. Clean up old restores after grace period
-    if let Some(prev_name) = replica.status.as_ref().and_then(|s| s.previous_restore.clone()) {
+    if let Some(prev_name) = replica
+        .status
+        .as_ref()
+        .and_then(|s| s.previous_restore.clone())
+    {
         let grace_period = parse_duration(&replica.spec.switchover_grace_period)
             .unwrap_or(Duration::from_secs(300));
         let last_completed = replica
@@ -234,10 +237,7 @@ pub async fn reconcile(
                     restore = prev_name,
                     "cleaning up previous restore after grace period"
                 );
-                if let Err(e) = restores
-                    .delete(&prev_name, &Default::default())
-                    .await
-                {
+                if let Err(e) = restores.delete(&prev_name, &Default::default()).await {
                     warn!(restore = prev_name, error = %e, "failed to delete previous restore");
                 }
                 // Clear previousRestore from status
@@ -366,8 +366,8 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
     // Check minimumTTL
     if let Some(last_completed) = status.and_then(|s| s.last_restore_completed_at.as_ref()) {
         if let Ok(last_completed) = last_completed.parse::<chrono::DateTime<Utc>>() {
-            let minimum_ttl = parse_duration(&replica.spec.minimum_ttl)
-                .unwrap_or(Duration::from_secs(6 * 3600));
+            let minimum_ttl =
+                parse_duration(&replica.spec.minimum_ttl).unwrap_or(Duration::from_secs(6 * 3600));
             let elapsed = Utc::now().signed_duration_since(last_completed);
             if elapsed.to_std().unwrap_or_default() < minimum_ttl {
                 return false;
@@ -435,9 +435,10 @@ async fn ensure_credentials_secret(
         metadata: ObjectMeta {
             name: Some(secret_name.to_string()),
             namespace: Some(namespace.to_string()),
-            labels: Some(BTreeMap::from([
-                ("bes.au/replica".to_string(), replica_name.to_string()),
-            ])),
+            labels: Some(BTreeMap::from([(
+                "bes.au/replica".to_string(),
+                replica_name.to_string(),
+            )])),
             owner_references: Some(vec![owner_reference(replica)]),
             ..Default::default()
         },
@@ -489,10 +490,7 @@ async fn ensure_service(
         return Ok(());
     }
 
-    info!(
-        replica = replica_name,
-        "creating stable service"
-    );
+    info!(replica = replica_name, "creating stable service");
 
     let mut annotations = BTreeMap::new();
     if let Some(sa) = &replica.spec.service_annotations {
@@ -505,9 +503,10 @@ async fn ensure_service(
         metadata: ObjectMeta {
             name: Some(replica_name.to_string()),
             namespace: Some(namespace.to_string()),
-            labels: Some(BTreeMap::from([
-                ("bes.au/replica".to_string(), replica_name.to_string()),
-            ])),
+            labels: Some(BTreeMap::from([(
+                "bes.au/replica".to_string(),
+                replica_name.to_string(),
+            )])),
             annotations: Some(annotations),
             owner_references: Some(vec![owner_reference(replica)]),
             ..Default::default()
@@ -772,8 +771,7 @@ async fn send_restore_notifications(
         .await;
 
         // Update notification status on the replica
-        let replicas: Api<PostgresPhysicalReplica> =
-            Api::namespaced(client.clone(), namespace);
+        let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
         let patch = serde_json::json!({
             "status": {
                 "notifications": [status],

@@ -1,8 +1,10 @@
-use super::{Condition, HeaderValue, ResourceRequirements, Toleration};
+use std::collections::HashMap;
+
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+
+use super::{Condition, HeaderValue, ResourceRequirements, Toleration};
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(

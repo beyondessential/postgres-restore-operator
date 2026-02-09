@@ -1,14 +1,14 @@
-mod replica;
-mod restore;
+//! Common types shared across CRDs
 
-pub use replica::*;
-pub use restore::*;
+use std::collections::HashMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 
-// Common types shared across CRDs
+pub use self::{replica::*, restore::*};
+
+mod replica;
+mod restore;
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
@@ -57,5 +57,7 @@ pub struct SecretKeySelector {
 pub enum HeaderValue {
     Plain(String),
     #[serde(rename_all = "camelCase")]
-    Secret { secret_key_ref: SecretKeySelector },
+    Secret {
+        secret_key_ref: SecretKeySelector,
+    },
 }
