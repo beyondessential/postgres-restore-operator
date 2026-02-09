@@ -680,8 +680,21 @@ fn format_bytes(bytes: u64) -> String {
 }
 
 /// Returns the next cron occurrence after `now`.
+/// Normalize a cron expression to the 7-field format expected by the `cron` crate.
+///
+/// Standard crontab uses 5 fields (min hour dom month dow).
+/// The `cron` crate expects 6-7 fields (sec min hour dom month dow [year]).
+/// This prepends `0` for seconds and appends `*` for year when needed.
+fn normalize_cron(expr: &str) -> String {
+	match expr.split_whitespace().count() {
+		5 => format!("0 {expr} *"),
+		6 => format!("0 {expr}"),
+		_ => expr.to_string(),
+	}
+}
+
 fn compute_next_scheduled_restore(schedule: &str) -> Option<chrono::DateTime<Utc>> {
-	let cron_schedule = schedule.parse::<cron::Schedule>().ok()?;
+	let cron_schedule = normalize_cron(schedule).parse::<cron::Schedule>().ok()?;
 	cron_schedule.upcoming(Utc).next()
 }
 
@@ -705,7 +718,7 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
 	}
 
 	// Check cron schedule
-	let Ok(cron_schedule) = schedule.parse::<cron::Schedule>() else {
+	let Ok(cron_schedule) = normalize_cron(schedule).parse::<cron::Schedule>() else {
 		warn!(schedule = schedule, "invalid cron expression");
 		return false;
 	};
@@ -1221,5 +1234,38 @@ mod tests {
 		let snap: SnapshotInfo = serde_json::from_str(raw).unwrap();
 		assert_eq!(snap.id, "snap0");
 		assert_eq!(snap.size, 0);
+	}
+
+	#[test]
+	fn normalize_cron_5_fields() {
+		assert_eq!(normalize_cron("*/20 * * * *"), "0 */20 * * * * *");
+	}
+
+	#[test]
+	fn normalize_cron_6_fields() {
+		assert_eq!(normalize_cron("*/20 * * * * *"), "0 */20 * * * * *");
+	}
+
+	#[test]
+	fn normalize_cron_7_fields_unchanged() {
+		assert_eq!(normalize_cron("0 */20 * * * * *"), "0 */20 * * * * *");
+	}
+
+	#[test]
+	fn compute_next_scheduled_restore_5_field() {
+		let next = compute_next_scheduled_restore("*/20 * * * *");
+		assert!(next.is_some(), "standard 5-field cron should parse");
+	}
+
+	#[test]
+	fn compute_next_scheduled_restore_7_field() {
+		let next = compute_next_scheduled_restore("0 */20 * * * * *");
+		assert!(next.is_some(), "7-field cron should parse");
+	}
+
+	#[test]
+	fn compute_next_scheduled_restore_invalid() {
+		let next = compute_next_scheduled_restore("not a cron");
+		assert!(next.is_none());
 	}
 }
