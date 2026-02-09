@@ -466,8 +466,17 @@ fn build_version_detect_job(
 	pvc_name: &str,
 ) -> Job {
 	let script = r#"set -e
+
+echo "PVC contents:"
+ls -la /pgdata/ 2>&1 || true
+echo "---"
+ls -la /pgdata/postgres/ 2>&1 || true
+echo "---"
+
 VERSION=$(cat /pgdata/.postgres-version 2>/dev/null || cat /pgdata/postgres/PG_VERSION 2>/dev/null || true)
 if [ -z "$VERSION" ]; then
+  echo "Searching for PG_VERSION recursively..."
+  find /pgdata -name "PG_VERSION" 2>/dev/null || true
   VERSION=$(find /pgdata -name "PG_VERSION" -exec cat {} \; 2>/dev/null | head -1)
 fi
 if [ -z "$VERSION" ]; then
@@ -512,7 +521,7 @@ echo -n "$VERSION" > /dev/termination-log
 					}),
 					containers: vec![Container {
 						name: "version-detect".to_string(),
-						image: Some("busybox:latest".to_string()),
+						image: Some("alpine:latest".to_string()),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![script.to_string()]),
 						volume_mounts: Some(vec![VolumeMount {
