@@ -73,6 +73,10 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default = "default_read_only")]
 	pub read_only: bool,
 
+	/// Extra lines appended to postgresql.conf (e.g. shared_preload_libraries)
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub postgres_extra_config: Option<String>,
+
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub notifications: Vec<NotificationConfig>,
 }

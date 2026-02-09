@@ -818,6 +818,17 @@ fn build_deployment(
 		"false"
 	};
 
+	let extra_config_block = if let Some(ref extra) = replica.spec.postgres_extra_config {
+		format!(
+			r#"echo "Appending extra postgresql.conf settings..."
+cat >> "$PGDATA/postgresql.conf" << 'EXTRACONFEOF'
+{extra}
+EXTRACONFEOF"#
+		)
+	} else {
+		String::new()
+	};
+
 	let init_script = format!(
 		r#"set -e
 PGDATA=/pgdata/pgdata
@@ -841,6 +852,8 @@ lc_numeric = 'C'
 lc_time = 'C'
 CONFEOF
 fi
+
+{extra_config_block}
 
 echo "Configuring pg_hba.conf..."
 cat > "$PGDATA/pg_hba.conf" << 'HBAEOF'
@@ -1170,4 +1183,164 @@ async fn cleanup_previous_jobs(
 	}
 
 	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn make_replica(extra_config: Option<String>) -> PostgresPhysicalReplica {
+		PostgresPhysicalReplica::new(
+			"test-replica",
+			PostgresPhysicalReplicaSpec {
+				kopia_secret_ref: "kopia-secret".to_string(),
+				snapshot_filter: None,
+				schedule: None,
+				schedule_jitter: "10m".to_string(),
+				minimum_ttl: None,
+				switchover_grace_period: "5m".to_string(),
+				analytics_username: "analytics".to_string(),
+				storage_class: None,
+				storage_size_override: None,
+				resources: None,
+				service_annotations: None,
+				pod_annotations: None,
+				node_selector: None,
+				tolerations: vec![],
+				read_only: true,
+				postgres_extra_config: extra_config,
+				notifications: vec![],
+			},
+		)
+	}
+
+	fn make_restore() -> PostgresPhysicalRestore {
+		let mut restore = PostgresPhysicalRestore::new(
+			"test-restore",
+			PostgresPhysicalRestoreSpec {
+				replica: "test-replica".to_string(),
+				snapshot: "snap123".to_string(),
+				snapshot_size: "10Gi".to_string(),
+				storage_size: "11Gi".to_string(),
+			},
+		);
+		restore.metadata.uid = Some("uid-123".to_string());
+		restore.status = Some(PostgresPhysicalRestoreStatus {
+			postgres_version: Some("16".to_string()),
+			..Default::default()
+		});
+		restore
+	}
+
+	fn get_init_script(deploy: &Deployment) -> String {
+		deploy
+			.spec
+			.as_ref()
+			.unwrap()
+			.template
+			.spec
+			.as_ref()
+			.unwrap()
+			.init_containers
+			.as_ref()
+			.unwrap()[0]
+			.args
+			.as_ref()
+			.unwrap()[0]
+			.clone()
+	}
+
+	#[test]
+	fn minimal_config_includes_max_prepared_transactions() {
+		let replica = make_replica(None);
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			script.contains("max_prepared_transactions = 16"),
+			"minimal config must include max_prepared_transactions"
+		);
+	}
+
+	#[test]
+	fn minimal_config_created_only_when_missing() {
+		let replica = make_replica(None);
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			script.contains(r#"if [ ! -f "$PGDATA/postgresql.conf" ]"#),
+			"minimal config should only be created when file is missing"
+		);
+	}
+
+	#[test]
+	fn extra_config_appended_to_postgresql_conf() {
+		let replica = make_replica(Some(
+			"shared_preload_libraries = 'timescaledb'\nwork_mem = '64MB'".into(),
+		));
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			script.contains("Appending extra postgresql.conf"),
+			"script must contain the extra config echo"
+		);
+		assert!(
+			script.contains("shared_preload_libraries = 'timescaledb'"),
+			"script must contain the user-provided shared_preload_libraries"
+		);
+		assert!(
+			script.contains("work_mem = '64MB'"),
+			"script must contain the user-provided work_mem"
+		);
+	}
+
+	#[test]
+	fn no_extra_config_block_when_none() {
+		let replica = make_replica(None);
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			!script.contains("EXTRACONFEOF"),
+			"script must not contain extra config heredoc when postgres_extra_config is None"
+		);
+	}
+
+	#[test]
+	fn extra_config_appended_unconditionally() {
+		let replica = make_replica(Some(
+			"shared_preload_libraries = 'pg_stat_statements'".into(),
+		));
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+
+		// The extra config block must be outside the `if [ ! -f ... ]` guard
+		// so it's appended even when postgresql.conf already exists in the snapshot
+		let conf_fi = script.find("CONFEOF\nfi").expect("must have CONFEOF/fi");
+		let extra_pos = script.find("EXTRACONFEOF").expect("must have EXTRACONFEOF");
+		assert!(
+			extra_pos > conf_fi,
+			"extra config block must appear after the minimal-config if/fi block"
+		);
+	}
+
+	#[test]
+	fn read_only_appended_after_extra_config() {
+		let replica = make_replica(Some("shared_preload_libraries = 'timescaledb'".into()));
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+
+		let extra_pos = script.find("EXTRACONFEOF").expect("must have EXTRACONFEOF");
+		let read_only_pos = script
+			.find("default_transaction_read_only")
+			.expect("must have read_only setting");
+		assert!(
+			read_only_pos > extra_pos,
+			"read_only setting must come after extra config so it can't be overridden"
+		);
+	}
 }
