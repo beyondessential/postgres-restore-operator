@@ -23,9 +23,7 @@ use kube::{
 };
 use tracing::{info, warn};
 
-use super::{jq_init_container, kopia_writable_env, tools_volume, tools_volume_mount};
-
-use super::{env_from_secret, read_job_termination_message};
+use super::{env_from_secret, kopia_writable_env, read_job_termination_message};
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -441,16 +439,17 @@ kopia repository connect s3 \
   --secret-access-key="$AWS_SECRET_ACCESS_KEY" \
   --password="$KOPIA_PASSWORD"
 
+echo "Starting restore..."
+kopia snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
+
+echo "Restore complete"
+ls -la /pgdata/
+
 echo "Detecting postgres version..."
-VERSION=$(kopia snapshot show "$SNAPSHOT_ID" --json 2>/dev/null | /tools/jq -r '.metadata.pg_version // empty' || true)
+VERSION=$(cat /pgdata/postgres/PG_VERSION 2>/dev/null || true)
 
 if [ -z "$VERSION" ]; then
-  echo "Version not in metadata, checking PG_VERSION file..."
-  kopia snapshot restore "$SNAPSHOT_ID" /tmp/pgcheck \
-    --include="**/PG_VERSION" \
-    --no-overwrite-files \
-    --ignore-errors || true
-  VERSION=$(find /tmp/pgcheck -name "PG_VERSION" -exec cat {} \; | head -1)
+  VERSION=$(find /pgdata/postgres -name "PG_VERSION" -exec cat {} \; 2>/dev/null | head -1)
 fi
 
 if [ -z "$VERSION" ]; then
@@ -461,12 +460,6 @@ fi
 echo "Detected postgres version: $VERSION"
 echo "$VERSION" > /pgdata/.postgres-version
 echo -n "$VERSION" > /dev/termination-log
-
-echo "Starting restore..."
-kopia snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
-
-echo "Restore complete"
-ls -la /pgdata/
 "#;
 
 	Ok(Job {
@@ -499,7 +492,7 @@ ls -la /pgdata/
 						fs_group: Some(999),
 						..Default::default()
 					}),
-					init_containers: Some(vec![jq_init_container()]),
+
 					containers: vec![Container {
 						name: "restore".to_string(),
 						image: Some("kopia/kopia:latest".to_string()),
@@ -535,14 +528,11 @@ ls -la /pgdata/
 							]
 							.concat(),
 						),
-						volume_mounts: Some(vec![
-							VolumeMount {
-								name: "pgdata".to_string(),
-								mount_path: "/pgdata".to_string(),
-								..Default::default()
-							},
-							tools_volume_mount(),
-						]),
+						volume_mounts: Some(vec![VolumeMount {
+							name: "pgdata".to_string(),
+							mount_path: "/pgdata".to_string(),
+							..Default::default()
+						}]),
 						resources: Some(ResourceRequirements {
 							requests: Some(BTreeMap::from([
 								("cpu".to_string(), Quantity("500m".to_string())),
@@ -556,19 +546,16 @@ ls -la /pgdata/
 						}),
 						..Default::default()
 					}],
-					volumes: Some(vec![
-						Volume {
-							name: "pgdata".to_string(),
-							persistent_volume_claim: Some(
-								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-									claim_name: pvc_name,
-									read_only: Some(false),
-								},
-							),
-							..Default::default()
-						},
-						tools_volume(),
-					]),
+					volumes: Some(vec![Volume {
+						name: "pgdata".to_string(),
+						persistent_volume_claim: Some(
+							k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+								claim_name: pvc_name,
+								read_only: Some(false),
+							},
+						),
+						..Default::default()
+					}]),
 					..Default::default()
 				}),
 			},

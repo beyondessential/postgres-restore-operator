@@ -1,9 +1,4 @@
-use k8s_openapi::api::core::v1::{
-	Container, EmptyDirVolumeSource, EnvVar, EnvVarSource, Pod, ResourceRequirements,
-	SecretKeySelector, SecurityContext, Volume, VolumeMount,
-};
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use std::collections::BTreeMap;
+use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector};
 
 use kube::{Api, Client};
 
@@ -51,60 +46,6 @@ pub fn kopia_writable_env() -> Vec<EnvVar> {
 			..Default::default()
 		},
 	]
-}
-
-/// An init container that installs `jq` into a shared `/tools` emptyDir volume.
-pub fn jq_init_container() -> Container {
-	Container {
-		name: "install-jq".to_string(),
-		image: Some("alpine:latest".to_string()),
-		command: Some(vec![
-			"sh".to_string(),
-			"-c".to_string(),
-			"apk add --no-cache jq && cp /usr/bin/jq /tools/jq".to_string(),
-		]),
-		volume_mounts: Some(vec![VolumeMount {
-			name: "tools".to_string(),
-			mount_path: "/tools".to_string(),
-			..Default::default()
-		}]),
-		security_context: Some(SecurityContext {
-			run_as_user: Some(0),
-			run_as_group: Some(0),
-			..Default::default()
-		}),
-		resources: Some(ResourceRequirements {
-			requests: Some(BTreeMap::from([
-				("cpu".to_string(), Quantity("10m".to_string())),
-				("memory".to_string(), Quantity("64Mi".to_string())),
-			])),
-			limits: Some(BTreeMap::from([
-				("cpu".to_string(), Quantity("100m".to_string())),
-				("memory".to_string(), Quantity("128Mi".to_string())),
-			])),
-			..Default::default()
-		}),
-		..Default::default()
-	}
-}
-
-/// Volume mount for the `/tools` emptyDir shared with the init container.
-pub fn tools_volume_mount() -> VolumeMount {
-	VolumeMount {
-		name: "tools".to_string(),
-		mount_path: "/tools".to_string(),
-		read_only: Some(true),
-		..Default::default()
-	}
-}
-
-/// The emptyDir volume backing the `/tools` mount.
-pub fn tools_volume() -> Volume {
-	Volume {
-		name: "tools".to_string(),
-		empty_dir: Some(EmptyDirVolumeSource::default()),
-		..Default::default()
-	}
 }
 
 /// Read the termination message from a named container in a Job's pod.
