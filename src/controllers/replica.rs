@@ -291,7 +291,14 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	}
 
 	// 9. Decide whether to trigger a new restore
-	if in_progress_restore.is_some() {
+	if let Some(in_progress) = in_progress_restore {
+		let phase = in_progress.status.as_ref().and_then(|s| s.phase.as_ref());
+		info!(
+			replica = name,
+			restore = in_progress.name_any(),
+			phase = ?phase,
+			"restore already in progress, waiting"
+		);
 		update_replica_phase(client, &namespace, &name, ReplicaPhase::Restoring).await?;
 		return Ok(Action::requeue(Duration::from_secs(30)));
 	}
@@ -701,7 +708,9 @@ fn compute_next_scheduled_restore(schedule: &str) -> Option<chrono::DateTime<Utc
 }
 
 fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
+	let name = replica.name_any();
 	let Some(schedule) = &replica.spec.schedule else {
+		info!(replica = %name, "no schedule configured, skipping scheduled restore");
 		return false;
 	};
 
@@ -721,12 +730,12 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
 
 	// Check cron schedule
 	let Ok(cron_schedule) = normalize_cron(schedule).parse::<cron::Schedule>() else {
-		warn!(schedule = schedule, "invalid cron expression");
+		warn!(replica = %name, schedule = schedule, "invalid cron expression");
 		return false;
 	};
 
 	let jitter = calculate_jitter(
-		&replica.name_any(),
+		&name,
 		parse_duration(&replica.spec.schedule_jitter).unwrap_or(Duration::from_secs(600)),
 	);
 
@@ -737,7 +746,23 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
 	{
 		// Add jitter to the scheduled time
 		let trigger_at = next + chrono::Duration::from_std(jitter).unwrap_or_default();
-		return now >= trigger_at;
+		if now >= trigger_at {
+			info!(
+				replica = %name,
+				next_scheduled = %next,
+				trigger_at = %trigger_at,
+				"scheduled restore time reached, triggering"
+			);
+			return true;
+		}
+		info!(
+			replica = %name,
+			next_scheduled = %next,
+			trigger_at = %trigger_at,
+			remaining_secs = (trigger_at - now).num_seconds(),
+			"scheduled restore not due yet, skipping"
+		);
+		return false;
 	}
 
 	// Initial seed: nextScheduledRestore not yet set (first reconciliation or field was cleared).
@@ -748,9 +773,19 @@ fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
 		.next()
 		&& prev <= now
 	{
+		info!(
+			replica = %name,
+			schedule = schedule,
+			"no nextScheduledRestore set, found cron occurrence in 24h lookback window, triggering"
+		);
 		return true;
 	}
 
+	info!(
+		replica = %name,
+		schedule = schedule,
+		"no nextScheduledRestore set and no cron occurrence in 24h lookback window, skipping"
+	);
 	false
 }
 
