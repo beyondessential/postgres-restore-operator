@@ -8,6 +8,8 @@ spec:
     backoffLimit: 3
     template:
         spec:
+            securityContext:
+                fsGroup: 999
             initContainers:
                 - name: create-bucket
                   image: minio/mc:latest
