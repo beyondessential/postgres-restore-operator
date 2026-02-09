@@ -54,7 +54,7 @@ jobs:
 
   kubeconform:
     name: Lint Kubernetes manifests
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
       - uses: actions/checkout@v6
       - name: Install kubeconform
