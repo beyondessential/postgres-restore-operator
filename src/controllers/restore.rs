@@ -884,7 +884,12 @@ HBAEOF
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
 
-psql -U postgres -d postgres << SQLEOF
+PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
+echo "Detected PG major version: $PG_MAJOR"
+
+if [ "{read_only}" = "true" ] && [ "$PG_MAJOR" -ge 14 ]; then
+  echo "Read-only mode with PG >= 14, granting pg_read_all_data..."
+  psql -U postgres -d postgres << SQLEOF
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${{ANALYTICS_USERNAME}}') THEN
@@ -894,11 +899,22 @@ BEGIN
   END IF;
 END
 \$\$;
-GRANT CONNECT ON DATABASE postgres TO ${{ANALYTICS_USERNAME}};
-GRANT USAGE ON SCHEMA public TO ${{ANALYTICS_USERNAME}};
-GRANT SELECT ON ALL TABLES IN SCHEMA public TO ${{ANALYTICS_USERNAME}};
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT ON TABLES TO ${{ANALYTICS_USERNAME}};
+GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};
 SQLEOF
+else
+  echo "Granting superuser to analytics user..."
+  psql -U postgres -d postgres << SQLEOF
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${{ANALYTICS_USERNAME}}') THEN
+    CREATE ROLE ${{ANALYTICS_USERNAME}} WITH LOGIN SUPERUSER PASSWORD '${{ANALYTICS_PASSWORD}}';
+  ELSE
+    ALTER ROLE ${{ANALYTICS_USERNAME}} WITH SUPERUSER PASSWORD '${{ANALYTICS_PASSWORD}}';
+  END IF;
+END
+\$\$;
+SQLEOF
+fi
 
 echo "Stopping temporary postgres..."
 pg_ctl -D "$PGDATA" -w stop
