@@ -127,7 +127,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .github/build-context
-          file: .github/Dockerfile.native
+          file: Containerfile
           platforms: linux/amd64,linux/arm64
           push: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') }}
           labels: ${{ steps.meta.outputs.labels }}
