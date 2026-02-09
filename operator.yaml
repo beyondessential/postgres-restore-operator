@@ -1,0 +1,194 @@
+# postgres-restore-operator install manifest
+# CRDs are not included — generate them with: cargo run --bin gen-crds
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+    name: pgro-system
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+    name: postgres-restore-operator
+    namespace: pgro-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+    name: postgres-restore-operator
+rules:
+    # CRD access
+    - apiGroups: ["bes.au"]
+      resources:
+          - postgresphysicalreplicas
+          - postgresphysicalreplicas/status
+          - postgresphysicalrestores
+          - postgresphysicalrestores/status
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # Secrets (kopia credentials, analytics credentials)
+    - apiGroups: [""]
+      resources: ["secrets"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # Services (stable service per replica)
+    - apiGroups: [""]
+      resources: ["services"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # PVCs (restore data volumes)
+    - apiGroups: [""]
+      resources: ["persistentvolumeclaims"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # Jobs (restore jobs)
+    - apiGroups: ["batch"]
+      resources: ["jobs"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # Deployments (postgres instances)
+    - apiGroups: ["apps"]
+      resources: ["deployments"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+    # Pods (reading Job pod termination messages for version detection)
+    - apiGroups: [""]
+      resources: ["pods"]
+      verbs: ["get", "list"]
+    # Events
+    - apiGroups: [""]
+      resources: ["events"]
+      verbs: ["create", "patch"]
+    # Leader election
+    - apiGroups: ["coordination.k8s.io"]
+      resources: ["leases"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+    name: postgres-restore-operator
+roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: ClusterRole
+    name: postgres-restore-operator
+subjects:
+    - kind: ServiceAccount
+      name: postgres-restore-operator
+      namespace: pgro-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+    name: postgres-restore-operator-config
+    namespace: pgro-system
+rules:
+    - apiGroups: [""]
+      resources: ["configmaps"]
+      resourceNames: ["postgres-restore-operator-config"]
+      verbs: ["get", "watch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+    name: postgres-restore-operator-config
+    namespace: pgro-system
+roleRef:
+    apiGroup: rbac.authorization.k8s.io
+    kind: Role
+    name: postgres-restore-operator-config
+subjects:
+    - kind: ServiceAccount
+      name: postgres-restore-operator
+      namespace: pgro-system
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+    name: postgres-restore-operator-config
+    namespace: pgro-system
+data:
+    maxConcurrentRestores: "2"
+---
+apiVersion: v1
+kind: Service
+metadata:
+    name: postgres-restore-operator-metrics
+    namespace: pgro-system
+    labels:
+        app.kubernetes.io/name: postgres-restore-operator
+        app.kubernetes.io/component: controller
+    annotations:
+        prometheus.io/port: "8080"
+        prometheus.io/scheme: http
+        prometheus.io/scrape: "true"
+spec:
+    ports:
+        - name: metrics
+          port: 8080
+          targetPort: metrics
+    selector:
+        app.kubernetes.io/name: postgres-restore-operator
+        app.kubernetes.io/component: controller
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+    name: postgres-restore-operator
+    namespace: pgro-system
+    labels:
+        app.kubernetes.io/name: postgres-restore-operator
+        app.kubernetes.io/component: controller
+spec:
+    replicas: 1
+    selector:
+        matchLabels:
+            app.kubernetes.io/name: postgres-restore-operator
+            app.kubernetes.io/component: controller
+    template:
+        metadata:
+            labels:
+                app.kubernetes.io/name: postgres-restore-operator
+                app.kubernetes.io/component: controller
+            annotations:
+                prometheus.io/scrape: "true"
+                prometheus.io/port: "8080"
+        spec:
+            serviceAccountName: postgres-restore-operator
+            securityContext:
+                runAsNonRoot: true
+                runAsUser: 65534
+                runAsGroup: 65534
+                fsGroup: 65534
+            containers:
+                - name: controller
+                  image: ghcr.io/beyondessential/postgres-restore-operator:latest
+                  env:
+                      - name: METRICS_ADDR
+                        value: "0.0.0.0:8080"
+                      - name: OPERATOR_NAMESPACE
+                        valueFrom:
+                            fieldRef:
+                                fieldPath: metadata.namespace
+                  ports:
+                      - name: metrics
+                        containerPort: 8080
+                        protocol: TCP
+                  readinessProbe:
+                      httpGet:
+                          path: /healthz
+                          port: metrics
+                      initialDelaySeconds: 5
+                      periodSeconds: 10
+                  livenessProbe:
+                      httpGet:
+                          path: /healthz
+                          port: metrics
+                      initialDelaySeconds: 15
+                      periodSeconds: 20
+                  resources:
+                      requests:
+                          cpu: 50m
+                          memory: 64Mi
+                      limits:
+                          cpu: 500m
+                          memory: 256Mi
+                  securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: true
+                      capabilities:
+                          drop: ["ALL"]
