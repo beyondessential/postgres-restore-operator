@@ -23,6 +23,8 @@ use kube::{
 };
 use tracing::{info, warn};
 
+use super::{jq_init_container, kopia_writable_env, tools_volume, tools_volume_mount};
+
 use super::{env_from_secret, read_job_termination_message};
 use crate::{
 	context::Context,
@@ -429,7 +431,7 @@ fn build_restore_job(
 
 	let restore_script = r#"set -e
 
-apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1
+mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
 
 echo "Connecting to kopia repository..."
 kopia repository connect s3 \
@@ -440,7 +442,7 @@ kopia repository connect s3 \
   --password="$KOPIA_PASSWORD"
 
 echo "Detecting postgres version..."
-VERSION=$(kopia snapshot show "$SNAPSHOT_ID" --json 2>/dev/null | jq -r '.metadata.pg_version // empty' || true)
+VERSION=$(kopia snapshot show "$SNAPSHOT_ID" --json 2>/dev/null | /tools/jq -r '.metadata.pg_version // empty' || true)
 
 if [ -z "$VERSION" ]; then
   echo "Version not in metadata, checking PG_VERSION file..."
@@ -497,32 +499,50 @@ ls -la /pgdata/
 						fs_group: Some(999),
 						..Default::default()
 					}),
+					init_containers: Some(vec![jq_init_container()]),
 					containers: vec![Container {
 						name: "restore".to_string(),
 						image: Some("kopia/kopia:latest".to_string()),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![restore_script.to_string()]),
-						env: Some(vec![
-							EnvVar {
-								name: "SNAPSHOT_ID".to_string(),
-								value: Some(restore.spec.snapshot.clone()),
+						env: Some(
+							[
+								vec![EnvVar {
+									name: "SNAPSHOT_ID".to_string(),
+									value: Some(restore.spec.snapshot.clone()),
+									..Default::default()
+								}],
+								kopia_writable_env(),
+								vec![
+									env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
+									env_from_secret("KOPIA_REGION", kopia_secret, "region"),
+									env_from_secret(
+										"AWS_ACCESS_KEY_ID",
+										kopia_secret,
+										"accessKeyId",
+									),
+									env_from_secret(
+										"AWS_SECRET_ACCESS_KEY",
+										kopia_secret,
+										"secretAccessKey",
+									),
+									env_from_secret(
+										"KOPIA_PASSWORD",
+										kopia_secret,
+										"repositoryPassword",
+									),
+								],
+							]
+							.concat(),
+						),
+						volume_mounts: Some(vec![
+							VolumeMount {
+								name: "pgdata".to_string(),
+								mount_path: "/pgdata".to_string(),
 								..Default::default()
 							},
-							env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
-							env_from_secret("KOPIA_REGION", kopia_secret, "region"),
-							env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
-							env_from_secret(
-								"AWS_SECRET_ACCESS_KEY",
-								kopia_secret,
-								"secretAccessKey",
-							),
-							env_from_secret("KOPIA_PASSWORD", kopia_secret, "repositoryPassword"),
+							tools_volume_mount(),
 						]),
-						volume_mounts: Some(vec![VolumeMount {
-							name: "pgdata".to_string(),
-							mount_path: "/pgdata".to_string(),
-							..Default::default()
-						}]),
 						resources: Some(ResourceRequirements {
 							requests: Some(BTreeMap::from([
 								("cpu".to_string(), Quantity("500m".to_string())),
@@ -536,16 +556,19 @@ ls -la /pgdata/
 						}),
 						..Default::default()
 					}],
-					volumes: Some(vec![Volume {
-						name: "pgdata".to_string(),
-						persistent_volume_claim: Some(
-							k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-								claim_name: pvc_name,
-								read_only: Some(false),
-							},
-						),
-						..Default::default()
-					}]),
+					volumes: Some(vec![
+						Volume {
+							name: "pgdata".to_string(),
+							persistent_volume_claim: Some(
+								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+									claim_name: pvc_name,
+									read_only: Some(false),
+								},
+							),
+							..Default::default()
+						},
+						tools_volume(),
+					]),
 					..Default::default()
 				}),
 			},
