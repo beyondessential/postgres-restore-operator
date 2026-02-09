@@ -88,9 +88,65 @@ mod tests {
     }
 
     #[test]
+    fn parse_duration_compound() {
+        assert_eq!(
+            parse_duration("1d2h3m4s").unwrap(),
+            Duration::from_secs(86400 + 7200 + 180 + 4)
+        );
+    }
+
+    #[test]
+    fn parse_duration_whitespace_trimmed() {
+        assert_eq!(parse_duration("  5m  ").unwrap(), Duration::from_secs(300));
+    }
+
+    #[test]
+    fn parse_duration_zero_is_error() {
+        assert!(parse_duration("0s").is_err());
+        assert!(parse_duration("0").is_err());
+    }
+
+    #[test]
+    fn parse_duration_invalid_unit() {
+        assert!(parse_duration("5x").is_err());
+    }
+
+    #[test]
+    fn parse_duration_leading_unit_is_error() {
+        assert!(parse_duration("h5").is_err());
+    }
+
+    #[test]
     fn test_glob_to_regex() {
         assert_eq!(glob_to_regex("fiji-prod-*"), "^fiji-prod-.*$");
         assert_eq!(glob_to_regex("*.example.com"), "^.*\\.example\\.com$");
         assert_eq!(glob_to_regex("host-?"), "^host-.$");
+    }
+
+    #[test]
+    fn glob_to_regex_special_chars() {
+        assert_eq!(glob_to_regex("a+b"), "^a\\+b$");
+        assert_eq!(glob_to_regex("a[b]c"), "^a\\[b\\]c$");
+        assert_eq!(glob_to_regex("a{b}c"), "^a\\{b\\}c$");
+        assert_eq!(glob_to_regex("a^b$c"), "^a\\^b\\$c$");
+        assert_eq!(glob_to_regex("a|b"), "^a\\|b$");
+        assert_eq!(glob_to_regex("a(b)c"), "^a\\(b\\)c$");
+    }
+
+    #[test]
+    fn glob_to_regex_exact_match() {
+        let re = regex::Regex::new(&glob_to_regex("exact")).unwrap();
+        assert!(re.is_match("exact"));
+        assert!(!re.is_match("not-exact"));
+        assert!(!re.is_match("exactnot"));
+    }
+
+    #[test]
+    fn glob_to_regex_question_mark() {
+        let re = regex::Regex::new(&glob_to_regex("ab?d")).unwrap();
+        assert!(re.is_match("abcd"));
+        assert!(re.is_match("abxd"));
+        assert!(!re.is_match("abd"));
+        assert!(!re.is_match("abccd"));
     }
 }

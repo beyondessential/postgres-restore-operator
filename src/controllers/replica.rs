@@ -791,3 +791,52 @@ async fn send_restore_notifications(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jitter_is_deterministic() {
+        let j1 = calculate_jitter("my-replica", Duration::from_secs(300));
+        let j2 = calculate_jitter("my-replica", Duration::from_secs(300));
+        assert_eq!(j1, j2);
+    }
+
+    #[test]
+    fn jitter_differs_for_different_names() {
+        let j1 = calculate_jitter("replica-a", Duration::from_secs(300));
+        let j2 = calculate_jitter("replica-b", Duration::from_secs(300));
+        // Extremely unlikely to collide with different names
+        assert_ne!(j1, j2);
+    }
+
+    #[test]
+    fn jitter_zero_max_returns_zero() {
+        let j = calculate_jitter("anything", Duration::ZERO);
+        assert_eq!(j, Duration::ZERO);
+    }
+
+    #[test]
+    fn jitter_within_bounds() {
+        let max = Duration::from_secs(600);
+        for name in ["a", "b", "c", "replica-prod-01", "zzz"] {
+            let j = calculate_jitter(name, max);
+            assert!(j < max, "jitter {j:?} should be < {max:?} for {name}");
+        }
+    }
+
+    #[test]
+    fn generate_password_length_and_charset() {
+        let pw = generate_password();
+        assert_eq!(pw.len(), 32);
+        assert!(pw.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn generate_password_is_random() {
+        let pw1 = generate_password();
+        let pw2 = generate_password();
+        assert_ne!(pw1, pw2);
+    }
+}

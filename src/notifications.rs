@@ -247,3 +247,105 @@ async fn send_graphql(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn connection_info_payload_from_connection_info() {
+        let info = ConnectionInfo {
+            host: "my-svc.ns.svc.cluster.local".into(),
+            port: 5432,
+            database: "mydb".into(),
+            username: "analytics".into(),
+            password_secret: "my-secret".into(),
+        };
+        let payload = ConnectionInfoPayload::from_connection_info(&info, Some("hunter2".into()));
+        assert_eq!(payload.host, "my-svc.ns.svc.cluster.local");
+        assert_eq!(payload.port, 5432);
+        assert_eq!(payload.database, "mydb");
+        assert_eq!(payload.username, "analytics");
+        assert_eq!(payload.password_secret, "my-secret");
+        assert_eq!(payload.password, Some("hunter2".into()));
+    }
+
+    #[test]
+    fn connection_info_payload_without_password() {
+        let info = ConnectionInfo {
+            host: "host".into(),
+            port: 5432,
+            database: "db".into(),
+            username: "user".into(),
+            password_secret: "sec".into(),
+        };
+        let payload = ConnectionInfoPayload::from_connection_info(&info, None);
+        assert_eq!(payload.password, None);
+    }
+
+    #[test]
+    fn notification_payload_serializes_camel_case() {
+        let payload = NotificationPayload {
+            event: "RestoreComplete".into(),
+            timestamp: "2024-01-01T00:00:00Z".into(),
+            replica: ReplicaRef {
+                name: "my-replica".into(),
+                namespace: "default".into(),
+            },
+            restore: RestoreRef {
+                name: "my-restore".into(),
+                snapshot: "snap-123".into(),
+                postgres_version: "16".into(),
+            },
+            connection_info: ConnectionInfoPayload {
+                host: "svc.ns".into(),
+                port: 5432,
+                database: "mydb".into(),
+                username: "user".into(),
+                password_secret: "secret".into(),
+                password: None,
+            },
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        // camelCase keys
+        assert!(json.get("connectionInfo").is_some());
+        assert!(json.get("connection_info").is_none());
+        let ci = json.get("connectionInfo").unwrap();
+        assert!(ci.get("passwordSecret").is_some());
+        // password should be omitted when None
+        assert!(ci.get("password").is_none());
+    }
+
+    #[test]
+    fn notification_payload_includes_password_when_set() {
+        let payload = NotificationPayload {
+            event: "RestoreComplete".into(),
+            timestamp: "t".into(),
+            replica: ReplicaRef { name: "r".into(), namespace: "ns".into() },
+            restore: RestoreRef { name: "x".into(), snapshot: "s".into(), postgres_version: "16".into() },
+            connection_info: ConnectionInfoPayload {
+                host: "h".into(),
+                port: 5432,
+                database: "d".into(),
+                username: "u".into(),
+                password_secret: "ps".into(),
+                password: Some("mypass".into()),
+            },
+        };
+        let json = serde_json::to_value(&payload).unwrap();
+        let ci = json.get("connectionInfo").unwrap();
+        assert_eq!(ci.get("password").unwrap(), "mypass");
+    }
+
+    #[test]
+    fn restore_ref_serializes_camel_case() {
+        let r = RestoreRef {
+            name: "n".into(),
+            snapshot: "s".into(),
+            postgres_version: "15".into(),
+        };
+        let json = serde_json::to_value(&r).unwrap();
+        assert!(json.get("postgresVersion").is_some());
+        assert!(json.get("postgres_version").is_none());
+    }
+}

@@ -165,3 +165,47 @@ impl Default for Metrics {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn metrics_new_registers_all() {
+        let m = Metrics::new();
+        let families = m.registry.gather();
+        // Some metric types (counters without labels) don't appear until first use.
+        // At minimum we should have the labeled CounterVecs and the histogram.
+        assert!(
+            !families.is_empty(),
+            "expected metric families to be registered"
+        );
+    }
+
+    #[test]
+    fn metrics_counters_increment() {
+        let m = Metrics::new();
+        m.restores_started_total.inc();
+        m.restores_started_total.inc();
+        assert_eq!(m.restores_started_total.get(), 2);
+    }
+
+    #[test]
+    fn metrics_gauges_set() {
+        let m = Metrics::new();
+        m.queue_depth.set(5);
+        assert_eq!(m.queue_depth.get(), 5);
+        m.queue_depth.set(0);
+        assert_eq!(m.queue_depth.get(), 0);
+    }
+
+    #[test]
+    fn metrics_counter_vec_labels() {
+        let m = Metrics::new();
+        m.reconciliations_total.with_label_values(&["replica"]).inc();
+        m.reconciliations_total.with_label_values(&["restore"]).inc();
+        m.reconciliations_total.with_label_values(&["replica"]).inc();
+        assert_eq!(m.reconciliations_total.with_label_values(&["replica"]).get(), 2);
+        assert_eq!(m.reconciliations_total.with_label_values(&["restore"]).get(), 1);
+    }
+}

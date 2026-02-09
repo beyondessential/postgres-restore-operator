@@ -77,3 +77,128 @@ impl RestoreQueue {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_queue() -> RestoreQueue {
+        RestoreQueue::default()
+    }
+
+    #[test]
+    fn empty_queue_can_start() {
+        let q = make_queue();
+        assert!(q.can_start(3));
+    }
+
+    #[test]
+    fn full_queue_cannot_start() {
+        let mut q = make_queue();
+        q.active = vec!["a".into(), "b".into(), "c".into()];
+        assert!(!q.can_start(3));
+    }
+
+    #[test]
+    fn position_returns_none_for_missing() {
+        let q = make_queue();
+        assert_eq!(q.position("nope"), None);
+    }
+
+    #[test]
+    fn position_is_one_based() {
+        let mut q = make_queue();
+        q.enqueue("first".into());
+        q.enqueue("second".into());
+        q.enqueue("third".into());
+        assert_eq!(q.position("first"), Some(1));
+        assert_eq!(q.position("second"), Some(2));
+        assert_eq!(q.position("third"), Some(3));
+    }
+
+    #[test]
+    fn enqueue_deduplicates() {
+        let mut q = make_queue();
+        q.enqueue("a".into());
+        q.enqueue("a".into());
+        q.enqueue("a".into());
+        assert_eq!(q.pending.len(), 1);
+    }
+
+    #[test]
+    fn mark_active_moves_from_pending() {
+        let mut q = make_queue();
+        q.enqueue("restore-1".into());
+        q.enqueue("restore-2".into());
+        assert_eq!(q.pending.len(), 2);
+        assert_eq!(q.active.len(), 0);
+
+        q.mark_active("restore-1");
+        assert_eq!(q.pending.len(), 1);
+        assert_eq!(q.active.len(), 1);
+        assert_eq!(q.active[0], "restore-1");
+        assert_eq!(q.position("restore-1"), None);
+    }
+
+    #[test]
+    fn mark_active_is_idempotent() {
+        let mut q = make_queue();
+        q.enqueue("a".into());
+        q.mark_active("a");
+        q.mark_active("a");
+        assert_eq!(q.active.len(), 1);
+    }
+
+    #[test]
+    fn remove_clears_from_both() {
+        let mut q = make_queue();
+        q.enqueue("pending-one".into());
+        q.enqueue("active-one".into());
+        q.mark_active("active-one");
+
+        q.remove("pending-one");
+        assert_eq!(q.pending.len(), 0);
+
+        q.remove("active-one");
+        assert_eq!(q.active.len(), 0);
+    }
+
+    #[test]
+    fn try_promote_fifo_order() {
+        let mut q = make_queue();
+        q.enqueue("first".into());
+        q.enqueue("second".into());
+        q.enqueue("third".into());
+
+        assert_eq!(q.try_promote(2), Some("first".into()));
+        assert_eq!(q.try_promote(2), Some("second".into()));
+        // Now at capacity (2 active)
+        assert_eq!(q.try_promote(2), None);
+    }
+
+    #[test]
+    fn try_promote_empty_returns_none() {
+        let mut q = make_queue();
+        assert_eq!(q.try_promote(5), None);
+    }
+
+    #[test]
+    fn try_promote_at_capacity_returns_none() {
+        let mut q = make_queue();
+        q.active = vec!["a".into(), "b".into()];
+        q.enqueue("c".into());
+        assert_eq!(q.try_promote(2), None);
+    }
+
+    #[test]
+    fn remove_then_promote_frees_slot() {
+        let mut q = make_queue();
+        q.enqueue("a".into());
+        q.enqueue("b".into());
+        q.mark_active("a");
+        // a is active, b is pending, max=1
+        assert_eq!(q.try_promote(1), None);
+        q.remove("a");
+        assert_eq!(q.try_promote(1), Some("b".into()));
+    }
+}

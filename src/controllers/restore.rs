@@ -819,6 +819,31 @@ fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference 
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn env_from_secret_structure() {
+        let env = env_from_secret("PG_PASSWORD", "my-secret", "password");
+        assert_eq!(env.name, "PG_PASSWORD");
+        assert!(env.value.is_none());
+        let vf = env.value_from.unwrap();
+        let skr = vf.secret_key_ref.unwrap();
+        assert_eq!(skr.name, "my-secret");
+        assert_eq!(skr.key, "password");
+        assert_eq!(skr.optional, Some(false));
+    }
+
+    #[test]
+    fn env_from_secret_different_keys() {
+        let env = env_from_secret("DB_HOST", "conn-secret", "host");
+        let skr = env.value_from.unwrap().secret_key_ref.unwrap();
+        assert_eq!(skr.name, "conn-secret");
+        assert_eq!(skr.key, "host");
+    }
+}
+
 async fn update_restore_status(
     client: &Client,
     namespace: &str,
