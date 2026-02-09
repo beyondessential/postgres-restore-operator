@@ -83,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
 		max_concurrent_restores,
 		metrics_addr,
 		operator_namespace = namespace,
+		version = env!("CARGO_PKG_VERSION"),
 		"starting postgres-restore-operator"
 	);
 
