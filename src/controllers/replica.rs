@@ -507,6 +507,8 @@ fn build_snapshot_list_job(
 
 	let script = r#"set -e
 
+apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1
+
 kopia repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
   --region="$KOPIA_REGION" \
