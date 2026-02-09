@@ -1059,7 +1059,6 @@ async fn send_restore_notifications(
             http_client,
             namespace,
             notif_config,
-            &NotificationEvent::RestoreComplete,
             &payload,
         )
         .await;

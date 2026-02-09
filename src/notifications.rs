@@ -9,8 +9,8 @@ use tracing::{info, warn};
 use crate::{
     error::Error,
     types::{
-        ConnectionInfo, GraphQLConfig, HeaderValue, NotificationConfig, NotificationEvent,
-        NotificationStatus, WebhookConfig,
+        ConnectionInfo, GraphQLConfig, HeaderValue, NotificationConfig, NotificationStatus,
+        WebhookConfig,
     },
 };
 
@@ -73,7 +73,6 @@ pub async fn send_notification(
     http_client: &reqwest::Client,
     namespace: &str,
     config: &NotificationConfig,
-    _event: &NotificationEvent,
     payload: &NotificationPayload,
 ) -> NotificationStatus {
     let now = chrono::Utc::now().to_rfc3339();
