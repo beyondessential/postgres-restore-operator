@@ -261,12 +261,17 @@ async fn reconcile_restoring(
         )
         .await?;
 
-        // Remove from active queue
+        // Remove from active queue and promote next pending restore
         let mut queue = ctx.restore_queue.write().await;
         queue.remove(name);
+        let promoted = queue.try_promote(ctx.max_concurrent_restores());
         ctx.metrics.active_restores.set(queue.active.len() as i64);
         ctx.metrics.queue_depth.set(queue.pending.len() as i64);
         drop(queue);
+
+        if let Some(promoted_name) = promoted {
+            info!(restore = %promoted_name, "promoted queued restore after failure");
+        }
 
         ctx.metrics.restores_failed_total.inc();
 
@@ -326,11 +331,17 @@ async fn reconcile_ready(
             )
             .await?;
 
-            // Remove from active queue — restore is done
+            // Remove from active queue and promote next pending restore
             let mut queue = ctx.restore_queue.write().await;
             queue.remove(name);
+            let promoted = queue.try_promote(ctx.max_concurrent_restores());
             ctx.metrics.active_restores.set(queue.active.len() as i64);
             ctx.metrics.queue_depth.set(queue.pending.len() as i64);
+            drop(queue);
+
+            if let Some(promoted_name) = promoted {
+                info!(restore = %promoted_name, "promoted queued restore after switchover");
+            }
 
             return Ok(Action::requeue(Duration::from_secs(5)));
         }
@@ -356,7 +367,15 @@ async fn reconcile_ready(
 
                     let mut queue = ctx.restore_queue.write().await;
                     queue.remove(name);
+                    let promoted = queue.try_promote(ctx.max_concurrent_restores());
                     ctx.metrics.active_restores.set(queue.active.len() as i64);
+                    ctx.metrics.queue_depth.set(queue.pending.len() as i64);
+                    drop(queue);
+
+                    if let Some(promoted_name) = promoted {
+                        info!(restore = %promoted_name, "promoted queued restore after timeout failure");
+                    }
+
                     ctx.metrics.restores_failed_total.inc();
 
                     return Ok(Action::requeue(Duration::from_secs(300)));
