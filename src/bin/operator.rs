@@ -22,7 +22,7 @@ use postgres_restore_operator::{
 };
 
 const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 2;
-const DEFAULT_METRICS_ADDR: &str = "0.0.0.0:8080";
+const DEFAULT_METRICS_ADDR: &str = "[::]:8080";
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
 
 fn operator_namespace() -> String {
@@ -169,7 +169,9 @@ async fn main() -> anyhow::Result<()> {
 			.await
 			.expect("failed to bind metrics server");
 		info!(addr = metrics_addr_clone, "metrics server listening");
-		axum::serve(listener, app).await.unwrap();
+		if let Err(e) = axum::serve(listener, app).await {
+			tracing::error!(error = %e, "metrics/probe server exited with error");
+		}
 	});
 
 	// Start controllers
@@ -240,6 +242,7 @@ async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
 	let age = chrono::Utc::now().timestamp() - last;
 	if age <= 30 {
+		info!(heartbeat_age_secs = age, "livez ok");
 		(StatusCode::OK, "ok")
 	} else {
 		tracing::warn!(
@@ -255,6 +258,7 @@ async fn readyz(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
 	let age = chrono::Utc::now().timestamp() - last;
 	if age <= 30 {
+		info!(heartbeat_age_secs = age, "readyz ok");
 		(StatusCode::OK, "ok")
 	} else {
 		tracing::warn!(
