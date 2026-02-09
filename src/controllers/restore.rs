@@ -682,6 +682,7 @@ if [ -z "$PGDATA_DIR" ]; then
 fi
 echo "Found PGDATA at: $PGDATA_DIR"
 ln -sfn "$PGDATA_DIR" /pgdata/pgdata
+rm -f "$PGDATA_DIR/postmaster.pid"
 
 VERSION=$(cat /pgdata/pgdata/PG_VERSION)
 echo "Detected postgres version: $VERSION"
