@@ -290,6 +290,35 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
+	// 8b. Clean up failed restores (ownerReferences will cascade-delete their PVCs)
+	let failed_restores: Vec<_> = restore_list
+		.items
+		.iter()
+		.filter(|r| r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Failed))
+		.collect();
+	for failed in &failed_restores {
+		let failed_name = failed.name_any();
+		let created_at = failed
+			.status
+			.as_ref()
+			.and_then(|s| s.created_at.as_ref())
+			.and_then(|t| t.parse::<chrono::DateTime<Utc>>().ok());
+		let age = created_at
+			.map(|t| Utc::now().signed_duration_since(t))
+			.and_then(|d| d.to_std().ok())
+			.unwrap_or_default();
+		if age > Duration::from_secs(300) {
+			info!(
+				replica = name,
+				restore = failed_name,
+				"cleaning up failed restore"
+			);
+			if let Err(e) = restores.delete(&failed_name, &Default::default()).await {
+				warn!(restore = failed_name, error = %e, "failed to delete failed restore");
+			}
+		}
+	}
+
 	// 9. Decide whether to trigger a new restore
 	if let Some(in_progress) = in_progress_restore {
 		let phase = in_progress.status.as_ref().and_then(|s| s.phase.as_ref());
