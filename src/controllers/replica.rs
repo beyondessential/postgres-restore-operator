@@ -706,11 +706,11 @@ fn format_bytes(bytes: u64) -> String {
 	const GI: u64 = 1024 * 1024 * 1024;
 	const MI: u64 = 1024 * 1024;
 	if bytes >= GI {
-		let gi = (bytes as f64) / (GI as f64);
-		format!("{:.1}Gi", gi)
+		let gi = bytes.div_ceil(GI);
+		format!("{gi}Gi")
 	} else {
-		let mi = (bytes as f64) / (MI as f64);
-		format!("{:.0}Mi", mi.max(1.0))
+		let mi = bytes.div_ceil(MI).max(1);
+		format!("{mi}Mi")
 	}
 }
 
@@ -1276,15 +1276,30 @@ mod tests {
 
 	#[test]
 	fn format_bytes_gigabytes() {
-		assert_eq!(format_bytes(10 * 1024 * 1024 * 1024), "10.0Gi");
-		assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0Gi");
-		assert_eq!(format_bytes(2_500_000_000), "2.3Gi");
+		assert_eq!(format_bytes(10 * 1024 * 1024 * 1024), "10Gi");
+		assert_eq!(format_bytes(1024 * 1024 * 1024), "1Gi");
+		assert_eq!(format_bytes(2_500_000_000), "3Gi");
+	}
+
+	#[test]
+	fn format_bytes_gigabytes_exact() {
+		assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2Gi");
+	}
+
+	#[test]
+	fn format_bytes_gigabytes_ceil() {
+		assert_eq!(format_bytes(1024 * 1024 * 1024 + 1), "2Gi");
 	}
 
 	#[test]
 	fn format_bytes_megabytes() {
 		assert_eq!(format_bytes(500 * 1024 * 1024), "500Mi");
 		assert_eq!(format_bytes(1024 * 1024), "1Mi");
+	}
+
+	#[test]
+	fn format_bytes_megabytes_ceil() {
+		assert_eq!(format_bytes(1024 * 1024 + 1), "2Mi");
 	}
 
 	#[test]
