@@ -118,7 +118,9 @@ async fn reconcile_pending(
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
     if pvcs.get_opt(&pvc_name).await?.is_none() {
         info!(restore = name, pvc = pvc_name, "creating PVC");
-        let pvc = build_pvc(restore, &pvc_name, namespace)?;
+        let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+        let replica = replicas.get(&restore.spec.replica).await?;
+        let pvc = build_pvc(restore, &pvc_name, namespace, &replica)?;
         pvcs.create(&PostParams::default(), &pvc).await?;
     }
 
@@ -382,9 +384,8 @@ fn build_pvc(
     restore: &PostgresPhysicalRestore,
     pvc_name: &str,
     namespace: &str,
+    replica: &PostgresPhysicalReplica,
 ) -> Result<PersistentVolumeClaim> {
-    // Look up storage class from the parent replica if available.
-    // For now, use the storage_size from the restore spec.
     Ok(PersistentVolumeClaim {
         metadata: ObjectMeta {
             name: Some(pvc_name.to_string()),
@@ -398,6 +399,7 @@ fn build_pvc(
         },
         spec: Some(PersistentVolumeClaimSpec {
             access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+            storage_class_name: replica.spec.storage_class.clone(),
             resources: Some(VolumeResourceRequirements {
                 requests: Some(BTreeMap::from([(
                     "storage".to_string(),
