@@ -3,8 +3,16 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use chrono::Utc;
 use k8s_openapi::{
     ByteString,
-    api::core::v1::{Secret, Service, ServicePort, ServiceSpec},
-    apimachinery::pkg::{apis::meta::v1::OwnerReference, util::intstr::IntOrString},
+    api::{
+        batch::v1::{Job, JobSpec},
+        core::v1::{
+            Container, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements, Secret, Service,
+            ServicePort, ServiceSpec,
+        },
+    },
+    apimachinery::pkg::{
+        api::resource::Quantity, apis::meta::v1::OwnerReference, util::intstr::IntOrString,
+    },
 };
 use kube::{
     Api, Client, ResourceExt,
@@ -12,8 +20,10 @@ use kube::{
     runtime::controller::Action,
 };
 use rand::RngExt;
+use serde::Deserialize;
 use tracing::{info, warn};
 
+use super::{env_from_secret, read_job_termination_message};
 use crate::{
     context::Context,
     error::{Error, Result},
@@ -22,6 +32,12 @@ use crate::{
     types::*,
     util::parse_duration,
 };
+
+#[derive(Debug, Deserialize)]
+struct SnapshotInfo {
+    id: String,
+    size: u64,
+}
 
 /// Calculate stable jitter for a replica name.
 fn calculate_jitter(replica_name: &str, max_jitter: Duration) -> Duration {
@@ -261,19 +277,10 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
     // 9. Decide whether to trigger a new restore
     if in_progress_restore.is_some() {
-        // Already have a restore in progress, don't trigger another
         update_replica_phase(client, &namespace, &name, ReplicaPhase::Restoring).await?;
         return Ok(Action::requeue(Duration::from_secs(30)));
     }
 
-    // TODO: Query kopia for latest snapshot. For now, this is a placeholder
-    // that will be implemented when we have the kopia CLI integration via Jobs.
-    // The operator doesn't directly connect to kopia — it delegates to Jobs.
-    // Snapshot detection will happen through:
-    //   a) Schedule-based triggers (cron + jitter)
-    //   b) External triggers (e.g., webhook or annotation)
-    //
-    // For now, we check if a restore should be triggered based on schedule.
     let should_restore = should_trigger_scheduled_restore(&replica);
 
     if should_restore {
@@ -286,7 +293,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
             let pending_len = queue.pending.len();
             drop(queue);
 
-            // Update queue position in status
             let replicas: Api<PostgresPhysicalReplica> =
                 Api::namespaced(client.clone(), &namespace);
             let patch = serde_json::json!({
@@ -307,13 +313,89 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
         }
         drop(queue);
 
-        // Note: actual restore creation will require a snapshot ID,
-        // which comes from kopia snapshot listing (done via Job or direct API).
-        // This is the integration point where the snapshot ID flows in.
-        info!(
-            replica = name,
-            "schedule triggered, ready to create restore when snapshot is available"
-        );
+        // 10. Snapshot discovery via Job
+        let snapshot_job_name = format!("{name}-snapshot-list");
+        let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
+
+        match jobs.get_opt(&snapshot_job_name).await? {
+            None => {
+                info!(replica = name, "creating snapshot list job");
+                let job = build_snapshot_list_job(&replica, &snapshot_job_name, &namespace)?;
+                jobs.create(&PostParams::default(), &job).await?;
+                return Ok(Action::requeue(Duration::from_secs(10)));
+            }
+            Some(job) => {
+                let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
+                let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+                let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
+
+                if succeeded > 0 {
+                    let msg = read_job_termination_message(
+                        client,
+                        &namespace,
+                        &snapshot_job_name,
+                        "snapshot-list",
+                    )
+                    .await;
+
+                    if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
+                        warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
+                    }
+
+                    if let Some(ref raw) = msg {
+                        if let Ok(snap) = serde_json::from_str::<SnapshotInfo>(raw) {
+                            update_replica_status_field(
+                                client,
+                                &namespace,
+                                &name,
+                                "latestAvailableSnapshot",
+                                &snap.id,
+                            )
+                            .await?;
+
+                            let current_snapshot_id =
+                                active_restore.map(|r| r.spec.snapshot.as_str());
+
+                            if current_snapshot_id == Some(&snap.id) {
+                                info!(
+                                    replica = name,
+                                    snapshot = snap.id,
+                                    "latest snapshot already active, skipping"
+                                );
+                            } else {
+                                info!(
+                                    replica = name,
+                                    snapshot = snap.id,
+                                    size = snap.size,
+                                    "new snapshot available, creating restore"
+                                );
+                                create_restore_for_snapshot(client, &namespace, &replica, &snap)
+                                    .await?;
+                                ctx.metrics.restores_started_total.inc();
+                            }
+                        } else {
+                            warn!(
+                                replica = name,
+                                raw = raw,
+                                "failed to parse snapshot list job output"
+                            );
+                        }
+                    } else {
+                        info!(
+                            replica = name,
+                            "snapshot list job returned no matching snapshots"
+                        );
+                    }
+                } else if failed > backoff_limit {
+                    warn!(replica = name, "snapshot list job failed");
+                    if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
+                        warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
+                    }
+                } else {
+                    return Ok(Action::requeue(Duration::from_secs(10)));
+                }
+            }
+        }
     }
 
     // Update phase based on current state
@@ -355,6 +437,218 @@ pub fn error_policy(
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
+
+fn build_snapshot_list_job(
+    replica: &PostgresPhysicalReplica,
+    job_name: &str,
+    namespace: &str,
+) -> Result<Job> {
+    let kopia_secret = &replica.spec.kopia_secret_ref;
+    let replica_name = replica.name_any();
+
+    let mut env_vars = vec![
+        env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
+        env_from_secret("KOPIA_REGION", kopia_secret, "region"),
+        env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
+        env_from_secret("AWS_SECRET_ACCESS_KEY", kopia_secret, "secretAccessKey"),
+        env_from_secret("KOPIA_PASSWORD", kopia_secret, "repositoryPassword"),
+    ];
+
+    if let Some(ref filter) = replica.spec.snapshot_filter {
+        if let Some(ref pattern) = filter.host_pattern {
+            env_vars.push(EnvVar {
+                name: "FILTER_HOST_PATTERN".to_string(),
+                value: Some(pattern.clone()),
+                ..Default::default()
+            });
+        }
+        if let Some(ref tags) = filter.tags {
+            let tag_str = tags
+                .iter()
+                .map(|(k, v)| format!("{k}={v}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            env_vars.push(EnvVar {
+                name: "FILTER_TAGS".to_string(),
+                value: Some(tag_str),
+                ..Default::default()
+            });
+        }
+    }
+
+    let script = r#"set -e
+
+kopia repository connect s3 \
+  --bucket="$KOPIA_BUCKET" \
+  --region="$KOPIA_REGION" \
+  --access-key="$AWS_ACCESS_KEY_ID" \
+  --secret-access-key="$AWS_SECRET_ACCESS_KEY" \
+  --password="$KOPIA_PASSWORD"
+
+SNAPSHOTS=$(kopia snapshot list --json --all 2>/dev/null || echo "[]")
+
+if [ -n "$FILTER_HOST_PATTERN" ]; then
+  REGEX=$(printf '%s' "$FILTER_HOST_PATTERN" | sed 's/\./\\./g; s/\*/\.\*/g; s/\?/\./g')
+  SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg pat "^${REGEX}$" '[.[] | select(.hostname | test($pat))]')
+fi
+
+if [ -n "$FILTER_TAGS" ]; then
+  IFS=',' read -r TAG_LIST <<EOF
+$FILTER_TAGS
+EOF
+  for tag in $TAG_LIST; do
+    KEY="${tag%%=*}"
+    VALUE="${tag#*=}"
+    SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v)]')
+  done
+fi
+
+LATEST=$(echo "$SNAPSHOTS" | jq -c 'sort_by(.startTime) | last // empty')
+
+if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+  echo "No matching snapshots found"
+  exit 0
+fi
+
+ID=$(echo "$LATEST" | jq -r '.id')
+SIZE=$(echo "$LATEST" | jq -r '.summary.size // 0')
+echo "Latest snapshot: id=$ID size=$SIZE"
+printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
+"#;
+
+    Ok(Job {
+        metadata: ObjectMeta {
+            name: Some(job_name.to_string()),
+            namespace: Some(namespace.to_string()),
+            labels: Some(BTreeMap::from([
+                ("bes.au/replica".to_string(), replica_name.clone()),
+                ("bes.au/job-type".to_string(), "snapshot-list".to_string()),
+            ])),
+            owner_references: Some(vec![owner_reference(replica)]),
+            ..Default::default()
+        },
+        spec: Some(JobSpec {
+            backoff_limit: Some(2),
+            active_deadline_seconds: Some(300),
+            ttl_seconds_after_finished: Some(120),
+            template: PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    labels: Some(BTreeMap::from([
+                        ("bes.au/replica".to_string(), replica_name),
+                        ("bes.au/job-type".to_string(), "snapshot-list".to_string()),
+                    ])),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    restart_policy: Some("Never".to_string()),
+                    containers: vec![Container {
+                        name: "snapshot-list".to_string(),
+                        image: Some("kopia/kopia:latest".to_string()),
+                        command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+                        args: Some(vec![script.to_string()]),
+                        env: Some(env_vars),
+                        resources: Some(ResourceRequirements {
+                            requests: Some(BTreeMap::from([
+                                ("cpu".to_string(), Quantity("50m".to_string())),
+                                ("memory".to_string(), Quantity("64Mi".to_string())),
+                            ])),
+                            limits: Some(BTreeMap::from([
+                                ("cpu".to_string(), Quantity("200m".to_string())),
+                                ("memory".to_string(), Quantity("128Mi".to_string())),
+                            ])),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }),
+            },
+            ..Default::default()
+        }),
+        ..Default::default()
+    })
+}
+
+async fn create_restore_for_snapshot(
+    client: &Client,
+    namespace: &str,
+    replica: &PostgresPhysicalReplica,
+    snapshot: &SnapshotInfo,
+) -> Result<()> {
+    let replica_name = replica.name_any();
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
+    let restore_name = format!("{replica_name}-{timestamp}");
+
+    let snapshot_size_bytes = snapshot.size;
+    let storage_bytes = (snapshot_size_bytes as f64 * 1.1) as u64;
+
+    let snapshot_size = format_bytes(snapshot_size_bytes);
+    let storage_size = format_bytes(storage_bytes);
+
+    let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
+    let restore = PostgresPhysicalRestore::new(
+        &restore_name,
+        PostgresPhysicalRestoreSpec {
+            replica: replica_name.clone(),
+            snapshot: snapshot.id.clone(),
+            snapshot_size,
+            storage_size,
+        },
+    );
+
+    let mut restore_obj = serde_json::to_value(&restore)?;
+    if let Some(meta) = restore_obj
+        .as_object_mut()
+        .and_then(|o| o.get_mut("metadata"))
+        .and_then(|m| m.as_object_mut())
+    {
+        meta.insert(
+            "namespace".to_string(),
+            serde_json::Value::String(namespace.to_string()),
+        );
+        meta.insert(
+            "labels".to_string(),
+            serde_json::json!({ "bes.au/replica": replica_name }),
+        );
+        meta.insert(
+            "ownerReferences".to_string(),
+            serde_json::json!([{
+                "apiVersion": "bes.au/v1alpha1",
+                "kind": "PostgresPhysicalReplica",
+                "name": replica.name_any(),
+                "uid": replica.uid().unwrap_or_default(),
+                "controller": true,
+                "blockOwnerDeletion": true,
+            }]),
+        );
+    }
+
+    let restore_resource: PostgresPhysicalRestore = serde_json::from_value(restore_obj)?;
+    restores
+        .create(&PostParams::default(), &restore_resource)
+        .await?;
+
+    info!(
+        replica = replica_name,
+        restore = restore_name,
+        snapshot = snapshot.id,
+        "created restore resource"
+    );
+
+    Ok(())
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const GI: u64 = 1024 * 1024 * 1024;
+    const MI: u64 = 1024 * 1024;
+    if bytes >= GI {
+        let gi = (bytes as f64) / (GI as f64);
+        format!("{:.1}Gi", gi)
+    } else {
+        let mi = (bytes as f64) / (MI as f64);
+        format!("{:.0}Mi", mi.max(1.0))
+    }
+}
 
 fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
     let Some(schedule) = &replica.spec.schedule else {
@@ -836,5 +1130,40 @@ mod tests {
         let pw1 = generate_password();
         let pw2 = generate_password();
         assert_ne!(pw1, pw2);
+    }
+
+    #[test]
+    fn format_bytes_gigabytes() {
+        assert_eq!(format_bytes(10 * 1024 * 1024 * 1024), "10.0Gi");
+        assert_eq!(format_bytes(1024 * 1024 * 1024), "1.0Gi");
+        assert_eq!(format_bytes(2_500_000_000), "2.3Gi");
+    }
+
+    #[test]
+    fn format_bytes_megabytes() {
+        assert_eq!(format_bytes(500 * 1024 * 1024), "500Mi");
+        assert_eq!(format_bytes(1024 * 1024), "1Mi");
+    }
+
+    #[test]
+    fn format_bytes_small_clamps_to_1mi() {
+        assert_eq!(format_bytes(0), "1Mi");
+        assert_eq!(format_bytes(1024), "1Mi");
+    }
+
+    #[test]
+    fn snapshot_info_parse() {
+        let raw = r#"{"id":"abc123def","size":5368709120}"#;
+        let snap: SnapshotInfo = serde_json::from_str(raw).unwrap();
+        assert_eq!(snap.id, "abc123def");
+        assert_eq!(snap.size, 5368709120);
+    }
+
+    #[test]
+    fn snapshot_info_parse_zero_size() {
+        let raw = r#"{"id":"snap0","size":0}"#;
+        let snap: SnapshotInfo = serde_json::from_str(raw).unwrap();
+        assert_eq!(snap.id, "snap0");
+        assert_eq!(snap.size, 0);
     }
 }

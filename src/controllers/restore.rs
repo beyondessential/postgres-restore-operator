@@ -6,9 +6,9 @@ use k8s_openapi::{
         apps::v1::{Deployment, DeploymentSpec},
         batch::v1::{Job, JobSpec},
         core::v1::{
-            Container, ContainerPort, EnvVar, EnvVarSource, ExecAction, PersistentVolumeClaim,
-            PersistentVolumeClaimSpec, Pod, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-            SecretKeySelector, Volume, VolumeMount, VolumeResourceRequirements,
+            Container, ContainerPort, EnvVar, ExecAction, PersistentVolumeClaim,
+            PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
+            Volume, VolumeMount, VolumeResourceRequirements,
         },
     },
     apimachinery::pkg::{
@@ -23,6 +23,7 @@ use kube::{
 };
 use tracing::{info, warn};
 
+use super::{env_from_secret, read_job_termination_message};
 use crate::{
     context::Context,
     error::{Error, Result},
@@ -197,7 +198,8 @@ async fn reconcile_restoring(
     if succeeded > 0 {
         info!(restore = name, "restore job succeeded");
 
-        let pg_version = read_pg_version_from_job_pod(client, namespace, &job_name).await;
+        let pg_version =
+            read_job_termination_message(client, namespace, &job_name, "restore").await;
         if let Some(ref v) = pg_version {
             info!(
                 restore = name,
@@ -851,48 +853,6 @@ echo "Auth setup complete"
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
 
-fn env_from_secret(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
-    EnvVar {
-        name: env_name.to_string(),
-        value_from: Some(EnvVarSource {
-            secret_key_ref: Some(SecretKeySelector {
-                name: secret_name.to_string(),
-                key: key.to_string(),
-                optional: Some(false),
-            }),
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
-async fn read_pg_version_from_job_pod(
-    client: &Client,
-    namespace: &str,
-    job_name: &str,
-) -> Option<String> {
-    let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-    let pod_list = pods
-        .list(&kube::api::ListParams::default().labels(&format!("job-name={job_name}")))
-        .await
-        .ok()?;
-
-    for pod in &pod_list.items {
-        let statuses = pod.status.as_ref()?.container_statuses.as_ref()?;
-        for cs in statuses {
-            if cs.name == "restore" {
-                let terminated = cs.state.as_ref()?.terminated.as_ref()?;
-                let msg = terminated.message.as_ref()?.trim().to_string();
-                if !msg.is_empty() {
-                    return Some(msg);
-                }
-            }
-        }
-    }
-
-    None
-}
-
 fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference {
     OwnerReference {
         api_version: "bes.au/v1alpha1".to_string(),
@@ -901,31 +861,6 @@ fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference 
         uid: restore.uid().unwrap_or_default(),
         controller: Some(true),
         block_owner_deletion: Some(true),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_from_secret_structure() {
-        let env = env_from_secret("PG_PASSWORD", "my-secret", "password");
-        assert_eq!(env.name, "PG_PASSWORD");
-        assert!(env.value.is_none());
-        let vf = env.value_from.unwrap();
-        let skr = vf.secret_key_ref.unwrap();
-        assert_eq!(skr.name, "my-secret");
-        assert_eq!(skr.key, "password");
-        assert_eq!(skr.optional, Some(false));
-    }
-
-    #[test]
-    fn env_from_secret_different_keys() {
-        let env = env_from_secret("DB_HOST", "conn-secret", "host");
-        let skr = env.value_from.unwrap().secret_key_ref.unwrap();
-        assert_eq!(skr.name, "conn-secret");
-        assert_eq!(skr.key, "host");
     }
 }
 
