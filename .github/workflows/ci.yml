@@ -85,8 +85,9 @@ jobs:
       - name: Lint manifests
         run: |
           kubeconform -strict -summary \
+            -kubernetes-version 1.35.0 \
             -schema-location default \
-            -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/{{ .NormalizedKubernetesVersion }}-standalone{{ .StrictSuffix }}/{{ .ResourceKind }}{{ .KindSuffix }}.json' \
+            -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/{{ .NormalizedKubernetesVersion }}/{{ .ResourceKind }}{{ .KindSuffix }}.json' \
             operator.yaml crds.yaml
 
   tests-pass:
