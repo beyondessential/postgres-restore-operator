@@ -275,6 +275,7 @@ fn fdw_user_created_when_overlay_configured() {
 		resources: None,
 		affinity: None,
 		tolerations: vec![],
+		service_annotations: None,
 		schema_mapping: None,
 	});
 	let restore = make_restore();

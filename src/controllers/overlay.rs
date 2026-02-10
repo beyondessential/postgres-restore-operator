@@ -4,7 +4,9 @@ use k8s_openapi::{
 	ByteString,
 	api::{
 		batch::v1::{Job, JobSpec},
-		core::v1::{Container, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements, Secret},
+		core::v1::{
+			Container, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements, Secret, Service,
+		},
 	},
 	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::OwnerReference},
 };
@@ -12,6 +14,7 @@ use kube::{
 	Api, Client, ResourceExt,
 	api::{DynamicObject, ObjectMeta, Patch, PatchParams, PostParams},
 };
+
 use kube_quantity::ParsedQuantity;
 use tracing::{info, warn};
 
@@ -317,6 +320,68 @@ pub async fn ensure_cnpg_cluster(
 	}
 }
 
+/// Apply user-specified annotations to the CNPG-generated `-rw` Service.
+///
+/// CNPG creates a `<cluster-name>-rw` Service automatically. This function
+/// patches that Service with any annotations from `overlayDatabase.serviceAnnotations`.
+pub async fn ensure_overlay_service_annotations(
+	client: &Client,
+	namespace: &str,
+	replica: &PostgresPhysicalReplica,
+) -> Result<()> {
+	let overlay_config = match &replica.spec.overlay_database {
+		Some(c) => c,
+		None => return Ok(()),
+	};
+
+	let annotations = match &overlay_config.service_annotations {
+		Some(a) if !a.is_empty() => a,
+		_ => return Ok(()),
+	};
+
+	let replica_name = replica.name_any();
+	let cluster_name = overlay_cluster_name(&replica_name);
+	let svc_name = format!("{cluster_name}-rw");
+
+	let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+
+	if services.get_opt(&svc_name).await?.is_none() {
+		info!(
+			replica = replica_name,
+			service = svc_name,
+			"overlay -rw service not yet created by CNPG, skipping annotation patch"
+		);
+		return Ok(());
+	}
+
+	let ann_map: BTreeMap<String, String> = annotations
+		.iter()
+		.map(|(k, v)| (k.clone(), v.clone()))
+		.collect();
+
+	let patch = serde_json::json!({
+		"metadata": {
+			"annotations": ann_map,
+		}
+	});
+	services
+		.patch(
+			&svc_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+
+	info!(
+		replica = replica_name,
+		service = svc_name,
+		count = annotations.len(),
+		"applied service annotations to overlay -rw service"
+	);
+
+	Ok(())
+}
+
 /// Build a Job that sets up FDW in the overlay database on switchover.
 pub fn build_fdw_setup_job(
 	replica: &PostgresPhysicalReplica,
@@ -521,6 +586,16 @@ pub async fn reconcile_overlay(
 
 	let cluster_ready =
 		ensure_cnpg_cluster(client, namespace, replica, &storage_size, &pg_version).await?;
+
+	if cluster_ready
+		&& let Err(e) = ensure_overlay_service_annotations(client, namespace, replica).await
+	{
+		warn!(
+			replica = replica_name,
+			error = %e,
+			"failed to apply annotations to overlay -rw service"
+		);
+	}
 
 	Ok((cluster_ready, storage_size, pg_version))
 }
@@ -759,6 +834,7 @@ mod tests {
 					resources: None,
 					affinity: None,
 					tolerations: vec![],
+					service_annotations: None,
 					schema_mapping: None,
 				}),
 			},

@@ -135,6 +135,10 @@ pub struct OverlayDatabaseConfig {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub tolerations: Vec<Toleration>,
 
+	/// Annotations to apply to the overlay database's -rw Service
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub service_annotations: Option<HashMap<String, String>>,
+
 	/// Schema mapping: if provided, only these schemas are imported.
 	/// Key = remote schema name, Value = local schema name in overlay DB.
 	/// If absent, all user schemas are imported at their original names.
