@@ -34,6 +34,9 @@ pub enum Error {
 
 	#[error("Invalid overlay database config: {0}")]
 	InvalidOverlayConfig(String),
+
+	#[error("FDW setup error: {0}")]
+	FdwSetup(#[from] tokio_postgres::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

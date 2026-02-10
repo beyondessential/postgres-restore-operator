@@ -2,23 +2,17 @@ use std::{collections::BTreeMap, iter::FromIterator};
 
 use k8s_openapi::{
 	ByteString,
-	api::{
-		batch::v1::{Job, JobSpec},
-		core::v1::{
-			Container, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements, Secret, Service,
-		},
-	},
-	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::OwnerReference},
+	api::core::v1::{Secret, Service},
+	apimachinery::pkg::apis::meta::v1::OwnerReference,
 };
 use kube::{
 	Api, Client, ResourceExt,
 	api::{DynamicObject, ObjectMeta, Patch, PatchParams, PostParams},
 };
-
 use kube_quantity::ParsedQuantity;
+use tokio_postgres::NoTls;
 use tracing::{debug, info, warn};
 
-use super::env_from_secret;
 use crate::{
 	error::{Error, Result},
 	types::{
@@ -422,163 +416,176 @@ pub async fn ensure_overlay_service_annotations(
 	Ok(())
 }
 
-/// Build a Job that sets up FDW in the overlay database on switchover.
-pub fn build_fdw_setup_job(
+/// Escape a SQL identifier by double-quoting it.
+fn quote_ident(s: &str) -> String {
+	format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Escape a SQL string literal by single-quoting it.
+fn quote_literal(s: &str) -> String {
+	format!("'{}'", s.replace('\'', "''"))
+}
+
+/// Read a UTF-8 string field from a Kubernetes Secret.
+fn read_secret_field(secret: &Secret, key: &str) -> Result<String> {
+	let data = secret
+		.data
+		.as_ref()
+		.ok_or_else(|| Error::MissingField("secret has no data".to_string()))?;
+	let bytes = data
+		.get(key)
+		.ok_or_else(|| Error::MissingField(format!("secret missing key: {key}")))?;
+	String::from_utf8(bytes.0.clone())
+		.map_err(|_| Error::MissingField(format!("secret key {key} is not valid UTF-8")))
+}
+
+/// Set up FDW in the overlay database by connecting directly via tokio-postgres.
+///
+/// This replaces the previous Job-based approach — no container is spawned.
+pub async fn setup_fdw(
+	client: &Client,
+	namespace: &str,
 	replica: &PostgresPhysicalReplica,
 	restore_name: &str,
-	namespace: &str,
-	pg_version: &str,
 	old_restore: Option<&str>,
-) -> Result<Job> {
+) -> Result<()> {
 	let replica_name = replica.name_any();
 	let cluster_name = overlay_cluster_name(&replica_name);
 	let fdw_secret_name = overlay_fdw_secret_name(&replica_name);
-	let superuser_secret = format!("{cluster_name}-superuser");
+	let superuser_secret_name = format!("{cluster_name}-superuser");
 	let server_name = overlay_fdw_server_name(restore_name);
 
-	let old_server_drop = if let Some(old) = old_restore {
-		let old_server = overlay_fdw_server_name(old);
-		format!(
-			r#"
-echo "Dropping old FDW server '{old_server}' and its dependent objects..."
-psql "$OVERLAY_CONNSTR" -c "DROP SERVER IF EXISTS {old_server} CASCADE;"
-"#
-		)
-	} else {
-		String::new()
-	};
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let su_secret = secrets.get(&superuser_secret_name).await?;
+	let fdw_secret = secrets.get(&fdw_secret_name).await?;
 
-	let schema_mapping_env = replica
+	let overlay_user = read_secret_field(&su_secret, "username")?;
+	let overlay_password = read_secret_field(&su_secret, "password")?;
+	let fdw_user = read_secret_field(&fdw_secret, "username")?;
+	let fdw_password = read_secret_field(&fdw_secret, "password")?;
+
+	let overlay_host = format!("{cluster_name}-rw.{namespace}.svc");
+	let overlay_connstr = format!(
+		"host={overlay_host} port=5432 dbname=postgres user={} password={} connect_timeout=10",
+		overlay_user, overlay_password,
+	);
+
+	let (overlay_pg, overlay_conn) = tokio_postgres::connect(&overlay_connstr, NoTls).await?;
+	tokio::spawn(async move {
+		if let Err(e) = overlay_conn.await {
+			warn!(error = %e, "overlay database connection error");
+		}
+	});
+
+	// Drop old FDW server if switching from a previous restore
+	if let Some(old) = old_restore {
+		let old_server = overlay_fdw_server_name(old);
+		info!(replica = %replica_name, old_server = %old_server, "dropping old FDW server");
+		overlay_pg
+			.batch_execute(&format!("DROP SERVER IF EXISTS {old_server} CASCADE"))
+			.await?;
+	}
+
+	// Install extension in a dedicated schema to avoid cascade issues with public
+	overlay_pg
+		.batch_execute("CREATE SCHEMA IF NOT EXISTS _pgro")
+		.await?;
+	overlay_pg
+		.batch_execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro")
+		.await?;
+
+	let restore_host = format!("{restore_name}.{namespace}.svc");
+	info!(
+		replica = %replica_name,
+		server = %server_name,
+		restore = %restore_name,
+		"creating FDW server"
+	);
+	overlay_pg
+		.batch_execute(&format!(
+			"CREATE SERVER IF NOT EXISTS {server_name} FOREIGN DATA WRAPPER postgres_fdw \
+			 OPTIONS (host {}, port '5432', dbname 'postgres')",
+			quote_literal(&restore_host),
+		))
+		.await?;
+
+	overlay_pg
+		.batch_execute(&format!(
+			"DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER {server_name}"
+		))
+		.await?;
+	overlay_pg
+		.batch_execute(&format!(
+			"CREATE USER MAPPING FOR CURRENT_USER SERVER {server_name} \
+			 OPTIONS (user {}, password {})",
+			quote_literal(&fdw_user),
+			quote_literal(&fdw_password),
+		))
+		.await?;
+
+	// Resolve schema mapping
+	let schemas: Vec<(String, String)> = if let Some(mapping) = replica
 		.spec
 		.overlay_database
 		.as_ref()
 		.and_then(|c| c.schema_mapping.as_ref())
-		.map(|m| serde_json::to_string(m).unwrap_or_default());
-
-	let schema_discovery_script = if schema_mapping_env.is_some() {
-		r#"
-echo "Using explicit schema mapping from SCHEMA_MAPPING env..."
-SCHEMAS=$(echo "$SCHEMA_MAPPING" | python3 -c "
-import sys, json
-m = json.load(sys.stdin)
-for remote, local in m.items():
-    print(f'{remote}:{local}')
-" 2>/dev/null || echo "$SCHEMA_MAPPING" | jq -r 'to_entries[] | "\(.key):\(.value)"')
-"#
-		.to_string()
+	{
+		mapping
+			.iter()
+			.map(|(k, v)| (k.clone(), v.clone()))
+			.collect()
 	} else {
-		format!(
-			r#"
-echo "Discovering schemas from restore database..."
-SCHEMAS=$(psql "host={restore_name}.{namespace}.svc port=5432 dbname=postgres user=$FDW_USER password=$FDW_PASSWORD" \
-  -t -A -c "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg_%' AND schema_name != 'information_schema'" \
-  | while read -r s; do echo "$s:$s"; done)
-"#
-		)
+		let restore_connstr = format!(
+			"host={restore_host} port=5432 dbname=postgres user={} password={} connect_timeout=10",
+			fdw_user, fdw_password,
+		);
+		let (restore_pg, restore_conn) = tokio_postgres::connect(&restore_connstr, NoTls).await?;
+		tokio::spawn(async move {
+			if let Err(e) = restore_conn.await {
+				warn!(error = %e, "restore database connection error");
+			}
+		});
+
+		let rows = restore_pg
+			.query(
+				"SELECT schema_name FROM information_schema.schemata \
+				 WHERE schema_name NOT LIKE 'pg_%' AND schema_name != 'information_schema'",
+				&[],
+			)
+			.await?;
+		rows.iter()
+			.map(|row| {
+				let name: String = row.get(0);
+				(name.clone(), name)
+			})
+			.collect()
 	};
 
-	let script = format!(
-		r#"set -e
-
-OVERLAY_CONNSTR="host={cluster_name}-rw.{namespace}.svc port=5432 dbname=postgres user=$OVERLAY_USER password=$OVERLAY_PASSWORD"
-
-{old_server_drop}
-
-echo "Setting up FDW extension..."
-psql "$OVERLAY_CONNSTR" -c "CREATE SCHEMA IF NOT EXISTS _pgro;"
-psql "$OVERLAY_CONNSTR" -c "CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro;"
-
-echo "Creating FDW server '{server_name}' -> {restore_name}..."
-psql "$OVERLAY_CONNSTR" -c "CREATE SERVER IF NOT EXISTS {server_name} FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host '{restore_name}.{namespace}.svc', port '5432', dbname 'postgres');"
-
-echo "Creating user mapping..."
-psql "$OVERLAY_CONNSTR" -c "DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER {server_name};"
-psql "$OVERLAY_CONNSTR" -c "CREATE USER MAPPING FOR CURRENT_USER SERVER {server_name} OPTIONS (user '$FDW_USER', password '$FDW_PASSWORD');"
-
-{schema_discovery_script}
-
-echo "Importing foreign schemas..."
-echo "$SCHEMAS" | while IFS=: read -r REMOTE LOCAL; do
-  [ -z "$REMOTE" ] && continue
-  echo "  Importing $REMOTE -> $LOCAL"
-  psql "$OVERLAY_CONNSTR" -c "DROP SCHEMA IF EXISTS \"$LOCAL\" CASCADE;"
-  psql "$OVERLAY_CONNSTR" -c "CREATE SCHEMA IF NOT EXISTS \"$LOCAL\";"
-  psql "$OVERLAY_CONNSTR" -c "IMPORT FOREIGN SCHEMA \"$REMOTE\" FROM SERVER {server_name} INTO \"$LOCAL\";"
-done
-
-echo "FDW setup complete"
-"#
-	);
-
-	let job_name = format!("{replica_name}-fdw-setup");
-	let pg_image = format!("postgres:{pg_version}-alpine");
-
-	let mut env_vars = vec![
-		env_from_secret("OVERLAY_USER", &superuser_secret, "username"),
-		env_from_secret("OVERLAY_PASSWORD", &superuser_secret, "password"),
-		env_from_secret("FDW_USER", &fdw_secret_name, "username"),
-		env_from_secret("FDW_PASSWORD", &fdw_secret_name, "password"),
-	];
-
-	if let Some(ref mapping) = schema_mapping_env {
-		env_vars.push(EnvVar {
-			name: "SCHEMA_MAPPING".to_string(),
-			value: Some(mapping.clone()),
-			..Default::default()
-		});
+	for (remote, local) in &schemas {
+		info!(remote = %remote, local = %local, "importing foreign schema");
+		let local_quoted = quote_ident(local);
+		let remote_quoted = quote_ident(remote);
+		overlay_pg
+			.batch_execute(&format!("DROP SCHEMA IF EXISTS {local_quoted} CASCADE"))
+			.await?;
+		overlay_pg
+			.batch_execute(&format!("CREATE SCHEMA {local_quoted}"))
+			.await?;
+		overlay_pg
+			.batch_execute(&format!(
+				"IMPORT FOREIGN SCHEMA {remote_quoted} FROM SERVER {server_name} INTO {local_quoted}"
+			))
+			.await?;
 	}
 
-	Ok(Job {
-		metadata: ObjectMeta {
-			name: Some(job_name.clone()),
-			namespace: Some(namespace.to_string()),
-			labels: Some(BTreeMap::from([
-				("pgro.bes.au/replica".to_string(), replica_name.clone()),
-				("pgro.bes.au/job-type".to_string(), "fdw-setup".to_string()),
-			])),
-			owner_references: Some(vec![owner_reference(replica)]),
-			..Default::default()
-		},
-		spec: Some(JobSpec {
-			backoff_limit: Some(3),
-			active_deadline_seconds: Some(300),
-			ttl_seconds_after_finished: Some(120),
-			template: PodTemplateSpec {
-				metadata: Some(ObjectMeta {
-					labels: Some(BTreeMap::from([
-						("pgro.bes.au/replica".to_string(), replica_name),
-						("pgro.bes.au/job-type".to_string(), "fdw-setup".to_string()),
-					])),
-					..Default::default()
-				}),
-				spec: Some(PodSpec {
-					restart_policy: Some("Never".to_string()),
-					containers: vec![Container {
-						name: "fdw-setup".to_string(),
-						image: Some(pg_image),
-						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![script]),
-						env: Some(env_vars),
-						resources: Some(ResourceRequirements {
-							requests: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("50m".to_string())),
-								("memory".to_string(), Quantity("64Mi".to_string())),
-							])),
-							limits: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("200m".to_string())),
-								("memory".to_string(), Quantity("128Mi".to_string())),
-							])),
-							..Default::default()
-						}),
-						..Default::default()
-					}],
-					..Default::default()
-				}),
-			},
-			..Default::default()
-		}),
-		..Default::default()
-	})
+	info!(
+		replica = %replica_name,
+		restore = %restore_name,
+		schema_count = schemas.len(),
+		"FDW setup complete"
+	);
+
+	Ok(())
 }
 
 fn owner_reference(replica: &PostgresPhysicalReplica) -> OwnerReference {
@@ -641,53 +648,29 @@ pub async fn reconcile_overlay(
 	Ok((cluster_ready, storage_size, pg_version))
 }
 
-/// Run the FDW setup job for a switchover.
-///
-/// Deletes any existing fdw-setup job first, then creates a new one.
-pub async fn run_fdw_setup(
-	client: &Client,
-	namespace: &str,
-	replica: &PostgresPhysicalReplica,
-	restore_name: &str,
-	pg_version: &str,
-	old_restore: Option<&str>,
-) -> Result<()> {
-	let replica_name = replica.name_any();
-	let job_name = format!("{replica_name}-fdw-setup");
-	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
-
-	if let Ok(Some(_)) = jobs.get_opt(&job_name).await {
-		info!(
-			replica = replica_name,
-			job = job_name,
-			"deleting existing FDW setup job"
-		);
-		let dp = kube::api::DeleteParams {
-			propagation_policy: Some(kube::api::PropagationPolicy::Background),
-			..Default::default()
-		};
-		if let Err(e) = jobs.delete(&job_name, &dp).await {
-			warn!(job = job_name, error = %e, "failed to delete old FDW setup job");
-		}
-		tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-	}
-
-	let job = build_fdw_setup_job(replica, restore_name, namespace, pg_version, old_restore)?;
-	jobs.create(&PostParams::default(), &job).await?;
-
-	info!(
-		replica = replica_name,
-		restore = restore_name,
-		"created FDW setup job"
-	);
-
-	Ok(())
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::types::*;
+
+	#[test]
+	fn quote_ident_plain() {
+		assert_eq!(quote_ident("public"), "\"public\"");
+	}
+
+	#[test]
+	fn quote_ident_with_quotes() {
+		assert_eq!(quote_ident("my\"schema"), "\"my\"\"schema\"");
+	}
+
+	#[test]
+	fn quote_literal_plain() {
+		assert_eq!(quote_literal("hello"), "'hello'");
+	}
+
+	#[test]
+	fn quote_literal_with_quotes() {
+		assert_eq!(quote_literal("it's"), "'it''s'");
+	}
 
 	#[test]
 	fn compute_overlay_storage_100gi_snapshot() {
@@ -816,78 +799,5 @@ mod tests {
 			overlay_fdw_server_name("my-replica-20250101-120000"),
 			"fdw_my_replica_20250101_120000"
 		);
-	}
-
-	#[test]
-	fn build_fdw_setup_job_without_old_restore() {
-		let replica = make_test_replica();
-		let job = build_fdw_setup_job(&replica, "test-restore-1", "default", "17", None).unwrap();
-		let pod_spec = job.spec.unwrap().template.spec.unwrap();
-		let script = &pod_spec.containers[0].args.as_ref().unwrap()[0];
-		assert!(script.contains("CREATE SCHEMA IF NOT EXISTS _pgro"));
-		assert!(script.contains("CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro"));
-		assert!(script.contains("CREATE SERVER IF NOT EXISTS fdw_test_restore_1"));
-		assert!(!script.contains("DROP SERVER"));
-	}
-
-	#[test]
-	fn build_fdw_setup_job_with_old_restore() {
-		let replica = make_test_replica();
-		let job = build_fdw_setup_job(
-			&replica,
-			"test-restore-2",
-			"default",
-			"17",
-			Some("test-restore-1"),
-		)
-		.unwrap();
-		let pod_spec = job.spec.unwrap().template.spec.unwrap();
-		let script = &pod_spec.containers[0].args.as_ref().unwrap()[0];
-		assert!(script.contains("DROP SERVER IF EXISTS fdw_test_restore_1 CASCADE"));
-		assert!(script.contains("CREATE SERVER IF NOT EXISTS fdw_test_restore_2"));
-	}
-
-	#[test]
-	fn build_fdw_setup_job_uses_correct_image() {
-		let replica = make_test_replica();
-		let job = build_fdw_setup_job(&replica, "test-restore-1", "default", "16", None).unwrap();
-		let image = &job.spec.unwrap().template.spec.unwrap().containers[0].image;
-		assert_eq!(image.as_deref(), Some("postgres:16-alpine"));
-	}
-
-	fn make_test_replica() -> PostgresPhysicalReplica {
-		PostgresPhysicalReplica::new(
-			"test-replica",
-			PostgresPhysicalReplicaSpec {
-				kopia_secret_ref: "kopia-secret".to_string(),
-				snapshot_filter: None,
-				schedule: None,
-				schedule_jitter: "10m".to_string(),
-				minimum_ttl: None,
-				switchover_grace_period: "5m".to_string(),
-				analytics_username: "analytics".to_string(),
-				storage_class: None,
-				storage_size_override: None,
-				resources: None,
-				service_annotations: None,
-				pod_annotations: None,
-				affinity: None,
-				tolerations: vec![],
-				read_only: true,
-				postgres_extra_config: None,
-				notifications: vec![],
-				overlay_database: Some(OverlayDatabaseConfig {
-					postgres_version: None,
-					image_catalog: None,
-					storage_size_override: None,
-					storage_class: None,
-					resources: None,
-					affinity: None,
-					tolerations: vec![],
-					service_annotations: None,
-					schema_mapping: None,
-				}),
-			},
-		)
 	}
 }

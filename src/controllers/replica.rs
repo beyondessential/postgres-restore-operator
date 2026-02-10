@@ -271,8 +271,8 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	}
 
 	// 7b. Ensure FDW setup is current for overlay databases.
-	// On each reconciliation, if currentRestore != overlayFdwRestore, we drive
-	// the fdw-setup Job to completion, retrying on failure.
+	// On each reconciliation, if currentRestore != overlayFdwRestore, connect
+	// directly to the overlay and restore databases to set up FDW.
 	if replica.spec.overlay_database.is_some() {
 		let current_restore = replica
 			.status
@@ -286,83 +286,39 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		if let Some(current) = current_restore
 			&& fdw_restore.as_ref() != Some(&current)
 		{
-			let job_name = format!("{name}-fdw-setup");
-			let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
-
-			match jobs.get_opt(&job_name).await? {
-				Some(job) => {
-					let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
-					let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
-					let backoff_limit =
-						job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(3);
-
-					if succeeded > 0 {
-						info!(replica = name, restore = current, "FDW setup job succeeded");
-						if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
-							warn!(job = job_name, error = %e, "failed to delete completed FDW setup job");
+			match overlay::setup_fdw(
+				client,
+				&namespace,
+				&replica,
+				current,
+				fdw_restore.map(|s| s.as_str()),
+			)
+			.await
+			{
+				Ok(()) => {
+					let replicas: Api<PostgresPhysicalReplica> =
+						Api::namespaced(client.clone(), &namespace);
+					let patch = serde_json::json!({
+						"status": {
+							"overlayFdwRestore": current,
 						}
-						let replicas: Api<PostgresPhysicalReplica> =
-							Api::namespaced(client.clone(), &namespace);
-						let patch = serde_json::json!({
-							"status": {
-								"overlayFdwRestore": current,
-							}
-						});
-						replicas
-							.patch_status(
-								&name,
-								&PatchParams::apply("postgres-restore-operator"),
-								&Patch::Merge(&patch),
-							)
-							.await?;
-					} else if failed > backoff_limit {
-						warn!(
-							replica = name,
-							restore = current,
-							"FDW setup job failed, deleting for retry"
-						);
-						let dp = kube::api::DeleteParams {
-							propagation_policy: Some(kube::api::PropagationPolicy::Background),
-							..Default::default()
-						};
-						if let Err(e) = jobs.delete(&job_name, &dp).await {
-							warn!(job = job_name, error = %e, "failed to delete failed FDW setup job");
-						}
-						return Ok(Action::requeue(Duration::from_secs(30)));
-					} else {
-						return Ok(Action::requeue(Duration::from_secs(10)));
-					}
+					});
+					replicas
+						.patch_status(
+							&name,
+							&PatchParams::apply("postgres-restore-operator"),
+							&Patch::Merge(&patch),
+						)
+						.await?;
 				}
-				None => {
-					let pg_version = replica
-						.status
-						.as_ref()
-						.and_then(|s| s.overlay_postgres_version.clone())
-						.unwrap_or_else(|| "17".to_string());
-
-					match overlay::run_fdw_setup(
-						client,
-						&namespace,
-						&replica,
-						current,
-						&pg_version,
-						fdw_restore.map(|s| s.as_str()),
-					)
-					.await
-					{
-						Ok(()) => {
-							info!(replica = name, restore = current, "created FDW setup job");
-						}
-						Err(e) => {
-							warn!(
-								replica = name,
-								restore = current,
-								error = %e,
-								"failed to create FDW setup job"
-							);
-						}
-					}
-					return Ok(Action::requeue(Duration::from_secs(10)));
+				Err(e) => {
+					warn!(
+						replica = name,
+						restore = current,
+						error = %e,
+						"FDW setup failed, will retry"
+					);
+					return Ok(Action::requeue(Duration::from_secs(30)));
 				}
 			}
 		}
