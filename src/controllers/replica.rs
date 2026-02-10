@@ -159,21 +159,21 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		// Try to get snapshot size from active restore
 		let restores_api: Api<PostgresPhysicalRestore> =
 			Api::namespaced(client.clone(), &namespace);
-		let snapshot_bytes = if let Some(current_restore_name) = replica
+		let snapshot_size = if let Some(current_restore_name) = replica
 			.status
 			.as_ref()
 			.and_then(|s| s.current_restore.as_ref())
 		{
 			if let Ok(current_restore) = restores_api.get(current_restore_name).await {
-				parse_snapshot_size_bytes(&current_restore.spec.snapshot_size)
+				current_restore.spec.snapshot_size.clone()
 			} else {
-				0
+				"0".to_string()
 			}
 		} else {
-			0
+			"0".to_string()
 		};
 
-		match overlay::reconcile_overlay(client, &namespace, &replica, snapshot_bytes).await {
+		match overlay::reconcile_overlay(client, &namespace, &replica, &snapshot_size).await {
 			Ok((cluster_ready, storage_size, pg_version)) => {
 				let replicas_api: Api<PostgresPhysicalReplica> =
 					Api::namespaced(client.clone(), &namespace);
@@ -879,20 +879,6 @@ async fn create_restore_for_snapshot(
 	);
 
 	Ok(())
-}
-
-/// Parse a snapshot size string like "10Gi" or "500Mi" into bytes.
-fn parse_snapshot_size_bytes(s: &str) -> u64 {
-	let s = s.trim();
-	if let Some(rest) = s.strip_suffix("Gi") {
-		rest.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024
-	} else if let Some(rest) = s.strip_suffix("Mi") {
-		rest.parse::<u64>().unwrap_or(0) * 1024 * 1024
-	} else if let Some(rest) = s.strip_suffix("Ti") {
-		rest.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024 * 1024
-	} else {
-		s.parse::<u64>().unwrap_or(0)
-	}
 }
 
 fn format_bytes(bytes: u64) -> String {

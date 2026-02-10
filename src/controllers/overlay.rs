@@ -12,6 +12,7 @@ use kube::{
 	Api, Client, ResourceExt,
 	api::{DynamicObject, ObjectMeta, Patch, PatchParams, PostParams},
 };
+use kube_quantity::ParsedQuantity;
 use tracing::{info, warn};
 
 use super::env_from_secret;
@@ -27,8 +28,8 @@ use crate::{
 };
 
 const DEFAULT_PG_VERSION: &str = "17";
-const OVERLAY_STORAGE_BASE_BYTES: u64 = 5 * GI;
 const GI: u64 = 1024 * 1024 * 1024;
+const OVERLAY_STORAGE_BASE_GI: u64 = 5;
 
 pub fn overlay_cluster_name(replica_name: &str) -> String {
 	format!("{replica_name}-overlay")
@@ -43,28 +44,20 @@ fn overlay_fdw_server_name(restore_name: &str) -> String {
 	format!("fdw_{sanitized}")
 }
 
-/// Compute overlay storage size from snapshot size bytes.
-///
-/// Formula: `5Gi + ceil(snapshot_size_bytes / 10)`, rounded up to whole Gi.
-pub fn compute_overlay_storage_size(snapshot_bytes: u64) -> String {
-	let extra = snapshot_bytes.div_ceil(10);
-	let total = OVERLAY_STORAGE_BASE_BYTES + extra;
-	let gi_count = total.div_ceil(GI);
-	format!("{gi_count}Gi")
+/// Parse a Kubernetes quantity string (e.g. "10Gi", "500Mi") into bytes.
+fn quantity_to_bytes(s: &str) -> Option<u64> {
+	let pq: ParsedQuantity = s.try_into().ok()?;
+	pq.to_bytes_u64()
 }
 
-/// Parse a Kubernetes quantity string like "10Gi" or "500Mi" into bytes.
-fn parse_quantity_bytes(s: &str) -> Option<u64> {
-	let s = s.trim();
-	if let Some(rest) = s.strip_suffix("Gi") {
-		rest.parse::<u64>().ok().map(|n| n * GI)
-	} else if let Some(rest) = s.strip_suffix("Mi") {
-		rest.parse::<u64>().ok().map(|n| n * 1024 * 1024)
-	} else if let Some(rest) = s.strip_suffix("Ti") {
-		rest.parse::<u64>().ok().map(|n| n * 1024 * GI)
-	} else {
-		s.parse::<u64>().ok()
-	}
+/// Compute overlay storage size from a snapshot size quantity string.
+///
+/// Formula: `5Gi + ceil(snapshot_size_bytes / 10)`, rounded up to whole Gi.
+pub fn compute_overlay_storage_size(snapshot_size: &str) -> String {
+	let snapshot_bytes = quantity_to_bytes(snapshot_size).unwrap_or(0);
+	let extra_gi = snapshot_bytes.div_ceil(10 * GI);
+	let total_gi = OVERLAY_STORAGE_BASE_GI + extra_gi;
+	format!("{total_gi}Gi")
 }
 
 /// Apply ratchet logic: only increase, never shrink.
@@ -74,13 +67,13 @@ pub fn ratchet_storage_size(new_size: &str, current_size: Option<&str>) -> Strin
 		return new_size.to_string();
 	};
 
-	let new_bytes = parse_quantity_bytes(new_size).unwrap_or(0);
-	let current_bytes = parse_quantity_bytes(current).unwrap_or(0);
+	let new_pq: std::result::Result<ParsedQuantity, _> = new_size.try_into();
+	let cur_pq: std::result::Result<ParsedQuantity, _> = current.try_into();
 
-	if new_bytes > current_bytes {
-		new_size.to_string()
-	} else {
-		current.to_string()
+	match (new_pq, cur_pq) {
+		(Ok(n), Ok(c)) if n > c => new_size.to_string(),
+		(_, Ok(_)) => current.to_string(),
+		_ => new_size.to_string(),
 	}
 }
 
@@ -495,12 +488,15 @@ fn owner_reference(replica: &PostgresPhysicalReplica) -> OwnerReference {
 
 /// Full overlay reconciliation: version resolution, cluster creation, FDW credentials.
 ///
+/// `snapshot_size` is a Kubernetes quantity string (e.g. "10Gi") from the
+/// active restore's spec.
+///
 /// Returns `(cluster_ready, storage_size, pg_version)`.
 pub async fn reconcile_overlay(
 	client: &Client,
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
-	snapshot_size_bytes: u64,
+	snapshot_size: &str,
 ) -> Result<(bool, String, String)> {
 	let replica_name = replica.name_any();
 	let overlay_config = match &replica.spec.overlay_database {
@@ -512,7 +508,7 @@ pub async fn reconcile_overlay(
 
 	let computed_size = match &overlay_config.storage_size_override {
 		Some(override_size) => override_size.clone(),
-		None => compute_overlay_storage_size(snapshot_size_bytes),
+		None => compute_overlay_storage_size(snapshot_size),
 	};
 
 	let current_size = replica
@@ -607,43 +603,44 @@ mod tests {
 
 	#[test]
 	fn compute_overlay_storage_100gi_snapshot() {
-		// 100Gi = 107374182400 bytes
-		// extra = ceil(107374182400 / 10) = 10737418240
-		// total = 5Gi + ~10Gi = ~15Gi
-		let result = compute_overlay_storage_size(100 * GI);
+		// 100Gi snapshot -> extra = ceil(100Gi / 10Gi) = 10Gi -> 5 + 10 = 15Gi
+		let result = compute_overlay_storage_size("100Gi");
 		assert_eq!(result, "15Gi");
 	}
 
 	#[test]
 	fn compute_overlay_storage_1gi_snapshot() {
-		// 1Gi = 1073741824 bytes
-		// extra = ceil(1073741824 / 10) = 107374183 (~0.1Gi)
-		// total = 5Gi + 0.1Gi = ~5.1Gi -> ceil to 6Gi
-		let result = compute_overlay_storage_size(GI);
+		// 1Gi snapshot -> extra = ceil(1Gi / 10Gi) = 1 -> 5 + 1 = 6Gi
+		let result = compute_overlay_storage_size("1Gi");
 		assert_eq!(result, "6Gi");
 	}
 
 	#[test]
 	fn compute_overlay_storage_500mi_snapshot() {
-		// 500Mi = 524288000 bytes
-		// extra = ceil(524288000 / 10) = 52428800 (~50Mi)
-		// total = 5Gi + 50Mi -> ceil to 6Gi
-		let result = compute_overlay_storage_size(500 * 1024 * 1024);
+		// 500Mi -> 500*1024*1024 = 524288000 bytes
+		// extra_gi = ceil(524288000 / (10 * 1073741824)) = ceil(0.0488...) = 1
+		// total = 5 + 1 = 6Gi
+		let result = compute_overlay_storage_size("500Mi");
 		assert_eq!(result, "6Gi");
 	}
 
 	#[test]
 	fn compute_overlay_storage_zero() {
-		// 0 bytes -> 5Gi base
-		let result = compute_overlay_storage_size(0);
+		let result = compute_overlay_storage_size("0");
 		assert_eq!(result, "5Gi");
 	}
 
 	#[test]
 	fn compute_overlay_storage_50gi_snapshot() {
-		// 50Gi -> extra = 5Gi, total = 10Gi
-		let result = compute_overlay_storage_size(50 * GI);
+		// 50Gi -> extra = ceil(50/10) = 5 -> 5 + 5 = 10Gi
+		let result = compute_overlay_storage_size("50Gi");
 		assert_eq!(result, "10Gi");
+	}
+
+	#[test]
+	fn compute_overlay_storage_bad_input() {
+		let result = compute_overlay_storage_size("not-a-quantity");
+		assert_eq!(result, "5Gi");
 	}
 
 	#[test]
@@ -667,18 +664,26 @@ mod tests {
 	}
 
 	#[test]
-	fn parse_quantity_gi() {
-		assert_eq!(parse_quantity_bytes("10Gi"), Some(10 * GI));
+	fn ratchet_mixed_units() {
+		// 1Gi = 1024Mi, so 1Gi > 512Mi
+		assert_eq!(ratchet_storage_size("1Gi", Some("512Mi")), "1Gi");
+		// 512Mi < 1Gi
+		assert_eq!(ratchet_storage_size("512Mi", Some("1Gi")), "1Gi");
 	}
 
 	#[test]
-	fn parse_quantity_mi() {
-		assert_eq!(parse_quantity_bytes("512Mi"), Some(512 * 1024 * 1024));
+	fn quantity_to_bytes_gi() {
+		assert_eq!(quantity_to_bytes("10Gi"), Some(10 * GI));
 	}
 
 	#[test]
-	fn parse_quantity_ti() {
-		assert_eq!(parse_quantity_bytes("1Ti"), Some(1024 * GI));
+	fn quantity_to_bytes_mi() {
+		assert_eq!(quantity_to_bytes("512Mi"), Some(512 * 1024 * 1024));
+	}
+
+	#[test]
+	fn quantity_to_bytes_bare() {
+		assert_eq!(quantity_to_bytes("1024"), Some(1024));
 	}
 
 	#[test]
