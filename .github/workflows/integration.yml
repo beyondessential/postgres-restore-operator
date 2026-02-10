@@ -75,8 +75,9 @@ jobs:
           docker pull minio/mc:latest
           docker pull kopia/kopia:latest
           docker pull postgres:16
+          docker pull postgres:16-alpine
           docker pull alpine:latest
-          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:latest postgres:16 alpine:latest
+          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:latest postgres:16 postgres:16-alpine alpine:latest
 
       - name: Deploy MinIO
         run: |
