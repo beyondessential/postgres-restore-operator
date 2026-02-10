@@ -95,9 +95,15 @@ echo -n "$VERSION" > /dev/termination-log
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([
-				("bes.au/replica".to_string(), restore.spec.replica.clone()),
-				("bes.au/restore".to_string(), restore.name_any()),
-				("bes.au/job-type".to_string(), "version-detect".to_string()),
+				(
+					"pgro.bes.au/replica".to_string(),
+					restore.spec.replica.clone(),
+				),
+				("pgro.bes.au/restore".to_string(), restore.name_any()),
+				(
+					"pgro.bes.au/job-type".to_string(),
+					"version-detect".to_string(),
+				),
 			])),
 			owner_references: Some(vec![restore_owner_reference(restore)]),
 			..Default::default()
@@ -108,8 +114,11 @@ echo -n "$VERSION" > /dev/termination-log
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(BTreeMap::from([
-						("bes.au/replica".to_string(), restore.spec.replica.clone()),
-						("bes.au/restore".to_string(), restore.name_any()),
+						(
+							"pgro.bes.au/replica".to_string(),
+							restore.spec.replica.clone(),
+						),
+						("pgro.bes.au/restore".to_string(), restore.name_any()),
 					])),
 					..Default::default()
 				}),
@@ -174,8 +183,11 @@ pub fn build_pvc(
 			name: Some(pvc_name.to_string()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([
-				("bes.au/replica".to_string(), restore.spec.replica.clone()),
-				("bes.au/restore".to_string(), restore.name_any()),
+				(
+					"pgro.bes.au/replica".to_string(),
+					restore.spec.replica.clone(),
+				),
+				("pgro.bes.au/restore".to_string(), restore.name_any()),
 			])),
 			owner_references: Some(vec![restore_owner_reference(restore)]),
 			..Default::default()
@@ -275,8 +287,11 @@ echo -n "$VERSION" > /dev/termination-log
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([
-				("bes.au/replica".to_string(), restore.spec.replica.clone()),
-				("bes.au/restore".to_string(), restore.name_any()),
+				(
+					"pgro.bes.au/replica".to_string(),
+					restore.spec.replica.clone(),
+				),
+				("pgro.bes.au/restore".to_string(), restore.name_any()),
 			])),
 			owner_references: Some(vec![restore_owner_reference(restore)]),
 			..Default::default()
@@ -287,8 +302,11 @@ echo -n "$VERSION" > /dev/termination-log
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(BTreeMap::from([
-						("bes.au/replica".to_string(), restore.spec.replica.clone()),
-						("bes.au/restore".to_string(), restore.name_any()),
+						(
+							"pgro.bes.au/replica".to_string(),
+							restore.spec.replica.clone(),
+						),
+						("pgro.bes.au/restore".to_string(), restore.name_any()),
 					])),
 					..Default::default()
 				}),
@@ -543,8 +561,11 @@ echo "Auth setup complete"
 	);
 
 	let labels = BTreeMap::from([
-		("bes.au/replica".to_string(), restore.spec.replica.clone()),
-		("bes.au/restore".to_string(), name.to_string()),
+		(
+			"pgro.bes.au/replica".to_string(),
+			restore.spec.replica.clone(),
+		),
+		("pgro.bes.au/restore".to_string(), name.to_string()),
 	]);
 
 	let container_resources = replica
@@ -626,7 +647,7 @@ echo "Auth setup complete"
 			replicas: Some(1),
 			selector: LabelSelector {
 				match_labels: Some(BTreeMap::from([(
-					"bes.au/restore".to_string(),
+					"pgro.bes.au/restore".to_string(),
 					name.to_string(),
 				)])),
 				..Default::default()

@@ -22,7 +22,7 @@ Extend the existing `PostgresPhysicalReplica` CRD with an optional `overlayDatab
 - [x] Verify build and tests pass
 
 ### Phase 1: Per-Restore Services (foundation)
-- [x] Add per-restore `Service` creation in the restore controller (`reconcile_ready`), creating a `<restore-name>` Service with selector `bes.au/restore: <restore-name>` — this is the default experience for all restores, not just overlay-enabled ones
+- [x] Add per-restore `Service` creation in the restore controller (`reconcile_ready`), creating a `<restore-name>` Service with selector `pgro.bes.au/restore: <restore-name>` — this is the default experience for all restores, not just overlay-enabled ones
 - [x] Ensure the per-restore Service is owned by the restore (cascade delete)
 - [x] Add RBAC — already covered (Services are in the operator.yaml permissions)
 

@@ -8,7 +8,7 @@ use super::{Affinity, Condition, HeaderValue, ResourceRequirements, Toleration};
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(
-	group = "bes.au",
+	group = "pgro.bes.au",
 	version = "v1alpha1",
 	kind = "PostgresPhysicalReplica",
 	namespaced,

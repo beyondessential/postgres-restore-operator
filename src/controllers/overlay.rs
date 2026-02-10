@@ -192,7 +192,7 @@ pub async fn ensure_fdw_credentials(
 			name: Some(secret_name.clone()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([(
-				"bes.au/replica".to_string(),
+				"pgro.bes.au/replica".to_string(),
 				replica_name.to_string(),
 			)])),
 			owner_references: Some(vec![owner_reference(replica)]),
@@ -312,11 +312,11 @@ pub async fn ensure_cnpg_cluster(
 			"name": cluster_name,
 			"namespace": namespace,
 			"labels": {
-				"bes.au/replica": replica_name,
-				"bes.au/component": "overlay",
+				"pgro.bes.au/replica": replica_name,
+				"pgro.bes.au/component": "overlay",
 			},
 			"ownerReferences": [{
-				"apiVersion": "bes.au/v1alpha1",
+				"apiVersion": "pgro.bes.au/v1alpha1",
 				"kind": "PostgresPhysicalReplica",
 				"name": replica_name,
 				"uid": replica.uid().unwrap_or_default(),
@@ -531,8 +531,8 @@ echo "FDW setup complete"
 			name: Some(job_name.clone()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([
-				("bes.au/replica".to_string(), replica_name.clone()),
-				("bes.au/job-type".to_string(), "fdw-setup".to_string()),
+				("pgro.bes.au/replica".to_string(), replica_name.clone()),
+				("pgro.bes.au/job-type".to_string(), "fdw-setup".to_string()),
 			])),
 			owner_references: Some(vec![owner_reference(replica)]),
 			..Default::default()
@@ -544,8 +544,8 @@ echo "FDW setup complete"
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(BTreeMap::from([
-						("bes.au/replica".to_string(), replica_name),
-						("bes.au/job-type".to_string(), "fdw-setup".to_string()),
+						("pgro.bes.au/replica".to_string(), replica_name),
+						("pgro.bes.au/job-type".to_string(), "fdw-setup".to_string()),
 					])),
 					..Default::default()
 				}),
@@ -581,7 +581,7 @@ echo "FDW setup complete"
 
 fn owner_reference(replica: &PostgresPhysicalReplica) -> OwnerReference {
 	OwnerReference {
-		api_version: "bes.au/v1alpha1".to_string(),
+		api_version: "pgro.bes.au/v1alpha1".to_string(),
 		kind: "PostgresPhysicalReplica".to_string(),
 		name: replica.name_any(),
 		uid: replica.uid().unwrap_or_default(),

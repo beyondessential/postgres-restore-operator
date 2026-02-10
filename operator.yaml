@@ -18,7 +18,7 @@ metadata:
     name: postgres-restore-operator
 rules:
     # CRD access
-    - apiGroups: ["bes.au"]
+    - apiGroups: ["pgro.bes.au"]
       resources:
           - postgresphysicalreplicas
           - postgresphysicalreplicas/status

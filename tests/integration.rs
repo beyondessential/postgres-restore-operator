@@ -173,7 +173,7 @@ async fn wait_for_restore_phase(
 	timeout(timeout_dur, async {
 		loop {
 			let list = api
-				.list(&ListParams::default().labels(&format!("bes.au/replica={replica_name}")))
+				.list(&ListParams::default().labels(&format!("pgro.bes.au/replica={replica_name}")))
 				.await
 				.expect("failed to list restores");
 
@@ -239,7 +239,7 @@ async fn wait_for_replica_condition(
 async fn count_restores_for_replica(client: &Client, ns: &str, replica_name: &str) -> usize {
 	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
 	let list = match restores
-		.list(&ListParams::default().labels(&format!("bes.au/replica={replica_name}")))
+		.list(&ListParams::default().labels(&format!("pgro.bes.au/replica={replica_name}")))
 		.await
 	{
 		Ok(l) => l,
@@ -553,7 +553,7 @@ async fn invalid_kopia_secret_structure() {
 	// No snapshot-list jobs should be created
 	let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
 	let job_list = jobs
-		.list(&ListParams::default().labels("bes.au/replica=invalid-secret-replica"))
+		.list(&ListParams::default().labels("pgro.bes.au/replica=invalid-secret-replica"))
 		.await
 		.expect("failed to list jobs");
 	assert!(
@@ -677,11 +677,9 @@ async fn snapshot_job_fails_for_wrong_bucket() {
 	timeout(Duration::from_secs(60), async {
 		loop {
 			if let Ok(list) = jobs
-				.list(
-					&ListParams::default().labels(
-						"bes.au/replica=wrong-bucket-replica,bes.au/job-type=snapshot-list",
-					),
-				)
+				.list(&ListParams::default().labels(
+					"pgro.bes.au/replica=wrong-bucket-replica,pgro.bes.au/job-type=snapshot-list",
+				))
 				.await && !list.items.is_empty()
 			{
 				println!("[wrong-bucket-replica] snapshot-list job exists");
@@ -918,7 +916,7 @@ async fn second_restore_and_switchover() {
 		.cloned()
 		.unwrap_or_default();
 	assert_eq!(
-		svc_selector.get("bes.au/restore").map(|s| s.as_str()),
+		svc_selector.get("pgro.bes.au/restore").map(|s| s.as_str()),
 		Some(first_restore_name.as_str()),
 		"service selector should point to first restore"
 	);
@@ -949,12 +947,12 @@ async fn second_restore_and_switchover() {
 		);
 		meta.insert(
 			"labels".to_string(),
-			serde_json::json!({ "bes.au/replica": "switchover-replica" }),
+			serde_json::json!({ "pgro.bes.au/replica": "switchover-replica" }),
 		);
 		meta.insert(
 			"ownerReferences".to_string(),
 			serde_json::json!([{
-				"apiVersion": "bes.au/v1alpha1",
+				"apiVersion": "pgro.bes.au/v1alpha1",
 				"kind": "PostgresPhysicalReplica",
 				"name": "switchover-replica",
 				"uid": replica_uid,
@@ -1026,7 +1024,7 @@ async fn second_restore_and_switchover() {
 		.cloned()
 		.unwrap_or_default();
 	assert_eq!(
-		svc_selector.get("bes.au/restore").map(|s| s.as_str()),
+		svc_selector.get("pgro.bes.au/restore").map(|s| s.as_str()),
 		Some(second_restore_name),
 		"service selector should point to second restore after switchover"
 	);

@@ -304,8 +304,11 @@ async fn ensure_restore_service(
 			name: Some(name.to_string()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([
-				("bes.au/replica".to_string(), restore.spec.replica.clone()),
-				("bes.au/restore".to_string(), name.to_string()),
+				(
+					"pgro.bes.au/replica".to_string(),
+					restore.spec.replica.clone(),
+				),
+				("pgro.bes.au/restore".to_string(), name.to_string()),
 			])),
 			owner_references: Some(vec![restore_owner_reference(restore)]),
 			..Default::default()
@@ -322,7 +325,7 @@ async fn ensure_restore_service(
 				..Default::default()
 			}]),
 			selector: Some(BTreeMap::from([(
-				"bes.au/restore".to_string(),
+				"pgro.bes.au/restore".to_string(),
 				name.to_string(),
 			)])),
 			..Default::default()
@@ -520,7 +523,7 @@ async fn reconcile_ready(
 
 fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference {
 	OwnerReference {
-		api_version: "bes.au/v1alpha1".to_string(),
+		api_version: "pgro.bes.au/v1alpha1".to_string(),
 		kind: "PostgresPhysicalRestore".to_string(),
 		name: restore.name_any(),
 		uid: restore.uid().unwrap_or_default(),
@@ -557,7 +560,10 @@ async fn cleanup_previous_jobs(
 ) -> Result<()> {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
 	let job_list = jobs
-		.list(&kube::api::ListParams::default().labels(&format!("bes.au/replica={replica_name}")))
+		.list(
+			&kube::api::ListParams::default()
+				.labels(&format!("pgro.bes.au/replica={replica_name}")),
+		)
 		.await?;
 
 	for job in &job_list.items {
@@ -566,7 +572,7 @@ async fn cleanup_previous_jobs(
 			.metadata
 			.labels
 			.as_ref()
-			.and_then(|l| l.get("bes.au/restore"))
+			.and_then(|l| l.get("pgro.bes.au/restore"))
 			.map(|s| s.as_str())
 			.unwrap_or("");
 

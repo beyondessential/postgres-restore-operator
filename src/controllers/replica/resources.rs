@@ -47,7 +47,7 @@ pub fn format_bytes(bytes: u64) -> String {
 
 pub fn owner_reference(replica: &PostgresPhysicalReplica) -> OwnerReference {
 	OwnerReference {
-		api_version: "bes.au/v1alpha1".to_string(),
+		api_version: "pgro.bes.au/v1alpha1".to_string(),
 		kind: "PostgresPhysicalReplica".to_string(),
 		name: replica.name_any(),
 		uid: replica.uid().unwrap_or_default(),
@@ -153,8 +153,11 @@ printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([
-				("bes.au/replica".to_string(), replica_name.clone()),
-				("bes.au/job-type".to_string(), "snapshot-list".to_string()),
+				("pgro.bes.au/replica".to_string(), replica_name.clone()),
+				(
+					"pgro.bes.au/job-type".to_string(),
+					"snapshot-list".to_string(),
+				),
 			])),
 			owner_references: Some(vec![owner_reference(replica)]),
 			..Default::default()
@@ -166,8 +169,11 @@ printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(BTreeMap::from([
-						("bes.au/replica".to_string(), replica_name),
-						("bes.au/job-type".to_string(), "snapshot-list".to_string()),
+						("pgro.bes.au/replica".to_string(), replica_name),
+						(
+							"pgro.bes.au/job-type".to_string(),
+							"snapshot-list".to_string(),
+						),
 					])),
 					..Default::default()
 				}),
@@ -256,12 +262,12 @@ pub async fn create_restore_for_snapshot(
 		);
 		meta.insert(
 			"labels".to_string(),
-			serde_json::json!({ "bes.au/replica": replica_name }),
+			serde_json::json!({ "pgro.bes.au/replica": replica_name }),
 		);
 		meta.insert(
 			"ownerReferences".to_string(),
 			serde_json::json!([{
-				"apiVersion": "bes.au/v1alpha1",
+				"apiVersion": "pgro.bes.au/v1alpha1",
 				"kind": "PostgresPhysicalReplica",
 				"name": replica.name_any(),
 				"uid": replica.uid().unwrap_or_default(),
@@ -311,7 +317,7 @@ pub async fn ensure_credentials_secret(
 			name: Some(secret_name.to_string()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([(
-				"bes.au/replica".to_string(),
+				"pgro.bes.au/replica".to_string(),
 				replica_name.to_string(),
 			)])),
 			owner_references: Some(vec![owner_reference(replica)]),
@@ -379,7 +385,7 @@ pub async fn ensure_service(
 			name: Some(replica_name.to_string()),
 			namespace: Some(namespace.to_string()),
 			labels: Some(BTreeMap::from([(
-				"bes.au/replica".to_string(),
+				"pgro.bes.au/replica".to_string(),
 				replica_name.to_string(),
 			)])),
 			annotations: Some(annotations),
@@ -415,7 +421,7 @@ pub async fn update_service_selector(
 	let patch = serde_json::json!({
 		"spec": {
 			"selector": {
-				"bes.au/restore": restore_name,
+				"pgro.bes.au/restore": restore_name,
 			}
 		}
 	});

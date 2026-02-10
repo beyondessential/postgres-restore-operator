@@ -181,7 +181,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	// 6. Check child PostgresPhysicalRestore resources
 	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), &namespace);
 	let restore_list = restores
-		.list(&kube::api::ListParams::default().labels(&format!("bes.au/replica={name}")))
+		.list(&kube::api::ListParams::default().labels(&format!("pgro.bes.au/replica={name}")))
 		.await?;
 
 	// Find current active restore and any in-progress restores
