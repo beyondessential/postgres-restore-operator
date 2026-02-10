@@ -271,6 +271,7 @@ pub async fn ensure_cnpg_cluster(
 
 	let spec = CnpgClusterSpec {
 		instances: 1,
+		enable_superuser_access: Some(true),
 		image_catalog_ref,
 		image_name: if overlay_config.image_catalog.is_none() {
 			Some(format!("ghcr.io/cloudnative-pg/postgresql:{pg_version}"))

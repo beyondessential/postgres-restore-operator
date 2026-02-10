@@ -29,6 +29,9 @@ pub struct CnpgClusterSpec {
 	pub tolerations: Vec<serde_json::Value>,
 
 	#[serde(skip_serializing_if = "Option::is_none")]
+	pub enable_superuser_access: Option<bool>,
+
+	#[serde(skip_serializing_if = "Option::is_none")]
 	pub managed: Option<CnpgManagedSpec>,
 }
 
@@ -254,6 +257,7 @@ mod tests {
 			resources: None,
 			affinity: None,
 			tolerations: vec![],
+			enable_superuser_access: None,
 			managed: None,
 		};
 		let json = serde_json::to_value(&spec).unwrap();
