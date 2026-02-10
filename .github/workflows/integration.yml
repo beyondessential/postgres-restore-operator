@@ -17,9 +17,42 @@ concurrency:
 
 jobs:
   integration:
-    name: Integration tests
+    name: Integration (${{ matrix.name }})
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: lifecycle
+            tests: >-
+              full_restore_lifecycle
+              invalid_kopia_secret_structure
+              missing_kopia_secret_handled
+            namespaces: >-
+              test-lifecycle
+              test-invalid-secret
+              test-missing-secret
+            needs_non_pg_snapshot: false
+
+          - name: error-paths
+            tests: >-
+              restore_fails_for_non_postgres_data
+              snapshot_job_fails_for_wrong_bucket
+              minimum_ttl_prevents_premature_restore
+            namespaces: >-
+              test-non-pg-data
+              test-wrong-bucket
+              test-min-ttl
+            needs_non_pg_snapshot: true
+
+          - name: switchover
+            tests: >-
+              second_restore_and_switchover
+            namespaces: >-
+              test-switchover
+            needs_non_pg_snapshot: false
+
     steps:
       - uses: actions/checkout@v6
 
@@ -117,6 +150,7 @@ jobs:
           echo "--- Kopia repository ready ---"
 
       - name: Set up non-postgres kopia snapshot
+        if: matrix.needs_non_pg_snapshot
         run: |
           kubectl apply -f tests/fixtures/setup-non-postgres-snapshot.yaml
           for i in $(seq 1 60); do
@@ -166,7 +200,12 @@ jobs:
           done
 
       - name: Run integration tests
-        run: cargo test --test integration -- --ignored --nocapture --test-threads=2
+        run: |
+          for test in ${{ matrix.tests }}; do
+            echo "::group::Running $test"
+            cargo test --test integration -- --ignored --nocapture --exact "$test"
+            echo "::endgroup::"
+          done
         env:
           RUST_LOG: info
 
@@ -183,7 +222,7 @@ jobs:
           kubectl get ns
 
           echo "=== All resources in test namespaces ==="
-          for ns in test-lifecycle test-non-pg-data test-invalid-secret test-missing-secret test-wrong-bucket test-min-ttl test-switchover; do
+          for ns in ${{ matrix.namespaces }}; do
             echo "--- Namespace: $ns ---"
             kubectl get all -n "$ns" 2>/dev/null || true
           done
@@ -204,13 +243,13 @@ jobs:
           kubectl get pvc -A -o wide 2>/dev/null || true
 
           echo "=== Events in test namespaces ==="
-          for ns in test-lifecycle test-non-pg-data test-invalid-secret test-missing-secret test-wrong-bucket test-min-ttl test-switchover; do
+          for ns in ${{ matrix.namespaces }}; do
             echo "--- Events in $ns ---"
             kubectl get events -n "$ns" --sort-by=.lastTimestamp 2>/dev/null || true
           done
 
           echo "=== Failed pod logs ==="
-          for ns in test-lifecycle test-non-pg-data test-invalid-secret test-missing-secret test-wrong-bucket test-min-ttl test-switchover; do
+          for ns in ${{ matrix.namespaces }}; do
             for pod in $(kubectl get pods -n "$ns" --no-headers -o custom-columns=":metadata.name" 2>/dev/null); do
               echo "--- Pod: $ns/$pod ---"
               kubectl logs -n "$ns" "$pod" --all-containers 2>/dev/null || true
