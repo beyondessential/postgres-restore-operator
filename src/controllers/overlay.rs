@@ -684,34 +684,6 @@ pub async fn run_fdw_setup(
 	Ok(())
 }
 
-/// Check if an FDW setup job has completed.
-///
-/// Returns `Some(true)` if succeeded, `Some(false)` if failed, `None` if still running.
-pub async fn check_fdw_setup_job(
-	client: &Client,
-	namespace: &str,
-	replica_name: &str,
-) -> Option<bool> {
-	let job_name = format!("{replica_name}-fdw-setup");
-	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
-
-	let job = jobs.get(&job_name).await.ok()?;
-	let status = job.status.as_ref()?;
-
-	let succeeded = status.succeeded.unwrap_or(0);
-	if succeeded > 0 {
-		return Some(true);
-	}
-
-	let failed = status.failed.unwrap_or(0);
-	let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(3);
-	if failed > backoff_limit {
-		return Some(false);
-	}
-
-	None
-}
-
 #[cfg(test)]
 mod tests {
 	use super::*;

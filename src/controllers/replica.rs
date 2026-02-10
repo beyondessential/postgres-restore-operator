@@ -240,58 +240,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 		ctx.metrics.switchovers_total.inc();
 
-		// Trigger FDW setup in overlay database if configured
-		if replica.spec.overlay_database.is_some() {
-			let pg_version = replica
-				.status
-				.as_ref()
-				.and_then(|s| s.overlay_postgres_version.clone())
-				.unwrap_or_else(|| "17".to_string());
-			let old_restore = replica
-				.status
-				.as_ref()
-				.and_then(|s| s.overlay_fdw_restore.as_deref());
-
-			match overlay::run_fdw_setup(
-				client,
-				&namespace,
-				&replica,
-				&switching_name,
-				&pg_version,
-				old_restore,
-			)
-			.await
-			{
-				Ok(()) => {
-					info!(
-						replica = name,
-						restore = switching_name,
-						"FDW setup job created for overlay switchover"
-					);
-					let patch = serde_json::json!({
-						"status": {
-							"overlayFdwRestore": switching_name,
-						}
-					});
-					replicas
-						.patch_status(
-							&name,
-							&PatchParams::apply("postgres-restore-operator"),
-							&Patch::Merge(&patch),
-						)
-						.await?;
-				}
-				Err(e) => {
-					warn!(
-						replica = name,
-						restore = switching_name,
-						error = %e,
-						"failed to create FDW setup job for overlay"
-					);
-				}
-			}
-		}
-
 		// Send notifications
 		send_restore_notifications(
 			client,
@@ -322,28 +270,105 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
-	// 8. Clean up old restores after grace period
-	// Safety check: if the previous restore's schemas are still imported in the overlay,
-	// they should have been swapped out by the switchover step above.
-	if replica.spec.overlay_database.is_some()
-		&& let (Some(prev_name), Some(fdw_restore)) = (
-			replica
-				.status
-				.as_ref()
-				.and_then(|s| s.previous_restore.as_ref()),
-			replica
-				.status
-				.as_ref()
-				.and_then(|s| s.overlay_fdw_restore.as_ref()),
-		) && prev_name == fdw_restore
-	{
-		warn!(
-			replica = name,
-			previous_restore = prev_name,
-			fdw_restore = fdw_restore,
-			"previous restore still has FDW schemas imported — switchover may not have completed FDW swap"
-		);
+	// 7b. Ensure FDW setup is current for overlay databases.
+	// On each reconciliation, if currentRestore != overlayFdwRestore, we drive
+	// the fdw-setup Job to completion, retrying on failure.
+	if replica.spec.overlay_database.is_some() {
+		let current_restore = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.current_restore.as_ref());
+		let fdw_restore = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.overlay_fdw_restore.as_ref());
+
+		if let Some(current) = current_restore
+			&& fdw_restore.as_ref() != Some(&current)
+		{
+			let job_name = format!("{name}-fdw-setup");
+			let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
+
+			match jobs.get_opt(&job_name).await? {
+				Some(job) => {
+					let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
+					let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+					let backoff_limit =
+						job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(3);
+
+					if succeeded > 0 {
+						info!(replica = name, restore = current, "FDW setup job succeeded");
+						if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+							warn!(job = job_name, error = %e, "failed to delete completed FDW setup job");
+						}
+						let replicas: Api<PostgresPhysicalReplica> =
+							Api::namespaced(client.clone(), &namespace);
+						let patch = serde_json::json!({
+							"status": {
+								"overlayFdwRestore": current,
+							}
+						});
+						replicas
+							.patch_status(
+								&name,
+								&PatchParams::apply("postgres-restore-operator"),
+								&Patch::Merge(&patch),
+							)
+							.await?;
+					} else if failed > backoff_limit {
+						warn!(
+							replica = name,
+							restore = current,
+							"FDW setup job failed, deleting for retry"
+						);
+						let dp = kube::api::DeleteParams {
+							propagation_policy: Some(kube::api::PropagationPolicy::Background),
+							..Default::default()
+						};
+						if let Err(e) = jobs.delete(&job_name, &dp).await {
+							warn!(job = job_name, error = %e, "failed to delete failed FDW setup job");
+						}
+						return Ok(Action::requeue(Duration::from_secs(30)));
+					} else {
+						return Ok(Action::requeue(Duration::from_secs(10)));
+					}
+				}
+				None => {
+					let pg_version = replica
+						.status
+						.as_ref()
+						.and_then(|s| s.overlay_postgres_version.clone())
+						.unwrap_or_else(|| "17".to_string());
+
+					match overlay::run_fdw_setup(
+						client,
+						&namespace,
+						&replica,
+						current,
+						&pg_version,
+						fdw_restore.map(|s| s.as_str()),
+					)
+					.await
+					{
+						Ok(()) => {
+							info!(replica = name, restore = current, "created FDW setup job");
+						}
+						Err(e) => {
+							warn!(
+								replica = name,
+								restore = current,
+								error = %e,
+								"failed to create FDW setup job"
+							);
+						}
+					}
+					return Ok(Action::requeue(Duration::from_secs(10)));
+				}
+			}
+		}
 	}
+
+	// 8. Clean up old restores after grace period
 
 	if let Some(prev_name) = replica
 		.status
