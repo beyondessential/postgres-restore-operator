@@ -109,9 +109,7 @@ kind: ConfigMap
 metadata:
     name: postgres-restore-operator-config
     namespace: pgro-system
-data:
-    maxConcurrentRestores: "2"
-    kopiaImage: "kopia/kopia:0.22.3"
+data: {}
 ---
 apiVersion: v1
 kind: Service
