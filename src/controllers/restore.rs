@@ -502,15 +502,22 @@ if [ -L /pgdata/postgres/current ]; then
 fi
 
 # Fallback: pick the highest version directory containing PG_VERSION
+# Filter to cluster-root directories only (must contain a 'global' subdirectory)
 if [ -z "$PGDATA_DIR" ]; then
-  PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | sort -t/ -k4 -rn | head -1)
+  PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" 2>/dev/null | while read -r f; do
+    dir=$(dirname "$f")
+    [ -d "$dir/global" ] && echo "$dir"
+  done | sort -t/ -k4 -rn | head -1)
 fi
 
 # Last resort: search anywhere under /pgdata
 if [ -z "$PGDATA_DIR" ]; then
   echo "Searching for PG_VERSION recursively..."
   find /pgdata -name "PG_VERSION" 2>/dev/null || true
-  PGDATA_DIR=$(find /pgdata -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | sort -t/ -k4 -rn | head -1)
+  PGDATA_DIR=$(find /pgdata -name "PG_VERSION" 2>/dev/null | while read -r f; do
+    dir=$(dirname "$f")
+    [ -d "$dir/global" ] && echo "$dir"
+  done | sort -t/ -k4 -rn | head -1)
 fi
 
 if [ -z "$PGDATA_DIR" ]; then
@@ -687,8 +694,12 @@ if [ -L /pgdata/postgres/current ]; then
 fi
 
 # Fallback: pick the highest version directory containing PG_VERSION
+# Filter to cluster-root directories only (must contain a 'global' subdirectory)
 if [ -z "$PGDATA_DIR" ]; then
-  PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" -exec dirname {} \; 2>/dev/null | sort -t/ -k4 -rn | head -1)
+  PGDATA_DIR=$(find /pgdata/postgres -name "PG_VERSION" 2>/dev/null | while read -r f; do
+    dir=$(dirname "$f")
+    [ -d "$dir/global" ] && echo "$dir"
+  done | sort -t/ -k4 -rn | head -1)
 fi
 
 if [ -z "$PGDATA_DIR" ]; then
