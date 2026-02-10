@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use kube::ResourceExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::{types::*, util::parse_duration};
 
@@ -43,7 +43,7 @@ pub fn compute_next_scheduled_restore(schedule: &str) -> Option<chrono::DateTime
 pub fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bool {
 	let name = replica.name_any();
 	let Some(schedule) = &replica.spec.schedule else {
-		info!(replica = %name, "no schedule configured, skipping scheduled restore");
+		debug!(replica = %name, "no schedule configured, skipping scheduled restore");
 		return false;
 	};
 
@@ -58,7 +58,7 @@ pub fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bo
 			let elapsed = Utc::now().signed_duration_since(last_completed);
 			if elapsed.to_std().unwrap_or_default() < minimum_ttl {
 				let remaining = minimum_ttl - elapsed.to_std().unwrap_or_default();
-				info!(
+				debug!(
 					replica = %name,
 					minimum_ttl_secs = minimum_ttl.as_secs(),
 					remaining_secs = remaining.as_secs(),
@@ -98,7 +98,7 @@ pub fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bo
 			);
 			return true;
 		}
-		info!(
+		debug!(
 			replica = %name,
 			next_scheduled = %next,
 			trigger_at = %trigger_at,
@@ -124,7 +124,7 @@ pub fn should_trigger_scheduled_restore(replica: &PostgresPhysicalReplica) -> bo
 		return true;
 	}
 
-	info!(
+	debug!(
 		replica = %name,
 		schedule = schedule,
 		"no nextScheduledRestore set and no cron occurrence in 24h lookback window, skipping"

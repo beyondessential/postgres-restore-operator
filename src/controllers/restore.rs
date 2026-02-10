@@ -14,7 +14,7 @@ use kube::{
 	api::{ObjectMeta, Patch, PatchParams, PostParams},
 	runtime::controller::Action,
 };
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::read_job_termination_message;
 use crate::{
@@ -202,7 +202,7 @@ async fn reconcile_restoring(
 	let failed = job_status.as_ref().and_then(|s| s.failed).unwrap_or(0);
 
 	if succeeded > 0 {
-		info!(restore = name, "restore job succeeded");
+		debug!(restore = name, "restore job succeeded");
 
 		let pg_version =
 			read_job_termination_message(client, namespace, &job_name, "restore").await;

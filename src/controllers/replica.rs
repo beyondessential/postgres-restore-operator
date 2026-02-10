@@ -8,7 +8,7 @@ use kube::{
 	runtime::controller::Action,
 };
 use rand::RngExt;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::{overlay, read_job_termination_message};
 use crate::{
@@ -420,7 +420,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	// 9. Decide whether to trigger a new restore
 	if let Some(in_progress) = in_progress_restore {
 		let phase = in_progress.status.as_ref().and_then(|s| s.phase.as_ref());
-		info!(
+		debug!(
 			replica = name,
 			restore = in_progress.name_any(),
 			phase = ?phase,
@@ -519,7 +519,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 					// "{}" means no matching snapshots were found
 					if raw == "{}" {
-						info!(
+						warn!(
 							replica = name,
 							"snapshot list job returned no matching snapshots"
 						);
@@ -536,7 +536,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 						let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
 
 						if current_snapshot_id == Some(&snap.id) {
-							info!(
+							debug!(
 								replica = name,
 								snapshot = snap.id,
 								"latest snapshot already active, skipping"

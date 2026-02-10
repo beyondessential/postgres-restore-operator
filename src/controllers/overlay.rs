@@ -16,7 +16,7 @@ use kube::{
 };
 
 use kube_quantity::ParsedQuantity;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::env_from_secret;
 use crate::{
@@ -343,7 +343,7 @@ pub async fn ensure_cnpg_cluster(
 		.unwrap_or_default();
 
 	if status.is_ready() {
-		info!(
+		debug!(
 			replica = replica_name,
 			cluster = cluster_name,
 			"overlay CNPG cluster is ready"
@@ -386,7 +386,7 @@ pub async fn ensure_overlay_service_annotations(
 	let services: Api<Service> = Api::namespaced(client.clone(), namespace);
 
 	if services.get_opt(&svc_name).await?.is_none() {
-		info!(
+		debug!(
 			replica = replica_name,
 			service = svc_name,
 			"overlay -rw service not yet created by CNPG, skipping annotation patch"
@@ -412,7 +412,7 @@ pub async fn ensure_overlay_service_annotations(
 		)
 		.await?;
 
-	info!(
+	debug!(
 		replica = replica_name,
 		service = svc_name,
 		count = annotations.len(),

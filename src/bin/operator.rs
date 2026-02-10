@@ -13,7 +13,7 @@ use kube::{
 };
 use prometheus::Encoder;
 use tower_http::trace::TraceLayer;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
 	context::Context,
@@ -243,7 +243,7 @@ async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
 	let age = chrono::Utc::now().timestamp() - last;
 	if age <= 30 {
-		info!(heartbeat_age_secs = age, "livez ok");
+		debug!(heartbeat_age_secs = age, "livez ok");
 		(StatusCode::OK, "ok")
 	} else {
 		tracing::warn!(
@@ -259,7 +259,7 @@ async fn readyz(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
 	let age = chrono::Utc::now().timestamp() - last;
 	if age <= 30 {
-		info!(heartbeat_age_secs = age, "readyz ok");
+		debug!(heartbeat_age_secs = age, "readyz ok");
 		(StatusCode::OK, "ok")
 	} else {
 		tracing::warn!(
