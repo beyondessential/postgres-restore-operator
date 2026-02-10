@@ -76,6 +76,8 @@ spec:
                         value: /tmp/kopia/logs
                       - name: KOPIA_CACHE_DIRECTORY
                         value: /tmp/kopia/cache
+                      - name: KOPIA_PASSWORD
+                        value: test-repo-password
                       - name: USER
                         value: kopia
                   volumeMounts:
