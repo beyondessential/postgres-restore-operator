@@ -283,9 +283,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.as_ref()
 			.and_then(|s| s.overlay_fdw_restore.as_ref());
 
+		debug!(
+			replica = name,
+			current_restore = ?current_restore,
+			fdw_restore = ?fdw_restore,
+			"checking if FDW setup is needed"
+		);
+
 		if let Some(current) = current_restore
 			&& fdw_restore.as_ref() != Some(&current)
 		{
+			info!(
+				replica = name,
+				current_restore = %current,
+				fdw_restore = ?fdw_restore,
+				"FDW setup needed: current restore differs from overlay FDW restore"
+			);
 			match overlay::setup_fdw(
 				client,
 				&namespace,
@@ -296,6 +309,11 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.await
 			{
 				Ok(()) => {
+					info!(
+						replica = name,
+						restore = current,
+						"FDW setup succeeded, updating overlayFdwRestore status"
+					);
 					let replicas: Api<PostgresPhysicalReplica> =
 						Api::namespaced(client.clone(), &namespace);
 					let patch = serde_json::json!({
@@ -310,6 +328,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							&Patch::Merge(&patch),
 						)
 						.await?;
+					debug!(replica = name, "overlayFdwRestore status patched");
 				}
 				Err(e) => {
 					warn!(

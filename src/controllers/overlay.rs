@@ -171,6 +171,11 @@ pub async fn ensure_fdw_credentials(
 	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
 
 	if secrets.get_opt(&secret_name).await?.is_some() {
+		debug!(
+			replica = replica_name,
+			secret = secret_name,
+			"FDW credentials secret already exists, skipping creation"
+		);
 		return Ok(());
 	}
 
@@ -440,8 +445,6 @@ fn read_secret_field(secret: &Secret, key: &str) -> Result<String> {
 }
 
 /// Set up FDW in the overlay database by connecting directly via tokio-postgres.
-///
-/// This replaces the previous Job-based approach — no container is spawned.
 pub async fn setup_fdw(
 	client: &Client,
 	namespace: &str,
@@ -455,21 +458,37 @@ pub async fn setup_fdw(
 	let superuser_secret_name = format!("{cluster_name}-superuser");
 	let server_name = overlay_fdw_server_name(restore_name);
 
+	info!(
+		replica = %replica_name,
+		restore = %restore_name,
+		old_restore = ?old_restore,
+		server = %server_name,
+		"starting FDW setup"
+	);
+
 	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	debug!(
+		superuser_secret = %superuser_secret_name,
+		fdw_secret = %fdw_secret_name,
+		"fetching secrets for FDW setup"
+	);
 	let su_secret = secrets.get(&superuser_secret_name).await?;
 	let fdw_secret = secrets.get(&fdw_secret_name).await?;
+	debug!("successfully fetched both FDW secrets");
 
 	let overlay_user = read_secret_field(&su_secret, "username")?;
 	let overlay_password = read_secret_field(&su_secret, "password")?;
 	let fdw_user = read_secret_field(&fdw_secret, "username")?;
 	let fdw_password = read_secret_field(&fdw_secret, "password")?;
+	debug!(overlay_user = %overlay_user, fdw_user = %fdw_user, "read credentials from secrets");
 
 	let overlay_host = format!("{cluster_name}-rw.{namespace}.svc");
 	let overlay_connstr = format!(
-		"host={overlay_host} port=5432 dbname=postgres user={} password={} connect_timeout=10",
+		"host={overlay_host} port=5432 dbname=app user={} password={} connect_timeout=10",
 		overlay_user, overlay_password,
 	);
 
+	info!(host = %overlay_host, "connecting to overlay database");
 	let (overlay_pg, overlay_conn) = tokio_postgres::connect(&overlay_connstr, NoTls).await?;
 	tokio::spawn(async move {
 		if let Err(e) = overlay_conn.await {
@@ -484,15 +503,18 @@ pub async fn setup_fdw(
 		overlay_pg
 			.batch_execute(&format!("DROP SERVER IF EXISTS {old_server} CASCADE"))
 			.await?;
+		debug!(old_server = %old_server, "old FDW server dropped");
 	}
 
 	// Install extension in a dedicated schema to avoid cascade issues with public
+	debug!("ensuring _pgro schema and postgres_fdw extension exist");
 	overlay_pg
 		.batch_execute("CREATE SCHEMA IF NOT EXISTS _pgro")
 		.await?;
 	overlay_pg
 		.batch_execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro")
 		.await?;
+	debug!("_pgro schema and postgres_fdw extension ready");
 
 	let restore_host = format!("{restore_name}.{namespace}.svc");
 	info!(
@@ -508,7 +530,9 @@ pub async fn setup_fdw(
 			quote_literal(&restore_host),
 		))
 		.await?;
+	debug!(server = %server_name, host = %restore_host, "FDW server created/verified");
 
+	debug!(server = %server_name, "recreating user mapping");
 	overlay_pg
 		.batch_execute(&format!(
 			"DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER {server_name}"
@@ -522,6 +546,7 @@ pub async fn setup_fdw(
 			quote_literal(&fdw_password),
 		))
 		.await?;
+	debug!(server = %server_name, fdw_user = %fdw_user, "user mapping created");
 
 	// Resolve schema mapping
 	let schemas: Vec<(String, String)> = if let Some(mapping) = replica
@@ -530,21 +555,35 @@ pub async fn setup_fdw(
 		.as_ref()
 		.and_then(|c| c.schema_mapping.as_ref())
 	{
-		mapping
+		let result: Vec<_> = mapping
 			.iter()
 			.map(|(k, v)| (k.clone(), v.clone()))
-			.collect()
+			.collect();
+		info!(
+			replica = %replica_name,
+			schema_count = result.len(),
+			"using explicit schema mapping from spec"
+		);
+		debug!(schemas = ?result, "explicit schema mapping entries");
+		result
 	} else {
+		info!(
+			replica = %replica_name,
+			restore_host = %restore_host,
+			"no explicit schema mapping, discovering schemas from restore database"
+		);
 		let restore_connstr = format!(
-			"host={restore_host} port=5432 dbname=postgres user={} password={} connect_timeout=10",
+			"host={restore_host} port=5432 dbname=app user={} password={} connect_timeout=10",
 			fdw_user, fdw_password,
 		);
+		debug!(host = %restore_host, "connecting to restore database for schema discovery");
 		let (restore_pg, restore_conn) = tokio_postgres::connect(&restore_connstr, NoTls).await?;
 		tokio::spawn(async move {
 			if let Err(e) = restore_conn.await {
 				warn!(error = %e, "restore database connection error");
 			}
 		});
+		debug!("connected to restore database");
 
 		let rows = restore_pg
 			.query(
@@ -553,29 +592,51 @@ pub async fn setup_fdw(
 				&[],
 			)
 			.await?;
-		rows.iter()
+		let result: Vec<_> = rows
+			.iter()
 			.map(|row| {
 				let name: String = row.get(0);
 				(name.clone(), name)
 			})
-			.collect()
+			.collect();
+		info!(
+			replica = %replica_name,
+			schema_count = result.len(),
+			"discovered schemas from restore database"
+		);
+		debug!(schemas = ?result, "discovered schema entries");
+		result
 	};
 
-	for (remote, local) in &schemas {
-		info!(remote = %remote, local = %local, "importing foreign schema");
+	for (i, (remote, local)) in schemas.iter().enumerate() {
+		info!(
+			remote = %remote,
+			local = %local,
+			progress = format!("{}/{}", i + 1, schemas.len()),
+			"importing foreign schema"
+		);
 		let local_quoted = quote_ident(local);
 		let remote_quoted = quote_ident(remote);
+		debug!(local = %local, "dropping existing local schema if present");
 		overlay_pg
 			.batch_execute(&format!("DROP SCHEMA IF EXISTS {local_quoted} CASCADE"))
 			.await?;
+		debug!(local = %local, "creating local schema");
 		overlay_pg
 			.batch_execute(&format!("CREATE SCHEMA {local_quoted}"))
 			.await?;
+		debug!(
+			remote = %remote,
+			local = %local,
+			server = %server_name,
+			"executing IMPORT FOREIGN SCHEMA"
+		);
 		overlay_pg
 			.batch_execute(&format!(
 				"IMPORT FOREIGN SCHEMA {remote_quoted} FROM SERVER {server_name} INTO {local_quoted}"
 			))
 			.await?;
+		debug!(remote = %remote, local = %local, "foreign schema imported successfully");
 	}
 
 	info!(
@@ -614,8 +675,12 @@ pub async fn reconcile_overlay(
 	let replica_name = replica.name_any();
 	let overlay_config = match &replica.spec.overlay_database {
 		Some(c) => c,
-		None => return Ok((false, String::new(), String::new())),
+		None => {
+			debug!(replica = %replica_name, "no overlay database configured, skipping");
+			return Ok((false, String::new(), String::new()));
+		}
 	};
+	debug!(replica = %replica_name, "reconciling overlay database");
 
 	let pg_version = resolve_postgres_version(client, replica).await?;
 
@@ -629,6 +694,13 @@ pub async fn reconcile_overlay(
 		.as_ref()
 		.and_then(|s| s.overlay_storage_size.as_deref());
 	let storage_size = ratchet_storage_size(&computed_size, current_size);
+	debug!(
+		replica = %replica_name,
+		pg_version = %pg_version,
+		computed_size = %computed_size,
+		storage_size = %storage_size,
+		"resolved overlay parameters"
+	);
 
 	ensure_fdw_credentials(client, namespace, &replica_name, replica).await?;
 
