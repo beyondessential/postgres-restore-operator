@@ -1,4 +1,7 @@
-use std::{collections::BTreeMap, iter::FromIterator};
+use std::{
+	collections::{BTreeMap, HashSet},
+	iter::FromIterator,
+};
 
 use k8s_openapi::{
 	ByteString,
@@ -444,112 +447,137 @@ fn read_secret_field(secret: &Secret, key: &str) -> Result<String> {
 		.map_err(|_| Error::MissingField(format!("secret key {key} is not valid UTF-8")))
 }
 
-/// Set up FDW in the overlay database by connecting directly via tokio-postgres.
-pub async fn setup_fdw(
-	client: &Client,
+/// Connect to the overlay database and return a tokio-postgres client.
+async fn connect_overlay(
+	cluster_name: &str,
 	namespace: &str,
-	replica: &PostgresPhysicalReplica,
-	restore_name: &str,
-	old_restore: Option<&str>,
-) -> Result<()> {
-	let replica_name = replica.name_any();
-	let cluster_name = overlay_cluster_name(&replica_name);
-	let fdw_secret_name = overlay_fdw_secret_name(&replica_name);
-	let superuser_secret_name = format!("{cluster_name}-superuser");
-	let server_name = overlay_fdw_server_name(restore_name);
-
-	info!(
-		replica = %replica_name,
-		restore = %restore_name,
-		old_restore = ?old_restore,
-		server = %server_name,
-		"starting FDW setup"
-	);
-
-	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-	debug!(
-		superuser_secret = %superuser_secret_name,
-		fdw_secret = %fdw_secret_name,
-		"fetching secrets for FDW setup"
-	);
-	let su_secret = secrets.get(&superuser_secret_name).await?;
-	let fdw_secret = secrets.get(&fdw_secret_name).await?;
-	debug!("successfully fetched both FDW secrets");
-
-	let overlay_user = read_secret_field(&su_secret, "username")?;
-	let overlay_password = read_secret_field(&su_secret, "password")?;
-	let fdw_user = read_secret_field(&fdw_secret, "username")?;
-	let fdw_password = read_secret_field(&fdw_secret, "password")?;
-	debug!(overlay_user = %overlay_user, fdw_user = %fdw_user, "read credentials from secrets");
-
+	su_secret: &Secret,
+) -> Result<tokio_postgres::Client> {
+	let overlay_user = read_secret_field(su_secret, "username")?;
+	let overlay_password = read_secret_field(su_secret, "password")?;
 	let overlay_host = format!("{cluster_name}-rw.{namespace}.svc");
 	let overlay_connstr = format!(
 		"host={overlay_host} port=5432 dbname=app user={} password={} connect_timeout=10",
 		overlay_user, overlay_password,
 	);
 
-	info!(host = %overlay_host, "connecting to overlay database");
-	let (overlay_pg, overlay_conn) = tokio_postgres::connect(&overlay_connstr, NoTls).await?;
+	debug!(host = %overlay_host, "connecting to overlay database");
+	let (pg, conn) = tokio_postgres::connect(&overlay_connstr, NoTls).await?;
 	tokio::spawn(async move {
-		if let Err(e) = overlay_conn.await {
+		if let Err(e) = conn.await {
 			warn!(error = %e, "overlay database connection error");
 		}
 	});
+	info!(host = %overlay_host, "connected to overlay database");
+	Ok(pg)
+}
 
-	// Drop old FDW server if switching from a previous restore
-	if let Some(old) = old_restore {
-		let old_server = overlay_fdw_server_name(old);
-		info!(replica = %replica_name, old_server = %old_server, "dropping old FDW server");
-		overlay_pg
-			.batch_execute(&format!("DROP SERVER IF EXISTS {old_server} CASCADE"))
-			.await?;
-		debug!(old_server = %old_server, "old FDW server dropped");
-	}
+/// Query the overlay database to determine the current FDW state.
+///
+/// Returns `(has_extension, server_host_if_exists, has_user_mapping, schemas_with_foreign_tables)`.
+async fn check_fdw_state(
+	pg: &tokio_postgres::Client,
+	server_name: &str,
+) -> Result<(bool, Option<String>, bool, HashSet<String>)> {
+	let has_extension = pg
+		.query_opt(
+			"SELECT 1 FROM pg_extension WHERE extname = 'postgres_fdw'",
+			&[],
+		)
+		.await?
+		.is_some();
+	debug!(has_extension, "checked postgres_fdw extension");
 
-	// Install extension in a dedicated schema to avoid cascade issues with public
-	debug!("ensuring _pgro schema and postgres_fdw extension exist");
-	overlay_pg
-		.batch_execute("CREATE SCHEMA IF NOT EXISTS _pgro")
-		.await?;
-	overlay_pg
-		.batch_execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro")
-		.await?;
-	debug!("_pgro schema and postgres_fdw extension ready");
+	let server_host: Option<String> = pg
+		.query_opt(
+			"SELECT option_value FROM pg_options_to_table( \
+			   (SELECT srvoptions FROM pg_foreign_server WHERE srvname = $1) \
+			 ) WHERE option_name = 'host'",
+			&[&server_name],
+		)
+		.await?
+		.map(|row| row.get(0));
+	debug!(server = server_name, host = ?server_host, "checked FDW server");
 
-	let restore_host = format!("{restore_name}.{namespace}.svc");
-	info!(
-		replica = %replica_name,
-		server = %server_name,
-		restore = %restore_name,
-		"creating FDW server"
+	let has_user_mapping = pg
+		.query_opt(
+			"SELECT 1 FROM pg_user_mappings WHERE srvname = $1 AND usename = current_user",
+			&[&server_name],
+		)
+		.await?
+		.is_some();
+	debug!(
+		server = server_name,
+		has_user_mapping, "checked user mapping"
 	);
-	overlay_pg
-		.batch_execute(&format!(
-			"CREATE SERVER IF NOT EXISTS {server_name} FOREIGN DATA WRAPPER postgres_fdw \
-			 OPTIONS (host {}, port '5432', dbname 'postgres')",
-			quote_literal(&restore_host),
-		))
-		.await?;
-	debug!(server = %server_name, host = %restore_host, "FDW server created/verified");
 
-	debug!(server = %server_name, "recreating user mapping");
-	overlay_pg
-		.batch_execute(&format!(
-			"DROP USER MAPPING IF EXISTS FOR CURRENT_USER SERVER {server_name}"
-		))
+	let schema_rows = pg
+		.query(
+			"SELECT DISTINCT ft.foreign_table_schema \
+			 FROM information_schema.foreign_tables ft \
+			 WHERE ft.foreign_server_name = $1",
+			&[&server_name],
+		)
 		.await?;
-	overlay_pg
-		.batch_execute(&format!(
-			"CREATE USER MAPPING FOR CURRENT_USER SERVER {server_name} \
-			 OPTIONS (user {}, password {})",
-			quote_literal(&fdw_user),
-			quote_literal(&fdw_password),
-		))
-		.await?;
-	debug!(server = %server_name, fdw_user = %fdw_user, "user mapping created");
+	let schemas_with_fts: HashSet<String> = schema_rows.iter().map(|row| row.get(0)).collect();
+	debug!(
+		server = server_name,
+		schemas = ?schemas_with_fts,
+		"checked schemas with foreign tables"
+	);
 
-	// Resolve schema mapping
-	let schemas: Vec<(String, String)> = if let Some(mapping) = replica
+	Ok((
+		has_extension,
+		server_host,
+		has_user_mapping,
+		schemas_with_fts,
+	))
+}
+
+/// Find all FDW servers owned by this operator (matching the `fdw_` prefix)
+/// that are not the expected current server, and drop them.
+async fn drop_stale_fdw_servers(
+	pg: &tokio_postgres::Client,
+	current_server: &str,
+	replica_name: &str,
+) -> Result<()> {
+	let rows = pg
+		.query(
+			"SELECT srvname FROM pg_foreign_server WHERE srvname LIKE 'fdw_%'",
+			&[],
+		)
+		.await?;
+
+	for row in &rows {
+		let name: String = row.get(0);
+		if name != current_server {
+			info!(
+				replica = replica_name,
+				stale_server = %name,
+				"dropping stale FDW server"
+			);
+			pg.batch_execute(&format!(
+				"DROP SERVER IF EXISTS {} CASCADE",
+				quote_ident(&name)
+			))
+			.await?;
+		}
+	}
+	Ok(())
+}
+
+/// Resolve which schemas to import via FDW.
+///
+/// Uses the explicit `schema_mapping` from the spec if present, otherwise
+/// discovers user schemas from the restore database.
+async fn resolve_fdw_schemas(
+	replica: &PostgresPhysicalReplica,
+	restore_host: &str,
+	fdw_user: &str,
+	fdw_password: &str,
+	replica_name: &str,
+) -> Result<Vec<(String, String)>> {
+	if let Some(mapping) = replica
 		.spec
 		.overlay_database
 		.as_ref()
@@ -560,61 +588,211 @@ pub async fn setup_fdw(
 			.map(|(k, v)| (k.clone(), v.clone()))
 			.collect();
 		info!(
-			replica = %replica_name,
+			replica = replica_name,
 			schema_count = result.len(),
 			"using explicit schema mapping from spec"
 		);
 		debug!(schemas = ?result, "explicit schema mapping entries");
-		result
-	} else {
-		info!(
-			replica = %replica_name,
-			restore_host = %restore_host,
-			"no explicit schema mapping, discovering schemas from restore database"
-		);
-		let restore_connstr = format!(
-			"host={restore_host} port=5432 dbname=app user={} password={} connect_timeout=10",
-			fdw_user, fdw_password,
-		);
-		debug!(host = %restore_host, "connecting to restore database for schema discovery");
-		let (restore_pg, restore_conn) = tokio_postgres::connect(&restore_connstr, NoTls).await?;
-		tokio::spawn(async move {
-			if let Err(e) = restore_conn.await {
-				warn!(error = %e, "restore database connection error");
-			}
-		});
-		debug!("connected to restore database");
+		return Ok(result);
+	}
 
-		let rows = restore_pg
-			.query(
-				"SELECT schema_name FROM information_schema.schemata \
-				 WHERE schema_name NOT LIKE 'pg_%' AND schema_name != 'information_schema'",
-				&[],
-			)
+	info!(
+		replica = replica_name,
+		restore_host = restore_host,
+		"no explicit schema mapping, discovering schemas from restore database"
+	);
+	let restore_connstr = format!(
+		"host={restore_host} port=5432 dbname=app user={fdw_user} password={fdw_password} connect_timeout=10",
+	);
+	debug!(
+		host = restore_host,
+		"connecting to restore database for schema discovery"
+	);
+	let (restore_pg, restore_conn) = tokio_postgres::connect(&restore_connstr, NoTls).await?;
+	tokio::spawn(async move {
+		if let Err(e) = restore_conn.await {
+			warn!(error = %e, "restore database connection error");
+		}
+	});
+	debug!("connected to restore database");
+
+	let rows = restore_pg
+		.query(
+			"SELECT schema_name FROM information_schema.schemata \
+			 WHERE schema_name NOT LIKE 'pg_%' AND schema_name != 'information_schema'",
+			&[],
+		)
+		.await?;
+	let result: Vec<_> = rows
+		.iter()
+		.map(|row| {
+			let name: String = row.get(0);
+			(name.clone(), name)
+		})
+		.collect();
+	info!(
+		replica = replica_name,
+		schema_count = result.len(),
+		"discovered schemas from restore database"
+	);
+	debug!(schemas = ?result, "discovered schema entries");
+	Ok(result)
+}
+
+/// Reconcile FDW state in the overlay database.
+///
+/// Connects to the overlay, inspects the current FDW state (extension, server,
+/// user mapping, imported schemas), and fixes only what is missing or incorrect.
+/// Stale FDW servers from previous restores are dropped automatically.
+pub async fn reconcile_fdw(
+	client: &Client,
+	namespace: &str,
+	replica: &PostgresPhysicalReplica,
+	restore_name: &str,
+) -> Result<()> {
+	let replica_name = replica.name_any();
+	let cluster_name = overlay_cluster_name(&replica_name);
+	let fdw_secret_name = overlay_fdw_secret_name(&replica_name);
+	let superuser_secret_name = format!("{cluster_name}-superuser");
+	let server_name = overlay_fdw_server_name(restore_name);
+	let restore_host = format!("{restore_name}.{namespace}.svc");
+
+	info!(
+		replica = %replica_name,
+		restore = %restore_name,
+		server = %server_name,
+		"reconciling FDW state"
+	);
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	debug!(
+		superuser_secret = %superuser_secret_name,
+		fdw_secret = %fdw_secret_name,
+		"fetching secrets for FDW reconciliation"
+	);
+	let su_secret = secrets.get(&superuser_secret_name).await?;
+	let fdw_secret = secrets.get(&fdw_secret_name).await?;
+
+	let fdw_user = read_secret_field(&fdw_secret, "username")?;
+	let fdw_password = read_secret_field(&fdw_secret, "password")?;
+
+	let overlay_pg = connect_overlay(&cluster_name, namespace, &su_secret).await?;
+
+	// Check current state
+	let (has_extension, server_host, has_user_mapping, schemas_with_fts) =
+		check_fdw_state(&overlay_pg, &server_name).await?;
+
+	let server_host_correct = server_host.as_deref() == Some(&restore_host);
+
+	info!(
+		replica = %replica_name,
+		has_extension,
+		server_exists = server_host.is_some(),
+		server_host_correct,
+		has_user_mapping,
+		foreign_table_schemas = schemas_with_fts.len(),
+		"current FDW state in overlay database"
+	);
+
+	// Drop stale servers from previous restores
+	drop_stale_fdw_servers(&overlay_pg, &server_name, &replica_name).await?;
+
+	// Ensure _pgro schema and extension
+	if !has_extension {
+		info!(replica = %replica_name, "creating _pgro schema and postgres_fdw extension");
+		overlay_pg
+			.batch_execute("CREATE SCHEMA IF NOT EXISTS _pgro")
 			.await?;
-		let result: Vec<_> = rows
-			.iter()
-			.map(|row| {
-				let name: String = row.get(0);
-				(name.clone(), name)
-			})
-			.collect();
+		overlay_pg
+			.batch_execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro")
+			.await?;
+	} else {
+		debug!(replica = %replica_name, "postgres_fdw extension already present");
+	}
+
+	// Ensure FDW server with correct host
+	if server_host.is_none() {
 		info!(
 			replica = %replica_name,
-			schema_count = result.len(),
-			"discovered schemas from restore database"
+			server = %server_name,
+			host = %restore_host,
+			"creating FDW server"
 		);
-		debug!(schemas = ?result, "discovered schema entries");
-		result
-	};
+		overlay_pg
+			.batch_execute(&format!(
+				"CREATE SERVER {server_name} FOREIGN DATA WRAPPER postgres_fdw \
+				 OPTIONS (host {}, port '5432', dbname 'postgres')",
+				quote_literal(&restore_host),
+			))
+			.await?;
+	} else if !server_host_correct {
+		info!(
+			replica = %replica_name,
+			server = %server_name,
+			old_host = ?server_host,
+			new_host = %restore_host,
+			"updating FDW server host"
+		);
+		overlay_pg
+			.batch_execute(&format!(
+				"ALTER SERVER {server_name} OPTIONS (SET host {})",
+				quote_literal(&restore_host),
+			))
+			.await?;
+	} else {
+		debug!(
+			replica = %replica_name,
+			server = %server_name,
+			"FDW server already correct"
+		);
+	}
 
-	for (i, (remote, local)) in schemas.iter().enumerate() {
+	// Ensure user mapping (always recreate to pick up credential changes)
+	if has_user_mapping {
+		debug!(server = %server_name, "dropping existing user mapping before recreation");
+		overlay_pg
+			.batch_execute(&format!(
+				"DROP USER MAPPING FOR CURRENT_USER SERVER {server_name}"
+			))
+			.await?;
+	}
+	info!(server = %server_name, fdw_user = %fdw_user, "creating user mapping");
+	overlay_pg
+		.batch_execute(&format!(
+			"CREATE USER MAPPING FOR CURRENT_USER SERVER {server_name} \
+			 OPTIONS (user {}, password {})",
+			quote_literal(&fdw_user),
+			quote_literal(&fdw_password),
+		))
+		.await?;
+
+	// Resolve expected schemas and import any that are missing
+	let schemas = resolve_fdw_schemas(
+		replica,
+		&restore_host,
+		&fdw_user,
+		&fdw_password,
+		&replica_name,
+	)
+	.await?;
+
+	let mut imported_count = 0u32;
+	for (remote, local) in &schemas {
+		if schemas_with_fts.contains(local) {
+			debug!(
+				local = %local,
+				remote = %remote,
+				"schema already has foreign tables, skipping import"
+			);
+			continue;
+		}
+
 		info!(
 			remote = %remote,
 			local = %local,
-			progress = format!("{}/{}", i + 1, schemas.len()),
 			"importing foreign schema"
 		);
+		imported_count += 1;
 		let local_quoted = quote_ident(local);
 		let remote_quoted = quote_ident(remote);
 		debug!(local = %local, "dropping existing local schema if present");
@@ -642,8 +820,10 @@ pub async fn setup_fdw(
 	info!(
 		replica = %replica_name,
 		restore = %restore_name,
-		schema_count = schemas.len(),
-		"FDW setup complete"
+		total_schemas = schemas.len(),
+		schemas_imported = imported_count,
+		schemas_skipped = schemas.len() as u32 - imported_count,
+		"FDW reconciliation complete"
 	);
 
 	Ok(())

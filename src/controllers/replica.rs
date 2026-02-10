@@ -270,9 +270,10 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
-	// 7b. Ensure FDW setup is current for overlay databases.
-	// On each reconciliation, if currentRestore != overlayFdwRestore, connect
-	// directly to the overlay and restore databases to set up FDW.
+	// 7b. Reconcile FDW state for overlay databases.
+	// Always verify and fix the actual FDW state inside the overlay database
+	// rather than relying solely on the status field, which can become stale
+	// if the overlay cluster is reset.
 	if replica.spec.overlay_database.is_some() {
 		let current_restore = replica
 			.status
@@ -283,63 +284,54 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.as_ref()
 			.and_then(|s| s.overlay_fdw_restore.as_ref());
 
-		debug!(
-			replica = name,
-			current_restore = ?current_restore,
-			fdw_restore = ?fdw_restore,
-			"checking if FDW setup is needed"
-		);
-
-		if let Some(current) = current_restore
-			&& fdw_restore.as_ref() != Some(&current)
-		{
-			info!(
+		if let Some(current) = current_restore {
+			debug!(
 				replica = name,
 				current_restore = %current,
 				fdw_restore = ?fdw_restore,
-				"FDW setup needed: current restore differs from overlay FDW restore"
+				"reconciling FDW state in overlay database"
 			);
-			match overlay::setup_fdw(
-				client,
-				&namespace,
-				&replica,
-				current,
-				fdw_restore.map(|s| s.as_str()),
-			)
-			.await
-			{
+
+			match overlay::reconcile_fdw(client, &namespace, &replica, current).await {
 				Ok(()) => {
-					info!(
-						replica = name,
-						restore = current,
-						"FDW setup succeeded, updating overlayFdwRestore status"
-					);
-					let replicas: Api<PostgresPhysicalReplica> =
-						Api::namespaced(client.clone(), &namespace);
-					let patch = serde_json::json!({
-						"status": {
-							"overlayFdwRestore": current,
-						}
-					});
-					replicas
-						.patch_status(
-							&name,
-							&PatchParams::apply("postgres-restore-operator"),
-							&Patch::Merge(&patch),
-						)
-						.await?;
-					debug!(replica = name, "overlayFdwRestore status patched");
+					if fdw_restore.as_ref() != Some(&current) {
+						info!(
+							replica = name,
+							restore = current,
+							"FDW reconciled, updating overlayFdwRestore status"
+						);
+						let replicas: Api<PostgresPhysicalReplica> =
+							Api::namespaced(client.clone(), &namespace);
+						let patch = serde_json::json!({
+							"status": {
+								"overlayFdwRestore": current,
+							}
+						});
+						replicas
+							.patch_status(
+								&name,
+								&PatchParams::apply("postgres-restore-operator"),
+								&Patch::Merge(&patch),
+							)
+							.await?;
+						debug!(replica = name, "overlayFdwRestore status patched");
+					}
 				}
 				Err(e) => {
 					warn!(
 						replica = name,
 						restore = current,
 						error = %e,
-						"FDW setup failed, will retry"
+						"FDW reconciliation failed, will retry"
 					);
 					return Ok(Action::requeue(Duration::from_secs(30)));
 				}
 			}
+		} else {
+			debug!(
+				replica = name,
+				"no current restore set, skipping FDW reconciliation"
+			);
 		}
 	}
 
