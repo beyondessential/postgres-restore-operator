@@ -24,18 +24,19 @@ spec:
                 - name: init-pgdata
                   image: postgres:16
                   imagePullPolicy: IfNotPresent
+                  securityContext:
+                      runAsUser: 0
                   command: ["/bin/sh", "-c"]
                   args:
                       - |
                           set -e
                           echo "Initializing PostgreSQL data directory..."
-                          initdb -D /pgdata/16/main --no-locale --encoding=UTF8 --auth=trust
+                          mkdir -p /pgdata/16/main
+                          chown postgres:postgres /pgdata/16/main
+                          gosu postgres initdb -D /pgdata/16/main --no-locale --encoding=UTF8 --auth=trust
                           echo "PostgreSQL data directory initialized"
                           ls -la /pgdata/16/main/
                           cat /pgdata/16/main/PG_VERSION
-                  env:
-                      - name: POSTGRES_HOST_AUTH_METHOD
-                        value: trust
                   volumeMounts:
                       - name: pgdata
                         mountPath: /pgdata
