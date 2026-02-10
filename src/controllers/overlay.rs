@@ -485,7 +485,8 @@ OVERLAY_CONNSTR="host={cluster_name}-rw.{namespace}.svc port=5432 dbname=postgre
 {old_server_drop}
 
 echo "Setting up FDW extension..."
-psql "$OVERLAY_CONNSTR" -c "CREATE EXTENSION IF NOT EXISTS postgres_fdw;"
+psql "$OVERLAY_CONNSTR" -c "CREATE SCHEMA IF NOT EXISTS _pgro;"
+psql "$OVERLAY_CONNSTR" -c "CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro;"
 
 echo "Creating FDW server '{server_name}' -> {restore_name}..."
 psql "$OVERLAY_CONNSTR" -c "CREATE SERVER IF NOT EXISTS {server_name} FOREIGN DATA WRAPPER postgres_fdw OPTIONS (host '{restore_name}.{namespace}.svc', port '5432', dbname 'postgres');"
@@ -851,7 +852,8 @@ mod tests {
 		let job = build_fdw_setup_job(&replica, "test-restore-1", "default", "17", None).unwrap();
 		let pod_spec = job.spec.unwrap().template.spec.unwrap();
 		let script = &pod_spec.containers[0].args.as_ref().unwrap()[0];
-		assert!(script.contains("CREATE EXTENSION IF NOT EXISTS postgres_fdw"));
+		assert!(script.contains("CREATE SCHEMA IF NOT EXISTS _pgro"));
+		assert!(script.contains("CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro"));
 		assert!(script.contains("CREATE SERVER IF NOT EXISTS fdw_test_restore_1"));
 		assert!(!script.contains("DROP SERVER"));
 	}
