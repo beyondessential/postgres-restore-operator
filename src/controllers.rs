@@ -2,6 +2,7 @@ use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector};
 
 use kube::{Api, Client};
 
+pub mod overlay;
 pub mod replica;
 pub mod restore;
 

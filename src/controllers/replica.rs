@@ -23,7 +23,7 @@ use rand::RngExt;
 use serde::Deserialize;
 use tracing::{info, warn};
 
-use super::{env_from_secret, env_from_secret_optional, read_job_termination_message};
+use super::{env_from_secret, env_from_secret_optional, overlay, read_job_termination_message};
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -56,7 +56,7 @@ fn calculate_jitter(replica_name: &str, max_jitter: Duration) -> Duration {
 }
 
 /// Generate a random password for analytics credentials.
-fn generate_password() -> String {
+pub(crate) fn generate_password() -> String {
 	let mut rng = rand::rng();
 	let chars: Vec<char> = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 		.chars()
@@ -154,6 +154,55 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	};
 	update_replica_connection_info(client, &namespace, &name, &conn_info).await?;
 
+	// 5b. Reconcile overlay database if configured
+	if replica.spec.overlay_database.is_some() {
+		// Try to get snapshot size from active restore
+		let restores_api: Api<PostgresPhysicalRestore> =
+			Api::namespaced(client.clone(), &namespace);
+		let snapshot_bytes = if let Some(current_restore_name) = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.current_restore.as_ref())
+		{
+			if let Ok(current_restore) = restores_api.get(current_restore_name).await {
+				parse_snapshot_size_bytes(&current_restore.spec.snapshot_size)
+			} else {
+				0
+			}
+		} else {
+			0
+		};
+
+		match overlay::reconcile_overlay(client, &namespace, &replica, snapshot_bytes).await {
+			Ok((cluster_ready, storage_size, pg_version)) => {
+				let replicas_api: Api<PostgresPhysicalReplica> =
+					Api::namespaced(client.clone(), &namespace);
+				let cluster_name = overlay::overlay_cluster_name(&name);
+				let patch = serde_json::json!({
+					"status": {
+						"overlayClusterName": cluster_name,
+						"overlayStorageSize": storage_size,
+						"overlayPostgresVersion": pg_version,
+					}
+				});
+				replicas_api
+					.patch_status(
+						&name,
+						&PatchParams::apply("postgres-restore-operator"),
+						&Patch::Merge(&patch),
+					)
+					.await?;
+
+				if !cluster_ready {
+					info!(replica = name, "overlay cluster not yet ready, will retry");
+				}
+			}
+			Err(e) => {
+				warn!(replica = name, error = %e, "failed to reconcile overlay database");
+			}
+		}
+	}
+
 	// 6. Check child PostgresPhysicalRestore resources
 	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), &namespace);
 	let restore_list = restores
@@ -216,6 +265,58 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 		ctx.metrics.switchovers_total.inc();
 
+		// Trigger FDW setup in overlay database if configured
+		if replica.spec.overlay_database.is_some() {
+			let pg_version = replica
+				.status
+				.as_ref()
+				.and_then(|s| s.overlay_postgres_version.clone())
+				.unwrap_or_else(|| "17".to_string());
+			let old_restore = replica
+				.status
+				.as_ref()
+				.and_then(|s| s.overlay_fdw_restore.as_deref());
+
+			match overlay::run_fdw_setup(
+				client,
+				&namespace,
+				&replica,
+				&switching_name,
+				&pg_version,
+				old_restore,
+			)
+			.await
+			{
+				Ok(()) => {
+					info!(
+						replica = name,
+						restore = switching_name,
+						"FDW setup job created for overlay switchover"
+					);
+					let patch = serde_json::json!({
+						"status": {
+							"overlayFdwRestore": switching_name,
+						}
+					});
+					replicas
+						.patch_status(
+							&name,
+							&PatchParams::apply("postgres-restore-operator"),
+							&Patch::Merge(&patch),
+						)
+						.await?;
+				}
+				Err(e) => {
+					warn!(
+						replica = name,
+						restore = switching_name,
+						error = %e,
+						"failed to create FDW setup job for overlay"
+					);
+				}
+			}
+		}
+
 		// Send notifications
 		send_restore_notifications(
 			client,
@@ -247,6 +348,28 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	}
 
 	// 8. Clean up old restores after grace period
+	// Safety check: if the previous restore's schemas are still imported in the overlay,
+	// they should have been swapped out by the switchover step above.
+	if replica.spec.overlay_database.is_some()
+		&& let (Some(prev_name), Some(fdw_restore)) = (
+			replica
+				.status
+				.as_ref()
+				.and_then(|s| s.previous_restore.as_ref()),
+			replica
+				.status
+				.as_ref()
+				.and_then(|s| s.overlay_fdw_restore.as_ref()),
+		) && prev_name == fdw_restore
+	{
+		warn!(
+			replica = name,
+			previous_restore = prev_name,
+			fdw_restore = fdw_restore,
+			"previous restore still has FDW schemas imported — switchover may not have completed FDW swap"
+		);
+	}
+
 	if let Some(prev_name) = replica
 		.status
 		.as_ref()
@@ -756,6 +879,20 @@ async fn create_restore_for_snapshot(
 	);
 
 	Ok(())
+}
+
+/// Parse a snapshot size string like "10Gi" or "500Mi" into bytes.
+fn parse_snapshot_size_bytes(s: &str) -> u64 {
+	let s = s.trim();
+	if let Some(rest) = s.strip_suffix("Gi") {
+		rest.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024
+	} else if let Some(rest) = s.strip_suffix("Mi") {
+		rest.parse::<u64>().unwrap_or(0) * 1024 * 1024
+	} else if let Some(rest) = s.strip_suffix("Ti") {
+		rest.parse::<u64>().unwrap_or(0) * 1024 * 1024 * 1024 * 1024
+	} else {
+		s.parse::<u64>().unwrap_or(0)
+	}
 }
 
 fn format_bytes(bytes: u64) -> String {

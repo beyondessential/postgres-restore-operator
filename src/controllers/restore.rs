@@ -8,7 +8,7 @@ use k8s_openapi::{
 		core::v1::{
 			Container, ContainerPort, EnvVar, ExecAction, PersistentVolumeClaim,
 			PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-			Volume, VolumeMount, VolumeResourceRequirements,
+			Service, Volume, VolumeMount, VolumeResourceRequirements,
 		},
 	},
 	apimachinery::pkg::{
@@ -24,7 +24,8 @@ use kube::{
 use tracing::{info, warn};
 
 use super::{
-	env_from_secret, env_from_secret_optional, kopia_writable_env, read_job_termination_message,
+	env_from_secret, env_from_secret_optional, kopia_writable_env, overlay,
+	read_job_termination_message,
 };
 use crate::{
 	context::Context,
@@ -286,6 +287,56 @@ async fn reconcile_restoring(
 	Ok(Action::requeue(Duration::from_secs(15)))
 }
 
+/// Ensure a per-restore Service exists for stable FDW endpoints.
+async fn ensure_restore_service(
+	client: &Client,
+	restore: &PostgresPhysicalRestore,
+	name: &str,
+	namespace: &str,
+) -> Result<()> {
+	let services: Api<Service> = Api::namespaced(client.clone(), namespace);
+
+	if services.get_opt(name).await?.is_some() {
+		return Ok(());
+	}
+
+	info!(restore = name, "creating per-restore service");
+
+	let service = Service {
+		metadata: ObjectMeta {
+			name: Some(name.to_string()),
+			namespace: Some(namespace.to_string()),
+			labels: Some(BTreeMap::from([
+				("bes.au/replica".to_string(), restore.spec.replica.clone()),
+				("bes.au/restore".to_string(), name.to_string()),
+			])),
+			owner_references: Some(vec![restore_owner_reference(restore)]),
+			..Default::default()
+		},
+		spec: Some(k8s_openapi::api::core::v1::ServiceSpec {
+			type_: Some("ClusterIP".to_string()),
+			ports: Some(vec![k8s_openapi::api::core::v1::ServicePort {
+				name: Some("postgres".to_string()),
+				port: 5432,
+				target_port: Some(
+					k8s_openapi::apimachinery::pkg::util::intstr::IntOrString::Int(5432),
+				),
+				protocol: Some("TCP".to_string()),
+				..Default::default()
+			}]),
+			selector: Some(BTreeMap::from([(
+				"bes.au/restore".to_string(),
+				name.to_string(),
+			)])),
+			..Default::default()
+		}),
+		..Default::default()
+	};
+
+	services.create(&PostParams::default(), &service).await?;
+	Ok(())
+}
+
 async fn reconcile_ready(
 	restore: &PostgresPhysicalRestore,
 	ctx: &Context,
@@ -395,6 +446,9 @@ async fn reconcile_ready(
 	// Look up the parent replica for config
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 	let replica = replicas.get(&restore.spec.replica).await?;
+
+	// Ensure per-restore Service exists (stable endpoint for FDW and direct access)
+	ensure_restore_service(client, restore, name, namespace).await?;
 
 	// Apply desired deployment (creates or updates to converge on operator upgrades)
 	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
@@ -854,6 +908,32 @@ fn build_deployment(
 		"false"
 	};
 
+	let has_overlay = replica.spec.overlay_database.is_some();
+	let fdw_secret_name = overlay::overlay_fdw_secret_name(&restore.spec.replica);
+
+	let fdw_user_block = if has_overlay {
+		r#"
+if [ -n "$FDW_USERNAME" ] && [ -n "$FDW_PASSWORD" ]; then
+  echo "Creating FDW read-only user..."
+  psql -U postgres -d postgres << FDWEOF
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${FDW_USERNAME}') THEN
+    CREATE ROLE ${FDW_USERNAME} WITH LOGIN PASSWORD '${FDW_PASSWORD}';
+  ELSE
+    ALTER ROLE ${FDW_USERNAME} WITH PASSWORD '${FDW_PASSWORD}';
+  END IF;
+END
+\$\$;
+GRANT pg_read_all_data TO ${FDW_USERNAME};
+FDWEOF
+fi
+"#
+		.to_string()
+	} else {
+		String::new()
+	};
+
 	let extra_config_block = if let Some(ref extra) = replica.spec.postgres_extra_config {
 		format!(
 			r#"echo "Appending extra postgresql.conf settings..."
@@ -947,7 +1027,7 @@ END
 \$\$;
 SQLEOF
 fi
-
+{fdw_user_block}
 echo "Stopping temporary postgres..."
 pg_ctl -D "$PGDATA" -w stop
 
@@ -993,12 +1073,7 @@ echo "Auth setup complete"
 		}
 	}
 
-	let mut node_selector = BTreeMap::new();
-	if let Some(ns) = &replica.spec.node_selector {
-		for (k, v) in ns {
-			node_selector.insert(k.clone(), v.clone());
-		}
-	}
+	let k8s_affinity = replica.spec.affinity.as_ref().and_then(|a| a.to_k8s());
 
 	let tolerations: Vec<k8s_openapi::api::core::v1::Toleration> = replica
 		.spec
@@ -1012,6 +1087,33 @@ echo "Auth setup complete"
 			toleration_seconds: t.toleration_seconds,
 		})
 		.collect();
+
+	let mut init_env = vec![
+		EnvVar {
+			name: "ANALYTICS_USERNAME".to_string(),
+			value: Some(replica.spec.analytics_username.clone()),
+			..Default::default()
+		},
+		env_from_secret("ANALYTICS_PASSWORD", &creds_secret, "password"),
+		EnvVar {
+			name: "READ_ONLY".to_string(),
+			value: Some(read_only.to_string()),
+			..Default::default()
+		},
+	];
+
+	if has_overlay {
+		init_env.push(env_from_secret(
+			"FDW_USERNAME",
+			&fdw_secret_name,
+			"username",
+		));
+		init_env.push(env_from_secret(
+			"FDW_PASSWORD",
+			&fdw_secret_name,
+			"password",
+		));
+	}
 
 	Ok(Deployment {
 		metadata: ObjectMeta {
@@ -1056,19 +1158,7 @@ echo "Auth setup complete"
 						image: Some(pg_alpine_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![init_script]),
-						env: Some(vec![
-							EnvVar {
-								name: "ANALYTICS_USERNAME".to_string(),
-								value: Some(replica.spec.analytics_username.clone()),
-								..Default::default()
-							},
-							env_from_secret("ANALYTICS_PASSWORD", &creds_secret, "password"),
-							EnvVar {
-								name: "READ_ONLY".to_string(),
-								value: Some(read_only.to_string()),
-								..Default::default()
-							},
-						]),
+						env: Some(init_env),
 						volume_mounts: Some(vec![VolumeMount {
 							name: "pgdata".to_string(),
 							mount_path: "/pgdata".to_string(),
@@ -1163,11 +1253,7 @@ echo "Auth setup complete"
 						),
 						..Default::default()
 					}]),
-					node_selector: if node_selector.is_empty() {
-						None
-					} else {
-						Some(node_selector)
-					},
+					affinity: k8s_affinity,
 					tolerations: if tolerations.is_empty() {
 						None
 					} else {
@@ -1278,11 +1364,12 @@ mod tests {
 				resources: None,
 				service_annotations: None,
 				pod_annotations: None,
-				node_selector: None,
+				affinity: None,
 				tolerations: vec![],
 				read_only,
 				postgres_extra_config: extra_config,
 				notifications: vec![],
+				overlay_database: None,
 			},
 		)
 	}
@@ -1513,6 +1600,80 @@ mod tests {
 		assert!(
 			read_only_pos > extra_pos,
 			"read_only setting must come after extra config so it can't be overridden"
+		);
+	}
+
+	#[test]
+	fn fdw_user_created_when_overlay_configured() {
+		let mut replica = make_replica(None);
+		replica.spec.overlay_database = Some(OverlayDatabaseConfig {
+			postgres_version: None,
+			image_catalog: None,
+			storage_size_override: None,
+			storage_class: None,
+			resources: None,
+			affinity: None,
+			tolerations: vec![],
+			schema_mapping: None,
+		});
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			script.contains("Creating FDW read-only user"),
+			"init script must create FDW user when overlay is configured"
+		);
+		assert!(
+			script.contains("FDW_USERNAME"),
+			"init script must reference FDW_USERNAME env"
+		);
+	}
+
+	#[test]
+	fn fdw_user_not_created_without_overlay() {
+		let replica = make_replica(None);
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let script = get_init_script(&deploy);
+		assert!(
+			!script.contains("Creating FDW read-only user"),
+			"init script must not create FDW user when overlay is not configured"
+		);
+	}
+
+	#[test]
+	fn deployment_uses_affinity_not_node_selector() {
+		let mut replica = make_replica(None);
+		replica.spec.affinity = Some(crate::types::Affinity(serde_json::json!({
+			"nodeAffinity": {
+				"requiredDuringSchedulingIgnoredDuringExecution": {
+					"nodeSelectorTerms": [{
+						"matchExpressions": [{
+							"key": "kubernetes.io/os",
+							"operator": "In",
+							"values": ["linux"]
+						}]
+					}]
+				}
+			}
+		})));
+		let restore = make_restore();
+		let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+		let pod_spec = deploy
+			.spec
+			.as_ref()
+			.unwrap()
+			.template
+			.spec
+			.as_ref()
+			.unwrap();
+		assert!(
+			pod_spec.affinity.is_some(),
+			"pod spec must have affinity set"
+		);
+		assert!(
+			pod_spec.node_selector.is_none(),
+			"pod spec must not have node_selector"
 		);
 	}
 }

@@ -4,7 +4,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{Condition, HeaderValue, ResourceRequirements, Toleration};
+use super::{Affinity, Condition, HeaderValue, ResourceRequirements, Toleration};
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(
@@ -64,7 +64,7 @@ pub struct PostgresPhysicalReplicaSpec {
 	pub pod_annotations: Option<HashMap<String, String>>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub node_selector: Option<HashMap<String, String>>,
+	pub affinity: Option<Affinity>,
 
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub tolerations: Vec<Toleration>,
@@ -79,6 +79,10 @@ pub struct PostgresPhysicalReplicaSpec {
 
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub notifications: Vec<NotificationConfig>,
+
+	/// Optional overlay database configuration (FDW-based persistent database)
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub overlay_database: Option<OverlayDatabaseConfig>,
 }
 
 fn default_read_only() -> bool {
@@ -93,6 +97,60 @@ fn default_schedule_jitter() -> String {
 }
 fn default_analytics_username() -> String {
 	"analytics".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct OverlayDatabaseConfig {
+	/// PostgreSQL major version for the CNPG cluster (e.g. "17").
+	/// If absent, resolved from the CNPG image catalog (see image_catalog).
+	/// Falls back to a hardcoded default ("17") if no catalog is available.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub postgres_version: Option<String>,
+
+	/// CNPG image catalog to use for PG version discovery and image resolution.
+	/// If absent, defaults to ClusterImageCatalog kind.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub image_catalog: Option<ImageCatalogRef>,
+
+	/// Override for the overlay database PVC size.
+	/// If absent, auto-sized: 5Gi + ceil(snapshot_size / 10) rounded up to whole Gi.
+	/// Auto-sizing only ever increases (ratchets up), never shrinks.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub storage_size_override: Option<String>,
+
+	/// Storage class for the overlay database PVC
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub storage_class: Option<String>,
+
+	/// Resource requirements for the overlay database pods
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resources: Option<ResourceRequirements>,
+
+	/// Pod affinity/anti-affinity rules for the overlay database
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub affinity: Option<Affinity>,
+
+	/// Tolerations for the overlay database pods
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub tolerations: Vec<Toleration>,
+
+	/// Schema mapping: if provided, only these schemas are imported.
+	/// Key = remote schema name, Value = local schema name in overlay DB.
+	/// If absent, all user schemas are imported at their original names.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub schema_mapping: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ImageCatalogRef {
+	/// Name of the image catalog resource
+	pub name: String,
+
+	/// Kind: "ClusterImageCatalog" (default) or "ImageCatalog"
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -194,6 +252,22 @@ pub struct PostgresPhysicalReplicaStatus {
 
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub conditions: Vec<Condition>,
+
+	/// Name of the CNPG Cluster CR for the overlay database
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub overlay_cluster_name: Option<String>,
+
+	/// Name of the restore whose schemas are currently imported via FDW
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub overlay_fdw_restore: Option<String>,
+
+	/// Current (possibly ratcheted) storage size of the overlay PVC
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub overlay_storage_size: Option<String>,
+
+	/// Resolved PG major version used for the overlay cluster
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub overlay_postgres_version: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]

@@ -129,11 +129,12 @@ fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhy
 			resources: None,
 			service_annotations: None,
 			pod_annotations: None,
-			node_selector: None,
+			affinity: None,
 			tolerations: vec![],
 			read_only: true,
 			postgres_extra_config: None,
 			notifications: vec![],
+			overlay_database: None,
 		},
 	)
 }
