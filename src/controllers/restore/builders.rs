@@ -213,6 +213,7 @@ pub fn build_restore_job(
 	job_name: &str,
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
+	kopia_image: &str,
 ) -> Result<Job> {
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let pvc_name = format!("{}-data", restore.name_any());
@@ -321,7 +322,7 @@ echo -n "$VERSION" > /dev/termination-log
 
 					containers: vec![Container {
 						name: "restore".to_string(),
-						image: Some("kopia/kopia:latest".to_string()),
+						image: Some(kopia_image.to_string()),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![restore_script.to_string()]),
 						env: Some(

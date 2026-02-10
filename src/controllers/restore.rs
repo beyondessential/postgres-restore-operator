@@ -191,7 +191,8 @@ async fn reconcile_restoring(
 			let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 			let replica = replicas.get(&restore.spec.replica).await?;
 
-			let job = build_restore_job(restore, &job_name, namespace, &replica)?;
+			let job =
+				build_restore_job(restore, &job_name, namespace, &replica, &ctx.kopia_image())?;
 			jobs.create(&PostParams::default(), &job).await?
 		}
 	};

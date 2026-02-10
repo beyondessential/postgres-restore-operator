@@ -21,7 +21,7 @@ spec:
                           echo "Bucket created"
             containers:
                 - name: create-snapshot
-                  image: kopia/kopia:latest
+                  image: kopia/kopia:0.22.3
                   imagePullPolicy: IfNotPresent
                   command: ["/bin/sh", "-c"]
                   args:

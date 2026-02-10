@@ -111,6 +111,7 @@ metadata:
     namespace: pgro-system
 data:
     maxConcurrentRestores: "2"
+    kopiaImage: "kopia/kopia:0.22.3"
 ---
 apiVersion: v1
 kind: Service

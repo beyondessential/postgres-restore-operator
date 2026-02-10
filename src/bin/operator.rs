@@ -16,7 +16,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
-	context::Context,
+	context::{Context, DEFAULT_KOPIA_IMAGE},
 	controllers,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
@@ -50,13 +50,28 @@ fn extract_max_concurrent_restores(cm: &ConfigMap) -> usize {
 		.unwrap_or(DEFAULT_MAX_CONCURRENT_RESTORES)
 }
 
-async fn read_max_concurrent_restores(client: &Client, namespace: &str) -> usize {
+fn extract_kopia_image(cm: &ConfigMap) -> String {
+	cm.data
+		.as_ref()
+		.and_then(|d| d.get("kopiaImage"))
+		.filter(|v| !v.is_empty())
+		.cloned()
+		.unwrap_or_else(|| DEFAULT_KOPIA_IMAGE.to_string())
+}
+
+async fn read_config(client: &Client, namespace: &str) -> (usize, String) {
 	let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
 	match api.get(CONFIGMAP_NAME).await {
-		Ok(cm) => extract_max_concurrent_restores(&cm),
+		Ok(cm) => (
+			extract_max_concurrent_restores(&cm),
+			extract_kopia_image(&cm),
+		),
 		Err(e) => {
-			warn!(error = %e, "failed to read ConfigMap {CONFIGMAP_NAME}, defaulting to {DEFAULT_MAX_CONCURRENT_RESTORES}");
-			DEFAULT_MAX_CONCURRENT_RESTORES
+			warn!(error = %e, "failed to read ConfigMap {CONFIGMAP_NAME}, using defaults");
+			(
+				DEFAULT_MAX_CONCURRENT_RESTORES,
+				DEFAULT_KOPIA_IMAGE.to_string(),
+			)
 		}
 	}
 }
@@ -77,17 +92,22 @@ async fn main() -> anyhow::Result<()> {
 	let client = Client::try_default().await?;
 
 	let namespace = operator_namespace();
-	let max_concurrent_restores = read_max_concurrent_restores(&client, &namespace).await;
+	let (max_concurrent_restores, kopia_image) = read_config(&client, &namespace).await;
 
 	info!(
 		max_concurrent_restores,
+		kopia_image,
 		metrics_addr,
 		operator_namespace = namespace,
 		version = env!("CARGO_PKG_VERSION"),
 		"starting postgres-restore-operator"
 	);
 
-	let ctx = Arc::new(Context::new(client.clone(), max_concurrent_restores));
+	let ctx = Arc::new(Context::new(
+		client.clone(),
+		max_concurrent_restores,
+		kopia_image,
+	));
 
 	// Heartbeat: a background task updates this timestamp every 5s.
 	// If the runtime is deadlocked, the timestamp goes stale and /livez fails.
@@ -106,6 +126,7 @@ async fn main() -> anyhow::Result<()> {
 	let config_watcher_config =
 		Config::default().fields(&format!("metadata.name={CONFIGMAP_NAME}"));
 	let max_concurrent_ref = ctx.max_concurrent_restores.clone();
+	let kopia_image_ref = ctx.kopia_image.clone();
 	tokio::spawn(async move {
 		let stream = watcher::watcher(config_api, config_watcher_config);
 		futures::pin_mut!(stream);
@@ -121,6 +142,17 @@ async fn main() -> anyhow::Result<()> {
 							"max_concurrent_restores updated from ConfigMap"
 						);
 					}
+
+					let new_image = extract_kopia_image(&cm);
+					let mut image = kopia_image_ref.write().unwrap();
+					if *image != new_image {
+						info!(
+							old = %*image,
+							new = new_image,
+							"kopia_image updated from ConfigMap"
+						);
+						*image = new_image;
+					}
 				}
 				Ok(watcher::Event::Delete(_)) => {
 					let old_val =
@@ -131,6 +163,16 @@ async fn main() -> anyhow::Result<()> {
 							new = DEFAULT_MAX_CONCURRENT_RESTORES,
 							"ConfigMap deleted, reverted max_concurrent_restores to default"
 						);
+					}
+
+					let mut image = kopia_image_ref.write().unwrap();
+					if *image != DEFAULT_KOPIA_IMAGE {
+						info!(
+							old = %*image,
+							new = DEFAULT_KOPIA_IMAGE,
+							"ConfigMap deleted, reverted kopia_image to default"
+						);
+						*image = DEFAULT_KOPIA_IMAGE.to_string();
 					}
 				}
 				Ok(watcher::Event::Init | watcher::Event::InitDone) => {}

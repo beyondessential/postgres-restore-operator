@@ -1,33 +1,40 @@
-use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 
 use chrono::{DateTime, Utc};
 use kube::Client;
-use tokio::sync::RwLock;
 
 use crate::metrics::Metrics;
+
+pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 
 pub struct Context {
 	pub client: Client,
 	pub metrics: Metrics,
-	pub restore_queue: Arc<RwLock<RestoreQueue>>,
+	pub restore_queue: Arc<tokio::sync::RwLock<RestoreQueue>>,
 	pub max_concurrent_restores: Arc<AtomicUsize>,
+	pub kopia_image: Arc<RwLock<String>>,
 	pub http_client: reqwest::Client,
 }
 
 impl Context {
-	pub fn new(client: Client, max_concurrent_restores: usize) -> Self {
+	pub fn new(client: Client, max_concurrent_restores: usize, kopia_image: String) -> Self {
 		Self {
 			client,
 			metrics: Metrics::new(),
-			restore_queue: Arc::new(RwLock::new(RestoreQueue::default())),
+			restore_queue: Arc::new(tokio::sync::RwLock::new(RestoreQueue::default())),
 			max_concurrent_restores: Arc::new(AtomicUsize::new(max_concurrent_restores)),
+			kopia_image: Arc::new(RwLock::new(kopia_image)),
 			http_client: reqwest::Client::new(),
 		}
 	}
 
 	pub fn max_concurrent_restores(&self) -> usize {
 		self.max_concurrent_restores.load(Ordering::Relaxed)
+	}
+
+	pub fn kopia_image(&self) -> String {
+		self.kopia_image.read().unwrap().clone()
 	}
 
 	/// Remove a restore from the queue, promote the next pending one if there

@@ -474,7 +474,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		match jobs.get_opt(&snapshot_job_name).await? {
 			None => {
 				info!(replica = name, "creating snapshot list job");
-				let job = build_snapshot_list_job(&replica, &snapshot_job_name, &namespace)?;
+				let job = build_snapshot_list_job(
+					&replica,
+					&snapshot_job_name,
+					&namespace,
+					&ctx.kopia_image(),
+				)?;
 				jobs.create(&PostParams::default(), &job).await?;
 				return Ok(Action::requeue(Duration::from_secs(10)));
 			}

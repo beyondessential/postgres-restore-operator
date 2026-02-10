@@ -60,6 +60,7 @@ pub fn build_snapshot_list_job(
 	replica: &PostgresPhysicalReplica,
 	job_name: &str,
 	namespace: &str,
+	kopia_image: &str,
 ) -> Result<Job> {
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let replica_name = replica.name_any();
@@ -181,7 +182,7 @@ printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 					restart_policy: Some("Never".to_string()),
 					containers: vec![Container {
 						name: "snapshot-list".to_string(),
-						image: Some("kopia/kopia:latest".to_string()),
+						image: Some(kopia_image.to_string()),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![script.to_string()]),
 						env: Some(env_vars),

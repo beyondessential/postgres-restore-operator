@@ -123,11 +123,11 @@ jobs:
         run: |
           docker pull minio/minio:latest
           docker pull minio/mc:latest
-          docker pull kopia/kopia:latest
+          docker pull kopia/kopia:0.22.3
           docker pull postgres:16
           docker pull postgres:16-alpine
           docker pull alpine:latest
-          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:latest postgres:16 postgres:16-alpine alpine:latest
+          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:0.22.3 postgres:16 postgres:16-alpine alpine:latest
 
       - name: Pre-pull CNPG images
         if: matrix.needs_cnpg
