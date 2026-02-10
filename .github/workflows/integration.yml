@@ -39,10 +39,15 @@ jobs:
             tests: >-
               restore_fails_for_non_postgres_data
               snapshot_job_fails_for_wrong_bucket
-              minimum_ttl_prevents_premature_restore
             namespaces: >-
               test-non-pg-data
               test-wrong-bucket
+            needs_non_pg_snapshot: true
+
+          - name: ttls
+            tests: >-
+              minimum_ttl_prevents_premature_restore
+            namespaces: >-
               test-min-ttl
             needs_non_pg_snapshot: true
 
