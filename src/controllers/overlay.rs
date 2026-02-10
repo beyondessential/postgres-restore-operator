@@ -25,7 +25,8 @@ use crate::{
 		PostgresPhysicalReplica,
 		cnpg::{
 			self, CnpgClusterSpec, CnpgClusterStatus, CnpgImageCatalogRef, CnpgImageCatalogSpec,
-			CnpgManagedSpec, CnpgPostgresqlSpec, CnpgResourceRequirements, CnpgStorageSpec,
+			CnpgManagedRole, CnpgManagedSpec, CnpgPasswordSecretRef, CnpgPostgresqlSpec,
+			CnpgResourceRequirements, CnpgStorageSpec,
 		},
 	},
 };
@@ -263,7 +264,21 @@ pub async fn ensure_cnpg_cluster(
 		resources: cnpg_resources,
 		affinity: cnpg_affinity,
 		tolerations: cnpg_tolerations,
-		managed: Some(CnpgManagedSpec { roles: vec![] }),
+		managed: Some(CnpgManagedSpec {
+			roles: vec![CnpgManagedRole {
+				name: replica.spec.analytics_username.clone(),
+				ensure: "present".into(),
+				login: true,
+				superuser: false,
+				createdb: true,
+				password_secret: Some(CnpgPasswordSecretRef {
+					name: format!("{replica_name}-creds"),
+				}),
+				in_roles: vec!["pg_read_all_data".into(), "pg_write_all_data".into()],
+				connection_limit: None,
+				comment: None,
+			}],
+		}),
 	};
 
 	let cluster_json = serde_json::json!({

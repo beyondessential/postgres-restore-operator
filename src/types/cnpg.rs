@@ -73,7 +73,47 @@ pub struct CnpgResourceRequirements {
 #[serde(rename_all = "camelCase")]
 pub struct CnpgManagedSpec {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub roles: Vec<serde_json::Value>,
+	pub roles: Vec<CnpgManagedRole>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CnpgManagedRole {
+	pub name: String,
+
+	#[serde(default = "ensure_present")]
+	pub ensure: String,
+
+	#[serde(default)]
+	pub login: bool,
+
+	#[serde(default)]
+	pub superuser: bool,
+
+	#[serde(default)]
+	pub createdb: bool,
+
+	#[serde(skip_serializing_if = "Option::is_none")]
+	pub password_secret: Option<CnpgPasswordSecretRef>,
+
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub in_roles: Vec<String>,
+
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub connection_limit: Option<i64>,
+
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub comment: Option<String>,
+}
+
+fn ensure_present() -> String {
+	"present".to_string()
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CnpgPasswordSecretRef {
+	pub name: String,
 }
 
 /// Minimal representation of CNPG Cluster status fields we need to check readiness.
@@ -221,6 +261,39 @@ mod tests {
 		assert_eq!(json["storage"]["size"], "10Gi");
 		assert_eq!(json["imageCatalogRef"]["name"], "my-catalog");
 		assert_eq!(json["imageCatalogRef"]["major"], 17);
+	}
+
+	#[test]
+	fn managed_role_serializes() {
+		let managed = CnpgManagedSpec {
+			roles: vec![CnpgManagedRole {
+				name: "analytics".into(),
+				ensure: "present".into(),
+				login: true,
+				superuser: false,
+				createdb: true,
+				password_secret: Some(CnpgPasswordSecretRef {
+					name: "my-replica-creds".into(),
+				}),
+				in_roles: vec!["pg_read_all_data".into(), "pg_write_all_data".into()],
+				connection_limit: None,
+				comment: None,
+			}],
+		};
+		let json = serde_json::to_value(&managed).unwrap();
+		let role = &json["roles"][0];
+		assert_eq!(role["name"], "analytics");
+		assert_eq!(role["ensure"], "present");
+		assert_eq!(role["login"], true);
+		assert_eq!(role["superuser"], false);
+		assert_eq!(role["createdb"], true);
+		assert_eq!(role["passwordSecret"]["name"], "my-replica-creds");
+		assert_eq!(role["inRoles"][0], "pg_read_all_data");
+		assert_eq!(role["inRoles"][1], "pg_write_all_data");
+		assert!(
+			role.get("connectionLimit").is_none(),
+			"None fields must be omitted"
+		);
 	}
 
 	#[test]
