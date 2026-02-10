@@ -10,8 +10,8 @@ use kube::{Api, Client, ResourceExt};
 use tokio::time::{sleep, timeout};
 
 use postgres_restore_operator::types::{
-	PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore,
-	PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
+	OverlayDatabaseConfig, PostgresPhysicalReplica, PostgresPhysicalReplicaSpec,
+	PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
 };
 
 // ─── Constants ───────────────────────────────────────────────────────────────
@@ -106,11 +106,22 @@ fn build_kopia_secret(ns: &str, name: &str, bucket: &str) -> Secret {
 	}
 }
 
-#[derive(Default)]
 struct ReplicaOpts {
 	schedule: Option<String>,
 	minimum_ttl: Option<String>,
 	schedule_jitter: Option<String>,
+	overlay_database: Option<OverlayDatabaseConfig>,
+}
+
+impl Default for ReplicaOpts {
+	fn default() -> Self {
+		Self {
+			schedule: None,
+			minimum_ttl: None,
+			schedule_jitter: None,
+			overlay_database: None,
+		}
+	}
 }
 
 fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhysicalReplica {
@@ -134,7 +145,7 @@ fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhy
 			read_only: true,
 			postgres_extra_config: None,
 			notifications: vec![],
-			overlay_database: None,
+			overlay_database: opts.overlay_database,
 		},
 	)
 }
@@ -754,6 +765,7 @@ async fn minimum_ttl_prevents_premature_restore() {
 			schedule: Some("* * * * *".into()), // every minute
 			minimum_ttl: Some("24h".into()),    // 24 hours - won't expire during test
 			schedule_jitter: Some("0s".into()),
+			..Default::default()
 		},
 	);
 	replica.metadata.namespace = Some(ns.into());
@@ -1046,4 +1058,285 @@ async fn second_restore_and_switchover() {
 
 	println!("--- switchover completed successfully");
 	cleanup_namespace(&client, ns, &["switchover-replica"]).await;
+}
+
+// ─── Test 7: Overlay FDW reconciliation ──────────────────────────────────────
+
+/// Helper: run kubectl exec and return stdout as a String.
+async fn kubectl_exec(ns: &str, pod: &str, cmd: &[&str]) -> String {
+	let mut args = vec!["exec", "-n", ns, pod, "--"];
+	args.extend_from_slice(cmd);
+	let output = tokio::process::Command::new("kubectl")
+		.args(&args)
+		.output()
+		.await
+		.expect("failed to run kubectl exec");
+	let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+	let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+	if !output.status.success() {
+		panic!(
+			"kubectl exec failed (exit {})\nstdout: {stdout}\nstderr: {stderr}",
+			output.status
+		);
+	}
+	stdout
+}
+
+/// Wait for a pod to be ready (all containers running).
+async fn wait_for_pod_ready(ns: &str, pod: &str, timeout_dur: Duration) {
+	timeout(timeout_dur, async {
+		loop {
+			let result = tokio::process::Command::new("kubectl")
+				.args([
+					"get",
+					"pod",
+					"-n",
+					ns,
+					pod,
+					"-o",
+					"jsonpath={.status.conditions[?(@.type=='Ready')].status}",
+				])
+				.output()
+				.await
+				.expect("failed to run kubectl");
+			let stdout = String::from_utf8_lossy(&result.stdout);
+			if stdout.trim() == "True" {
+				println!("[{pod}] pod is ready");
+				return;
+			}
+			println!("[{pod}] not ready yet, waiting...");
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.unwrap_or_else(|_| panic!("timed out waiting for pod {pod} to be ready in namespace {ns}"));
+}
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO, kopia, and CNPG"]
+async fn overlay_fdw_reconciliation() {
+	let client = make_client().await;
+	let ns = "test-overlay";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["overlay-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "overlay-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating PostgresPhysicalReplica with overlay database");
+	let mut replica = build_replica(
+		"overlay-replica",
+		"overlay-kopia-creds",
+		ReplicaOpts {
+			overlay_database: Some(OverlayDatabaseConfig {
+				postgres_version: Some("17".into()),
+				image_catalog: None,
+				storage_size_override: Some("2Gi".into()),
+				storage_class: None,
+				resources: None,
+				affinity: None,
+				tolerations: vec![],
+				service_annotations: None,
+				schema_mapping: None,
+			}),
+			..Default::default()
+		},
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for replica Restoring phase");
+	wait_for_replica_phase(
+		&replicas,
+		"overlay-replica",
+		ReplicaPhase::Restoring,
+		PHASE_TIMEOUT,
+	)
+	.await;
+
+	println!("--- waiting for restore Active phase");
+	let restore_name = wait_for_restore_phase(
+		&restores,
+		"overlay-replica",
+		RestorePhase::Active,
+		PHASE_TIMEOUT,
+	)
+	.await;
+
+	println!("--- waiting for replica Ready phase");
+	wait_for_replica_phase(
+		&replicas,
+		"overlay-replica",
+		ReplicaPhase::Ready,
+		LONG_PHASE_TIMEOUT,
+	)
+	.await;
+
+	println!("--- waiting for overlay CNPG cluster pod to be ready");
+	let overlay_pod = "overlay-replica-overlay-1";
+	wait_for_pod_ready(ns, overlay_pod, LONG_PHASE_TIMEOUT).await;
+
+	println!("--- waiting for overlayFdwRestore status to be set");
+	timeout(PHASE_TIMEOUT, async {
+		loop {
+			if let Ok(r) = replicas.get("overlay-replica").await {
+				let fdw_restore = r
+					.status
+					.as_ref()
+					.and_then(|s| s.overlay_fdw_restore.as_ref());
+				if fdw_restore.is_some() {
+					println!(
+						"[overlay-replica] overlayFdwRestore = {}",
+						fdw_restore.unwrap()
+					);
+					return;
+				}
+				println!("[overlay-replica] overlayFdwRestore not set yet");
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for overlayFdwRestore to be set");
+
+	println!("--- verifying replica status fields");
+	let replica = replicas
+		.get("overlay-replica")
+		.await
+		.expect("failed to get replica");
+	let status = replica.status.as_ref().expect("replica has no status");
+
+	assert_eq!(
+		status.overlay_fdw_restore.as_deref(),
+		Some(restore_name.as_str()),
+		"overlayFdwRestore should match currentRestore"
+	);
+	assert!(
+		status.overlay_cluster_name.is_some(),
+		"overlayClusterName should be set"
+	);
+	assert_eq!(
+		status.overlay_cluster_name.as_deref(),
+		Some("overlay-replica-overlay"),
+	);
+
+	println!("--- verifying FDW server exists in overlay database");
+	let fdw_servers = kubectl_exec(
+		ns,
+		overlay_pod,
+		&[
+			"psql",
+			"-U",
+			"postgres",
+			"-d",
+			"app",
+			"-t",
+			"-A",
+			"-c",
+			"SELECT srvname FROM pg_foreign_server WHERE srvname LIKE 'fdw_%'",
+		],
+	)
+	.await;
+	let fdw_servers: Vec<&str> = fdw_servers.trim().lines().collect();
+	assert!(
+		!fdw_servers.is_empty(),
+		"expected at least one FDW server, got none"
+	);
+	println!("  FDW servers: {fdw_servers:?}");
+
+	println!("--- verifying FDW server points to the correct database (myapp)");
+	let server_dbname = kubectl_exec(
+		ns,
+		overlay_pod,
+		&[
+			"psql",
+			"-U",
+			"postgres",
+			"-d",
+			"app",
+			"-t",
+			"-A",
+			"-c",
+			&format!(
+				"SELECT option_value FROM pg_options_to_table( \
+				   (SELECT srvoptions FROM pg_foreign_server WHERE srvname = '{}') \
+				 ) WHERE option_name = 'dbname'",
+				fdw_servers[0]
+			),
+		],
+	)
+	.await;
+	assert_eq!(
+		server_dbname.trim(),
+		"myapp",
+		"FDW server should point to 'myapp' database, got '{}'",
+		server_dbname.trim()
+	);
+
+	println!("--- verifying foreign tables were imported");
+	let ft_count = kubectl_exec(
+		ns,
+		overlay_pod,
+		&[
+			"psql",
+			"-U",
+			"postgres",
+			"-d",
+			"app",
+			"-t",
+			"-A",
+			"-c",
+			"SELECT COUNT(*) FROM information_schema.foreign_tables",
+		],
+	)
+	.await;
+	let ft_count: i64 = ft_count
+		.trim()
+		.parse()
+		.expect("failed to parse foreign table count");
+	assert!(
+		ft_count > 0,
+		"expected at least one foreign table, got {ft_count}"
+	);
+	println!("  foreign tables: {ft_count}");
+
+	println!("--- verifying end-to-end FDW query works (reading through foreign table)");
+	let row_count = kubectl_exec(
+		ns,
+		overlay_pod,
+		&[
+			"psql",
+			"-U",
+			"postgres",
+			"-d",
+			"app",
+			"-t",
+			"-A",
+			"-c",
+			"SELECT COUNT(*) FROM public.test_data",
+		],
+	)
+	.await;
+	let row_count: i64 = row_count.trim().parse().expect("failed to parse row count");
+	assert_eq!(
+		row_count, 1000,
+		"expected 1000 rows from foreign table test_data, got {row_count}"
+	);
+
+	println!("--- all overlay FDW assertions passed, cleaning up");
+	cleanup_namespace(&client, ns, &["overlay-replica"]).await;
 }

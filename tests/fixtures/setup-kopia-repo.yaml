@@ -34,6 +34,17 @@ spec:
                           mkdir -p /pgdata/16/main
                           chown postgres:postgres /pgdata/16/main
                           gosu postgres initdb -D /pgdata/16/main --no-locale --encoding=UTF8 --auth=trust
+
+                          echo "Starting temporary PostgreSQL to create application database..."
+                          gosu postgres pg_ctl -D /pgdata/16/main -l /tmp/pg.log start -w
+
+                          gosu postgres psql -d postgres -c "CREATE DATABASE myapp"
+                          gosu postgres psql -d myapp -c "CREATE TABLE test_data (id serial PRIMARY KEY, data text)"
+                          gosu postgres psql -d myapp -c "INSERT INTO test_data (data) SELECT repeat('x', 1000) FROM generate_series(1, 1000)"
+                          echo "Application database 'myapp' created with test data"
+
+                          gosu postgres pg_ctl -D /pgdata/16/main stop -w
+
                           echo "PostgreSQL data directory initialized"
                           ls -la /pgdata/16/main/
                           cat /pgdata/16/main/PG_VERSION

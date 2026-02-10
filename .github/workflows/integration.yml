@@ -34,6 +34,7 @@ jobs:
               test-invalid-secret
               test-missing-secret
             needs_non_pg_snapshot: false
+            needs_cnpg: false
 
           - name: error-paths
             tests: >-
@@ -43,6 +44,7 @@ jobs:
               test-non-pg-data
               test-wrong-bucket
             needs_non_pg_snapshot: true
+            needs_cnpg: false
 
           - name: ttls
             tests: >-
@@ -50,6 +52,7 @@ jobs:
             namespaces: >-
               test-min-ttl
             needs_non_pg_snapshot: true
+            needs_cnpg: false
 
           - name: switchover
             tests: >-
@@ -57,6 +60,15 @@ jobs:
             namespaces: >-
               test-switchover
             needs_non_pg_snapshot: false
+            needs_cnpg: false
+
+          - name: overlay
+            tests: >-
+              overlay_fdw_reconciliation
+            namespaces: >-
+              test-overlay
+            needs_non_pg_snapshot: false
+            needs_cnpg: true
 
     steps:
       - uses: actions/checkout@v6
@@ -116,6 +128,20 @@ jobs:
           docker pull postgres:16-alpine
           docker pull alpine:latest
           kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:latest postgres:16 postgres:16-alpine alpine:latest
+
+      - name: Pre-pull CNPG images
+        if: matrix.needs_cnpg
+        run: |
+          docker pull ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
+          docker pull ghcr.io/cloudnative-pg/postgresql:17
+          kind load docker-image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1 ghcr.io/cloudnative-pg/postgresql:17
+
+      - name: Install CNPG operator
+        if: matrix.needs_cnpg
+        run: |
+          kubectl apply --server-side -f https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+          kubectl wait --for=condition=Available deployment/cnpg-controller-manager -n cnpg-system --timeout=120s
+          echo "CNPG operator is ready"
 
       - name: Deploy MinIO
         run: |
@@ -231,6 +257,9 @@ jobs:
             echo "--- Namespace: $ns ---"
             kubectl get all -n "$ns" 2>/dev/null || true
           done
+
+          echo "=== CNPG Clusters ==="
+          kubectl get clusters.postgresql.cnpg.io -A -o yaml 2>/dev/null || true
 
           echo "=== PostgresPhysicalReplicas ==="
           kubectl get postgresphysicalreplicas -A -o yaml 2>/dev/null || true
