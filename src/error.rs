@@ -31,6 +31,9 @@ pub enum Error {
 
 	#[error("Missing field: {0}")]
 	MissingField(String),
+
+	#[error("Invalid overlay database config: {0}")]
+	InvalidOverlayConfig(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

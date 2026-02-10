@@ -32,6 +32,7 @@ use crate::{
 };
 
 const DEFAULT_PG_VERSION: &str = "17";
+const MIN_OVERLAY_PG_VERSION: i32 = 14;
 const GI: u64 = 1024 * 1024 * 1024;
 const OVERLAY_STORAGE_BASE_GI: u64 = 5;
 
@@ -83,43 +84,66 @@ pub fn ratchet_storage_size(new_size: &str, current_size: Option<&str>) -> Strin
 
 /// Resolve the PostgreSQL major version for the overlay cluster.
 ///
+/// Validate that a resolved PG major version is high enough for the overlay.
+///
+/// The overlay relies on `pg_read_all_data` and `pg_write_all_data` which
+/// require PostgreSQL >= 14.
+pub fn validate_overlay_pg_version(version: &str) -> Result<()> {
+	let major: i32 = version.parse().unwrap_or(0);
+	if major < MIN_OVERLAY_PG_VERSION {
+		return Err(Error::InvalidOverlayConfig(format!(
+			"overlay database requires PostgreSQL >= {MIN_OVERLAY_PG_VERSION} \
+			 (pg_read_all_data / pg_write_all_data), got \"{version}\""
+		)));
+	}
+	Ok(())
+}
+
 /// Resolution order:
 /// 1. Explicit `postgres_version` in config
 /// 2. Highest major from CNPG image catalog
 /// 3. Hardcoded default "17"
+///
+/// Returns an error if the resolved version is below 14 (required for
+/// `pg_read_all_data` / `pg_write_all_data`).
 pub async fn resolve_postgres_version(
 	client: &Client,
 	replica: &PostgresPhysicalReplica,
-) -> String {
+) -> Result<String> {
 	let overlay_config = match &replica.spec.overlay_database {
 		Some(c) => c,
-		None => return DEFAULT_PG_VERSION.to_string(),
+		None => return Ok(DEFAULT_PG_VERSION.to_string()),
 	};
 
-	if let Some(ref v) = overlay_config.postgres_version {
-		return v.clone();
-	}
+	let version = if let Some(ref v) = overlay_config.postgres_version {
+		v.clone()
+	} else {
+		let catalog_ref = overlay_config.image_catalog.as_ref();
+		let catalog_name = catalog_ref.map(|c| c.name.as_str());
+		let catalog_kind = catalog_ref
+			.and_then(|c| c.kind.as_deref())
+			.unwrap_or("ClusterImageCatalog");
 
-	let catalog_ref = overlay_config.image_catalog.as_ref();
-	let catalog_name = catalog_ref.map(|c| c.name.as_str());
-	let catalog_kind = catalog_ref
-		.and_then(|c| c.kind.as_deref())
-		.unwrap_or("ClusterImageCatalog");
-
-	if let Some(name) = catalog_name {
-		let version = match catalog_kind {
-			"ImageCatalog" => {
-				let namespace = replica.namespace().unwrap_or_default();
-				lookup_image_catalog_version(client, &namespace, name).await
+		let from_catalog = if let Some(name) = catalog_name {
+			match catalog_kind {
+				"ImageCatalog" => {
+					let namespace = replica.namespace().unwrap_or_default();
+					lookup_image_catalog_version(client, &namespace, name).await
+				}
+				_ => lookup_cluster_image_catalog_version(client, name).await,
 			}
-			_ => lookup_cluster_image_catalog_version(client, name).await,
+		} else {
+			None
 		};
-		if let Some(v) = version {
-			return v.to_string();
-		}
-	}
 
-	DEFAULT_PG_VERSION.to_string()
+		from_catalog
+			.map(|v| v.to_string())
+			.unwrap_or_else(|| DEFAULT_PG_VERSION.to_string())
+	};
+
+	validate_overlay_pg_version(&version)?;
+
+	Ok(version)
 }
 
 async fn lookup_cluster_image_catalog_version(client: &Client, name: &str) -> Option<i32> {
@@ -584,7 +608,7 @@ pub async fn reconcile_overlay(
 		None => return Ok((false, String::new(), String::new())),
 	};
 
-	let pg_version = resolve_postgres_version(client, replica).await;
+	let pg_version = resolve_postgres_version(client, replica).await?;
 
 	let computed_size = match &overlay_config.storage_size_override {
 		Some(override_size) => override_size.clone(),
@@ -774,6 +798,42 @@ mod tests {
 	#[test]
 	fn quantity_to_bytes_bare() {
 		assert_eq!(quantity_to_bytes("1024"), Some(1024));
+	}
+
+	#[test]
+	fn validate_pg_version_14_ok() {
+		assert!(validate_overlay_pg_version("14").is_ok());
+	}
+
+	#[test]
+	fn validate_pg_version_17_ok() {
+		assert!(validate_overlay_pg_version("17").is_ok());
+	}
+
+	#[test]
+	fn validate_pg_version_13_rejected() {
+		let err = validate_overlay_pg_version("13").unwrap_err();
+		let msg = err.to_string();
+		assert!(msg.contains(">= 14"), "error should mention >= 14: {msg}");
+		assert!(
+			msg.contains("13"),
+			"error should mention the bad version: {msg}"
+		);
+	}
+
+	#[test]
+	fn validate_pg_version_11_rejected() {
+		assert!(validate_overlay_pg_version("11").is_err());
+	}
+
+	#[test]
+	fn validate_pg_version_garbage_rejected() {
+		assert!(validate_overlay_pg_version("banana").is_err());
+	}
+
+	#[test]
+	fn validate_pg_version_empty_rejected() {
+		assert!(validate_overlay_pg_version("").is_err());
 	}
 
 	#[test]
