@@ -1,5 +1,6 @@
 ## LLM Rules to follow
 - When adding or changing features, or when fixing bugs, add tests whenever possible.
+- When adding integration tests, they don't run locally, so ensure the user knows about them so they can be tested in CI.
 - Never write documentation files or readmes.
 - Always run `cargo clippy` and `cargo fmt` before committing changes.
 - Use conventional commit messages.

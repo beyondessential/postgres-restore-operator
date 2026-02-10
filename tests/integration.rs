@@ -3,32 +3,95 @@ use std::time::Duration;
 
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::Deployment;
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret, Service};
-use kube::api::{ObjectMeta, Patch, PatchParams, PostParams};
+use kube::api::{ListParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Api, Client, ResourceExt};
 use tokio::time::{sleep, timeout};
 
 use postgres_restore_operator::types::{
-	PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore, ReplicaPhase,
-	RestorePhase,
+	PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore,
+	PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
 };
 
-const TEST_NAMESPACE: &str = "integration-test";
-const KOPIA_SECRET_NAME: &str = "test-kopia-creds";
-const REPLICA_NAME: &str = "test-replica";
+// ─── Constants ───────────────────────────────────────────────────────────────
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 const PHASE_TIMEOUT: Duration = Duration::from_secs(300);
+const LONG_PHASE_TIMEOUT: Duration = Duration::from_secs(480);
 
-fn kopia_secret() -> Secret {
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+async fn make_client() -> Client {
+	Client::try_default()
+		.await
+		.expect("expected a valid kubeconfig (e.g. from kind)")
+}
+
+async fn setup_namespace(client: &Client, ns: &str) {
+	let ns_api: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(client.clone());
+	let ns_obj = k8s_openapi::api::core::v1::Namespace {
+		metadata: ObjectMeta {
+			name: Some(ns.into()),
+			..Default::default()
+		},
+		..Default::default()
+	};
+	let _ = ns_api
+		.patch(
+			ns,
+			&PatchParams::apply("integration-test"),
+			&Patch::Apply(ns_obj),
+		)
+		.await;
+}
+
+async fn cleanup_namespace(client: &Client, ns: &str, replica_names: &[&str]) {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	for name in replica_names {
+		let _ = replicas.delete(name, &Default::default()).await;
+	}
+
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+	if let Ok(list) = restores.list(&ListParams::default()).await {
+		for restore in &list.items {
+			let _ = restores
+				.delete(&restore.name_any(), &Default::default())
+				.await;
+		}
+	}
+
+	// Wait for cascading deletes from owner references
+	sleep(Duration::from_secs(5)).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	if let Ok(list) = secrets.list(&ListParams::default()).await {
+		for secret in &list.items {
+			let _ = secrets
+				.delete(&secret.name_any(), &Default::default())
+				.await;
+		}
+	}
+
+	let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+	if let Ok(list) = jobs.list(&ListParams::default()).await {
+		for job in &list.items {
+			let _ = jobs.delete(&job.name_any(), &Default::default()).await;
+		}
+	}
+
+	sleep(Duration::from_secs(3)).await;
+}
+
+fn build_kopia_secret(ns: &str, name: &str, bucket: &str) -> Secret {
 	Secret {
 		metadata: ObjectMeta {
-			name: Some(KOPIA_SECRET_NAME.into()),
-			namespace: Some(TEST_NAMESPACE.into()),
+			name: Some(name.into()),
+			namespace: Some(ns.into()),
 			..Default::default()
 		},
 		data: Some(BTreeMap::from([
-			("bucket".into(), ByteString("test-bucket".into())),
+			("bucket".into(), ByteString(bucket.as_bytes().to_vec())),
 			("region".into(), ByteString("us-east-1".into())),
 			("accessKeyId".into(), ByteString("minioadmin".into())),
 			("secretAccessKey".into(), ByteString("minioadmin".into())),
@@ -43,15 +106,22 @@ fn kopia_secret() -> Secret {
 	}
 }
 
-fn replica_cr() -> PostgresPhysicalReplica {
+#[derive(Default)]
+struct ReplicaOpts {
+	schedule: Option<String>,
+	minimum_ttl: Option<String>,
+	schedule_jitter: Option<String>,
+}
+
+fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhysicalReplica {
 	PostgresPhysicalReplica::new(
-		REPLICA_NAME,
+		name,
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: KOPIA_SECRET_NAME.into(),
+			kopia_secret_ref: secret_ref.into(),
 			snapshot_filter: None,
-			schedule: None,
-			schedule_jitter: "0s".into(),
-			minimum_ttl: None,
+			schedule: opts.schedule,
+			schedule_jitter: opts.schedule_jitter.unwrap_or_else(|| "0s".into()),
+			minimum_ttl: opts.minimum_ttl,
 			switchover_grace_period: "10s".into(),
 			analytics_username: "analytics".into(),
 			storage_class: None,
@@ -72,17 +142,18 @@ async fn wait_for_replica_phase(
 	api: &Api<PostgresPhysicalReplica>,
 	name: &str,
 	target: ReplicaPhase,
+	timeout_dur: Duration,
 ) {
 	let phase_name = format!("{target:?}");
-	timeout(PHASE_TIMEOUT, async {
+	timeout(timeout_dur, async {
 		loop {
 			if let Ok(replica) = api.get(name).await {
 				let phase = replica.status.as_ref().and_then(|s| s.phase.as_ref());
 				if phase == Some(&target) {
-					println!("replica {name} reached phase {phase_name}");
+					println!("[{name}] reached phase {phase_name}");
 					return;
 				}
-				println!("replica {name} phase: {phase:?}, waiting for {phase_name}",);
+				println!("[{name}] phase: {phase:?}, waiting for {phase_name}");
 			}
 			sleep(POLL_INTERVAL).await;
 		}
@@ -95,15 +166,13 @@ async fn wait_for_restore_phase(
 	api: &Api<PostgresPhysicalRestore>,
 	replica_name: &str,
 	target: RestorePhase,
+	timeout_dur: Duration,
 ) -> String {
 	let phase_name = format!("{target:?}");
-	timeout(PHASE_TIMEOUT, async {
+	timeout(timeout_dur, async {
 		loop {
 			let list = api
-				.list(
-					&kube::api::ListParams::default()
-						.labels(&format!("bes.au/replica={replica_name}")),
-				)
+				.list(&ListParams::default().labels(&format!("bes.au/replica={replica_name}")))
 				.await
 				.expect("failed to list restores");
 
@@ -111,19 +180,17 @@ async fn wait_for_restore_phase(
 				let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
 				if phase == Some(&target) {
 					let name = restore.name_any();
-					println!("restore {name} reached phase {phase_name}");
+					println!("[{replica_name}] restore {name} reached phase {phase_name}");
 					return name;
 				}
 				println!(
-					"restore {} phase: {phase:?}, waiting for {phase_name}",
+					"[{replica_name}] restore {} phase: {phase:?}, waiting for {phase_name}",
 					restore.name_any(),
 				);
 			}
 
 			if list.items.is_empty() {
-				println!(
-					"no restores found yet for replica {replica_name}, waiting for {phase_name}"
-				);
+				println!("[{replica_name}] no restores found yet, waiting for {phase_name}");
 			}
 
 			sleep(POLL_INTERVAL).await;
@@ -135,101 +202,168 @@ async fn wait_for_restore_phase(
 	})
 }
 
-async fn setup_namespace(client: &Client) {
-	let ns_api: Api<k8s_openapi::api::core::v1::Namespace> = Api::all(client.clone());
-	let ns = k8s_openapi::api::core::v1::Namespace {
-		metadata: ObjectMeta {
-			name: Some(TEST_NAMESPACE.into()),
-			..Default::default()
-		},
-		..Default::default()
-	};
-	let _ = ns_api
-		.patch(
-			TEST_NAMESPACE,
-			&PatchParams::apply("integration-test"),
-			&Patch::Apply(ns),
-		)
-		.await;
+async fn wait_for_replica_condition(
+	client: &Client,
+	ns: &str,
+	name: &str,
+	condition_type: &str,
+	expected_status: &str,
+	timeout_dur: Duration,
+) {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	timeout(timeout_dur, async {
+		loop {
+			if let Ok(replica) = replicas.get(name).await
+				&& let Some(status) = &replica.status
+			{
+				for cond in &status.conditions {
+					if cond.type_ == condition_type && cond.status == expected_status {
+						println!(
+							"[{name}] condition {condition_type}={expected_status} (reason: {})",
+							cond.reason
+						);
+						return;
+					}
+				}
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.unwrap_or_else(|_| {
+		panic!("timed out waiting for replica {name} condition {condition_type}={expected_status}")
+	});
 }
 
-async fn cleanup(client: &Client) {
-	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let _ = replicas.delete(REPLICA_NAME, &Default::default()).await;
-
-	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let list = match restores.list(&kube::api::ListParams::default()).await {
-		Ok(list) => list,
-		Err(_) => return,
+async fn count_restores_for_replica(client: &Client, ns: &str, replica_name: &str) -> usize {
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+	let list = match restores
+		.list(&ListParams::default().labels(&format!("bes.au/replica={replica_name}")))
+		.await
+	{
+		Ok(l) => l,
+		Err(_) => return 0,
 	};
-	for restore in &list.items {
-		let _ = restores
-			.delete(&restore.name_any(), &Default::default())
-			.await;
-	}
-
-	// Wait for restores to be deleted so their owned resources are cleaned up
-	sleep(Duration::from_secs(5)).await;
-
-	let secrets: Api<Secret> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let _ = secrets.delete(KOPIA_SECRET_NAME, &Default::default()).await;
-
-	// Wait for cascading deletes
-	sleep(Duration::from_secs(5)).await;
+	list.items.len()
 }
+
+async fn wait_for_job_failure(
+	client: &Client,
+	ns: &str,
+	job_label_selector: &str,
+	timeout_dur: Duration,
+) {
+	let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+	timeout(timeout_dur, async {
+		loop {
+			if let Ok(list) = jobs
+				.list(&ListParams::default().labels(job_label_selector))
+				.await
+			{
+				for job in &list.items {
+					let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+					let backoff = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
+					if failed > backoff {
+						println!(
+							"[{}] job failed ({failed} > backoff_limit {backoff})",
+							job.name_any()
+						);
+						return;
+					}
+					let conditions = job
+						.status
+						.as_ref()
+						.and_then(|s| s.conditions.as_ref())
+						.cloned()
+						.unwrap_or_default();
+					for cond in &conditions {
+						if cond.type_ == "Failed" && cond.status == "True" {
+							println!("[{}] job has Failed condition", job.name_any());
+							return;
+						}
+					}
+				}
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.unwrap_or_else(|_| {
+		panic!("timed out waiting for job with label {job_label_selector} to fail");
+	});
+}
+
+// ─── Test 1: Full restore lifecycle (happy path) ─────────────────────────────
 
 #[tokio::test]
 #[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
 async fn full_restore_lifecycle() {
-	let client = Client::try_default()
-		.await
-		.expect("expected a valid kubeconfig (e.g. from kind)");
+	let client = make_client().await;
+	let ns = "test-lifecycle";
 
-	setup_namespace(&client).await;
-	cleanup(&client).await;
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["lifecycle-replica"]).await;
 
-	let secrets: Api<Secret> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let services: Api<Service> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), TEST_NAMESPACE);
-	let deployments: Api<Deployment> = Api::namespaced(client.clone(), TEST_NAMESPACE);
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+	let services: Api<Service> = Api::namespaced(client.clone(), ns);
+	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), ns);
+	let deployments: Api<Deployment> = Api::namespaced(client.clone(), ns);
 
-	// Step 1: Create kopia secret
 	println!("--- creating kopia secret");
 	secrets
-		.create(&PostParams::default(), &kopia_secret())
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "lifecycle-kopia-creds", "test-bucket"),
+		)
 		.await
 		.expect("failed to create kopia secret");
 
-	// Step 2: Create the replica CR
 	println!("--- creating PostgresPhysicalReplica");
-	let mut replica = replica_cr();
-	replica.metadata.namespace = Some(TEST_NAMESPACE.into());
+	let mut replica = build_replica(
+		"lifecycle-replica",
+		"lifecycle-kopia-creds",
+		Default::default(),
+	);
+	replica.metadata.namespace = Some(ns.into());
 	replicas
 		.create(&PostParams::default(), &replica)
 		.await
 		.expect("failed to create replica");
 
-	// Step 3: Wait for replica to start restoring (snapshot discovery + restore creation)
 	println!("--- waiting for replica Restoring phase");
-	wait_for_replica_phase(&replicas, REPLICA_NAME, ReplicaPhase::Restoring).await;
+	wait_for_replica_phase(
+		&replicas,
+		"lifecycle-replica",
+		ReplicaPhase::Restoring,
+		PHASE_TIMEOUT,
+	)
+	.await;
 
-	// Step 4: Wait for a restore to reach the Active phase (full lifecycle)
 	println!("--- waiting for restore Active phase");
-	let restore_name = wait_for_restore_phase(&restores, REPLICA_NAME, RestorePhase::Active).await;
+	let restore_name = wait_for_restore_phase(
+		&restores,
+		"lifecycle-replica",
+		RestorePhase::Active,
+		PHASE_TIMEOUT,
+	)
+	.await;
 
-	// Step 5: Verify replica reaches Ready
 	println!("--- waiting for replica Ready phase");
-	wait_for_replica_phase(&replicas, REPLICA_NAME, ReplicaPhase::Ready).await;
+	wait_for_replica_phase(
+		&replicas,
+		"lifecycle-replica",
+		ReplicaPhase::Ready,
+		PHASE_TIMEOUT,
+	)
+	.await;
 
-	// Step 6: Verify resources were created
 	println!("--- verifying created resources");
 
-	// Credentials secret
-	let creds_secret_name = format!("{REPLICA_NAME}-creds");
+	let creds_secret_name = "lifecycle-replica-creds";
 	let creds = secrets
-		.get(&creds_secret_name)
+		.get(creds_secret_name)
 		.await
 		.expect("credentials secret not found");
 	let creds_data = creds.data.expect("credentials secret has no data");
@@ -238,8 +372,10 @@ async fn full_restore_lifecycle() {
 		"credentials secret missing 'password' key"
 	);
 
-	// Service
-	let svc = services.get(REPLICA_NAME).await.expect("service not found");
+	let svc = services
+		.get("lifecycle-replica")
+		.await
+		.expect("service not found");
 	let svc_spec = svc.spec.expect("service has no spec");
 	let ports = svc_spec.ports.expect("service has no ports");
 	assert!(
@@ -247,21 +383,18 @@ async fn full_restore_lifecycle() {
 		"service should expose port 5432"
 	);
 
-	// PVC for the restore
 	let pvc_name = format!("{restore_name}-data");
 	pvcs.get(&pvc_name)
 		.await
 		.unwrap_or_else(|_| panic!("PVC {pvc_name} not found"));
 
-	// Deployment for the restore (deployment name = restore name)
 	deployments
 		.get(&restore_name)
 		.await
 		.unwrap_or_else(|_| panic!("Deployment {restore_name} not found"));
 
-	// Step 7: Verify replica status fields
 	let replica = replicas
-		.get(REPLICA_NAME)
+		.get("lifecycle-replica")
 		.await
 		.expect("failed to get replica");
 	let status = replica.status.expect("replica has no status");
@@ -270,17 +403,10 @@ async fn full_restore_lifecycle() {
 	assert_eq!(
 		status.current_restore.as_deref(),
 		Some(restore_name.as_str()),
-		"currentRestore should match"
 	);
-	assert!(status.service_name.is_some(), "serviceName should be set");
-	assert!(
-		status.last_restore_completed_at.is_some(),
-		"lastRestoreCompletedAt should be set"
-	);
-	assert!(
-		status.connection_info.is_some(),
-		"connectionInfo should be set"
-	);
+	assert!(status.service_name.is_some());
+	assert!(status.last_restore_completed_at.is_some());
+	assert!(status.connection_info.is_some());
 
 	let conn = status.connection_info.unwrap();
 	assert_eq!(conn.port, 5432);
@@ -288,7 +414,6 @@ async fn full_restore_lifecycle() {
 	assert_eq!(conn.username, "analytics");
 	assert_eq!(conn.password_secret, creds_secret_name);
 
-	// Step 8: Verify restore status fields
 	let restore = restores
 		.get(&restore_name)
 		.await
@@ -296,24 +421,658 @@ async fn full_restore_lifecycle() {
 	let restore_status = restore.status.expect("restore has no status");
 
 	assert_eq!(restore_status.phase, Some(RestorePhase::Active));
-	assert!(
-		restore_status.postgres_version.is_some(),
-		"postgresVersion should be detected"
-	);
-	assert!(
-		restore_status.restored_at.is_some(),
-		"restoredAt should be set"
-	);
-	assert!(
-		restore_status.activated_at.is_some(),
-		"activatedAt should be set"
-	);
-	assert!(restore_status.pvc.is_some(), "pvc should be set in status");
-	assert!(
-		restore_status.deployment.is_some(),
-		"deployment should be set in status"
-	);
+	assert!(restore_status.postgres_version.is_some());
+	assert!(restore_status.restored_at.is_some());
+	assert!(restore_status.activated_at.is_some());
+	assert!(restore_status.pvc.is_some());
+	assert!(restore_status.deployment.is_some());
 
 	println!("--- all assertions passed, cleaning up");
-	cleanup(&client).await;
+	cleanup_namespace(&client, ns, &["lifecycle-replica"]).await;
+}
+
+// ─── Test 2: Restore fails when snapshot contains non-Postgres data ──────────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn restore_fails_for_non_postgres_data() {
+	let client = make_client().await;
+	let ns = "test-non-pg-data";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["non-pg-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret pointing to non-postgres bucket");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "non-pg-kopia-creds", "non-postgres-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating PostgresPhysicalReplica");
+	let mut replica = build_replica("non-pg-replica", "non-pg-kopia-creds", Default::default());
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for replica to start restoring");
+	wait_for_replica_phase(
+		&replicas,
+		"non-pg-replica",
+		ReplicaPhase::Restoring,
+		PHASE_TIMEOUT,
+	)
+	.await;
+
+	println!("--- waiting for restore to fail (no PG_VERSION in restored data)");
+	let restore_name = wait_for_restore_phase(
+		&restores,
+		"non-pg-replica",
+		RestorePhase::Failed,
+		LONG_PHASE_TIMEOUT,
+	)
+	.await;
+
+	let restore = restores
+		.get(&restore_name)
+		.await
+		.expect("failed to get restore");
+	let restore_status = restore.status.expect("restore has no status");
+	assert_eq!(restore_status.phase, Some(RestorePhase::Failed));
+	assert!(
+		restore_status.restore_job.is_some(),
+		"restore should have a restoreJob status"
+	);
+	let job_status = restore_status.restore_job.unwrap();
+	assert_eq!(job_status.phase, "Failed");
+
+	// Postgres version should NOT be detected (since data isn't postgres)
+	assert!(
+		restore_status.postgres_version.is_none(),
+		"postgresVersion should not be set for non-postgres data"
+	);
+
+	// Replica should still be functional (not crashed)
+	let replica = replicas
+		.get("non-pg-replica")
+		.await
+		.expect("failed to get replica after failure");
+	assert!(
+		replica.status.is_some(),
+		"replica should still have status after restore failure"
+	);
+
+	println!("--- restore correctly failed for non-postgres data");
+	cleanup_namespace(&client, ns, &["non-pg-replica"]).await;
+}
+
+// ─── Test 3: Invalid kopia secret structure ──────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn invalid_kopia_secret_structure() {
+	let client = make_client().await;
+	let ns = "test-invalid-secret";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["invalid-secret-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret with missing required keys");
+	let invalid_secret = Secret {
+		metadata: ObjectMeta {
+			name: Some("invalid-kopia-creds".into()),
+			namespace: Some(ns.into()),
+			..Default::default()
+		},
+		data: Some(BTreeMap::from([
+			("bucket".into(), ByteString("test-bucket".into())),
+			// Missing: region, accessKeyId, secretAccessKey, repositoryPassword
+		])),
+		..Default::default()
+	};
+	secrets
+		.create(&PostParams::default(), &invalid_secret)
+		.await
+		.expect("failed to create invalid secret");
+
+	println!("--- creating PostgresPhysicalReplica");
+	let mut replica = build_replica(
+		"invalid-secret-replica",
+		"invalid-kopia-creds",
+		Default::default(),
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for KopiaSecretValid=False condition");
+	wait_for_replica_condition(
+		&client,
+		ns,
+		"invalid-secret-replica",
+		"KopiaSecretValid",
+		"False",
+		Duration::from_secs(60),
+	)
+	.await;
+
+	// Verify the condition has the right reason
+	let replica = replicas
+		.get("invalid-secret-replica")
+		.await
+		.expect("failed to get replica");
+	let status = replica.status.expect("replica has no status");
+	let cond = status
+		.conditions
+		.iter()
+		.find(|c| c.type_ == "KopiaSecretValid")
+		.expect("KopiaSecretValid condition not found");
+	assert_eq!(cond.status, "False");
+	assert_eq!(cond.reason, "SecretInvalid");
+	assert!(
+		cond.message.contains("missing key"),
+		"condition message should mention missing key, got: {}",
+		cond.message
+	);
+
+	// No restores should be created
+	let restore_count = count_restores_for_replica(&client, ns, "invalid-secret-replica").await;
+	assert_eq!(
+		restore_count, 0,
+		"no restores should be created with invalid secret"
+	);
+
+	// No snapshot-list jobs should be created
+	let jobs: Api<Job> = Api::namespaced(client.clone(), ns);
+	let job_list = jobs
+		.list(&ListParams::default().labels("bes.au/replica=invalid-secret-replica"))
+		.await
+		.expect("failed to list jobs");
+	assert!(
+		job_list.items.is_empty(),
+		"no jobs should be created with invalid secret"
+	);
+
+	println!("--- invalid secret correctly detected");
+	cleanup_namespace(&client, ns, &["invalid-secret-replica"]).await;
+}
+
+// ─── Test 4: Missing kopia secret ────────────────────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn missing_kopia_secret_handled() {
+	let client = make_client().await;
+	let ns = "test-missing-secret";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["missing-secret-replica"]).await;
+
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating PostgresPhysicalReplica referencing non-existent secret");
+	let mut replica = build_replica(
+		"missing-secret-replica",
+		"this-secret-does-not-exist",
+		Default::default(),
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for KopiaSecretValid=False condition");
+	wait_for_replica_condition(
+		&client,
+		ns,
+		"missing-secret-replica",
+		"KopiaSecretValid",
+		"False",
+		Duration::from_secs(60),
+	)
+	.await;
+
+	let replica = replicas
+		.get("missing-secret-replica")
+		.await
+		.expect("failed to get replica");
+	let status = replica.status.expect("replica has no status");
+	let cond = status
+		.conditions
+		.iter()
+		.find(|c| c.type_ == "KopiaSecretValid")
+		.expect("KopiaSecretValid condition not found");
+	assert_eq!(cond.status, "False");
+	assert_eq!(cond.reason, "SecretNotFound");
+
+	let restore_count = count_restores_for_replica(&client, ns, "missing-secret-replica").await;
+	assert_eq!(
+		restore_count, 0,
+		"no restores should be created when secret is missing"
+	);
+
+	println!("--- missing secret correctly detected");
+	cleanup_namespace(&client, ns, &["missing-secret-replica"]).await;
+}
+
+// ─── Test 5: Snapshot job fails when bucket doesn't exist ────────────────────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn snapshot_job_fails_for_wrong_bucket() {
+	let client = make_client().await;
+	let ns = "test-wrong-bucket";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["wrong-bucket-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret pointing to non-existent bucket");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "wrong-bucket-creds", "bucket-that-does-not-exist"),
+		)
+		.await
+		.expect("failed to create secret");
+
+	println!("--- creating PostgresPhysicalReplica");
+	let mut replica = build_replica(
+		"wrong-bucket-replica",
+		"wrong-bucket-creds",
+		Default::default(),
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	// The kopia secret is structurally valid, so the condition should be True
+	println!("--- waiting for KopiaSecretValid=True condition");
+	wait_for_replica_condition(
+		&client,
+		ns,
+		"wrong-bucket-replica",
+		"KopiaSecretValid",
+		"True",
+		Duration::from_secs(60),
+	)
+	.await;
+
+	// Wait for the snapshot-list job to be created and fail
+	println!("--- waiting for snapshot-list job to fail");
+	wait_for_job_failure(
+		&client,
+		ns,
+		"bes.au/replica=wrong-bucket-replica,bes.au/job-type=snapshot-list",
+		LONG_PHASE_TIMEOUT,
+	)
+	.await;
+
+	// No restores should be created since snapshot discovery failed
+	let restore_count = count_restores_for_replica(&client, ns, "wrong-bucket-replica").await;
+	assert_eq!(
+		restore_count, 0,
+		"no restores should be created when snapshot list job fails"
+	);
+
+	// Replica should stay in Pending (no active restore)
+	// Allow some time for the operator to reconcile after the job failure
+	sleep(Duration::from_secs(10)).await;
+	let replica = replicas
+		.get("wrong-bucket-replica")
+		.await
+		.expect("failed to get replica");
+	let phase = replica.status.as_ref().and_then(|s| s.phase.as_ref());
+	assert_eq!(
+		phase,
+		Some(&ReplicaPhase::Pending),
+		"replica should be Pending after snapshot job failure"
+	);
+
+	println!("--- snapshot job failure handled correctly");
+	cleanup_namespace(&client, ns, &["wrong-bucket-replica"]).await;
+}
+
+// ─── Test 6: Minimum TTL prevents premature restores ─────────────────────────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn minimum_ttl_prevents_premature_restore() {
+	let client = make_client().await;
+	let ns = "test-min-ttl";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["ttl-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "ttl-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating PostgresPhysicalReplica with schedule and long minimum_ttl");
+	let mut replica = build_replica(
+		"ttl-replica",
+		"ttl-kopia-creds",
+		ReplicaOpts {
+			schedule: Some("* * * * *".into()), // every minute
+			minimum_ttl: Some("24h".into()),    // 24 hours - won't expire during test
+			schedule_jitter: Some("0s".into()),
+		},
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for first restore to complete");
+	wait_for_replica_phase(
+		&replicas,
+		"ttl-replica",
+		ReplicaPhase::Restoring,
+		PHASE_TIMEOUT,
+	)
+	.await;
+	let first_restore_name = wait_for_restore_phase(
+		&restores,
+		"ttl-replica",
+		RestorePhase::Active,
+		PHASE_TIMEOUT,
+	)
+	.await;
+
+	println!("--- waiting for replica to be Ready");
+	wait_for_replica_phase(&replicas, "ttl-replica", ReplicaPhase::Ready, PHASE_TIMEOUT).await;
+
+	// Record the number of restores after first restore completes
+	let initial_restore_count = count_restores_for_replica(&client, ns, "ttl-replica").await;
+	println!(
+		"--- first restore complete: {first_restore_name} (total restores: {initial_restore_count})"
+	);
+
+	// Wait long enough for at least 2 cron schedule triggers (>= 90s)
+	// If TTL were not blocking, the operator would trigger a new restore
+	println!("--- waiting 100s to verify no premature restores are triggered");
+	sleep(Duration::from_secs(100)).await;
+
+	// Count restores again - should be the same (TTL blocks new restores)
+	let final_restore_count = count_restores_for_replica(&client, ns, "ttl-replica").await;
+	println!(
+		"--- restore count after waiting: {final_restore_count} (was: {initial_restore_count})"
+	);
+
+	// The count may stay the same or decrease (if the operator cleaned up failed ones),
+	// but it should NOT increase
+	assert!(
+		final_restore_count <= initial_restore_count,
+		"minimum_ttl should prevent new restores: expected <= {initial_restore_count}, got {final_restore_count}"
+	);
+
+	// Verify the replica is still Ready (not trying to restore again)
+	let replica = replicas
+		.get("ttl-replica")
+		.await
+		.expect("failed to get replica");
+	let status = replica.status.expect("replica has no status");
+	assert_eq!(
+		status.phase,
+		Some(ReplicaPhase::Ready),
+		"replica should remain Ready while TTL is active"
+	);
+	assert_eq!(
+		status.current_restore.as_deref(),
+		Some(first_restore_name.as_str()),
+		"currentRestore should still be the first restore"
+	);
+
+	println!("--- minimum TTL correctly prevented premature restore");
+	cleanup_namespace(&client, ns, &["ttl-replica"]).await;
+}
+
+// ─── Test 7: Second restore triggers switchover ──────────────────────────────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn second_restore_and_switchover() {
+	let client = make_client().await;
+	let ns = "test-switchover";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["switchover-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+	let services: Api<Service> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "switchover-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating PostgresPhysicalReplica (no schedule, manual trigger)");
+	let mut replica = build_replica(
+		"switchover-replica",
+		"switchover-kopia-creds",
+		Default::default(),
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for first restore to complete");
+	wait_for_replica_phase(
+		&replicas,
+		"switchover-replica",
+		ReplicaPhase::Restoring,
+		PHASE_TIMEOUT,
+	)
+	.await;
+	let first_restore_name = wait_for_restore_phase(
+		&restores,
+		"switchover-replica",
+		RestorePhase::Active,
+		PHASE_TIMEOUT,
+	)
+	.await;
+	wait_for_replica_phase(
+		&replicas,
+		"switchover-replica",
+		ReplicaPhase::Ready,
+		PHASE_TIMEOUT,
+	)
+	.await;
+
+	println!("--- first restore active: {first_restore_name}");
+
+	// Read the first restore's snapshot info to reuse
+	let first_restore = restores
+		.get(&first_restore_name)
+		.await
+		.expect("failed to get first restore");
+	let snapshot_id = first_restore.spec.snapshot.clone();
+	let snapshot_size = first_restore.spec.snapshot_size.clone();
+	let storage_size = first_restore.spec.storage_size.clone();
+
+	// Get replica UID for owner reference
+	let replica = replicas
+		.get("switchover-replica")
+		.await
+		.expect("failed to get replica");
+	let replica_uid = replica.uid().expect("replica has no UID");
+
+	// Verify the service selector points to the first restore
+	let svc = services
+		.get("switchover-replica")
+		.await
+		.expect("service not found");
+	let svc_selector = svc
+		.spec
+		.as_ref()
+		.and_then(|s| s.selector.as_ref())
+		.cloned()
+		.unwrap_or_default();
+	assert_eq!(
+		svc_selector.get("bes.au/restore").map(|s| s.as_str()),
+		Some(first_restore_name.as_str()),
+		"service selector should point to first restore"
+	);
+
+	// Manually create a second PostgresPhysicalRestore to trigger switchover
+	let second_restore_name = "switchover-replica-manual-second";
+	println!("--- creating second restore manually: {second_restore_name}");
+
+	let second_restore = PostgresPhysicalRestore::new(
+		second_restore_name,
+		PostgresPhysicalRestoreSpec {
+			replica: "switchover-replica".into(),
+			snapshot: snapshot_id.clone(),
+			snapshot_size,
+			storage_size,
+		},
+	);
+
+	let mut restore_value = serde_json::to_value(&second_restore).unwrap();
+	if let Some(meta) = restore_value
+		.as_object_mut()
+		.and_then(|o| o.get_mut("metadata"))
+		.and_then(|m| m.as_object_mut())
+	{
+		meta.insert(
+			"namespace".to_string(),
+			serde_json::Value::String(ns.to_string()),
+		);
+		meta.insert(
+			"labels".to_string(),
+			serde_json::json!({ "bes.au/replica": "switchover-replica" }),
+		);
+		meta.insert(
+			"ownerReferences".to_string(),
+			serde_json::json!([{
+				"apiVersion": "bes.au/v1alpha1",
+				"kind": "PostgresPhysicalReplica",
+				"name": "switchover-replica",
+				"uid": replica_uid,
+				"controller": true,
+				"blockOwnerDeletion": true,
+			}]),
+		);
+	}
+
+	let second_restore_resource: PostgresPhysicalRestore =
+		serde_json::from_value(restore_value).unwrap();
+	restores
+		.create(&PostParams::default(), &second_restore_resource)
+		.await
+		.expect("failed to create second restore");
+
+	println!("--- waiting for second restore to become Active");
+	timeout(LONG_PHASE_TIMEOUT, async {
+		loop {
+			if let Ok(restore) = restores.get(second_restore_name).await {
+				let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
+				println!("[{second_restore_name}] phase: {phase:?}");
+				if phase == Some(&RestorePhase::Active) {
+					return;
+				}
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for second restore to become Active");
+
+	println!("--- verifying switchover occurred");
+
+	// Replica status should reflect the switchover
+	let replica = replicas
+		.get("switchover-replica")
+		.await
+		.expect("failed to get replica after switchover");
+	let status = replica
+		.status
+		.expect("replica has no status after switchover");
+
+	assert_eq!(
+		status.phase,
+		Some(ReplicaPhase::Ready),
+		"replica should be Ready after switchover"
+	);
+	assert_eq!(
+		status.current_restore.as_deref(),
+		Some(second_restore_name),
+		"currentRestore should be the second restore"
+	);
+	assert_eq!(
+		status.previous_restore.as_deref(),
+		Some(first_restore_name.as_str()),
+		"previousRestore should be the first restore"
+	);
+
+	// Service selector should now point to the second restore
+	let svc = services
+		.get("switchover-replica")
+		.await
+		.expect("service not found after switchover");
+	let svc_selector = svc
+		.spec
+		.as_ref()
+		.and_then(|s| s.selector.as_ref())
+		.cloned()
+		.unwrap_or_default();
+	assert_eq!(
+		svc_selector.get("bes.au/restore").map(|s| s.as_str()),
+		Some(second_restore_name),
+		"service selector should point to second restore after switchover"
+	);
+
+	// Second restore should have activated_at set
+	let second_restore = restores
+		.get(second_restore_name)
+		.await
+		.expect("failed to get second restore");
+	let second_status = second_restore.status.expect("second restore has no status");
+	assert!(
+		second_status.activated_at.is_some(),
+		"activatedAt should be set on second restore"
+	);
+	assert!(
+		second_status.restored_at.is_some(),
+		"restoredAt should be set on second restore"
+	);
+
+	println!("--- switchover completed successfully");
+	cleanup_namespace(&client, ns, &["switchover-replica"]).await;
 }

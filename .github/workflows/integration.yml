@@ -19,7 +19,7 @@ jobs:
   integration:
     name: Integration tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
 
@@ -66,7 +66,7 @@ jobs:
             name: postgres-restore-operator-config
             namespace: pgro-system
           data:
-            maxConcurrentRestores: "2"
+            maxConcurrentRestores: "4"
           EOF
 
       - name: Pre-pull images on kind node
@@ -85,7 +85,7 @@ jobs:
           kubectl wait --namespace minio --for=condition=Available deployment/minio --timeout=120s
           echo "MinIO is ready"
 
-      - name: Set up test kopia repository
+      - name: Set up test kopia repository (postgres data)
         run: |
           kubectl apply -f tests/fixtures/setup-kopia-repo.yaml
           for i in $(seq 1 60); do
@@ -116,6 +116,33 @@ jobs:
           kubectl logs job/setup-kopia-repo --all-containers --prefix
           echo "--- Kopia repository ready ---"
 
+      - name: Set up non-postgres kopia snapshot
+        run: |
+          kubectl apply -f tests/fixtures/setup-non-postgres-snapshot.yaml
+          for i in $(seq 1 60); do
+            STATUS=$(kubectl get job/setup-non-postgres-snapshot -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)
+            FAILED=$(kubectl get job/setup-non-postgres-snapshot -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+            if [ "$STATUS" = "True" ]; then
+              echo "Non-postgres snapshot job completed successfully"
+              break
+            fi
+            if [ "$FAILED" = "True" ]; then
+              echo "Non-postgres snapshot job failed!"
+              kubectl describe job/setup-non-postgres-snapshot
+              kubectl logs job/setup-non-postgres-snapshot --all-containers --prefix
+              exit 1
+            fi
+            if [ "$i" = "60" ]; then
+              echo "Non-postgres snapshot job timed out after 300s"
+              kubectl describe job/setup-non-postgres-snapshot
+              kubectl logs job/setup-non-postgres-snapshot --all-containers --prefix 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "--- Non-postgres snapshot job logs ---"
+          kubectl logs job/setup-non-postgres-snapshot --all-containers --prefix
+
       - name: Start operator (out-of-cluster)
         run: |
           RUST_LOG=info,tower_http=debug \
@@ -139,7 +166,7 @@ jobs:
           done
 
       - name: Run integration tests
-        run: cargo test --test integration -- --ignored --nocapture
+        run: cargo test --test integration -- --ignored --nocapture --test-threads=2
         env:
           RUST_LOG: info
 
@@ -155,8 +182,11 @@ jobs:
           echo "=== Namespaces ==="
           kubectl get ns
 
-          echo "=== All resources in integration-test namespace ==="
-          kubectl get all -n integration-test 2>/dev/null || true
+          echo "=== All resources in test namespaces ==="
+          for ns in test-lifecycle test-non-pg-data test-invalid-secret test-missing-secret test-wrong-bucket test-min-ttl test-switchover; do
+            echo "--- Namespace: $ns ---"
+            kubectl get all -n "$ns" 2>/dev/null || true
+          done
 
           echo "=== PostgresPhysicalReplicas ==="
           kubectl get postgresphysicalreplicas -A -o yaml 2>/dev/null || true
@@ -170,13 +200,21 @@ jobs:
           echo "=== Pods ==="
           kubectl get pods -A -o wide 2>/dev/null || true
 
-          echo "=== Events in integration-test ==="
-          kubectl get events -n integration-test --sort-by=.lastTimestamp 2>/dev/null || true
+          echo "=== PVCs ==="
+          kubectl get pvc -A -o wide 2>/dev/null || true
+
+          echo "=== Events in test namespaces ==="
+          for ns in test-lifecycle test-non-pg-data test-invalid-secret test-missing-secret test-wrong-bucket test-min-ttl test-switchover; do
+            echo "--- Events in $ns ---"
+            kubectl get events -n "$ns" --sort-by=.lastTimestamp 2>/dev/null || true
+          done
 
           echo "=== Failed pod logs ==="
-          for pod in $(kubectl get pods -n integration-test --no-headers -o custom-columns=":metadata.name" 2>/dev/null); do
-            echo "--- Pod: $pod ---"
-            kubectl logs -n integration-test "$pod" --all-containers 2>/dev/null || true
+          for ns in test-lifecycle test-non-pg-data test-invalid-secret test-missing-secret test-wrong-bucket test-min-ttl test-switchover; do
+            for pod in $(kubectl get pods -n "$ns" --no-headers -o custom-columns=":metadata.name" 2>/dev/null); do
+              echo "--- Pod: $ns/$pod ---"
+              kubectl logs -n "$ns" "$pod" --all-containers 2>/dev/null || true
+            done
           done
 
       - name: Stop operator
