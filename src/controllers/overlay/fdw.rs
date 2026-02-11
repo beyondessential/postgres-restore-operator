@@ -352,13 +352,120 @@ async fn discover_remote_enums(pg: &tokio_postgres::Client) -> Result<Vec<Remote
 	Ok(result)
 }
 
+/// Ensure the `_pgro.stub_types` tracking table exists.
+async fn ensure_stub_types_table(pg: &tokio_postgres::Client) -> Result<()> {
+	pg.batch_execute(
+		"CREATE TABLE IF NOT EXISTS _pgro.stub_types ( \
+		   schema_name text NOT NULL, \
+		   type_name text NOT NULL, \
+		   kind text NOT NULL, \
+		   PRIMARY KEY (schema_name, type_name) \
+		 )",
+	)
+	.await?;
+	Ok(())
+}
+
+/// Drop all previously tracked stub types from the overlay database.
+///
+/// Domains are dropped before enums because a domain could reference an enum.
+/// Within domains, we drop in reverse insertion order to respect dependencies
+/// (domains inserted later may depend on earlier ones).
+async fn drop_tracked_stub_types(pg: &tokio_postgres::Client) -> Result<()> {
+	// Drop domains first (in reverse order to handle dependencies)
+	let domain_rows = pg
+		.query(
+			"SELECT schema_name, type_name FROM _pgro.stub_types \
+			 WHERE kind = 'domain' \
+			 ORDER BY ctid DESC",
+			&[],
+		)
+		.await?;
+	for row in &domain_rows {
+		let schema: String = row.get(0);
+		let name: String = row.get(1);
+		let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&name));
+		if let Err(err) = pg
+			.batch_execute(&format!("DROP DOMAIN IF EXISTS {qualified}"))
+			.await
+		{
+			warn!(
+				schema = %schema,
+				name = %name,
+				error = %err,
+				"failed to drop stale stub domain"
+			);
+		}
+	}
+
+	// Then drop enums
+	let enum_rows = pg
+		.query(
+			"SELECT schema_name, type_name FROM _pgro.stub_types \
+			 WHERE kind = 'enum'",
+			&[],
+		)
+		.await?;
+	for row in &enum_rows {
+		let schema: String = row.get(0);
+		let name: String = row.get(1);
+		let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&name));
+		if let Err(err) = pg
+			.batch_execute(&format!("DROP TYPE IF EXISTS {qualified}"))
+			.await
+		{
+			warn!(
+				schema = %schema,
+				name = %name,
+				error = %err,
+				"failed to drop stale stub enum"
+			);
+		}
+	}
+
+	let total = domain_rows.len() + enum_rows.len();
+	if total > 0 {
+		info!(
+			domains = domain_rows.len(),
+			enums = enum_rows.len(),
+			"dropped stale stub types from previous restore"
+		);
+	}
+
+	pg.batch_execute("DELETE FROM _pgro.stub_types").await?;
+	Ok(())
+}
+
+/// Record a successfully created stub type in the tracking table.
+async fn track_stub_type(
+	pg: &tokio_postgres::Client,
+	schema: &str,
+	name: &str,
+	kind: &str,
+) -> Result<()> {
+	pg.execute(
+		"INSERT INTO _pgro.stub_types (schema_name, type_name, kind) \
+		 VALUES ($1, $2, $3) \
+		 ON CONFLICT (schema_name, type_name) DO NOTHING",
+		&[&schema, &name, &kind],
+	)
+	.await?;
+	Ok(())
+}
+
 /// Create stub custom types (domains and enums) on the overlay database so
 /// that `IMPORT FOREIGN SCHEMA` can resolve column types.
+///
+/// Previously created stub types are dropped first via the `_pgro.stub_types`
+/// tracking table, ensuring stale types from old restores don't accumulate.
 async fn ensure_custom_types_on_overlay(
 	overlay_pg: &tokio_postgres::Client,
 	domains: &[RemoteDomain],
 	enums: &[RemoteEnum],
 ) -> Result<()> {
+	ensure_stub_types_table(overlay_pg).await?;
+	drop_tracked_stub_types(overlay_pg).await?;
+
 	if domains.is_empty() && enums.is_empty() {
 		return Ok(());
 	}
@@ -399,6 +506,7 @@ async fn ensure_custom_types_on_overlay(
 			);
 		} else {
 			debug!(schema = %e.schema, name = %e.name, "created stub enum type");
+			track_stub_type(overlay_pg, &e.schema, &e.name, "enum").await?;
 		}
 	}
 
@@ -422,6 +530,7 @@ async fn ensure_custom_types_on_overlay(
 			);
 		} else {
 			debug!(schema = %d.schema, name = %d.name, base_type = %d.base_type, "created stub domain");
+			track_stub_type(overlay_pg, &d.schema, &d.name, "domain").await?;
 		}
 	}
 
