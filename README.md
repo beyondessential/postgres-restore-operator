@@ -106,6 +106,16 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 Using the `overlayDatabase` requires the CloudNative-PG operator to be installed and configured.
 Installing the CNPG cluster-level catalogs is optional but recommended.
 
+The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
+It has two interesting features:
+- you can append a timezone (we default to UTC): `20 15 * * * Pacific/Auckland`;
+- you can use `H` in any field to use an arbitrary quantity which is derived from the replica's identity, e.g. `H 15 * * *`.
+
+Jitter is applied to the scheduled time after the cron expression is evaluated.
+The jitter is a random duration between -time/2 and +time/2.
+For example, `10m` will result in a jitter between -5m and 5m.
+When using `H` in the cron expression, you might want to set the jitter to zero to properly take advantage of the spread-but-stable behaviour.
+
 #### SnapshotFilter
 
 | Field | Type | Required | Description |
