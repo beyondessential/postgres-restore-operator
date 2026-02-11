@@ -49,6 +49,10 @@ rules:
     - apiGroups: [""]
       resources: ["pods"]
       verbs: ["get", "list"]
+    # Pod port-forward (overlay FDW reconciliation)
+    - apiGroups: [""]
+      resources: ["pods/portforward"]
+      verbs: ["create"]
     # Events
     - apiGroups: [""]
       resources: ["events"]
