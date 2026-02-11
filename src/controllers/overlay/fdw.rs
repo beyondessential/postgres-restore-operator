@@ -453,19 +453,28 @@ async fn track_stub_type(
 	Ok(())
 }
 
+/// Drop all previously tracked stub types and clear the tracking table.
+///
+/// Called once before the schema import loop so that stale types from a
+/// previous restore are removed.
+async fn cleanup_stale_stub_types(overlay_pg: &tokio_postgres::Client) -> Result<()> {
+	ensure_stub_types_table(overlay_pg).await?;
+	drop_tracked_stub_types(overlay_pg).await?;
+	Ok(())
+}
+
 /// Create stub custom types (domains and enums) on the overlay database so
 /// that `IMPORT FOREIGN SCHEMA` can resolve column types.
 ///
-/// Previously created stub types are dropped first via the `_pgro.stub_types`
-/// tracking table, ensuring stale types from old restores don't accumulate.
-async fn ensure_custom_types_on_overlay(
+/// This is idempotent: types that already exist are silently skipped via
+/// `EXCEPTION WHEN duplicate_object`. It must be called inside the import
+/// loop (after `DROP SCHEMA ... CASCADE` + `CREATE SCHEMA`) because
+/// dropping a schema also drops any stub types that lived in it.
+async fn create_stub_types(
 	overlay_pg: &tokio_postgres::Client,
 	domains: &[RemoteDomain],
 	enums: &[RemoteEnum],
 ) -> Result<()> {
-	ensure_stub_types_table(overlay_pg).await?;
-	drop_tracked_stub_types(overlay_pg).await?;
-
 	if domains.is_empty() && enums.is_empty() {
 		return Ok(());
 	}
@@ -534,11 +543,6 @@ async fn ensure_custom_types_on_overlay(
 		}
 	}
 
-	info!(
-		domains = domains.len(),
-		enums = enums.len(),
-		"ensured custom stub types on overlay database"
-	);
 	Ok(())
 }
 
@@ -737,8 +741,10 @@ pub async fn reconcile_fdw(
 			enums = enums.len(),
 			"replicating custom types from restore to overlay"
 		);
-		ensure_custom_types_on_overlay(overlay_pg, &domains, &enums).await?;
 	}
+
+	// Drop stale stub types from a previous restore once before the loop
+	cleanup_stale_stub_types(overlay_pg).await?;
 
 	// Resolve expected schemas and import any that are missing
 	let schemas = resolve_fdw_schemas(
@@ -780,6 +786,9 @@ pub async fn reconcile_fdw(
 		overlay_pg
 			.batch_execute(&format!("CREATE SCHEMA {local_quoted}"))
 			.await?;
+		// Re-create stub types after schema drop since DROP SCHEMA CASCADE
+		// destroys any stub types that lived in the dropped schema.
+		create_stub_types(overlay_pg, &domains, &enums).await?;
 		debug!(
 			remote = %remote,
 			local = %local,
