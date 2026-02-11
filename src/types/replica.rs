@@ -42,8 +42,7 @@ pub struct PostgresPhysicalReplicaSpec {
 	pub snapshot_filter: Option<SnapshotFilter>,
 
 	/// Cron expression for scheduled restores
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub schedule: Option<String>,
+	pub schedule: String,
 
 	/// Random jitter added to scheduled restores
 	#[serde(default = "default_schedule_jitter")]

@@ -29,7 +29,7 @@ fn make_replica_with_opts(
 				namespace: None,
 			},
 			snapshot_filter: None,
-			schedule: None,
+			schedule: "0 */6 * * *".into(),
 			schedule_jitter: TimeSpan(Span::new().minutes(10)),
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),

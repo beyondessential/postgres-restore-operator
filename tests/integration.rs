@@ -112,7 +112,7 @@ fn build_kopia_secret(ns: &str, name: &str, bucket: &str) -> Secret {
 }
 
 struct ReplicaOpts {
-	schedule: Option<String>,
+	schedule: String,
 	minimum_ttl: Option<TimeSpan>,
 	schedule_jitter: Option<TimeSpan>,
 	overlay_database: Option<OverlayDatabaseConfig>,
@@ -121,7 +121,7 @@ struct ReplicaOpts {
 impl Default for ReplicaOpts {
 	fn default() -> Self {
 		Self {
-			schedule: None,
+			schedule: "0 */6 * * *".into(),
 			minimum_ttl: None,
 			schedule_jitter: None,
 			overlay_database: None,
@@ -770,7 +770,7 @@ async fn minimum_ttl_prevents_premature_restore() {
 		"ttl-replica",
 		"ttl-kopia-creds",
 		ReplicaOpts {
-			schedule: Some("* * * * *".into()),                 // every minute
+			schedule: "* * * * *".into(),                       // every minute
 			minimum_ttl: Some(TimeSpan(Span::new().hours(24))), // 24 hours - won't expire during test
 			schedule_jitter: Some(TimeSpan::default()),         // no jitter
 			..Default::default()

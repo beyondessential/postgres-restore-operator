@@ -86,7 +86,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 |-------|------|----------|---------|-------------|
 | `kopiaSecretRef` | `SecretReference` | Yes | — | Reference to a Secret containing Kopia repository credentials (`bucket`, `region`, `repositoryPassword`, `accessKeyId`, `secretAccessKey`). |
 | `snapshotFilter` | `SnapshotFilter` | No | — | Filter criteria to select which Kopia snapshot to restore. |
-| `schedule` | `string` | No | — | Cron expression controlling how often new restores are triggered. |
+| `schedule` | `string` | Yes | — | Cron expression controlling how often new restores are triggered. |
 | `scheduleJitter` | `string` | No | `"10m"` | Random jitter added to scheduled restores (friendly duration, e.g. `"5m"`, `"1h"`). |
 | `minimumTtl` | `string` | No | — | Don't restore a new snapshot within this duration of the last restore completing. |
 | `switchoverGracePeriod` | `string` | No | `"5m"` | How long to wait before deleting the old restore after a switchover. |

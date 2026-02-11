@@ -20,6 +20,7 @@ use crate::{
 	kopia,
 	types::*,
 };
+use scheduling::ScheduleDecision;
 
 mod resources;
 mod scheduling;
@@ -239,13 +240,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.send_notifications(client, &ctx.http_client, switching, &ctx.metrics)
 			.await;
 
-		// Recompute next scheduled restore in case schedule changed while restore was in flight
-		if let Some(next) = replica.compute_next_scheduled_restore(now) {
-			replica
-				.update_status_field(client, "nextScheduledRestore", Time(next))
-				.await?;
-		}
-
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
@@ -402,6 +396,19 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.and_then(|s| s.last_restore_completed_at.as_ref())
 			.is_none();
 
+	// Ensure nextScheduledRestore is populated
+	if replica
+		.status
+		.as_ref()
+		.and_then(|s| s.next_scheduled_restore.as_ref())
+		.is_none()
+		&& let Some(next) = replica.compute_next_scheduled_restore(now)
+	{
+		replica
+			.update_status_field(client, "nextScheduledRestore", Time(next))
+			.await?;
+	}
+
 	if never_restored {
 		info!(
 			replica = name,
@@ -409,15 +416,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		);
 	}
 
-	let should_restore = never_restored || replica.should_trigger_scheduled_restore();
+	let schedule_decision = replica.check_schedule();
+
+	let should_restore = never_restored || matches!(schedule_decision, ScheduleDecision::Trigger);
+
+	// Recompute nextScheduledRestore when a trigger fires (whether it proceeds or is skipped by TTL)
+	if matches!(
+		schedule_decision,
+		ScheduleDecision::Trigger | ScheduleDecision::SkippedByTtl
+	) && let Some(next) = replica.compute_next_scheduled_restore(now)
+	{
+		replica
+			.update_status_field(client, "nextScheduledRestore", Time(next))
+			.await?;
+	}
 
 	if should_restore {
-		if let Some(next) = replica.compute_next_scheduled_restore(now) {
-			replica
-				.update_status_field(client, "nextScheduledRestore", Time(next))
-				.await?;
-		}
-
 		// Check concurrent restore limit
 		let mut queue = ctx.restore_queue.write().await;
 		if !queue.can_start(ctx.max_concurrent_restores()) {
