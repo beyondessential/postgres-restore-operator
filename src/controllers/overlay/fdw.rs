@@ -667,45 +667,32 @@ pub async fn reconcile_fdw(
 		}
 	}
 
-	// Ensure user mappings (always recreate to pick up credential changes)
-	let analytics_user = &replica.spec.analytics_username;
-	let mapped_users: &[&str] = &["CURRENT_USER", analytics_user];
-	for &map_user in mapped_users {
-		let is_role = map_user != "CURRENT_USER";
-		let user_sql = if is_role {
-			quote_ident(map_user)
-		} else {
-			map_user.to_string()
-		};
-
-		// Drop existing mapping if present
-		let exists = overlay_pg
-			.query_opt(
-				"SELECT 1 FROM pg_user_mappings WHERE srvname = $1 AND usename = \
-				 CASE WHEN $2 = 'CURRENT_USER' THEN current_user ELSE $2 END",
-				&[&server_name.as_str(), &map_user],
-			)
-			.await?
-			.is_some();
-		if exists {
-			debug!(server = %server_name, user = %map_user, "dropping existing user mapping before recreation");
-			overlay_pg
-				.batch_execute(&format!(
-					"DROP USER MAPPING FOR {user_sql} SERVER {server_name}"
-				))
-				.await?;
-		}
-
-		info!(server = %server_name, map_user = %map_user, fdw_user = %fdw_user, "creating user mapping");
+	// Ensure PUBLIC user mapping (always recreate to pick up credential changes).
+	// A PUBLIC mapping applies to all overlay users that don't have a specific one.
+	let has_public_mapping = overlay_pg
+		.query_opt(
+			"SELECT 1 FROM pg_user_mappings WHERE srvname = $1 AND usename = 'public'",
+			&[&server_name.as_str()],
+		)
+		.await?
+		.is_some();
+	if has_public_mapping {
+		debug!(server = %server_name, "dropping existing PUBLIC user mapping before recreation");
 		overlay_pg
 			.batch_execute(&format!(
-				"CREATE USER MAPPING FOR {user_sql} SERVER {server_name} \
-				 OPTIONS (user {}, password {})",
-				quote_literal(&fdw_user),
-				quote_literal(&fdw_password),
+				"DROP USER MAPPING FOR PUBLIC SERVER {server_name}"
 			))
 			.await?;
 	}
+	info!(server = %server_name, fdw_user = %fdw_user, "creating PUBLIC user mapping");
+	overlay_pg
+		.batch_execute(&format!(
+			"CREATE USER MAPPING FOR PUBLIC SERVER {server_name} \
+			 OPTIONS (user {}, password {})",
+			quote_literal(&fdw_user),
+			quote_literal(&fdw_password),
+		))
+		.await?;
 
 	// Discover and replicate custom types from the restore database
 	let restore_conn = super::connect::connect_to_restore(
