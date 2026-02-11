@@ -1,8 +1,13 @@
-use kube::CustomResource;
+use k8s_openapi::{
+	api::core::v1::LocalObjectReference,
+	apimachinery::pkg::{
+		api::resource::Quantity,
+		apis::meta::v1::{Condition, Time},
+	},
+};
+use kube::{CustomResource, ResourceExt as _};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use super::Condition;
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(
@@ -14,22 +19,22 @@ use super::Condition;
 	shortname = "pprestore",
 	category = "all",
 	printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
-	printcolumn = r#"{"name":"Replica","type":"string","jsonPath":".spec.replica"}"#,
+	printcolumn = r#"{"name":"Replica","type":"string","jsonPath":".spec.replica.name"}"#,
 	printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPhysicalRestoreSpec {
 	/// Reference to parent PostgresPhysicalReplica
-	pub replica: String,
+	pub replica: LocalObjectReference,
 
 	/// Kopia snapshot ID to restore
 	pub snapshot: String,
 
 	/// Size of the snapshot from kopia metadata
-	pub snapshot_size: String,
+	pub snapshot_size: Quantity,
 
 	/// Calculated PVC size (snapshot_size * 1.1)
-	pub storage_size: String,
+	pub storage_size: Quantity,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
@@ -42,15 +47,15 @@ pub struct PostgresPhysicalRestoreStatus {
 	pub postgres_version: Option<String>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub created_at: Option<String>,
+	pub created_at: Option<Time>,
 
 	/// When restore job completed
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub restored_at: Option<String>,
+	pub restored_at: Option<Time>,
 
 	/// When service switched to this restore
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub activated_at: Option<String>,
+	pub activated_at: Option<Time>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub restore_job: Option<JobStatus>,
@@ -85,5 +90,12 @@ pub struct JobStatus {
 	pub name: String,
 	pub phase: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub completed_at: Option<String>,
+	pub completed_at: Option<Time>,
+}
+
+impl PostgresPhysicalRestore {
+	pub fn ns(&self) -> String {
+		self.namespace()
+			.expect("PostgresPhysicalRestore is a namespaced resource")
+	}
 }

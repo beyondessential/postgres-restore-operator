@@ -7,7 +7,7 @@ use k8s_openapi::{
 		core::v1::{
 			Container, ContainerPort, EnvVar, ExecAction, PersistentVolumeClaim,
 			PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-			Volume, VolumeMount, VolumeResourceRequirements,
+			SecretReference, Volume, VolumeMount, VolumeResourceRequirements,
 		},
 	},
 	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::LabelSelector},
@@ -97,7 +97,7 @@ echo -n "$VERSION" > /dev/termination-log
 			labels: Some(BTreeMap::from([
 				(
 					"pgro.bes.au/replica".to_string(),
-					restore.spec.replica.clone(),
+					restore.spec.replica.name.clone(),
 				),
 				("pgro.bes.au/restore".to_string(), restore.name_any()),
 				(
@@ -116,7 +116,7 @@ echo -n "$VERSION" > /dev/termination-log
 					labels: Some(BTreeMap::from([
 						(
 							"pgro.bes.au/replica".to_string(),
-							restore.spec.replica.clone(),
+							restore.spec.replica.name.clone(),
 						),
 						("pgro.bes.au/restore".to_string(), restore.name_any()),
 					])),
@@ -185,7 +185,7 @@ pub fn build_pvc(
 			labels: Some(BTreeMap::from([
 				(
 					"pgro.bes.au/replica".to_string(),
-					restore.spec.replica.clone(),
+					restore.spec.replica.name.clone(),
 				),
 				("pgro.bes.au/restore".to_string(), restore.name_any()),
 			])),
@@ -198,7 +198,7 @@ pub fn build_pvc(
 			resources: Some(VolumeResourceRequirements {
 				requests: Some(BTreeMap::from([(
 					"storage".to_string(),
-					Quantity(restore.spec.storage_size.clone()),
+					restore.spec.storage_size.clone(),
 				)])),
 				..Default::default()
 			}),
@@ -290,7 +290,7 @@ echo -n "$VERSION" > /dev/termination-log
 			labels: Some(BTreeMap::from([
 				(
 					"pgro.bes.au/replica".to_string(),
-					restore.spec.replica.clone(),
+					restore.spec.replica.name.clone(),
 				),
 				("pgro.bes.au/restore".to_string(), restore.name_any()),
 			])),
@@ -305,7 +305,7 @@ echo -n "$VERSION" > /dev/termination-log
 					labels: Some(BTreeMap::from([
 						(
 							"pgro.bes.au/replica".to_string(),
-							restore.spec.replica.clone(),
+							restore.spec.replica.name.clone(),
 						),
 						("pgro.bes.au/restore".to_string(), restore.name_any()),
 					])),
@@ -409,7 +409,10 @@ pub fn build_deployment(
 	replica: &PostgresPhysicalReplica,
 ) -> Result<Deployment> {
 	let pvc_name = format!("{name}-data");
-	let creds_secret = format!("{}-creds", restore.spec.replica);
+	let creds_secret = SecretReference {
+		name: Some(format!("{}-creds", restore.spec.replica.name)),
+		namespace: Some(namespace.to_string()),
+	};
 
 	let pg_version = restore
 		.status
@@ -421,14 +424,13 @@ pub fn build_deployment(
 	let pg_image = format!("postgres:{pg_version}");
 	let pg_alpine_image = format!("postgres:{pg_version}-alpine");
 
-	let read_only = if replica.spec.read_only {
-		"true"
-	} else {
-		"false"
-	};
+	let read_only = replica.spec.read_only.to_string();
 
 	let has_overlay = replica.spec.overlay_database.is_some();
-	let fdw_secret_name = overlay::overlay_fdw_secret_name(&restore.spec.replica);
+	let fdw_secret = SecretReference {
+		name: Some(overlay::overlay_fdw_secret_name(&restore.spec.replica.name)),
+		namespace: Some(namespace.to_string()),
+	};
 
 	let fdw_user_block = if has_overlay {
 		r#"
@@ -564,50 +566,10 @@ echo "Auth setup complete"
 	let labels = BTreeMap::from([
 		(
 			"pgro.bes.au/replica".to_string(),
-			restore.spec.replica.clone(),
+			restore.spec.replica.name.clone(),
 		),
 		("pgro.bes.au/restore".to_string(), name.to_string()),
 	]);
-
-	let container_resources = replica
-		.spec
-		.resources
-		.as_ref()
-		.map(|r| ResourceRequirements {
-			requests: r.requests.as_ref().map(|reqs| {
-				reqs.iter()
-					.map(|(k, v)| (k.clone(), Quantity(v.clone())))
-					.collect()
-			}),
-			limits: r.limits.as_ref().map(|lims| {
-				lims.iter()
-					.map(|(k, v)| (k.clone(), Quantity(v.clone())))
-					.collect()
-			}),
-			..Default::default()
-		});
-
-	let mut pod_annotations = BTreeMap::new();
-	if let Some(pa) = &replica.spec.pod_annotations {
-		for (k, v) in pa {
-			pod_annotations.insert(k.clone(), v.clone());
-		}
-	}
-
-	let k8s_affinity = replica.spec.affinity.as_ref().and_then(|a| a.to_k8s());
-
-	let tolerations: Vec<k8s_openapi::api::core::v1::Toleration> = replica
-		.spec
-		.tolerations
-		.iter()
-		.map(|t| k8s_openapi::api::core::v1::Toleration {
-			key: t.key.clone(),
-			operator: t.operator.clone(),
-			value: t.value.clone(),
-			effect: t.effect.clone(),
-			toleration_seconds: t.toleration_seconds,
-		})
-		.collect();
 
 	let mut init_env = vec![
 		EnvVar {
@@ -624,16 +586,8 @@ echo "Auth setup complete"
 	];
 
 	if has_overlay {
-		init_env.push(env_from_secret(
-			"FDW_USERNAME",
-			&fdw_secret_name,
-			"username",
-		));
-		init_env.push(env_from_secret(
-			"FDW_PASSWORD",
-			&fdw_secret_name,
-			"password",
-		));
+		init_env.push(env_from_secret("FDW_USERNAME", &fdw_secret, "username"));
+		init_env.push(env_from_secret("FDW_PASSWORD", &fdw_secret, "password"));
 	}
 
 	Ok(Deployment {
@@ -660,11 +614,7 @@ echo "Auth setup complete"
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(labels),
-					annotations: if pod_annotations.is_empty() {
-						None
-					} else {
-						Some(pod_annotations)
-					},
+					annotations: replica.spec.pod_annotations.clone(),
 					..Default::default()
 				}),
 				spec: Some(PodSpec {
@@ -761,7 +711,7 @@ echo "Auth setup complete"
 							failure_threshold: Some(3),
 							..Default::default()
 						}),
-						resources: container_resources,
+						resources: replica.spec.resources.clone(),
 						..Default::default()
 					}],
 					volumes: Some(vec![Volume {
@@ -774,12 +724,8 @@ echo "Auth setup complete"
 						),
 						..Default::default()
 					}]),
-					affinity: k8s_affinity,
-					tolerations: if tolerations.is_empty() {
-						None
-					} else {
-						Some(tolerations)
-					},
+					affinity: replica.spec.affinity.clone(),
+					tolerations: Some(replica.spec.tolerations.clone()),
 					..Default::default()
 				}),
 			},

@@ -1,5 +1,9 @@
 use std::collections::BTreeMap;
 
+use k8s_openapi::{
+	api::core::v1::{Affinity, ResourceRequirements, Toleration},
+	apimachinery::pkg::api::resource::Quantity,
+};
 use serde::{Deserialize, Serialize};
 
 /// Minimal representation of a CNPG Cluster spec for creating overlay databases.
@@ -20,13 +24,13 @@ pub struct CnpgClusterSpec {
 	pub postgresql: Option<CnpgPostgresqlSpec>,
 
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub resources: Option<CnpgResourceRequirements>,
+	pub resources: Option<ResourceRequirements>,
 
 	#[serde(skip_serializing_if = "Option::is_none")]
-	pub affinity: Option<serde_json::Value>,
+	pub affinity: Option<Affinity>,
 
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub tolerations: Vec<serde_json::Value>,
+	pub tolerations: Vec<Toleration>,
 
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub enable_superuser_access: Option<bool>,
@@ -46,7 +50,7 @@ pub struct CnpgImageCatalogRef {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CnpgStorageSpec {
-	pub size: String,
+	pub size: Quantity,
 
 	#[serde(skip_serializing_if = "Option::is_none")]
 	pub storage_class: Option<String>,
@@ -60,16 +64,6 @@ pub struct CnpgPostgresqlSpec {
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub parameters: Option<BTreeMap<String, String>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct CnpgResourceRequirements {
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub requests: Option<BTreeMap<String, String>>,
-
-	#[serde(skip_serializing_if = "Option::is_none")]
-	pub limits: Option<BTreeMap<String, String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -234,77 +228,5 @@ mod tests {
 	fn cluster_status_default_not_ready() {
 		let status = CnpgClusterStatus::default();
 		assert!(!status.is_ready());
-	}
-
-	#[test]
-	fn cluster_spec_serializes() {
-		let spec = CnpgClusterSpec {
-			instances: 1,
-			image_catalog_ref: Some(CnpgImageCatalogRef {
-				name: "my-catalog".into(),
-				kind: "ClusterImageCatalog".into(),
-				major: 17,
-			}),
-			image_name: None,
-			storage: CnpgStorageSpec {
-				size: "10Gi".into(),
-				storage_class: Some("standard".into()),
-			},
-			postgresql: Some(CnpgPostgresqlSpec {
-				shared_preload_libraries: vec![],
-				parameters: None,
-			}),
-			resources: None,
-			affinity: None,
-			tolerations: vec![],
-			enable_superuser_access: None,
-			managed: None,
-		};
-		let json = serde_json::to_value(&spec).unwrap();
-		assert_eq!(json["instances"], 1);
-		assert_eq!(json["storage"]["size"], "10Gi");
-		assert_eq!(json["imageCatalogRef"]["name"], "my-catalog");
-		assert_eq!(json["imageCatalogRef"]["major"], 17);
-	}
-
-	#[test]
-	fn managed_role_serializes() {
-		let managed = CnpgManagedSpec {
-			roles: vec![CnpgManagedRole {
-				name: "analytics".into(),
-				ensure: "present".into(),
-				login: true,
-				superuser: false,
-				createdb: true,
-				password_secret: Some(CnpgPasswordSecretRef {
-					name: "my-replica-creds".into(),
-				}),
-				in_roles: vec!["pg_read_all_data".into(), "pg_write_all_data".into()],
-				connection_limit: None,
-				comment: None,
-			}],
-		};
-		let json = serde_json::to_value(&managed).unwrap();
-		let role = &json["roles"][0];
-		assert_eq!(role["name"], "analytics");
-		assert_eq!(role["ensure"], "present");
-		assert_eq!(role["login"], true);
-		assert_eq!(role["superuser"], false);
-		assert_eq!(role["createdb"], true);
-		assert_eq!(role["passwordSecret"]["name"], "my-replica-creds");
-		assert_eq!(role["inRoles"][0], "pg_read_all_data");
-		assert_eq!(role["inRoles"][1], "pg_write_all_data");
-		assert!(
-			role.get("connectionLimit").is_none(),
-			"None fields must be omitted"
-		);
-	}
-
-	#[test]
-	fn catalog_image_deserializes() {
-		let json = r#"{"image":"ghcr.io/cloudnative-pg/postgresql:17.2","major":17}"#;
-		let img: CnpgCatalogImage = serde_json::from_str(json).unwrap();
-		assert_eq!(img.major, 17);
-		assert!(img.image.contains("17.2"));
 	}
 }

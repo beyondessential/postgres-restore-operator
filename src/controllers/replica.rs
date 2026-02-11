@@ -1,7 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use chrono::Utc;
-use k8s_openapi::api::{batch::v1::Job, core::v1::Secret};
+use jiff::{SignedDuration, Timestamp};
+use k8s_openapi::{
+	api::{batch::v1::Job, core::v1::Secret},
+	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
+};
 use kube::{
 	Api, ResourceExt,
 	api::{Patch, PatchParams, PostParams},
@@ -16,7 +19,6 @@ use crate::{
 	error::{Error, Result},
 	kopia,
 	types::*,
-	util::parse_duration,
 };
 
 mod resources;
@@ -27,8 +29,6 @@ mod status;
 mod tests;
 
 use resources::*;
-use scheduling::*;
-use status::*;
 
 /// Generate a random password for analytics credentials.
 pub(crate) fn generate_password() -> String {
@@ -46,6 +46,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	let namespace = replica
 		.namespace()
 		.ok_or_else(|| Error::MissingNamespace(name.clone()))?;
+	let now = Timestamp::now();
 
 	ctx.metrics
 		.reconciliations_total
@@ -54,82 +55,75 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	let client = &ctx.client;
 
-	// 1. Validate kopia Secret
+	// Validate kopia Secret
+	let secret_name = replica
+		.spec
+		.kopia_secret_ref
+		.name
+		.as_deref()
+		.unwrap_or_default();
 	let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
-	let secret = match secrets.get(&replica.spec.kopia_secret_ref).await {
+	let secret = match secrets.get(secret_name).await {
 		Ok(s) => s,
 		Err(e) => {
 			warn!(
 				replica = name,
-				secret = replica.spec.kopia_secret_ref,
+				secret = ?replica.spec.kopia_secret_ref,
 				error = %e,
 				"kopia secret not found"
 			);
-			update_replica_condition(
-				client,
-				&namespace,
-				&name,
-				"KopiaSecretValid",
-				"False",
-				"SecretNotFound",
-				&format!("Secret {} not found: {e}", replica.spec.kopia_secret_ref),
-			)
-			.await?;
+			replica
+				.update_condition(
+					client,
+					"KopiaSecretValid",
+					"False",
+					"SecretNotFound",
+					&format!("Secret {secret_name} not found: {e}"),
+				)
+				.await?;
 			return Ok(Action::requeue(Duration::from_secs(60)));
 		}
 	};
 
 	let _creds = match kopia::validate_kopia_secret(&secret) {
 		Ok(c) => {
-			update_replica_condition(
-				client,
-				&namespace,
-				&name,
-				"KopiaSecretValid",
-				"True",
-				"SecretValid",
-				"All required keys present",
-			)
-			.await?;
+			replica
+				.update_condition(
+					client,
+					"KopiaSecretValid",
+					"True",
+					"SecretValid",
+					"All required keys present",
+				)
+				.await?;
 			c
 		}
 		Err(e) => {
 			warn!(replica = name, error = %e, "kopia secret invalid");
-			update_replica_condition(
-				client,
-				&namespace,
-				&name,
-				"KopiaSecretValid",
-				"False",
-				"SecretInvalid",
-				&e.to_string(),
-			)
-			.await?;
+			replica
+				.update_condition(
+					client,
+					"KopiaSecretValid",
+					"False",
+					"SecretInvalid",
+					&e.to_string(),
+				)
+				.await?;
 			return Ok(Action::requeue(Duration::from_secs(60)));
 		}
 	};
 
-	// 2. Ensure credentials Secret exists
-	let creds_secret_name = format!("{name}-creds");
-	ensure_credentials_secret(client, &namespace, &name, &creds_secret_name, &replica).await?;
+	replica.ensure_credentials_secret(client).await?;
 
-	// 3. Ensure stable Service exists
-	ensure_service(client, &namespace, &name, &replica).await?;
+	replica.ensure_service(client).await?;
 
-	// 4. Update service name in status
-	update_replica_status_field(client, &namespace, &name, "serviceName", &name).await?;
+	replica
+		.update_status_field(client, "serviceName", &name)
+		.await?;
 
-	// 5. Update connection info in status
-	let conn_info = ConnectionInfo {
-		host: format!("{name}.{namespace}.svc.cluster.local"),
-		port: 5432,
-		database: "postgres".to_string(),
-		username: replica.spec.analytics_username.clone(),
-		password_secret: creds_secret_name.clone(),
-	};
-	update_replica_connection_info(client, &namespace, &name, &conn_info).await?;
+	replica.update_connection_info(client).await?;
 
-	// 5b. Reconcile overlay database if configured
+	// Reconcile overlay database if configured
 	if replica.spec.overlay_database.is_some() {
 		// Try to get snapshot size from active restore
 		let restores_api: Api<PostgresPhysicalRestore> =
@@ -142,10 +136,10 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			if let Ok(current_restore) = restores_api.get(current_restore_name).await {
 				current_restore.spec.snapshot_size.clone()
 			} else {
-				"0".to_string()
+				Quantity("0".to_string())
 			}
 		} else {
-			"0".to_string()
+			Quantity("0".to_string())
 		};
 
 		match overlay::reconcile_overlay(client, &namespace, &replica, &snapshot_size).await {
@@ -178,7 +172,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// 6. Check child PostgresPhysicalRestore resources
+	// Check child PostgresPhysicalRestore resources
 	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), &namespace);
 	let restore_list = restores
 		.list(&kube::api::ListParams::default().labels(&format!("pgro.bes.au/replica={name}")))
@@ -199,7 +193,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		)
 	});
 
-	// 7. Handle switchover: if a restore is in Switching phase, update Service selector
+	// Handle switchover: if a restore is in Switching phase, update Service selector
 	if let Some(switching) = switching_restore {
 		let switching_name = switching.name_any();
 		info!(
@@ -209,12 +203,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		);
 
 		// Update Service selector to point to the new restore
-		update_service_selector(client, &namespace, &name, &switching_name).await?;
+		switching.update_service_selector(client, &name).await?;
 
 		// Transition the switching restore to Active
-		update_restore_phase(client, &namespace, &switching_name, RestorePhase::Active).await?;
-		let now = Utc::now().to_rfc3339();
-		update_restore_activated_at(client, &namespace, &switching_name, &now).await?;
+		switching.update_phase(client, RestorePhase::Active).await?;
+		let now = Timestamp::now();
+		switching.update_activated_at(client, Time(now)).await?;
 
 		// Update replica status
 		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), &namespace);
@@ -227,7 +221,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				"phase": "Ready",
 				"currentRestore": switching_name,
 				"previousRestore": previous_restore,
-				"lastRestoreCompletedAt": now,
+				"lastRestoreCompletedAt": Time(now),
 			}
 		});
 		replicas
@@ -241,36 +235,21 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		ctx.metrics.switchovers_total.inc();
 
 		// Send notifications
-		send_restore_notifications(
-			client,
-			&ctx.http_client,
-			&namespace,
-			&replica,
-			switching,
-			&conn_info,
-			&creds_secret_name,
-			&ctx.metrics,
-		)
-		.await;
+		replica
+			.send_notifications(client, &ctx.http_client, switching, &ctx.metrics)
+			.await;
 
 		// Recompute next scheduled restore in case schedule changed while restore was in flight
-		if let Some(schedule) = &replica.spec.schedule
-			&& let Some(next) = compute_next_scheduled_restore(schedule)
-		{
-			update_replica_status_field(
-				client,
-				&namespace,
-				&name,
-				"nextScheduledRestore",
-				&next.to_rfc3339(),
-			)
-			.await?;
+		if let Some(next) = replica.compute_next_scheduled_restore(now) {
+			replica
+				.update_status_field(client, "nextScheduledRestore", Time(next))
+				.await?;
 		}
 
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
-	// 7b. Reconcile FDW state for overlay databases.
+	// Reconcile FDW state for overlay databases.
 	// Always verify and fix the actual FDW state inside the overlay database
 	// rather than relying solely on the status field, which can become stale
 	// if the overlay cluster is reset.
@@ -292,7 +271,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				"reconciling FDW state in overlay database"
 			);
 
-			match overlay::reconcile_fdw(client, &namespace, &replica, current).await {
+			match overlay::fdw::reconcile_fdw(client, &namespace, &replica, current).await {
 				Ok(()) => {
 					if fdw_restore.as_ref() != Some(&current) {
 						info!(
@@ -321,7 +300,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 					warn!(
 						replica = name,
 						restore = current,
-						error = %e,
+						error = ?e,
 						"FDW reconciliation failed, will retry"
 					);
 					return Ok(Action::requeue(Duration::from_secs(30)));
@@ -335,24 +314,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// 8. Clean up old restores after grace period
-
+	// Clean up old restores after grace period
 	if let Some(prev_name) = replica
 		.status
 		.as_ref()
 		.and_then(|s| s.previous_restore.clone())
 	{
-		let grace_period = parse_duration(&replica.spec.switchover_grace_period)
-			.unwrap_or(Duration::from_secs(300));
+		let grace_period =
+			SignedDuration::try_from(replica.spec.switchover_grace_period.0).unwrap_or_default();
 		let last_completed = replica
 			.status
 			.as_ref()
-			.and_then(|s| s.last_restore_completed_at.as_ref())
-			.and_then(|t| t.parse::<chrono::DateTime<Utc>>().ok());
+			.and_then(|s| s.last_restore_completed_at.as_ref());
 
 		if let Some(completed_at) = last_completed {
-			let elapsed = Utc::now().signed_duration_since(completed_at);
-			if elapsed.to_std().unwrap_or_default() > grace_period {
+			let elapsed = now.duration_since(completed_at.0);
+			if elapsed > grace_period {
 				info!(
 					replica = name,
 					restore = prev_name,
@@ -380,7 +357,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// 8b. Clean up failed restores (ownerReferences will cascade-delete their PVCs)
+	// Clean up failed restores (ownerReferences will cascade-delete their PVCs)
 	let failed_restores: Vec<_> = restore_list
 		.items
 		.iter()
@@ -388,28 +365,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.collect();
 	for failed in &failed_restores {
 		let failed_name = failed.name_any();
-		let created_at = failed
-			.status
-			.as_ref()
-			.and_then(|s| s.created_at.as_ref())
-			.and_then(|t| t.parse::<chrono::DateTime<Utc>>().ok());
-		let age = created_at
-			.map(|t| Utc::now().signed_duration_since(t))
-			.and_then(|d| d.to_std().ok())
-			.unwrap_or_default();
-		if age > Duration::from_secs(300) {
-			info!(
-				replica = name,
-				restore = failed_name,
-				"cleaning up failed restore"
-			);
-			if let Err(e) = restores.delete(&failed_name, &Default::default()).await {
-				warn!(restore = failed_name, error = %e, "failed to delete failed restore");
+		if let Some(created_at) = failed.status.as_ref().and_then(|s| s.created_at.as_ref()) {
+			let age = now.duration_since(created_at.0);
+			if age > SignedDuration::from_secs(300) {
+				info!(
+					replica = name,
+					restore = failed_name,
+					"cleaning up failed restore"
+				);
+				if let Err(e) = restores.delete(&failed_name, &Default::default()).await {
+					warn!(restore = failed_name, error = %e, "failed to delete failed restore");
+				}
 			}
 		}
 	}
 
-	// 9. Decide whether to trigger a new restore
+	// Decide whether to trigger a new restore
 	if let Some(in_progress) = in_progress_restore {
 		let phase = in_progress.status.as_ref().and_then(|s| s.phase.as_ref());
 		debug!(
@@ -418,7 +389,9 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			phase = ?phase,
 			"restore already in progress, waiting"
 		);
-		update_replica_phase(client, &namespace, &name, ReplicaPhase::Restoring).await?;
+		replica
+			.update_phase(client, ReplicaPhase::Restoring)
+			.await?;
 		return Ok(Action::requeue(Duration::from_secs(30)));
 	}
 
@@ -436,9 +409,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		);
 	}
 
-	let should_restore = never_restored || should_trigger_scheduled_restore(&replica);
+	let should_restore = never_restored || replica.should_trigger_scheduled_restore();
 
 	if should_restore {
+		if let Some(next) = replica.compute_next_scheduled_restore(now.into()) {
+			replica
+				.update_status_field(client, "nextScheduledRestore", Time(next))
+				.await?;
+		}
+
 		// Check concurrent restore limit
 		let mut queue = ctx.restore_queue.write().await;
 		if !queue.can_start(ctx.max_concurrent_restores()) {
@@ -467,7 +446,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 		drop(queue);
 
-		// 10. Snapshot discovery via Job
+		// Snapshot discovery via Job
 		let snapshot_job_name = format!("{name}-snapshot-list");
 		let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
 
@@ -521,14 +500,9 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							"snapshot list job returned no matching snapshots"
 						);
 					} else if let Ok(snap) = serde_json::from_str::<SnapshotInfo>(raw) {
-						update_replica_status_field(
-							client,
-							&namespace,
-							&name,
-							"latestAvailableSnapshot",
-							&snap.id,
-						)
-						.await?;
+						replica
+							.update_status_field(client, "latestAvailableSnapshot", &snap.id)
+							.await?;
 
 						let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
 
@@ -545,8 +519,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 								size = snap.size,
 								"new snapshot available, creating restore"
 							);
-							create_restore_for_snapshot(client, &namespace, &replica, &snap)
-								.await?;
+							replica.create_restore_for_snapshot(client, &snap).await?;
 							ctx.metrics.restores_started_total.inc();
 						}
 					} else {
@@ -566,28 +539,13 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				}
 			}
 		}
-
-		// Whether a restore was created or skipped, advance nextScheduledRestore
-		// so we don't re-trigger on the next reconciliation.
-		if let Some(schedule) = &replica.spec.schedule
-			&& let Some(next) = compute_next_scheduled_restore(schedule)
-		{
-			update_replica_status_field(
-				client,
-				&namespace,
-				&name,
-				"nextScheduledRestore",
-				&next.to_rfc3339(),
-			)
-			.await?;
-		}
 	}
 
 	// Update phase based on current state
 	if active_restore.is_some() {
-		update_replica_phase(client, &namespace, &name, ReplicaPhase::Ready).await?;
+		replica.update_phase(client, ReplicaPhase::Ready).await?;
 	} else {
-		update_replica_phase(client, &namespace, &name, ReplicaPhase::Pending).await?;
+		replica.update_phase(client, ReplicaPhase::Pending).await?;
 	}
 
 	// Clear queue position if not queued

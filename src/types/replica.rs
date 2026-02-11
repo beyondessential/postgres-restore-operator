@@ -1,10 +1,20 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use kube::CustomResource;
+use jiff::Span;
+use k8s_openapi::{
+	api::core::v1::{Affinity, ResourceRequirements, SecretReference, Toleration},
+	apimachinery::pkg::{
+		api::resource::Quantity,
+		apis::meta::v1::{Condition, OwnerReference, Time},
+	},
+};
+use kube::{CustomResource, ResourceExt as _};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{Affinity, Condition, HeaderValue, ResourceRequirements, Toleration};
+use crate::util::TimeSpan;
+
+use super::HeaderValue;
 
 #[derive(CustomResource, Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[kube(
@@ -22,7 +32,7 @@ use super::{Affinity, Condition, HeaderValue, ResourceRequirements, Toleration};
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPhysicalReplicaSpec {
 	/// Reference to a Secret containing kopia repository credentials
-	pub kopia_secret_ref: String,
+	pub kopia_secret_ref: SecretReference,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub snapshot_filter: Option<SnapshotFilter>,
@@ -33,15 +43,15 @@ pub struct PostgresPhysicalReplicaSpec {
 
 	/// Random jitter added to scheduled restores
 	#[serde(default = "default_schedule_jitter")]
-	pub schedule_jitter: String,
+	pub schedule_jitter: TimeSpan,
 
 	/// Don't restore a new snapshot within this duration of the last restore completing
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub minimum_ttl: Option<String>,
+	pub minimum_ttl: Option<TimeSpan>,
 
 	/// Wait before deleting old restore after switchover
 	#[serde(default = "default_switchover_grace_period")]
-	pub switchover_grace_period: String,
+	pub switchover_grace_period: TimeSpan,
 
 	/// Username for analytics connections
 	#[serde(default = "default_analytics_username")]
@@ -52,16 +62,16 @@ pub struct PostgresPhysicalReplicaSpec {
 
 	/// Override dynamic sizing with a fixed PVC size
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub storage_size_override: Option<String>,
+	pub storage_size_override: Option<Quantity>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub resources: Option<ResourceRequirements>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub service_annotations: Option<HashMap<String, String>>,
+	pub service_annotations: Option<BTreeMap<String, String>>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub pod_annotations: Option<HashMap<String, String>>,
+	pub pod_annotations: Option<BTreeMap<String, String>>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub affinity: Option<Affinity>,
@@ -88,12 +98,11 @@ pub struct PostgresPhysicalReplicaSpec {
 fn default_read_only() -> bool {
 	true
 }
-fn default_switchover_grace_period() -> String {
-	"5m".to_string()
+fn default_switchover_grace_period() -> TimeSpan {
+	TimeSpan(Span::new().minutes(5))
 }
-
-fn default_schedule_jitter() -> String {
-	"10m".to_string()
+fn default_schedule_jitter() -> TimeSpan {
+	TimeSpan(Span::new().minutes(10))
 }
 fn default_analytics_username() -> String {
 	"analytics".to_string()
@@ -102,11 +111,11 @@ fn default_analytics_username() -> String {
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayDatabaseConfig {
-	/// PostgreSQL major version for the CNPG cluster (e.g. "17").
+	/// PostgreSQL major version for the CNPG cluster.
 	/// If absent, resolved from the CNPG image catalog (see image_catalog).
-	/// Falls back to a hardcoded default ("17") if no catalog is available.
+	/// Falls back to a hardcoded default (17) if no catalog is available.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub postgres_version: Option<String>,
+	pub postgres_version: Option<u32>,
 
 	/// CNPG image catalog to use for PG version discovery and image resolution.
 	/// If absent, defaults to ClusterImageCatalog kind.
@@ -117,7 +126,7 @@ pub struct OverlayDatabaseConfig {
 	/// If absent, auto-sized: 5Gi + ceil(snapshot_size / 10) rounded up to whole Gi.
 	/// Auto-sizing only ever increases (ratchets up), never shrinks.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub storage_size_override: Option<String>,
+	pub storage_size_override: Option<Quantity>,
 
 	/// Storage class for the overlay database PVC
 	#[serde(default, skip_serializing_if = "Option::is_none")]
@@ -137,7 +146,7 @@ pub struct OverlayDatabaseConfig {
 
 	/// Annotations to apply to the overlay database's -rw Service
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub service_annotations: Option<HashMap<String, String>>,
+	pub service_annotations: Option<BTreeMap<String, String>>,
 
 	/// Schema mapping: if provided, only these schemas are imported.
 	/// Key = remote schema name, Value = local schema name in overlay DB.
@@ -166,30 +175,39 @@ pub struct SnapshotFilter {
 	/// Glob pattern for filtering snapshot hosts
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub host_pattern: Option<String>,
+
+	/// Glob pattern for filtering snapshot descriptions
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub description_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct NotificationConfig {
-	pub name: String,
-
-	#[serde(default)]
-	pub events: Vec<NotificationEvent>,
-
-	/// Include password directly in notification payload
-	#[serde(default)]
-	pub include_password: bool,
-
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub webhook: Option<WebhookConfig>,
-
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub graphql: Option<GraphQLConfig>,
+#[serde(rename_all = "camelCase", tag = "target")]
+pub enum NotificationConfig {
+	Webhook(WebhookConfig),
+	GraphQL(GraphQLConfig),
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
-pub enum NotificationEvent {
-	RestoreComplete,
+impl NotificationConfig {
+	pub fn name(&self) -> String {
+		match self {
+			NotificationConfig::Webhook(WebhookConfig { url, method, .. }) => {
+				format!("{method} {url}")
+			}
+			NotificationConfig::GraphQL(GraphQLConfig { url, .. }) => format!("GraphQL {url}"),
+		}
+	}
+
+	pub fn include_password(&self) -> bool {
+		match self {
+			NotificationConfig::Webhook(WebhookConfig {
+				include_password, ..
+			}) => *include_password,
+			NotificationConfig::GraphQL(GraphQLConfig {
+				include_password, ..
+			}) => *include_password,
+		}
+	}
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -202,6 +220,10 @@ pub struct WebhookConfig {
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub headers: Option<HashMap<String, HeaderValue>>,
+
+	/// Include password directly in notification payload
+	#[serde(default)]
+	pub include_password: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -213,6 +235,10 @@ pub struct GraphQLConfig {
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub headers: Option<HashMap<String, HeaderValue>>,
+
+	/// Include password directly in notification payload
+	#[serde(default)]
+	pub include_password: bool,
 }
 
 fn default_method() -> String {
@@ -237,10 +263,10 @@ pub struct PostgresPhysicalReplicaStatus {
 	pub service_name: Option<String>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub last_restore_completed_at: Option<String>,
+	pub last_restore_completed_at: Option<Time>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub next_scheduled_restore: Option<String>,
+	pub next_scheduled_restore: Option<Time>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub latest_available_snapshot: Option<String>,
@@ -267,11 +293,11 @@ pub struct PostgresPhysicalReplicaStatus {
 
 	/// Current (possibly ratcheted) storage size of the overlay PVC
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub overlay_storage_size: Option<String>,
+	pub overlay_storage_size: Option<Quantity>,
 
 	/// Resolved PG major version used for the overlay cluster
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub overlay_postgres_version: Option<String>,
+	pub overlay_postgres_version: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -297,9 +323,31 @@ pub struct ConnectionInfo {
 pub struct NotificationStatus {
 	pub name: String,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub last_sent_at: Option<String>,
+	pub last_sent_at: Option<Time>,
 	#[serde(default)]
 	pub success: bool,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub last_error: Option<String>,
+}
+
+impl PostgresPhysicalReplica {
+	pub fn ns(&self) -> String {
+		self.namespace()
+			.expect("PostgresPhysicalReplica is a namespaced resource")
+	}
+
+	pub fn owner_reference(&self) -> OwnerReference {
+		OwnerReference {
+			api_version: "pgro.bes.au/v1alpha1".to_string(),
+			kind: "PostgresPhysicalReplica".to_string(),
+			name: self.name_any(),
+			uid: self.uid().unwrap_or_default(),
+			controller: Some(true),
+			block_owner_deletion: Some(true),
+		}
+	}
+
+	pub fn creds_secret_name(&self) -> String {
+		format!("{name}-creds", name = self.name_any())
+	}
 }

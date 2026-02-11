@@ -1,23 +1,23 @@
 use std::collections::BTreeMap;
 
-use chrono::Utc;
+use jiff::Timestamp;
 use k8s_openapi::{
 	ByteString,
 	api::{
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, EnvVar, PodSpec, PodTemplateSpec, ResourceRequirements, Secret, Service,
-			ServicePort, ServiceSpec,
+			Container, EnvVar, LocalObjectReference, PodSpec, PodTemplateSpec,
+			ResourceRequirements, Secret, Service, ServicePort, ServiceSpec,
 		},
 	},
-	apimachinery::pkg::{
-		api::resource::Quantity, apis::meta::v1::OwnerReference, util::intstr::IntOrString,
-	},
+	apimachinery::pkg::{api::resource::Quantity, util::intstr::IntOrString},
 };
 use kube::{
 	Api, Client, ResourceExt,
 	api::{ObjectMeta, Patch, PatchParams, PostParams},
 };
+use kube_quantity::ParsedQuantity;
+use rust_decimal::Decimal;
 use tracing::{info, warn};
 
 use super::generate_password;
@@ -33,26 +33,9 @@ pub struct SnapshotInfo {
 	pub size: u64,
 }
 
-pub fn format_bytes(bytes: u64) -> String {
-	const GI: u64 = 1024 * 1024 * 1024;
-	const MI: u64 = 1024 * 1024;
-	if bytes >= GI {
-		let gi = bytes.div_ceil(GI);
-		format!("{gi}Gi")
-	} else {
-		let mi = bytes.div_ceil(MI).max(1);
-		format!("{mi}Mi")
-	}
-}
-
-pub fn owner_reference(replica: &PostgresPhysicalReplica) -> OwnerReference {
-	OwnerReference {
-		api_version: "pgro.bes.au/v1alpha1".to_string(),
-		kind: "PostgresPhysicalReplica".to_string(),
-		name: replica.name_any(),
-		uid: replica.uid().unwrap_or_default(),
-		controller: Some(true),
-		block_owner_deletion: Some(true),
+impl SnapshotInfo {
+	pub fn bytes(&self) -> ParsedQuantity {
+		ParsedQuantity::from(Decimal::from(self.size))
 	}
 }
 
@@ -160,7 +143,7 @@ printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 					"snapshot-list".to_string(),
 				),
 			])),
-			owner_references: Some(vec![owner_reference(replica)]),
+			owner_references: Some(vec![replica.owner_reference()]),
 			..Default::default()
 		},
 		spec: Some(JobSpec {
@@ -208,230 +191,181 @@ printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 	})
 }
 
-pub async fn create_restore_for_snapshot(
-	client: &Client,
-	namespace: &str,
-	replica: &PostgresPhysicalReplica,
-	snapshot: &SnapshotInfo,
-) -> Result<()> {
-	let replica_name = replica.name_any();
-	let timestamp = Utc::now().format("%Y%m%d-%H%M%S");
-	let restore_name = format!("{replica_name}-{timestamp}");
+impl PostgresPhysicalReplica {
+	pub async fn create_restore_for_snapshot(
+		&self,
+		client: &Client,
+		snapshot: &SnapshotInfo,
+	) -> Result<()> {
+		let replica_name = self.name_any();
+		let timestamp = Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
+		let restore_name = format!("{replica_name}-{timestamp}");
 
-	const MAX_PVC_BYTES: u64 = 2 * 1024 * 1024 * 1024 * 1024; // 2 TiB
+		let max_pvc_size = ParsedQuantity::try_from("2Ti").unwrap();
 
-	let snapshot_size = format_bytes(snapshot.size);
-	let storage_size = match &replica.spec.storage_size_override {
-		Some(override_size) => override_size.clone(),
-		None => {
-			let computed = (snapshot.size as f64 * 1.1) as u64;
-			if computed > MAX_PVC_BYTES {
-				warn!(
-					replica = replica.name_any(),
-					snapshot = snapshot.id,
-					computed_bytes = computed,
-					max_bytes = MAX_PVC_BYTES,
-					"computed PVC size exceeds 2TiB ceiling, capping"
-				);
-				format_bytes(MAX_PVC_BYTES)
-			} else {
-				format_bytes(computed)
+		let snapshot_bytes = snapshot.bytes();
+		let storage_size = match &self.spec.storage_size_override {
+			Some(override_size) => override_size.clone(),
+			None => {
+				let computed_size = snapshot_bytes * Decimal::new(11, 1); // 1.1
+				if computed_size > max_pvc_size {
+					warn!(
+						replica = self.name_any(),
+						snapshot = snapshot.id,
+						?computed_size,
+						?max_pvc_size,
+						"computed PVC size exceeds ceiling, capping"
+					);
+					max_pvc_size
+				} else {
+					computed_size
+				}
+				.into()
 			}
+		};
+
+		let mut restore = PostgresPhysicalRestore::new(
+			&restore_name,
+			PostgresPhysicalRestoreSpec {
+				replica: LocalObjectReference {
+					name: replica_name.clone(),
+				},
+				snapshot: snapshot.id.clone(),
+				snapshot_size: snapshot.bytes().into(),
+				storage_size,
+			},
+		);
+
+		restore.metadata.namespace = self.metadata.namespace.clone();
+		restore.metadata.owner_references = Some(vec![self.owner_reference()]);
+		restore
+			.labels_mut()
+			.insert("pgro.bes.au/replica".into(), self.name_any());
+
+		Api::<PostgresPhysicalRestore>::namespaced(client.clone(), &self.ns())
+			.create(&PostParams::default(), &restore)
+			.await?;
+
+		info!(
+			replica = replica_name,
+			restore = restore_name,
+			snapshot = snapshot.id,
+			"created restore resource"
+		);
+
+		Ok(())
+	}
+
+	pub async fn ensure_credentials_secret(&self, client: &Client) -> Result<()> {
+		let secret_name = &self.creds_secret_name();
+		let secrets: Api<Secret> = Api::namespaced(client.clone(), &self.ns());
+
+		if secrets.get_opt(secret_name).await?.is_some() {
+			return Ok(());
 		}
-	};
 
-	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
-	let restore = PostgresPhysicalRestore::new(
-		&restore_name,
-		PostgresPhysicalRestoreSpec {
-			replica: replica_name.clone(),
-			snapshot: snapshot.id.clone(),
-			snapshot_size,
-			storage_size,
-		},
-	);
-
-	let mut restore_obj = serde_json::to_value(&restore)?;
-	if let Some(meta) = restore_obj
-		.as_object_mut()
-		.and_then(|o| o.get_mut("metadata"))
-		.and_then(|m| m.as_object_mut())
-	{
-		meta.insert(
-			"namespace".to_string(),
-			serde_json::Value::String(namespace.to_string()),
+		info!(
+			replica = self.name_any(),
+			secret = secret_name,
+			"creating credentials secret"
 		);
-		meta.insert(
-			"labels".to_string(),
-			serde_json::json!({ "pgro.bes.au/replica": replica_name }),
-		);
-		meta.insert(
-			"ownerReferences".to_string(),
-			serde_json::json!([{
-				"apiVersion": "pgro.bes.au/v1alpha1",
-				"kind": "PostgresPhysicalReplica",
-				"name": replica.name_any(),
-				"uid": replica.uid().unwrap_or_default(),
-				"controller": true,
-				"blockOwnerDeletion": true,
-			}]),
-		);
-	}
 
-	let restore_resource: PostgresPhysicalRestore = serde_json::from_value(restore_obj)?;
-	restores
-		.create(&PostParams::default(), &restore_resource)
-		.await?;
-
-	info!(
-		replica = replica_name,
-		restore = restore_name,
-		snapshot = snapshot.id,
-		"created restore resource"
-	);
-
-	Ok(())
-}
-
-pub async fn ensure_credentials_secret(
-	client: &Client,
-	namespace: &str,
-	replica_name: &str,
-	secret_name: &str,
-	replica: &PostgresPhysicalReplica,
-) -> Result<()> {
-	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-
-	if secrets.get_opt(secret_name).await?.is_some() {
-		return Ok(());
-	}
-
-	info!(
-		replica = replica_name,
-		secret = secret_name,
-		"creating credentials secret"
-	);
-
-	let password = generate_password();
-	let secret = Secret {
-		metadata: ObjectMeta {
-			name: Some(secret_name.to_string()),
-			namespace: Some(namespace.to_string()),
-			labels: Some(BTreeMap::from([(
-				"pgro.bes.au/replica".to_string(),
-				replica_name.to_string(),
-			)])),
-			owner_references: Some(vec![owner_reference(replica)]),
+		let password = generate_password();
+		let secret = Secret {
+			metadata: ObjectMeta {
+				name: Some(secret_name.into()),
+				namespace: self.metadata.namespace.clone(),
+				labels: Some(BTreeMap::from([(
+					"pgro.bes.au/replica".into(),
+					self.name_any(),
+				)])),
+				owner_references: Some(vec![self.owner_reference()]),
+				..Default::default()
+			},
+			data: Some(BTreeMap::from([
+				(
+					"username".into(),
+					ByteString(self.spec.analytics_username.as_bytes().to_vec()),
+				),
+				("password".into(), ByteString(password.as_bytes().to_vec())),
+			])),
 			..Default::default()
-		},
-		data: Some(BTreeMap::from([
-			(
-				"username".to_string(),
-				ByteString(replica.spec.analytics_username.as_bytes().to_vec()),
-			),
-			(
-				"password".to_string(),
-				ByteString(password.as_bytes().to_vec()),
-			),
-		])),
-		..Default::default()
-	};
+		};
 
-	secrets.create(&PostParams::default(), &secret).await?;
-	Ok(())
+		secrets.create(&PostParams::default(), &secret).await?;
+		Ok(())
+	}
+
+	pub async fn ensure_service(&self, client: &Client) -> Result<()> {
+		let services: Api<Service> = Api::namespaced(client.clone(), &self.ns());
+
+		if services.get_opt(&self.name_any()).await?.is_some() {
+			// Service exists; update annotations if needed
+			let patch = serde_json::json!({
+				"metadata": {
+					"annotations": self.spec.service_annotations,
+				}
+			});
+			services
+				.patch(
+					&self.name_any(),
+					&PatchParams::apply("postgres-restore-operator"),
+					&Patch::Merge(&patch),
+				)
+				.await?;
+			return Ok(());
+		}
+
+		info!(replica = self.name_any(), "creating stable service");
+		let service = Service {
+			metadata: ObjectMeta {
+				name: Some(self.name_any()),
+				namespace: self.metadata.namespace.clone(),
+				labels: Some(BTreeMap::from([(
+					"pgro.bes.au/replica".into(),
+					self.name_any(),
+				)])),
+				annotations: self.spec.service_annotations.clone(),
+				owner_references: Some(vec![self.owner_reference()]),
+				..Default::default()
+			},
+			spec: Some(ServiceSpec {
+				type_: Some("ClusterIP".into()),
+				ports: Some(vec![ServicePort {
+					name: Some("postgres".into()),
+					port: 5432,
+					target_port: Some(IntOrString::Int(5432)),
+					protocol: Some("TCP".into()),
+					..Default::default()
+				}]),
+				// No selector initially — set during switchover
+				..Default::default()
+			}),
+			..Default::default()
+		};
+
+		services.create(&PostParams::default(), &service).await?;
+		Ok(())
+	}
 }
 
-pub async fn ensure_service(
-	client: &Client,
-	namespace: &str,
-	replica_name: &str,
-	replica: &PostgresPhysicalReplica,
-) -> Result<()> {
-	let services: Api<Service> = Api::namespaced(client.clone(), namespace);
-
-	if services.get_opt(replica_name).await?.is_some() {
-		// Service exists; update annotations if needed
-		let mut annotations = BTreeMap::new();
-		if let Some(sa) = &replica.spec.service_annotations {
-			for (k, v) in sa {
-				annotations.insert(k.clone(), v.clone());
-			}
-		}
+impl PostgresPhysicalRestore {
+	pub async fn update_service_selector(&self, client: &Client, service_name: &str) -> Result<()> {
+		let services: Api<Service> = Api::namespaced(client.clone(), &self.ns());
 		let patch = serde_json::json!({
-			"metadata": {
-				"annotations": annotations,
+			"spec": {
+				"selector": {
+					"pgro.bes.au/restore": self.name_any(),
+				}
 			}
 		});
 		services
 			.patch(
-				replica_name,
+				service_name,
 				&PatchParams::apply("postgres-restore-operator"),
 				&Patch::Merge(&patch),
 			)
 			.await?;
-		return Ok(());
+		Ok(())
 	}
-
-	info!(replica = replica_name, "creating stable service");
-
-	let mut annotations = BTreeMap::new();
-	if let Some(sa) = &replica.spec.service_annotations {
-		for (k, v) in sa {
-			annotations.insert(k.clone(), v.clone());
-		}
-	}
-
-	let service = Service {
-		metadata: ObjectMeta {
-			name: Some(replica_name.to_string()),
-			namespace: Some(namespace.to_string()),
-			labels: Some(BTreeMap::from([(
-				"pgro.bes.au/replica".to_string(),
-				replica_name.to_string(),
-			)])),
-			annotations: Some(annotations),
-			owner_references: Some(vec![owner_reference(replica)]),
-			..Default::default()
-		},
-		spec: Some(ServiceSpec {
-			type_: Some("ClusterIP".to_string()),
-			ports: Some(vec![ServicePort {
-				name: Some("postgres".to_string()),
-				port: 5432,
-				target_port: Some(IntOrString::Int(5432)),
-				protocol: Some("TCP".to_string()),
-				..Default::default()
-			}]),
-			// No selector initially — set during switchover
-			..Default::default()
-		}),
-		..Default::default()
-	};
-
-	services.create(&PostParams::default(), &service).await?;
-	Ok(())
-}
-
-pub async fn update_service_selector(
-	client: &Client,
-	namespace: &str,
-	service_name: &str,
-	restore_name: &str,
-) -> Result<()> {
-	let services: Api<Service> = Api::namespaced(client.clone(), namespace);
-	let patch = serde_json::json!({
-		"spec": {
-			"selector": {
-				"pgro.bes.au/restore": restore_name,
-			}
-		}
-	});
-	services
-		.patch(
-			service_name,
-			&PatchParams::apply("postgres-restore-operator"),
-			&Patch::Merge(&patch),
-		)
-		.await?;
-	Ok(())
 }

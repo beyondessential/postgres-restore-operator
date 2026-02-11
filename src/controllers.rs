@@ -1,4 +1,4 @@
-use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector};
+use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector, SecretReference};
 
 use kube::{Api, Client};
 
@@ -7,12 +7,12 @@ pub mod replica;
 pub mod restore;
 
 /// Build an EnvVar that references a key in a Kubernetes Secret.
-pub fn env_from_secret(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
+pub fn env_from_secret(env_name: &str, secret_ref: &SecretReference, key: &str) -> EnvVar {
 	EnvVar {
 		name: env_name.to_string(),
 		value_from: Some(EnvVarSource {
 			secret_key_ref: Some(SecretKeySelector {
-				name: secret_name.to_string(),
+				name: secret_ref.name.as_deref().unwrap_or_default().into(),
 				key: key.to_string(),
 				optional: Some(false),
 			}),
@@ -26,12 +26,12 @@ pub fn env_from_secret(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
 ///
 /// If the key does not exist in the Secret, the env var is simply not set
 /// (the pod will not fail to start).
-pub fn env_from_secret_optional(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
+pub fn env_from_secret_optional(env_name: &str, secret_ref: &SecretReference, key: &str) -> EnvVar {
 	EnvVar {
 		name: env_name.to_string(),
 		value_from: Some(EnvVarSource {
 			secret_key_ref: Some(SecretKeySelector {
-				name: secret_name.to_string(),
+				name: secret_ref.name.as_deref().unwrap_or_default().into(),
 				key: key.to_string(),
 				optional: Some(true),
 			}),
@@ -119,7 +119,14 @@ mod tests {
 
 	#[test]
 	fn env_from_secret_structure() {
-		let env = env_from_secret("PG_PASSWORD", "my-secret", "password");
+		let env = env_from_secret(
+			"PG_PASSWORD",
+			&SecretReference {
+				name: Some("my-secret".into()),
+				namespace: None,
+			},
+			"password",
+		);
 		assert_eq!(env.name, "PG_PASSWORD");
 		assert!(env.value.is_none());
 		let vf = env.value_from.unwrap();
@@ -131,7 +138,14 @@ mod tests {
 
 	#[test]
 	fn env_from_secret_different_keys() {
-		let env = env_from_secret("DB_HOST", "conn-secret", "host");
+		let env = env_from_secret(
+			"DB_HOST",
+			&SecretReference {
+				name: Some("conn-secret".into()),
+				namespace: None,
+			},
+			"host",
+		);
 		let skr = env.value_from.unwrap().secret_key_ref.unwrap();
 		assert_eq!(skr.name, "conn-secret");
 		assert_eq!(skr.key, "host");
@@ -139,7 +153,14 @@ mod tests {
 
 	#[test]
 	fn env_from_secret_optional_is_optional() {
-		let env = env_from_secret_optional("ENDPOINT", "my-secret", "endpoint");
+		let env = env_from_secret_optional(
+			"ENDPOINT",
+			&SecretReference {
+				name: Some("my-secret".into()),
+				namespace: None,
+			},
+			"endpoint",
+		);
 		assert_eq!(env.name, "ENDPOINT");
 		let skr = env.value_from.unwrap().secret_key_ref.unwrap();
 		assert_eq!(skr.name, "my-secret");

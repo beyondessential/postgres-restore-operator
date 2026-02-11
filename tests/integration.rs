@@ -1,12 +1,17 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use jiff::Span;
 use k8s_openapi::ByteString;
 use k8s_openapi::api::apps::v1::Deployment;
 use k8s_openapi::api::batch::v1::Job;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret, Service};
+use k8s_openapi::api::core::v1::{
+	LocalObjectReference, PersistentVolumeClaim, Secret, SecretReference, Service,
+};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::api::{ListParams, ObjectMeta, Patch, PatchParams, PostParams};
 use kube::{Api, Client, ResourceExt};
+use postgres_restore_operator::util::TimeSpan;
 use tokio::time::{sleep, timeout};
 
 use postgres_restore_operator::types::{
@@ -108,8 +113,8 @@ fn build_kopia_secret(ns: &str, name: &str, bucket: &str) -> Secret {
 
 struct ReplicaOpts {
 	schedule: Option<String>,
-	minimum_ttl: Option<String>,
-	schedule_jitter: Option<String>,
+	minimum_ttl: Option<TimeSpan>,
+	schedule_jitter: Option<TimeSpan>,
 	overlay_database: Option<OverlayDatabaseConfig>,
 }
 
@@ -128,12 +133,15 @@ fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhy
 	PostgresPhysicalReplica::new(
 		name,
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: secret_ref.into(),
+			kopia_secret_ref: SecretReference {
+				name: Some(secret_ref.into()),
+				namespace: None,
+			},
 			snapshot_filter: None,
 			schedule: opts.schedule,
-			schedule_jitter: opts.schedule_jitter.unwrap_or_else(|| "0s".into()),
+			schedule_jitter: opts.schedule_jitter.unwrap_or_default(),
 			minimum_ttl: opts.minimum_ttl,
-			switchover_grace_period: "10s".into(),
+			switchover_grace_period: TimeSpan(Span::new().seconds(10)),
 			analytics_username: "analytics".into(),
 			storage_class: None,
 			storage_size_override: None,
@@ -762,9 +770,9 @@ async fn minimum_ttl_prevents_premature_restore() {
 		"ttl-replica",
 		"ttl-kopia-creds",
 		ReplicaOpts {
-			schedule: Some("* * * * *".into()), // every minute
-			minimum_ttl: Some("24h".into()),    // 24 hours - won't expire during test
-			schedule_jitter: Some("0s".into()),
+			schedule: Some("* * * * *".into()),                 // every minute
+			minimum_ttl: Some(TimeSpan(Span::new().hours(24))), // 24 hours - won't expire during test
+			schedule_jitter: Some(TimeSpan::default()),         // no jitter
 			..Default::default()
 		},
 	);
@@ -940,7 +948,9 @@ async fn second_restore_and_switchover() {
 	let second_restore = PostgresPhysicalRestore::new(
 		second_restore_name,
 		PostgresPhysicalRestoreSpec {
-			replica: "switchover-replica".into(),
+			replica: LocalObjectReference {
+				name: "switchover-replica".into(),
+			},
 			snapshot: snapshot_id.clone(),
 			snapshot_size,
 			storage_size,
@@ -1140,9 +1150,9 @@ async fn overlay_fdw_reconciliation() {
 		"overlay-kopia-creds",
 		ReplicaOpts {
 			overlay_database: Some(OverlayDatabaseConfig {
-				postgres_version: Some("17".into()),
+				postgres_version: Some(17),
 				image_catalog: None,
-				storage_size_override: Some("2Gi".into()),
+				storage_size_override: Some(Quantity("2Gi".into())),
 				storage_class: None,
 				resources: None,
 				affinity: None,

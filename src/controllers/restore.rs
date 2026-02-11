@@ -1,13 +1,13 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use chrono::Utc;
+use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::{
 	api::{
 		apps::v1::Deployment,
 		batch::v1::Job,
 		core::v1::{PersistentVolumeClaim, Service},
 	},
-	apimachinery::pkg::apis::meta::v1::OwnerReference,
+	apimachinery::pkg::apis::meta::v1::{OwnerReference, Time},
 };
 use kube::{
 	Api, Client, ResourceExt,
@@ -98,8 +98,6 @@ pub fn error_policy(
 	Action::requeue(Duration::from_secs(30))
 }
 
-// ─── Phase handlers ─────────────────────────────────────────────────────────
-
 async fn reconcile_pending(
 	restore: &PostgresPhysicalRestore,
 	ctx: &Context,
@@ -107,7 +105,7 @@ async fn reconcile_pending(
 	namespace: &str,
 ) -> Result<Action> {
 	let client = &ctx.client;
-	let replica_name = &restore.spec.replica;
+	let replica_name = &restore.spec.replica.name;
 
 	// Set created_at if not set
 	if restore
@@ -116,7 +114,7 @@ async fn reconcile_pending(
 		.and_then(|s| s.created_at.as_ref())
 		.is_none()
 	{
-		let now = Utc::now().to_rfc3339();
+		let now = Timestamp::now();
 		update_restore_status(
 			client,
 			namespace,
@@ -130,7 +128,7 @@ async fn reconcile_pending(
 	}
 
 	// Delete previous restore's Job for the same replica (log cleanup)
-	cleanup_previous_jobs(client, namespace, &restore.spec.replica, name).await?;
+	cleanup_previous_jobs(client, namespace, replica_name, name).await?;
 
 	// Create PVC if it doesn't exist
 	let pvc_name = format!("{name}-data");
@@ -138,7 +136,7 @@ async fn reconcile_pending(
 	if pvcs.get_opt(&pvc_name).await?.is_none() {
 		info!(restore = name, pvc = pvc_name, "creating PVC");
 		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
-		let replica = replicas.get(&restore.spec.replica).await?;
+		let replica = replicas.get(replica_name).await?;
 		let pvc = build_pvc(restore, &pvc_name, namespace, &replica)?;
 		pvcs.create(&PostParams::default(), &pvc).await?;
 	}
@@ -176,7 +174,7 @@ async fn reconcile_restoring(
 	namespace: &str,
 ) -> Result<Action> {
 	let client = &ctx.client;
-	let replica_name = &restore.spec.replica;
+	let replica_name = &restore.spec.replica.name;
 
 	// Create or check restore Job
 	let job_name = format!("{name}-restore");
@@ -189,7 +187,7 @@ async fn reconcile_restoring(
 
 			// Look up the parent replica to get the kopia secret ref
 			let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
-			let replica = replicas.get(&restore.spec.replica).await?;
+			let replica = replicas.get(replica_name).await?;
 
 			let job =
 				build_restore_job(restore, &job_name, namespace, &replica, &ctx.kopia_image())?;
@@ -220,11 +218,10 @@ async fn reconcile_restoring(
 			);
 		}
 
-		let now = Utc::now().to_rfc3339();
+		let now = Time(Timestamp::now());
 		let completed_at = job_status
 			.as_ref()
-			.and_then(|s| s.completion_time.as_ref())
-			.map(|t| t.0.to_string())
+			.and_then(|s| s.completion_time.clone())
 			.unwrap_or_else(|| now.clone());
 
 		let mut status_patch = serde_json::json!({
@@ -307,7 +304,7 @@ async fn ensure_restore_service(
 			labels: Some(BTreeMap::from([
 				(
 					"pgro.bes.au/replica".to_string(),
-					restore.spec.replica.clone(),
+					restore.spec.replica.name.clone(),
 				),
 				("pgro.bes.au/restore".to_string(), name.to_string()),
 			])),
@@ -345,7 +342,7 @@ async fn reconcile_ready(
 	namespace: &str,
 ) -> Result<Action> {
 	let client = &ctx.client;
-	let replica_name = &restore.spec.replica;
+	let replica_name = &restore.spec.replica.name;
 
 	// If postgresVersion is missing (e.g. restore job pod was evicted before
 	// we could read the termination message), recover by launching a small job
@@ -446,7 +443,7 @@ async fn reconcile_ready(
 
 	// Look up the parent replica for config
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
-	let replica = replicas.get(&restore.spec.replica).await?;
+	let replica = replicas.get(&restore.spec.replica.name).await?;
 
 	// Ensure per-restore Service exists (stable endpoint for FDW and direct access)
 	ensure_restore_service(client, restore, name, namespace).await?;
@@ -497,11 +494,9 @@ async fn reconcile_ready(
 	}
 
 	// Check for timeout (10 minutes)
-	if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref())
-		&& let Ok(created) = created_at.parse::<chrono::DateTime<Utc>>()
-	{
-		let elapsed = Utc::now().signed_duration_since(created);
-		if elapsed > chrono::Duration::minutes(10) {
+	if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref()) {
+		let elapsed = Timestamp::now().duration_since(created_at.0);
+		if elapsed > SignedDuration::from_secs(10 * 60) {
 			warn!(
 				restore = name,
 				"deployment not ready after 10 minutes, marking as Failed"
@@ -519,8 +514,6 @@ async fn reconcile_ready(
 
 	Ok(Action::requeue(Duration::from_secs(10)))
 }
-
-// ─── Helpers ────────────────────────────────────────────────────────────────
 
 fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference {
 	OwnerReference {

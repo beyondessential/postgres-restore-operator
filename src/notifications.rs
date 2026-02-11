@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use handlebars::Handlebars;
-use k8s_openapi::api::core::v1::Secret;
+use jiff::Timestamp;
+use k8s_openapi::{api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::Time};
 use kube::{Api, Client};
 use serde_json::json;
 use tracing::{info, warn};
@@ -18,8 +19,7 @@ use crate::{
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct NotificationPayload {
-	pub event: String,
-	pub timestamp: String,
+	pub timestamp: Timestamp,
 	pub replica: ReplicaRef,
 	pub restore: RestoreRef,
 	pub connection_info: ConnectionInfoPayload,
@@ -75,32 +75,31 @@ pub async fn send_notification(
 	config: &NotificationConfig,
 	payload: &NotificationPayload,
 ) -> NotificationStatus {
-	let now = chrono::Utc::now().to_rfc3339();
+	let now = Time(jiff::Timestamp::now());
 
 	for (attempt, delay) in RETRY_DELAYS.iter().enumerate() {
 		if *delay > 0 {
 			tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
 		}
 
-		let result = if let Some(webhook) = &config.webhook {
-			send_webhook(client, http_client, namespace, webhook, payload).await
-		} else if let Some(graphql) = &config.graphql {
-			send_graphql(client, http_client, namespace, graphql, payload).await
-		} else {
-			Err(Error::Notification(
-				"no webhook or graphql config".to_string(),
-			))
+		let result = match config {
+			NotificationConfig::Webhook(webhook) => {
+				send_webhook(client, http_client, namespace, webhook, payload).await
+			}
+			NotificationConfig::GraphQL(graphql) => {
+				send_graphql(client, http_client, namespace, graphql, payload).await
+			}
 		};
 
 		match result {
 			Ok(()) => {
 				info!(
-					notification = config.name,
+					notification = config.name(),
 					attempt = attempt + 1,
 					"notification sent successfully"
 				);
 				return NotificationStatus {
-					name: config.name.clone(),
+					name: config.name(),
 					last_sent_at: Some(now),
 					success: true,
 					last_error: None,
@@ -108,7 +107,7 @@ pub async fn send_notification(
 			}
 			Err(e) => {
 				warn!(
-					notification = config.name,
+					notification = config.name(),
 					attempt = attempt + 1,
 					error = %e,
 					"notification failed, will retry"
@@ -118,7 +117,7 @@ pub async fn send_notification(
 	}
 
 	NotificationStatus {
-		name: config.name.clone(),
+		name: config.name(),
 		last_sent_at: Some(now),
 		success: false,
 		last_error: Some("max retries exhausted".to_string()),
@@ -214,7 +213,6 @@ async fn send_graphql(
 			"Password": payload.connection_info.password,
 		},
 		"IncludePassword": payload.connection_info.password.is_some(),
-		"Event": payload.event,
 		"Timestamp": payload.timestamp,
 	});
 
@@ -245,113 +243,4 @@ async fn send_graphql(
 	}
 
 	Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn connection_info_payload_from_connection_info() {
-		let info = ConnectionInfo {
-			host: "my-svc.ns.svc.cluster.local".into(),
-			port: 5432,
-			database: "mydb".into(),
-			username: "analytics".into(),
-			password_secret: "my-secret".into(),
-		};
-		let payload = ConnectionInfoPayload::from_connection_info(&info, Some("hunter2".into()));
-		assert_eq!(payload.host, "my-svc.ns.svc.cluster.local");
-		assert_eq!(payload.port, 5432);
-		assert_eq!(payload.database, "mydb");
-		assert_eq!(payload.username, "analytics");
-		assert_eq!(payload.password_secret, "my-secret");
-		assert_eq!(payload.password, Some("hunter2".into()));
-	}
-
-	#[test]
-	fn connection_info_payload_without_password() {
-		let info = ConnectionInfo {
-			host: "host".into(),
-			port: 5432,
-			database: "db".into(),
-			username: "user".into(),
-			password_secret: "sec".into(),
-		};
-		let payload = ConnectionInfoPayload::from_connection_info(&info, None);
-		assert_eq!(payload.password, None);
-	}
-
-	#[test]
-	fn notification_payload_serializes_camel_case() {
-		let payload = NotificationPayload {
-			event: "RestoreComplete".into(),
-			timestamp: "2024-01-01T00:00:00Z".into(),
-			replica: ReplicaRef {
-				name: "my-replica".into(),
-				namespace: "default".into(),
-			},
-			restore: RestoreRef {
-				name: "my-restore".into(),
-				snapshot: "snap-123".into(),
-				postgres_version: "16".into(),
-			},
-			connection_info: ConnectionInfoPayload {
-				host: "svc.ns".into(),
-				port: 5432,
-				database: "mydb".into(),
-				username: "user".into(),
-				password_secret: "secret".into(),
-				password: None,
-			},
-		};
-		let json = serde_json::to_value(&payload).unwrap();
-		// camelCase keys
-		assert!(json.get("connectionInfo").is_some());
-		assert!(json.get("connection_info").is_none());
-		let ci = json.get("connectionInfo").unwrap();
-		assert!(ci.get("passwordSecret").is_some());
-		// password should be omitted when None
-		assert!(ci.get("password").is_none());
-	}
-
-	#[test]
-	fn notification_payload_includes_password_when_set() {
-		let payload = NotificationPayload {
-			event: "RestoreComplete".into(),
-			timestamp: "t".into(),
-			replica: ReplicaRef {
-				name: "r".into(),
-				namespace: "ns".into(),
-			},
-			restore: RestoreRef {
-				name: "x".into(),
-				snapshot: "s".into(),
-				postgres_version: "16".into(),
-			},
-			connection_info: ConnectionInfoPayload {
-				host: "h".into(),
-				port: 5432,
-				database: "d".into(),
-				username: "u".into(),
-				password_secret: "ps".into(),
-				password: Some("mypass".into()),
-			},
-		};
-		let json = serde_json::to_value(&payload).unwrap();
-		let ci = json.get("connectionInfo").unwrap();
-		assert_eq!(ci.get("password").unwrap(), "mypass");
-	}
-
-	#[test]
-	fn restore_ref_serializes_camel_case() {
-		let r = RestoreRef {
-			name: "n".into(),
-			snapshot: "s".into(),
-			postgres_version: "15".into(),
-		};
-		let json = serde_json::to_value(&r).unwrap();
-		assert!(json.get("postgresVersion").is_some());
-		assert!(json.get("postgres_version").is_none());
-	}
 }

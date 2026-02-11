@@ -1,7 +1,17 @@
-use k8s_openapi::api::apps::v1::Deployment;
+use jiff::Span;
+use k8s_openapi::{
+	api::{
+		apps::v1::Deployment,
+		core::v1::{
+			Affinity, LocalObjectReference, NodeAffinity, NodeSelector, NodeSelectorRequirement,
+			NodeSelectorTerm, SecretReference,
+		},
+	},
+	apimachinery::pkg::api::resource::Quantity,
+};
 
 use super::builders::build_deployment;
-use crate::types::*;
+use crate::{types::*, util::TimeSpan};
 
 fn make_replica(extra_config: Option<String>) -> PostgresPhysicalReplica {
 	make_replica_with_opts(extra_config, true)
@@ -14,12 +24,15 @@ fn make_replica_with_opts(
 	PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: "kopia-secret".to_string(),
+			kopia_secret_ref: SecretReference {
+				name: Some("kopia-secret".to_string()),
+				namespace: None,
+			},
 			snapshot_filter: None,
 			schedule: None,
-			schedule_jitter: "10m".to_string(),
+			schedule_jitter: TimeSpan(Span::new().minutes(10)),
 			minimum_ttl: None,
-			switchover_grace_period: "5m".to_string(),
+			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 			analytics_username: "analytics".to_string(),
 			storage_class: None,
 			storage_size_override: None,
@@ -40,10 +53,12 @@ fn make_restore() -> PostgresPhysicalRestore {
 	let mut restore = PostgresPhysicalRestore::new(
 		"test-restore",
 		PostgresPhysicalRestoreSpec {
-			replica: "test-replica".to_string(),
+			replica: LocalObjectReference {
+				name: "test-replica".to_string(),
+			},
 			snapshot: "snap123".to_string(),
-			snapshot_size: "10Gi".to_string(),
-			storage_size: "11Gi".to_string(),
+			snapshot_size: Quantity("10Gi".to_string()),
+			storage_size: Quantity("11Gi".to_string()),
 		},
 	);
 	restore.metadata.uid = Some("uid-123".to_string());
@@ -306,19 +321,23 @@ fn fdw_user_not_created_without_overlay() {
 #[test]
 fn deployment_uses_affinity_not_node_selector() {
 	let mut replica = make_replica(None);
-	replica.spec.affinity = Some(crate::types::Affinity(serde_json::json!({
-		"nodeAffinity": {
-			"requiredDuringSchedulingIgnoredDuringExecution": {
-				"nodeSelectorTerms": [{
-					"matchExpressions": [{
-						"key": "kubernetes.io/os",
-						"operator": "In",
-						"values": ["linux"]
-					}]
-				}]
-			}
-		}
-	})));
+	replica.spec.affinity = Some(Affinity {
+		node_affinity: Some(NodeAffinity {
+			required_during_scheduling_ignored_during_execution: Some(NodeSelector {
+				node_selector_terms: vec![NodeSelectorTerm {
+					match_expressions: Some(vec![NodeSelectorRequirement {
+						key: "kubernetes.io/os".to_string(),
+						operator: "In".to_string(),
+						values: Some(vec!["linux".to_string()]),
+					}]),
+					..Default::default()
+				}],
+			}),
+			..Default::default()
+		}),
+		pod_affinity: None,
+		pod_anti_affinity: None,
+	});
 	let restore = make_restore();
 	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
 	let pod_spec = deploy

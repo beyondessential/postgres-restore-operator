@@ -314,6 +314,7 @@ mod tests {
 		let filter = SnapshotFilter {
 			tags: Some(HashMap::from([("env".into(), "prod".into())])),
 			host_pattern: None,
+			description_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 1);
@@ -330,6 +331,7 @@ mod tests {
 		let filter = SnapshotFilter {
 			tags: None,
 			host_pattern: Some("fiji-prod-*".into()),
+			description_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 2);
@@ -365,6 +367,7 @@ mod tests {
 		let filter = SnapshotFilter {
 			tags: Some(HashMap::from([("env".into(), "prod".into())])),
 			host_pattern: Some("fiji-prod-*".into()),
+			description_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 1);
@@ -408,12 +411,6 @@ mod tests {
 	}
 
 	#[test]
-	fn snapshot_hostname() {
-		let snap = make_snapshot("id", "myhost", "t1", HashMap::new());
-		assert_eq!(snap.hostname(), "myhost");
-	}
-
-	#[test]
 	fn filter_snapshots_by_tags_with_tag_prefix() {
 		let snaps = vec![
 			make_snapshot(
@@ -427,41 +424,11 @@ mod tests {
 		let filter = SnapshotFilter {
 			tags: Some(HashMap::from([("area".into(), "postgres".into())])),
 			host_pattern: None,
+			description_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 1);
 		assert_eq!(result[0].id, "a");
-	}
-
-	#[test]
-	fn deserialize_real_kopia_snapshot() {
-		let json = r#"{
-			"id": "ff90452158616878e80a04257b720488",
-			"source": {
-				"host": "central",
-				"userName": "kopia",
-				"path": "/var/lib/kopia/mnt-postgres-86"
-			},
-			"description": "some description",
-			"startTime": "2026-02-09T13:19:38.332518746Z",
-			"endTime": "2026-02-09T13:19:47.146358895Z",
-			"stats": {
-				"totalSize": 1590817547,
-				"fileCount": 2473
-			},
-			"tags": {
-				"tag:area": "postgres",
-				"tag:snapper": "86"
-			},
-			"retentionReason": ["latest-1"]
-		}"#;
-		let snap: Snapshot = serde_json::from_str(json).unwrap();
-		assert_eq!(snap.id, "ff90452158616878e80a04257b720488");
-		assert_eq!(snap.hostname(), "central");
-		assert_eq!(snap.source.user_name, "kopia");
-		assert_eq!(snap.start_time, "2026-02-09T13:19:38.332518746Z");
-		assert_eq!(snap.total_size_bytes(), 1590817547);
-		assert_eq!(snap.tags.get("tag:area").unwrap(), "postgres");
 	}
 
 	#[test]

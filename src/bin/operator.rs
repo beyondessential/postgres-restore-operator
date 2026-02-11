@@ -6,7 +6,9 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use futures::StreamExt;
+use jiff::Timestamp;
 use k8s_openapi::api::core::v1::ConfigMap;
+use kube::runtime::reflector::ObjectRef;
 use kube::{
 	Api, Client,
 	runtime::{controller::Controller, watcher, watcher::Config},
@@ -111,13 +113,13 @@ async fn main() -> anyhow::Result<()> {
 
 	// Heartbeat: a background task updates this timestamp every 5s.
 	// If the runtime is deadlocked, the timestamp goes stale and /livez fails.
-	let heartbeat = Arc::new(AtomicI64::new(chrono::Utc::now().timestamp()));
+	let heartbeat = Arc::new(AtomicI64::new(Timestamp::now().as_second()));
 	let heartbeat_writer = heartbeat.clone();
 	tokio::spawn(async move {
 		let mut interval = tokio::time::interval(Duration::from_secs(5));
 		loop {
 			interval.tick().await;
-			heartbeat_writer.store(chrono::Utc::now().timestamp(), Ordering::Relaxed);
+			heartbeat_writer.store(Timestamp::now().as_second(), Ordering::Relaxed);
 		}
 	});
 
@@ -229,10 +231,9 @@ async fn main() -> anyhow::Result<()> {
 			Api::<PostgresPhysicalRestore>::all(client.clone()),
 			Config::default(),
 			|restore| {
-				let replica_name = restore.spec.replica.clone();
+				let replica_name = restore.spec.replica.name.clone();
 				let namespace = restore.metadata.namespace.clone();
-				namespace
-					.map(|ns| kube::runtime::reflector::ObjectRef::new(&replica_name).within(&ns))
+				namespace.map(|ns| ObjectRef::new(&replica_name).within(&ns))
 			},
 		)
 		.run(
@@ -283,7 +284,7 @@ struct ProbeState {
 /// a background heartbeat was updated within the last 30 seconds.
 async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
-	let age = chrono::Utc::now().timestamp() - last;
+	let age = Timestamp::now().as_second() - last;
 	if age <= 30 {
 		debug!(heartbeat_age_secs = age, "livez ok");
 		(StatusCode::OK, "ok")
@@ -299,7 +300,7 @@ async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 /// Readiness: checks that the heartbeat is fresh (runtime is responsive).
 async fn readyz(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
-	let age = chrono::Utc::now().timestamp() - last;
+	let age = Timestamp::now().as_second() - last;
 	if age <= 30 {
 		debug!(heartbeat_age_secs = age, "readyz ok");
 		(StatusCode::OK, "ok")

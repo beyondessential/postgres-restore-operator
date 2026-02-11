@@ -1,7 +1,9 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{
+	Arc, RwLock,
+	atomic::{AtomicUsize, Ordering},
+};
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use kube::Client;
 
 use crate::metrics::Metrics;
@@ -55,7 +57,7 @@ pub struct RestoreQueue {
 	/// Restore names currently running (in Restoring phase)
 	pub active: Vec<String>,
 	/// (restore name, created_at) for pending restores, FIFO order
-	pub pending: Vec<(String, DateTime<Utc>)>,
+	pub pending: Vec<(String, Timestamp)>,
 }
 
 impl RestoreQueue {
@@ -73,7 +75,7 @@ impl RestoreQueue {
 
 	pub fn enqueue(&mut self, name: String) {
 		if !self.pending.iter().any(|(n, _)| n == &name) {
-			self.pending.push((name, Utc::now()));
+			self.pending.push((name, Timestamp::now()));
 		}
 	}
 
