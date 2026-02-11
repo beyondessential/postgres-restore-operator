@@ -7,7 +7,8 @@ use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use futures::StreamExt;
 use jiff::Timestamp;
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::core::v1::{ConfigMap, Pod};
+use kube::api::Patch;
 use kube::runtime::reflector::ObjectRef;
 use kube::{
 	Api, Client,
@@ -26,6 +27,38 @@ use postgres_restore_operator::{
 const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 2;
 const DEFAULT_METRICS_ADDR: &str = "[::]:8080";
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
+
+/// Annotate the operator's own pod with the running version.
+async fn annotate_own_pod(client: &Client, namespace: &str) {
+	let pod_name = match std::env::var("HOSTNAME") {
+		Ok(name) if !name.is_empty() => name,
+		_ => {
+			debug!("HOSTNAME not set, skipping pod self-annotation");
+			return;
+		}
+	};
+
+	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+	let patch = serde_json::json!({
+		"metadata": {
+			"annotations": {
+				"pgro.bes.au/version": env!("CARGO_PKG_VERSION")
+			}
+		}
+	});
+
+	match pods
+		.patch(&pod_name, &Default::default(), &Patch::Merge(&patch))
+		.await
+	{
+		Ok(_) => info!(
+			pod = pod_name,
+			version = env!("CARGO_PKG_VERSION"),
+			"annotated own pod with version"
+		),
+		Err(e) => warn!(pod = pod_name, error = %e, "failed to annotate own pod with version"),
+	}
+}
 
 fn operator_namespace() -> String {
 	if let Ok(ns) = std::env::var("OPERATOR_NAMESPACE") {
@@ -115,6 +148,8 @@ async fn main() -> anyhow::Result<()> {
 		version = env!("CARGO_PKG_VERSION"),
 		"starting postgres-restore-operator"
 	);
+
+	annotate_own_pod(&client, &namespace).await;
 
 	let ctx = Arc::new(Context::new(
 		client.clone(),

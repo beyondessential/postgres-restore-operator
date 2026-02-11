@@ -45,10 +45,10 @@ rules:
     - apiGroups: ["apps"]
       resources: ["deployments"]
       verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
-    # Pods (reading Job pod termination messages for version detection)
+    # Pods (reading Job pod termination messages for version detection, self-annotation)
     - apiGroups: [""]
       resources: ["pods"]
-      verbs: ["get", "list"]
+      verbs: ["get", "list", "patch"]
     # Pod port-forward (overlay FDW reconciliation)
     - apiGroups: [""]
       resources: ["pods/portforward"]
