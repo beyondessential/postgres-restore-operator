@@ -5,6 +5,7 @@ use std::sync::{
 
 use jiff::Timestamp;
 use kube::Client;
+use kube::runtime::events::{Recorder, Reporter};
 
 use crate::metrics::Metrics;
 
@@ -13,6 +14,7 @@ pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 pub struct Context {
 	pub client: Client,
 	pub metrics: Metrics,
+	pub recorder: Recorder,
 	pub restore_queue: Arc<tokio::sync::RwLock<RestoreQueue>>,
 	pub max_concurrent_restores: Arc<AtomicUsize>,
 	pub kopia_image: Arc<RwLock<String>>,
@@ -27,9 +29,13 @@ impl Context {
 		kopia_image: String,
 		use_port_forward: bool,
 	) -> Self {
+		let reporter = Reporter::from("postgres-restore-operator");
+		let recorder = Recorder::new(client.clone(), reporter);
+
 		Self {
 			client,
 			metrics: Metrics::new(),
+			recorder,
 			restore_queue: Arc::new(tokio::sync::RwLock::new(RestoreQueue::default())),
 			max_concurrent_restores: Arc::new(AtomicUsize::new(max_concurrent_restores)),
 			kopia_image: Arc::new(RwLock::new(kopia_image)),

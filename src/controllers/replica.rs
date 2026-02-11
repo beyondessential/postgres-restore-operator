@@ -6,9 +6,12 @@ use k8s_openapi::{
 	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
 };
 use kube::{
-	Api, ResourceExt,
+	Api, Resource, ResourceExt,
 	api::{Patch, PatchParams, PostParams},
-	runtime::controller::Action,
+	runtime::{
+		controller::Action,
+		events::{Event, EventType},
+	},
 };
 use rand::RngExt;
 use tracing::{debug, info, warn};
@@ -234,6 +237,24 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.await?;
 
 		ctx.metrics.switchovers_total.inc();
+
+		// Record event on replica CR
+		if let Err(e) = ctx
+			.recorder
+			.publish(
+				&Event {
+					type_: EventType::Normal,
+					reason: "RestoreCompleted".into(),
+					note: Some(format!("Switchover to restore {switching_name} completed")),
+					action: "Restore".into(),
+					secondary: Some(switching.object_ref(&())),
+				},
+				&replica.object_ref(&()),
+			)
+			.await
+		{
+			warn!(replica = name, error = %e, "failed to publish RestoreCompleted event");
+		}
 
 		// Send notifications
 		replica
@@ -561,6 +582,26 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							);
 							replica.create_restore_for_snapshot(client, &snap).await?;
 							ctx.metrics.restores_started_total.inc();
+
+							if let Err(e) = ctx
+								.recorder
+								.publish(
+									&Event {
+										type_: EventType::Normal,
+										reason: "RestoreStarted".into(),
+										note: Some(format!(
+											"Started restore from snapshot {}",
+											snap.id
+										)),
+										action: "Restore".into(),
+										secondary: None,
+									},
+									&replica.object_ref(&()),
+								)
+								.await
+							{
+								warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+							}
 						}
 					} else {
 						warn!(

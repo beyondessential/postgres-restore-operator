@@ -5,14 +5,17 @@ use k8s_openapi::{
 	api::{
 		apps::v1::Deployment,
 		batch::v1::Job,
-		core::v1::{PersistentVolumeClaim, Service},
+		core::v1::{ObjectReference, PersistentVolumeClaim, Service},
 	},
 	apimachinery::pkg::apis::meta::v1::{OwnerReference, Time},
 };
 use kube::{
 	Api, Client, ResourceExt,
 	api::{ObjectMeta, Patch, PatchParams, PostParams},
-	runtime::controller::Action,
+	runtime::{
+		controller::Action,
+		events::{Event, EventType},
+	},
 };
 use tracing::{debug, info, warn};
 
@@ -44,6 +47,30 @@ async fn fail_restore(
 	}
 
 	ctx.metrics.restores_failed_total.inc();
+
+	let replica_ref = ObjectReference {
+		api_version: Some("pgro.bes.au/v1alpha1".into()),
+		kind: Some("PostgresPhysicalReplica".into()),
+		name: Some(replica_name.into()),
+		namespace: Some(namespace.into()),
+		..Default::default()
+	};
+	if let Err(e) = ctx
+		.recorder
+		.publish(
+			&Event {
+				type_: EventType::Warning,
+				reason: "RestoreFailed".into(),
+				note: Some(format!("Restore {name} failed")),
+				action: "Restore".into(),
+				secondary: None,
+			},
+			&replica_ref,
+		)
+		.await
+	{
+		warn!(replica = replica_name, error = %e, "failed to publish RestoreFailed event");
+	}
 
 	Ok(Action::requeue(Duration::from_secs(300)))
 }
