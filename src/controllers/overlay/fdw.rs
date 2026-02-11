@@ -477,7 +477,7 @@ pub async fn reconcile_fdw(
 		);
 		overlay_pg
 			.batch_execute(&format!(
-				"IMPORT FOREIGN SCHEMA {remote_quoted} FROM SERVER {server_name} INTO {local_quoted}"
+				"IMPORT FOREIGN SCHEMA {remote_quoted} FROM SERVER {server_name} INTO {local_quoted} OPTIONS (import_collate 'false')"
 			))
 			.await?;
 		debug!(remote = %remote, local = %local, "foreign schema imported successfully");
