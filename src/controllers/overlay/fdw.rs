@@ -354,17 +354,8 @@ async fn drop_tracked_stub_types(pg: &tokio_postgres::Client) -> Result<()> {
 		let schema: String = row.get(0);
 		let name: String = row.get(1);
 		let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&name));
-		if let Err(err) = pg
-			.batch_execute(&format!("DROP DOMAIN IF EXISTS {qualified}"))
-			.await
-		{
-			warn!(
-				schema = %schema,
-				name = %name,
-				error = %err,
-				"failed to drop stale stub domain"
-			);
-		}
+		pg.batch_execute(&format!("DROP DOMAIN IF EXISTS {qualified} CASCADE"))
+			.await?;
 	}
 
 	// Then drop enums
@@ -379,17 +370,8 @@ async fn drop_tracked_stub_types(pg: &tokio_postgres::Client) -> Result<()> {
 		let schema: String = row.get(0);
 		let name: String = row.get(1);
 		let qualified = format!("{}.{}", quote_ident(&schema), quote_ident(&name));
-		if let Err(err) = pg
-			.batch_execute(&format!("DROP TYPE IF EXISTS {qualified}"))
-			.await
-		{
-			warn!(
-				schema = %schema,
-				name = %name,
-				error = %err,
-				"failed to drop stale stub enum"
-			);
-		}
+		pg.batch_execute(&format!("DROP TYPE IF EXISTS {qualified} CASCADE"))
+			.await?;
 	}
 
 	let total = domain_rows.len() + enum_rows.len();
