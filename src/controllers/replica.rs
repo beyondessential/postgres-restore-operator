@@ -404,16 +404,46 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.and_then(|s| s.last_restore_completed_at.as_ref())
 			.is_none();
 
-	// Ensure nextScheduledRestore is populated
-	if replica
+	// Detect if the schedule or jitter has changed since we last computed nextScheduledRestore
+	let current_schedule = &replica.spec.schedule;
+	let current_jitter = replica.spec.schedule_jitter.to_string();
+	let schedule_changed = replica
 		.status
 		.as_ref()
-		.and_then(|s| s.next_scheduled_restore.as_ref())
-		.is_none()
+		.and_then(|s| s.last_applied_schedule.as_ref())
+		.is_none_or(|s| s != current_schedule)
+		|| replica
+			.status
+			.as_ref()
+			.and_then(|s| s.last_applied_schedule_jitter.as_ref())
+			.is_none_or(|j| j != &current_jitter);
+
+	// Recompute nextScheduledRestore when missing or when schedule config changed
+	if (schedule_changed
+		|| replica
+			.status
+			.as_ref()
+			.and_then(|s| s.next_scheduled_restore.as_ref())
+			.is_none())
 		&& let Some(next) = replica.compute_next_scheduled_restore(now)
 	{
+		if schedule_changed {
+			debug!(
+				replica = %name,
+				schedule = %current_schedule,
+				jitter = %current_jitter,
+				next = %next,
+				"schedule config changed, recomputing nextScheduledRestore"
+			);
+		}
 		replica
 			.update_status_field(client, "nextScheduledRestore", Time(next))
+			.await?;
+		replica
+			.update_status_field(client, "lastAppliedSchedule", current_schedule)
+			.await?;
+		replica
+			.update_status_field(client, "lastAppliedScheduleJitter", &current_jitter)
 			.await?;
 	}
 
@@ -436,6 +466,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	{
 		replica
 			.update_status_field(client, "nextScheduledRestore", Time(next))
+			.await?;
+		replica
+			.update_status_field(client, "lastAppliedSchedule", current_schedule)
+			.await?;
+		replica
+			.update_status_field(client, "lastAppliedScheduleJitter", &current_jitter)
 			.await?;
 	}
 

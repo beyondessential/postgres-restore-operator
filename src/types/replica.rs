@@ -330,6 +330,14 @@ pub struct PostgresPhysicalReplicaStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub overlay_fdw_restore: Option<String>,
 
+	/// The schedule expression that was used to compute `nextScheduledRestore`
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_applied_schedule: Option<String>,
+
+	/// The schedule jitter that was used to compute `nextScheduledRestore`
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub last_applied_schedule_jitter: Option<String>,
+
 	/// Current (possibly ratcheted) storage size of the overlay PVC
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub overlay_storage_size: Option<Quantity>,
