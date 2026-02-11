@@ -61,18 +61,27 @@ fn extract_kopia_image(cm: &ConfigMap) -> String {
 		.unwrap_or_else(|| DEFAULT_KOPIA_IMAGE.to_string())
 }
 
-async fn read_config(client: &Client, namespace: &str) -> (usize, String) {
+fn extract_use_port_forward(cm: &ConfigMap) -> bool {
+	cm.data
+		.as_ref()
+		.and_then(|d| d.get("usePortForward"))
+		.is_some_and(|v| v == "true")
+}
+
+async fn read_config(client: &Client, namespace: &str) -> (usize, String, bool) {
 	let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
 	match api.get(CONFIGMAP_NAME).await {
 		Ok(cm) => (
 			extract_max_concurrent_restores(&cm),
 			extract_kopia_image(&cm),
+			extract_use_port_forward(&cm),
 		),
 		Err(e) => {
 			warn!(error = %e, "failed to read ConfigMap {CONFIGMAP_NAME}, using defaults");
 			(
 				DEFAULT_MAX_CONCURRENT_RESTORES,
 				DEFAULT_KOPIA_IMAGE.to_string(),
+				false,
 			)
 		}
 	}
@@ -94,11 +103,13 @@ async fn main() -> anyhow::Result<()> {
 	let client = Client::try_default().await?;
 
 	let namespace = operator_namespace();
-	let (max_concurrent_restores, kopia_image) = read_config(&client, &namespace).await;
+	let (max_concurrent_restores, kopia_image, use_port_forward) =
+		read_config(&client, &namespace).await;
 
 	info!(
 		max_concurrent_restores,
 		kopia_image,
+		use_port_forward,
 		metrics_addr,
 		operator_namespace = namespace,
 		version = env!("CARGO_PKG_VERSION"),
@@ -109,6 +120,7 @@ async fn main() -> anyhow::Result<()> {
 		client.clone(),
 		max_concurrent_restores,
 		kopia_image,
+		use_port_forward,
 	));
 
 	// Heartbeat: a background task updates this timestamp every 5s.
@@ -129,6 +141,7 @@ async fn main() -> anyhow::Result<()> {
 		Config::default().fields(&format!("metadata.name={CONFIGMAP_NAME}"));
 	let max_concurrent_ref = ctx.max_concurrent_restores.clone();
 	let kopia_image_ref = ctx.kopia_image.clone();
+	let use_port_forward_ref = ctx.use_port_forward.clone();
 	tokio::spawn(async move {
 		let stream = watcher::watcher(config_api, config_watcher_config);
 		futures::pin_mut!(stream);
@@ -155,6 +168,16 @@ async fn main() -> anyhow::Result<()> {
 						);
 						*image = new_image;
 					}
+
+					let new_pf = extract_use_port_forward(&cm);
+					let old_pf = use_port_forward_ref.swap(new_pf, Ordering::Relaxed);
+					if old_pf != new_pf {
+						info!(
+							old = old_pf,
+							new = new_pf,
+							"use_port_forward updated from ConfigMap"
+						);
+					}
 				}
 				Ok(watcher::Event::Delete(_)) => {
 					let old_val =
@@ -175,6 +198,15 @@ async fn main() -> anyhow::Result<()> {
 							"ConfigMap deleted, reverted kopia_image to default"
 						);
 						*image = DEFAULT_KOPIA_IMAGE.to_string();
+					}
+
+					let old_pf = use_port_forward_ref.swap(false, Ordering::Relaxed);
+					if old_pf {
+						info!(
+							old = old_pf,
+							new = false,
+							"ConfigMap deleted, reverted use_port_forward to default"
+						);
 					}
 				}
 				Ok(watcher::Event::Init | watcher::Event::InitDone) => {}

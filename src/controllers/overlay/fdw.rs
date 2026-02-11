@@ -137,26 +137,19 @@ async fn discover_restore_database(
 	restore_name: &str,
 	fdw_user: &str,
 	fdw_password: &str,
+	use_port_forward: bool,
 ) -> Result<String> {
-	let restore_pod = super::connect::find_pod_by_label(
+	let conn = super::connect::connect_to_restore(
 		client,
 		namespace,
-		&format!("pgro.bes.au/restore={restore_name}"),
-	)
-	.await?;
-	debug!(
-		pod = %restore_pod,
-		"connecting to restore database for database discovery via port-forward"
-	);
-	let (pg, _pf) = super::connect::connect_via_pod(
-		client,
-		namespace,
-		&restore_pod,
+		restore_name,
 		"postgres",
 		fdw_user,
 		fdw_password,
+		use_port_forward,
 	)
 	.await?;
+	let pg = &conn.client;
 
 	let row = pg
 		.query_opt(
@@ -188,6 +181,10 @@ async fn discover_restore_database(
 ///
 /// Uses the explicit `schema_mapping` from the spec if present, otherwise
 /// discovers user schemas from the restore database.
+#[expect(
+	clippy::too_many_arguments,
+	reason = "internal helper with tightly-coupled params"
+)]
 async fn resolve_fdw_schemas(
 	client: &Client,
 	namespace: &str,
@@ -196,6 +193,7 @@ async fn resolve_fdw_schemas(
 	restore_dbname: &str,
 	fdw_user: &str,
 	fdw_password: &str,
+	use_port_forward: bool,
 ) -> Result<Vec<(String, String)>> {
 	let replica_name = replica.name_any();
 	if let Some(mapping) = replica
@@ -223,29 +221,19 @@ async fn resolve_fdw_schemas(
 		restore_dbname = restore_dbname,
 		"no explicit schema mapping, discovering schemas from restore database"
 	);
-	let restore_pod = super::connect::find_pod_by_label(
+	let conn = super::connect::connect_to_restore(
 		client,
 		namespace,
-		&format!("pgro.bes.au/restore={restore_name}"),
-	)
-	.await?;
-	debug!(
-		pod = %restore_pod,
-		dbname = restore_dbname,
-		"connecting to restore database for schema discovery via port-forward"
-	);
-	let (restore_pg, _pf) = super::connect::connect_via_pod(
-		client,
-		namespace,
-		&restore_pod,
+		restore_name,
 		restore_dbname,
 		fdw_user,
 		fdw_password,
+		use_port_forward,
 	)
 	.await?;
-	debug!("connected to restore database");
 
-	let rows = restore_pg
+	let rows = conn
+		.client
 		.query(
 			"SELECT schema_name FROM information_schema.schemata \
 			 WHERE schema_name NOT LIKE 'pg_%' AND schema_name != 'information_schema'",
@@ -278,6 +266,7 @@ pub async fn reconcile_fdw(
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
 	restore_name: &str,
+	use_port_forward: bool,
 ) -> Result<()> {
 	let replica_name = replica.name_any();
 	let cluster_name = super::overlay_cluster_name(&replica_name);
@@ -305,16 +294,29 @@ pub async fn reconcile_fdw(
 	let fdw_user = super::connect::read_secret_field(&fdw_secret, "username")?;
 	let fdw_password = super::connect::read_secret_field(&fdw_secret, "password")?;
 
-	let (overlay_pg, _overlay_pf) =
-		super::connect::connect_overlay(client, &cluster_name, namespace, &su_secret).await?;
+	let overlay_conn = super::connect::connect_overlay(
+		client,
+		&cluster_name,
+		namespace,
+		&su_secret,
+		use_port_forward,
+	)
+	.await?;
+	let overlay_pg = &overlay_conn.client;
 
 	// Discover the main database in the restore (largest by size)
-	let restore_dbname =
-		discover_restore_database(client, namespace, restore_name, &fdw_user, &fdw_password)
-			.await?;
+	let restore_dbname = discover_restore_database(
+		client,
+		namespace,
+		restore_name,
+		&fdw_user,
+		&fdw_password,
+		use_port_forward,
+	)
+	.await?;
 
 	// Check current state
-	let state = check_fdw_state(&overlay_pg, &server_name).await?;
+	let state = check_fdw_state(overlay_pg, &server_name).await?;
 
 	let server_host_correct = state.server_host.as_deref() == Some(restore_host.as_str());
 	let server_dbname_correct = state.server_dbname.as_deref() == Some(restore_dbname.as_str());
@@ -333,7 +335,7 @@ pub async fn reconcile_fdw(
 	);
 
 	// Drop stale servers from previous restores
-	drop_stale_fdw_servers(&overlay_pg, &server_name, &replica_name).await?;
+	drop_stale_fdw_servers(overlay_pg, &server_name, &replica_name).await?;
 
 	// Ensure _pgro schema and extension
 	if !state.has_extension {
@@ -436,6 +438,7 @@ pub async fn reconcile_fdw(
 		&restore_dbname,
 		&fdw_user,
 		&fdw_password,
+		use_port_forward,
 	)
 	.await?;
 

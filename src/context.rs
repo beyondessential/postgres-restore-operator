@@ -1,6 +1,6 @@
 use std::sync::{
 	Arc, RwLock,
-	atomic::{AtomicUsize, Ordering},
+	atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use jiff::Timestamp;
@@ -16,17 +16,24 @@ pub struct Context {
 	pub restore_queue: Arc<tokio::sync::RwLock<RestoreQueue>>,
 	pub max_concurrent_restores: Arc<AtomicUsize>,
 	pub kopia_image: Arc<RwLock<String>>,
+	pub use_port_forward: Arc<AtomicBool>,
 	pub http_client: reqwest::Client,
 }
 
 impl Context {
-	pub fn new(client: Client, max_concurrent_restores: usize, kopia_image: String) -> Self {
+	pub fn new(
+		client: Client,
+		max_concurrent_restores: usize,
+		kopia_image: String,
+		use_port_forward: bool,
+	) -> Self {
 		Self {
 			client,
 			metrics: Metrics::new(),
 			restore_queue: Arc::new(tokio::sync::RwLock::new(RestoreQueue::default())),
 			max_concurrent_restores: Arc::new(AtomicUsize::new(max_concurrent_restores)),
 			kopia_image: Arc::new(RwLock::new(kopia_image)),
+			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
 		}
 	}
@@ -37,6 +44,10 @@ impl Context {
 
 	pub fn kopia_image(&self) -> String {
 		self.kopia_image.read().unwrap().clone()
+	}
+
+	pub fn use_port_forward(&self) -> bool {
+		self.use_port_forward.load(Ordering::Relaxed)
 	}
 
 	/// Remove a restore from the queue, promote the next pending one if there

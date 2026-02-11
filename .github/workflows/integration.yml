@@ -117,6 +117,7 @@ jobs:
             namespace: pgro-system
           data:
             maxConcurrentRestores: "4"
+            usePortForward: "true"
           EOF
 
       - name: Pre-pull images on kind node

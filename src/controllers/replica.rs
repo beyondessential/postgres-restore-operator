@@ -265,7 +265,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				"reconciling FDW state in overlay database"
 			);
 
-			match overlay::fdw::reconcile_fdw(client, &namespace, &replica, current).await {
+			match overlay::fdw::reconcile_fdw(
+				client,
+				&namespace,
+				&replica,
+				current,
+				ctx.use_port_forward(),
+			)
+			.await
+			{
 				Ok(()) => {
 					if fdw_restore.as_ref() != Some(&current) {
 						info!(
