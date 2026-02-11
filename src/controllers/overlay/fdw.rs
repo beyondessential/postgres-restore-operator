@@ -96,7 +96,7 @@ async fn drop_stale_fdw_servers(
 	for row in &rows {
 		let name: String = row.get(0);
 		if name != current_server {
-			info!(
+			debug!(
 				replica = replica_name,
 				stale_server = %name,
 				"dropping stale FDW server"
@@ -147,7 +147,7 @@ async fn discover_restore_database(
 	match row {
 		Some(r) => {
 			let name: String = r.get(0);
-			info!(
+			debug!(
 				restore = restore_name,
 				database = %name,
 				"discovered main database in restore by size"
@@ -189,7 +189,7 @@ async fn resolve_fdw_schemas(
 			.iter()
 			.map(|(k, v)| (k.clone(), v.clone()))
 			.collect();
-		info!(
+		debug!(
 			replica = %replica_name,
 			schema_count = result.len(),
 			"using explicit schema mapping from spec"
@@ -198,7 +198,7 @@ async fn resolve_fdw_schemas(
 		return Ok(result);
 	}
 
-	info!(
+	debug!(
 		replica = %replica_name,
 		restore = restore_name,
 		restore_dbname = restore_dbname,
@@ -230,7 +230,7 @@ async fn resolve_fdw_schemas(
 			(name.clone(), name)
 		})
 		.collect();
-	info!(
+	debug!(
 		replica = %replica_name,
 		schema_count = result.len(),
 		"discovered schemas from restore database"
@@ -376,7 +376,7 @@ async fn drop_tracked_stub_types(pg: &tokio_postgres::Client) -> Result<()> {
 
 	let total = domain_rows.len() + enum_rows.len();
 	if total > 0 {
-		info!(
+		debug!(
 			domains = domain_rows.len(),
 			enums = enum_rows.len(),
 			"dropped stale stub types from previous restore"
@@ -516,7 +516,7 @@ pub async fn reconcile_fdw(
 	let server_name = super::overlay_fdw_server_name(restore_name);
 	let restore_host = format!("{restore_name}.{namespace}.svc");
 
-	info!(
+	debug!(
 		replica = %replica_name,
 		restore = %restore_name,
 		server = %server_name,
@@ -562,7 +562,7 @@ pub async fn reconcile_fdw(
 	let server_host_correct = state.server_host.as_deref() == Some(restore_host.as_str());
 	let server_dbname_correct = state.server_dbname.as_deref() == Some(restore_dbname.as_str());
 
-	info!(
+	debug!(
 		replica = %replica_name,
 		has_extension = state.has_extension,
 		server_exists = state.server_host.is_some(),
@@ -578,7 +578,7 @@ pub async fn reconcile_fdw(
 
 	// Ensure _pgro schema and extension
 	if !state.has_extension {
-		info!(replica = %replica_name, "creating _pgro schema and postgres_fdw extension");
+		debug!(replica = %replica_name, "creating _pgro schema and postgres_fdw extension");
 		overlay_pg
 			.batch_execute("CREATE SCHEMA IF NOT EXISTS _pgro")
 			.await?;
@@ -591,7 +591,7 @@ pub async fn reconcile_fdw(
 
 	// Ensure FDW server with correct host and dbname
 	if state.server_host.is_none() {
-		info!(
+		debug!(
 			replica = %replica_name,
 			server = %server_name,
 			host = %restore_host,
@@ -610,7 +610,7 @@ pub async fn reconcile_fdw(
 		// Server exists — fix any options that are wrong
 		let mut alter_parts = Vec::new();
 		if !server_host_correct {
-			info!(
+			debug!(
 				replica = %replica_name,
 				server = %server_name,
 				old_host = ?state.server_host,
@@ -620,7 +620,7 @@ pub async fn reconcile_fdw(
 			alter_parts.push(format!("SET host {}", quote_literal(&restore_host)));
 		}
 		if !server_dbname_correct {
-			info!(
+			debug!(
 				replica = %replica_name,
 				server = %server_name,
 				old_dbname = ?state.server_dbname,
@@ -666,7 +666,7 @@ pub async fn reconcile_fdw(
 			))
 			.await?;
 	}
-	info!(server = %server_name, fdw_user = %fdw_user, "creating PUBLIC user mapping");
+	debug!(server = %server_name, fdw_user = %fdw_user, "creating PUBLIC user mapping");
 	overlay_pg
 		.batch_execute(&format!(
 			"CREATE USER MAPPING FOR PUBLIC SERVER {server_name} \
@@ -692,7 +692,7 @@ pub async fn reconcile_fdw(
 	drop(restore_conn);
 
 	if !domains.is_empty() || !enums.is_empty() {
-		info!(
+		debug!(
 			replica = %replica_name,
 			domains = domains.len(),
 			enums = enums.len(),
@@ -717,7 +717,7 @@ pub async fn reconcile_fdw(
 	.await?;
 
 	for (remote, local) in &schemas {
-		info!(
+		debug!(
 			remote = %remote,
 			local = %local,
 			"importing foreign schema"
