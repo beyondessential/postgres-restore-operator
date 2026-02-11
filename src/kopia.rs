@@ -161,6 +161,13 @@ pub fn filter_snapshots(snapshots: &[Snapshot], filter: Option<&SnapshotFilter>)
 				return false;
 			}
 
+			// Description pattern filtering
+			if let Some(pattern) = &filter.description_pattern
+				&& !glob_matches(pattern, &snap.description)
+			{
+				return false;
+			}
+
 			true
 		})
 		.cloned()
@@ -372,6 +379,36 @@ mod tests {
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 1);
 		assert_eq!(result[0].id, "a");
+	}
+
+	#[test]
+	fn filter_snapshots_by_description_pattern() {
+		let snaps = vec![
+			Snapshot {
+				id: "a".into(),
+				description: "daily-backup-prod".into(),
+				..Default::default()
+			},
+			Snapshot {
+				id: "b".into(),
+				description: "daily-backup-dev".into(),
+				..Default::default()
+			},
+			Snapshot {
+				id: "c".into(),
+				description: "weekly-backup-prod".into(),
+				..Default::default()
+			},
+		];
+		let filter = SnapshotFilter {
+			tags: None,
+			host_pattern: None,
+			description_pattern: Some("daily-*".into()),
+		};
+		let result = filter_snapshots(&snaps, Some(&filter));
+		assert_eq!(result.len(), 2);
+		assert_eq!(result[0].id, "a");
+		assert_eq!(result[1].id, "b");
 	}
 
 	#[test]
