@@ -13,6 +13,41 @@ use crate::{
 };
 
 impl PostgresPhysicalReplica {
+	/// Atomically update `nextScheduledRestore` and `scheduleInputHash` in a
+	/// single status patch, preventing race conditions where a reconcile
+	/// re-triggers between two separate field updates.
+	pub async fn update_schedule_status(
+		&self,
+		client: &Client,
+		next: Timestamp,
+		input_hash: &str,
+	) -> Result<()> {
+		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(
+			client.clone(),
+			self.metadata
+				.namespace
+				.as_deref()
+				.expect("PostgresPhysicalReplica is a namespaced resource"),
+		);
+		let patch = serde_json::json!({
+			"status": {
+				"nextScheduledRestore": Time(next),
+				"scheduleInputHash": input_hash,
+			}
+		});
+		replicas
+			.patch_status(
+				self.metadata
+					.name
+					.as_deref()
+					.expect("cannot be called on new resource"),
+				&PatchParams::apply("postgres-restore-operator"),
+				&Patch::Merge(&patch),
+			)
+			.await?;
+		Ok(())
+	}
+
 	pub async fn update_condition(
 		&self,
 		client: &Client,

@@ -405,18 +405,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.is_none();
 
 	// Detect if the schedule or jitter has changed since we last computed nextScheduledRestore
-	let current_schedule = &replica.spec.schedule;
-	let current_jitter = replica.spec.schedule_jitter.to_string();
+	let current_hash = replica.schedule_input_hash();
 	let schedule_changed = replica
 		.status
 		.as_ref()
-		.and_then(|s| s.last_applied_schedule.as_ref())
-		.is_none_or(|s| s != current_schedule)
-		|| replica
-			.status
-			.as_ref()
-			.and_then(|s| s.last_applied_schedule_jitter.as_ref())
-			.is_none_or(|j| j != &current_jitter);
+		.and_then(|s| s.schedule_input_hash.as_ref())
+		.is_none_or(|h| h != &current_hash);
 
 	// Recompute nextScheduledRestore when missing or when schedule config changed
 	if (schedule_changed
@@ -430,20 +424,14 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		if schedule_changed {
 			debug!(
 				replica = %name,
-				schedule = %current_schedule,
-				jitter = %current_jitter,
+				schedule = %replica.spec.schedule,
+				jitter = %replica.spec.schedule_jitter,
 				next = %next,
 				"schedule config changed, recomputing nextScheduledRestore"
 			);
 		}
 		replica
-			.update_status_field(client, "nextScheduledRestore", Time(next))
-			.await?;
-		replica
-			.update_status_field(client, "lastAppliedSchedule", current_schedule)
-			.await?;
-		replica
-			.update_status_field(client, "lastAppliedScheduleJitter", &current_jitter)
+			.update_schedule_status(client, next, &current_hash)
 			.await?;
 	}
 
@@ -465,13 +453,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	) && let Some(next) = replica.compute_next_scheduled_restore(now)
 	{
 		replica
-			.update_status_field(client, "nextScheduledRestore", Time(next))
-			.await?;
-		replica
-			.update_status_field(client, "lastAppliedSchedule", current_schedule)
-			.await?;
-		replica
-			.update_status_field(client, "lastAppliedScheduleJitter", &current_jitter)
+			.update_schedule_status(client, next, &current_hash)
 			.await?;
 	}
 

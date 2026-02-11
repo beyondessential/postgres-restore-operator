@@ -1,4 +1,4 @@
-use std::hash::{DefaultHasher, Hasher};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use cronexpr::{ParseOptions, parse_crontab_with};
 use jiff::{SignedDuration, SpanTotal, Timestamp, Unit, tz::TimeZone};
@@ -16,6 +16,15 @@ pub enum ScheduleDecision {
 }
 
 impl PostgresPhysicalReplica {
+	/// Compute a stable hash of the schedule inputs (`schedule` + `scheduleJitter`)
+	/// so we can detect when the user changes either field without storing raw values.
+	pub fn schedule_input_hash(&self) -> String {
+		let mut hasher = DefaultHasher::new();
+		self.spec.schedule.hash(&mut hasher);
+		self.spec.schedule_jitter.to_string().hash(&mut hasher);
+		format!("{:016x}", hasher.finish())
+	}
+
 	pub fn compute_next_scheduled_restore(&self, now: Timestamp) -> Option<Timestamp> {
 		let schedule = &self.spec.schedule;
 

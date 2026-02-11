@@ -330,13 +330,10 @@ pub struct PostgresPhysicalReplicaStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub overlay_fdw_restore: Option<String>,
 
-	/// The schedule expression that was used to compute `nextScheduledRestore`
+	/// Hash of the schedule inputs used to compute `nextScheduledRestore`,
+	/// so we only recompute when the inputs actually change.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub last_applied_schedule: Option<String>,
-
-	/// The schedule jitter that was used to compute `nextScheduledRestore`
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub last_applied_schedule_jitter: Option<String>,
+	pub schedule_input_hash: Option<String>,
 
 	/// Current (possibly ratcheted) storage size of the overlay PVC
 	#[serde(default, skip_serializing_if = "Option::is_none")]
