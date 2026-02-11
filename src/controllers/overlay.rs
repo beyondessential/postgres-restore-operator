@@ -33,13 +33,13 @@ pub async fn reconcile_overlay(
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
 	snapshot_size: &Quantity,
-) -> Result<(bool, Quantity, String)> {
+) -> Result<(bool, Quantity, i32)> {
 	let replica_name = replica.name_any();
 	let overlay_config = match &replica.spec.overlay_database {
 		Some(c) => c,
 		None => {
 			debug!(replica = %replica_name, "no overlay database configured, skipping");
-			return Ok((false, Quantity(String::new()), String::new()));
+			return Ok((false, Quantity(String::new()), 0));
 		}
 	};
 	debug!(replica = %replica_name, "reconciling overlay database");
@@ -67,7 +67,7 @@ pub async fn reconcile_overlay(
 	fdw::ensure_fdw_credentials(client, namespace, &replica_name, replica).await?;
 
 	let cluster_ready =
-		cnpg::ensure_cnpg_cluster(client, namespace, replica, storage_size, &pg_version).await?;
+		cnpg::ensure_cnpg_cluster(client, namespace, replica, storage_size, pg_version).await?;
 
 	if cluster_ready
 		&& let Err(e) = cnpg::ensure_overlay_service_annotations(client, namespace, replica).await

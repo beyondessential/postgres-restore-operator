@@ -35,14 +35,14 @@ const MIN_OVERLAY_PG_VERSION: i32 = 14;
 pub async fn resolve_postgres_version(
 	client: &Client,
 	replica: &PostgresPhysicalReplica,
-) -> Result<String> {
+) -> Result<i32> {
 	let overlay_config = match &replica.spec.overlay_database {
 		Some(c) => c,
-		None => return Ok(DEFAULT_PG_VERSION.to_string()),
+		None => return Ok(DEFAULT_PG_VERSION),
 	};
 
-	let version = if let Some(ref v) = overlay_config.postgres_version {
-		v.to_string()
+	let version = if let Some(v) = overlay_config.postgres_version {
+		v as i32
 	} else {
 		let catalog_ref = overlay_config.image_catalog.as_ref();
 		let catalog_name = catalog_ref.map(|c| c.name.as_str());
@@ -62,12 +62,10 @@ pub async fn resolve_postgres_version(
 			None
 		};
 
-		from_catalog
-			.map(|v| v.to_string())
-			.unwrap_or_else(|| DEFAULT_PG_VERSION.to_string())
+		from_catalog.unwrap_or(DEFAULT_PG_VERSION)
 	};
 
-	validate_overlay_pg_version(&version)?;
+	validate_overlay_pg_version(version)?;
 
 	Ok(version)
 }
@@ -78,12 +76,11 @@ pub async fn resolve_postgres_version(
 ///
 /// The overlay relies on `pg_read_all_data` and `pg_write_all_data` which
 /// require PostgreSQL >= 14.
-pub fn validate_overlay_pg_version(version: &str) -> Result<()> {
-	let major: i32 = version.parse().unwrap_or(0);
-	if major < MIN_OVERLAY_PG_VERSION {
+pub fn validate_overlay_pg_version(version: i32) -> Result<()> {
+	if version < MIN_OVERLAY_PG_VERSION {
 		return Err(Error::InvalidOverlayConfig(format!(
 			"overlay database requires PostgreSQL >= {MIN_OVERLAY_PG_VERSION} \
-			 (pg_read_all_data / pg_write_all_data), got \"{version}\""
+			 (pg_read_all_data / pg_write_all_data), got {version}"
 		)));
 	}
 	Ok(())
@@ -117,7 +114,7 @@ pub async fn ensure_cnpg_cluster(
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
 	storage_size: &Quantity,
-	pg_version: &str,
+	pg_version: i32,
 ) -> Result<bool> {
 	let replica_name = replica.name_any();
 	let cluster_name = super::overlay_cluster_name(&replica_name);
@@ -130,15 +127,13 @@ pub async fn ensure_cnpg_cluster(
 	let api_resource = cnpg::api::cluster_resource();
 	let api: Api<DynamicObject> = Api::namespaced_with(client.clone(), namespace, &api_resource);
 
-	let pg_major: i32 = pg_version.parse().unwrap_or(17);
-
 	let image_catalog_ref = overlay_config
 		.image_catalog
 		.as_ref()
 		.map(|cat| CnpgImageCatalogRef {
 			name: cat.name.clone(),
 			kind: cat.kind.clone().unwrap_or("ClusterImageCatalog".into()),
-			major: pg_major,
+			major: pg_version,
 		});
 
 	let spec = CnpgClusterSpec {
@@ -302,12 +297,12 @@ mod tests {
 
 	#[test]
 	fn validate_pg_version_17_ok() {
-		assert!(validate_overlay_pg_version("17").is_ok());
+		assert!(validate_overlay_pg_version(17).is_ok());
 	}
 
 	#[test]
 	fn validate_pg_version_13_rejected() {
-		let err = validate_overlay_pg_version("13").unwrap_err();
+		let err = validate_overlay_pg_version(13).unwrap_err();
 		let msg = err.to_string();
 		assert!(msg.contains(">= 14"), "error should mention >= 14: {msg}");
 		assert!(
