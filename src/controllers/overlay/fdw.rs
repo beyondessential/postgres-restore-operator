@@ -32,7 +32,6 @@ struct FdwState {
 	has_extension: bool,
 	server_host: Option<String>,
 	server_dbname: Option<String>,
-	has_user_mapping: bool,
 }
 
 /// Query the overlay database to determine the current FDW state.
@@ -73,23 +72,10 @@ async fn check_fdw_state(pg: &tokio_postgres::Client, server_name: &str) -> Resu
 		"checked FDW server options"
 	);
 
-	let has_user_mapping = pg
-		.query_opt(
-			"SELECT 1 FROM pg_user_mappings WHERE srvname = $1 AND usename = current_user",
-			&[&server_name],
-		)
-		.await?
-		.is_some();
-	debug!(
-		server = server_name,
-		has_user_mapping, "checked user mapping"
-	);
-
 	Ok(FdwState {
 		has_extension,
 		server_host,
 		server_dbname,
-		has_user_mapping,
 	})
 }
 
@@ -602,7 +588,6 @@ pub async fn reconcile_fdw(
 		server_dbname = ?state.server_dbname,
 		expected_dbname = %restore_dbname,
 		server_dbname_correct,
-		has_user_mapping = state.has_user_mapping,
 		"current FDW state in overlay database"
 	);
 
@@ -682,24 +667,45 @@ pub async fn reconcile_fdw(
 		}
 	}
 
-	// Ensure user mapping (always recreate to pick up credential changes)
-	if state.has_user_mapping {
-		debug!(server = %server_name, "dropping existing user mapping before recreation");
+	// Ensure user mappings (always recreate to pick up credential changes)
+	let analytics_user = &replica.spec.analytics_username;
+	let mapped_users: &[&str] = &["CURRENT_USER", analytics_user];
+	for &map_user in mapped_users {
+		let is_role = map_user != "CURRENT_USER";
+		let user_sql = if is_role {
+			quote_ident(map_user)
+		} else {
+			map_user.to_string()
+		};
+
+		// Drop existing mapping if present
+		let exists = overlay_pg
+			.query_opt(
+				"SELECT 1 FROM pg_user_mappings WHERE srvname = $1 AND usename = \
+				 CASE WHEN $2 = 'CURRENT_USER' THEN current_user ELSE $2 END",
+				&[&server_name.as_str(), &map_user],
+			)
+			.await?
+			.is_some();
+		if exists {
+			debug!(server = %server_name, user = %map_user, "dropping existing user mapping before recreation");
+			overlay_pg
+				.batch_execute(&format!(
+					"DROP USER MAPPING FOR {user_sql} SERVER {server_name}"
+				))
+				.await?;
+		}
+
+		info!(server = %server_name, map_user = %map_user, fdw_user = %fdw_user, "creating user mapping");
 		overlay_pg
 			.batch_execute(&format!(
-				"DROP USER MAPPING FOR CURRENT_USER SERVER {server_name}"
+				"CREATE USER MAPPING FOR {user_sql} SERVER {server_name} \
+				 OPTIONS (user {}, password {})",
+				quote_literal(&fdw_user),
+				quote_literal(&fdw_password),
 			))
 			.await?;
 	}
-	info!(server = %server_name, fdw_user = %fdw_user, "creating user mapping");
-	overlay_pg
-		.batch_execute(&format!(
-			"CREATE USER MAPPING FOR CURRENT_USER SERVER {server_name} \
-			 OPTIONS (user {}, password {})",
-			quote_literal(&fdw_user),
-			quote_literal(&fdw_password),
-		))
-		.await?;
 
 	// Discover and replicate custom types from the restore database
 	let restore_conn = super::connect::connect_to_restore(
