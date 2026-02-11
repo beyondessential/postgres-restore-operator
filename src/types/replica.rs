@@ -30,7 +30,8 @@ use super::HeaderValue;
 	category = "all",
 	printcolumn = r#"{"name":"Phase","type":"string","jsonPath":".status.phase"}"#,
 	printcolumn = r#"{"name":"Service","type":"string","jsonPath":".status.serviceName"}"#,
-	printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#
+	printcolumn = r#"{"name":"Age","type":"date","jsonPath":".metadata.creationTimestamp"}"#,
+	printcolumn = r#"{"name":"Next restore","type":"date","jsonPath":".status.nextScheduledRestore"}"#
 )]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPhysicalReplicaSpec {
