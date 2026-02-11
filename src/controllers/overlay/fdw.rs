@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, BTreeSet};
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
@@ -33,7 +33,6 @@ struct FdwState {
 	server_host: Option<String>,
 	server_dbname: Option<String>,
 	has_user_mapping: bool,
-	schemas_with_fts: HashSet<String>,
 }
 
 /// Query the overlay database to determine the current FDW state.
@@ -86,27 +85,11 @@ async fn check_fdw_state(pg: &tokio_postgres::Client, server_name: &str) -> Resu
 		has_user_mapping, "checked user mapping"
 	);
 
-	let schema_rows = pg
-		.query(
-			"SELECT DISTINCT ft.foreign_table_schema \
-			 FROM information_schema.foreign_tables ft \
-			 WHERE ft.foreign_server_name = $1",
-			&[&server_name],
-		)
-		.await?;
-	let schemas_with_fts: HashSet<String> = schema_rows.iter().map(|row| row.get(0)).collect();
-	debug!(
-		server = server_name,
-		schemas = ?schemas_with_fts,
-		"checked schemas with foreign tables"
-	);
-
 	Ok(FdwState {
 		has_extension,
 		server_host,
 		server_dbname,
 		has_user_mapping,
-		schemas_with_fts,
 	})
 }
 
@@ -620,7 +603,6 @@ pub async fn reconcile_fdw(
 		expected_dbname = %restore_dbname,
 		server_dbname_correct,
 		has_user_mapping = state.has_user_mapping,
-		foreign_table_schemas = state.schemas_with_fts.len(),
 		"current FDW state in overlay database"
 	);
 
@@ -759,23 +741,12 @@ pub async fn reconcile_fdw(
 	)
 	.await?;
 
-	let mut imported_count = 0u32;
 	for (remote, local) in &schemas {
-		if state.schemas_with_fts.contains(local) {
-			debug!(
-				local = %local,
-				remote = %remote,
-				"schema already has foreign tables, skipping import"
-			);
-			continue;
-		}
-
 		info!(
 			remote = %remote,
 			local = %local,
 			"importing foreign schema"
 		);
-		imported_count += 1;
 		let local_quoted = quote_ident(local);
 		let remote_quoted = quote_ident(remote);
 		debug!(local = %local, "dropping existing local schema if present");
@@ -812,8 +783,6 @@ pub async fn reconcile_fdw(
 		replica = %replica_name,
 		restore = %restore_name,
 		total_schemas = schemas.len(),
-		schemas_imported = imported_count,
-		schemas_skipped = schemas.len() as u32 - imported_count,
 		"FDW reconciliation complete"
 	);
 
