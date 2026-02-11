@@ -1,11 +1,25 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
 	Api, Client, ResourceExt,
 	api::{ObjectMeta, PostParams},
 };
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
+
+/// A custom domain type discovered from the remote database.
+struct RemoteDomain {
+	schema: String,
+	name: String,
+	base_type: String,
+}
+
+/// A custom enum type discovered from the remote database.
+struct RemoteEnum {
+	schema: String,
+	name: String,
+	labels: Vec<String>,
+}
 
 use crate::{
 	controllers::replica::generate_password,
@@ -256,6 +270,169 @@ async fn resolve_fdw_schemas(
 	Ok(result)
 }
 
+/// Discover all custom domains from the remote database.
+///
+/// Returns domains from all user schemas. The list is ordered so that
+/// domains depending on other domains come after their dependencies.
+async fn discover_remote_domains(pg: &tokio_postgres::Client) -> Result<Vec<RemoteDomain>> {
+	let rows = pg
+		.query(
+			"WITH RECURSIVE domain_tree AS ( \
+			   SELECT t.oid, n.nspname, t.typname, \
+			          format_type(t.typbasetype, t.typtypmod) AS base_type, \
+			          0 AS depth \
+			   FROM pg_type t \
+			   JOIN pg_namespace n ON t.typnamespace = n.oid \
+			   WHERE t.typtype = 'd' \
+			     AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+			     AND n.nspname NOT LIKE 'pg_toast%' \
+			     AND NOT EXISTS ( \
+			       SELECT 1 FROM pg_type bt \
+			       JOIN pg_namespace bn ON bt.typnamespace = bn.oid \
+			       WHERE bt.oid = t.typbasetype AND bt.typtype = 'd' \
+			         AND bn.nspname NOT IN ('pg_catalog', 'information_schema') \
+			     ) \
+			   UNION ALL \
+			   SELECT t.oid, n.nspname, t.typname, \
+			          format_type(t.typbasetype, t.typtypmod) AS base_type, \
+			          dt.depth + 1 \
+			   FROM pg_type t \
+			   JOIN pg_namespace n ON t.typnamespace = n.oid \
+			   JOIN domain_tree dt ON t.typbasetype = dt.oid \
+			   WHERE t.typtype = 'd' \
+			 ) \
+			 SELECT nspname, typname, base_type, depth \
+			 FROM domain_tree \
+			 ORDER BY depth, nspname, typname",
+			&[],
+		)
+		.await?;
+
+	let result: Vec<RemoteDomain> = rows
+		.iter()
+		.map(|row| RemoteDomain {
+			schema: row.get(0),
+			name: row.get(1),
+			base_type: row.get(2),
+		})
+		.collect();
+
+	debug!(count = result.len(), "discovered remote domains");
+	Ok(result)
+}
+
+/// Discover all custom enum types from the remote database.
+async fn discover_remote_enums(pg: &tokio_postgres::Client) -> Result<Vec<RemoteEnum>> {
+	let rows = pg
+		.query(
+			"SELECT n.nspname, t.typname, \
+			        array_agg(e.enumlabel ORDER BY e.enumsortorder)::text[] AS labels \
+			 FROM pg_type t \
+			 JOIN pg_namespace n ON t.typnamespace = n.oid \
+			 JOIN pg_enum e ON e.enumtypid = t.oid \
+			 WHERE t.typtype = 'e' \
+			   AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
+			   AND n.nspname NOT LIKE 'pg_toast%' \
+			 GROUP BY n.nspname, t.typname \
+			 ORDER BY n.nspname, t.typname",
+			&[],
+		)
+		.await?;
+
+	let result: Vec<RemoteEnum> = rows
+		.iter()
+		.map(|row| RemoteEnum {
+			schema: row.get(0),
+			name: row.get(1),
+			labels: row.get(2),
+		})
+		.collect();
+
+	debug!(count = result.len(), "discovered remote enums");
+	Ok(result)
+}
+
+/// Create stub custom types (domains and enums) on the overlay database so
+/// that `IMPORT FOREIGN SCHEMA` can resolve column types.
+async fn ensure_custom_types_on_overlay(
+	overlay_pg: &tokio_postgres::Client,
+	domains: &[RemoteDomain],
+	enums: &[RemoteEnum],
+) -> Result<()> {
+	if domains.is_empty() && enums.is_empty() {
+		return Ok(());
+	}
+
+	// Collect all schemas we need to ensure exist
+	let schemas: BTreeSet<&str> = domains
+		.iter()
+		.map(|d| d.schema.as_str())
+		.chain(enums.iter().map(|e| e.schema.as_str()))
+		.collect();
+
+	for schema in &schemas {
+		overlay_pg
+			.batch_execute(&format!(
+				"CREATE SCHEMA IF NOT EXISTS {}",
+				quote_ident(schema)
+			))
+			.await?;
+	}
+
+	// Create enums first (domains might reference them, though unlikely)
+	for e in enums {
+		let qualified = format!("{}.{}", quote_ident(&e.schema), quote_ident(&e.name));
+		let labels_sql: Vec<String> = e.labels.iter().map(|l| quote_literal(l)).collect();
+		let sql = format!(
+			"DO $$ BEGIN \
+			   CREATE TYPE {qualified} AS ENUM ({}); \
+			 EXCEPTION WHEN duplicate_object THEN NULL; \
+			 END $$;",
+			labels_sql.join(", ")
+		);
+		if let Err(err) = overlay_pg.batch_execute(&sql).await {
+			warn!(
+				schema = %e.schema,
+				name = %e.name,
+				error = %err,
+				"failed to create stub enum type, IMPORT FOREIGN SCHEMA may fail for columns using it"
+			);
+		} else {
+			debug!(schema = %e.schema, name = %e.name, "created stub enum type");
+		}
+	}
+
+	// Create domains in dependency order (the query returns them sorted)
+	for d in domains {
+		let qualified = format!("{}.{}", quote_ident(&d.schema), quote_ident(&d.name));
+		let sql = format!(
+			"DO $$ BEGIN \
+			   CREATE DOMAIN {qualified} AS {}; \
+			 EXCEPTION WHEN duplicate_object THEN NULL; \
+			 END $$;",
+			d.base_type
+		);
+		if let Err(err) = overlay_pg.batch_execute(&sql).await {
+			warn!(
+				schema = %d.schema,
+				name = %d.name,
+				base_type = %d.base_type,
+				error = %err,
+				"failed to create stub domain, IMPORT FOREIGN SCHEMA may fail for columns using it"
+			);
+		} else {
+			debug!(schema = %d.schema, name = %d.name, base_type = %d.base_type, "created stub domain");
+		}
+	}
+
+	info!(
+		domains = domains.len(),
+		enums = enums.len(),
+		"ensured custom stub types on overlay database"
+	);
+	Ok(())
+}
+
 /// Reconcile FDW state in the overlay database.
 ///
 /// Connects to the overlay, inspects the current FDW state (extension, server,
@@ -428,6 +605,31 @@ pub async fn reconcile_fdw(
 			quote_literal(&fdw_password),
 		))
 		.await?;
+
+	// Discover and replicate custom types from the restore database
+	let restore_conn = super::connect::connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		&restore_dbname,
+		&fdw_user,
+		&fdw_password,
+		use_port_forward,
+	)
+	.await?;
+	let domains = discover_remote_domains(&restore_conn.client).await?;
+	let enums = discover_remote_enums(&restore_conn.client).await?;
+	drop(restore_conn);
+
+	if !domains.is_empty() || !enums.is_empty() {
+		info!(
+			replica = %replica_name,
+			domains = domains.len(),
+			enums = enums.len(),
+			"replicating custom types from restore to overlay"
+		);
+		ensure_custom_types_on_overlay(overlay_pg, &domains, &enums).await?;
+	}
 
 	// Resolve expected schemas and import any that are missing
 	let schemas = resolve_fdw_schemas(
