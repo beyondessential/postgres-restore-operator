@@ -154,6 +154,7 @@ This can be used to persistently write data in other schemas in the overlay with
 | `tolerations` | `[]Toleration` | No | `[]` | Tolerations for the overlay database pods. |
 | `serviceAnnotations` | `map[string]string` | No | — | Annotations for the overlay database's `-rw` Service. |
 | `schemaMapping` | `map[string]string` | No | All schemas | Schema import mapping. Key = remote schema, Value = local schema in overlay DB. If absent, all user schemas are imported at their original names. |
+| `importGenerated` | `bool` | No | `false` | Include `GENERATED` column expressions when importing foreign schemas. Requires that all functions used in generated columns exist on the overlay database. |
 
 #### ImageCatalogRef
 

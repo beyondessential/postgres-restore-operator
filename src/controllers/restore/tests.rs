@@ -292,6 +292,7 @@ fn fdw_user_created_when_overlay_configured() {
 		tolerations: vec![],
 		service_annotations: None,
 		schema_mapping: None,
+		import_generated: false,
 	});
 	let restore = make_restore();
 	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();

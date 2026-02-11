@@ -1159,6 +1159,7 @@ async fn overlay_fdw_reconciliation() {
 				tolerations: vec![],
 				service_annotations: None,
 				schema_mapping: None,
+				import_generated: false,
 			}),
 			..Default::default()
 		},

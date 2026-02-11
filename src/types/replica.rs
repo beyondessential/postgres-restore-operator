@@ -156,6 +156,12 @@ pub struct OverlayDatabaseConfig {
 	/// If absent, all user schemas are imported at their original names.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub schema_mapping: Option<HashMap<String, String>>,
+
+	/// Include GENERATED expressions when importing foreign schemas.
+	/// Requires that all functions used in generated columns exist on the
+	/// overlay database. Defaults to false.
+	#[serde(default)]
+	pub import_generated: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

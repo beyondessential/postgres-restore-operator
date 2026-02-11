@@ -475,9 +475,14 @@ pub async fn reconcile_fdw(
 			server = %server_name,
 			"executing IMPORT FOREIGN SCHEMA"
 		);
+		let import_generated = replica
+			.spec
+			.overlay_database
+			.as_ref()
+			.is_some_and(|c| c.import_generated);
 		overlay_pg
 			.batch_execute(&format!(
-				"IMPORT FOREIGN SCHEMA {remote_quoted} FROM SERVER {server_name} INTO {local_quoted} OPTIONS (import_collate 'false')"
+				"IMPORT FOREIGN SCHEMA {remote_quoted} FROM SERVER {server_name} INTO {local_quoted} OPTIONS (import_collate 'false', import_generated '{import_generated}')"
 			))
 			.await?;
 		debug!(remote = %remote, local = %local, "foreign schema imported successfully");
