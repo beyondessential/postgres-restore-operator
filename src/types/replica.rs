@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, HashMap};
+use std::{
+	borrow::Cow,
+	collections::{BTreeMap, HashMap},
+};
 
 use jiff::Span;
 use k8s_openapi::{
@@ -9,7 +12,7 @@ use k8s_openapi::{
 	},
 };
 use kube::{CustomResource, ResourceExt as _};
-use schemars::JsonSchema;
+use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
 use crate::util::TimeSpan;
@@ -181,11 +184,41 @@ pub struct SnapshotFilter {
 	pub description_pattern: Option<String>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", tag = "target")]
 pub enum NotificationConfig {
 	Webhook(WebhookConfig),
 	GraphQL(GraphQLConfig),
+}
+
+impl JsonSchema for NotificationConfig {
+	fn inline_schema() -> bool {
+		true
+	}
+
+	fn schema_name() -> Cow<'static, str> {
+		"NotificationConfig".into()
+	}
+
+	fn json_schema(generator: &mut SchemaGenerator) -> Schema {
+		let header_schema = generator.subschema_for::<Option<HashMap<String, HeaderValue>>>();
+		json_schema!({
+			"type": "object",
+			"required": ["target", "url"],
+			"properties": {
+				"target": {
+					"type": "string",
+					"enum": ["webhook", "graphQL"]
+				},
+				"url": { "type": "string" },
+				"method": { "type": "string" },
+				"mutation": { "type": "string" },
+				"variablesTemplate": { "type": "string" },
+				"headers": header_schema,
+				"includePassword": { "type": "boolean" }
+			}
+		})
+	}
 }
 
 impl NotificationConfig {
