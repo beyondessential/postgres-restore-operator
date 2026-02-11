@@ -10,9 +10,7 @@ use crate::types::*;
 
 impl PostgresPhysicalReplica {
 	pub fn compute_next_scheduled_restore(&self, now: Timestamp) -> Option<Timestamp> {
-		let Some(schedule) = self.spec.schedule.as_deref() else {
-			return None;
-		};
+		let schedule = self.spec.schedule.as_deref()?;
 
 		let Ok(cron) = parse_crontab_with(schedule, {
 			let mut options = ParseOptions::default();

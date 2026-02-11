@@ -218,8 +218,7 @@ impl PostgresPhysicalReplica {
 			});
 			if let Err(e) = replicas
 				.patch_status(
-					&self
-						.metadata
+					self.metadata
 						.name
 						.as_deref()
 						.expect("cannot be called on new resource"),

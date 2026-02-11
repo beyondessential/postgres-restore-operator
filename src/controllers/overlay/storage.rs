@@ -1,13 +1,15 @@
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube_quantity::ParsedQuantity;
 
+use crate::quantity::{ParsedQuantityExt, QuantityUnit};
+
 /// Compute overlay storage size from a snapshot size quantity string.
 ///
 /// Formula: `5Gi + ceil(snapshot_size_bytes / 10)`, rounded up to whole Gi.
 pub fn compute_overlay_storage_size(snapshot_size: &Quantity) -> Quantity {
-	let base_size: ParsedQuantity = Quantity("5Gi".into()).try_into().unwrap_or_default();
-	let snapshot_size: ParsedQuantity = snapshot_size.try_into().unwrap_or_default();
-	(base_size + snapshot_size / 10).into()
+	let base = ParsedQuantity::from_unit(5, QuantityUnit::Gi);
+	let extra = ParsedQuantity::try_from(snapshot_size).unwrap_or_default() / 10;
+	((base + extra).ceil_to(QuantityUnit::Gi)).into()
 }
 
 /// Apply ratchet logic: only increase, never shrink.

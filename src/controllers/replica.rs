@@ -412,7 +412,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	let should_restore = never_restored || replica.should_trigger_scheduled_restore();
 
 	if should_restore {
-		if let Some(next) = replica.compute_next_scheduled_restore(now.into()) {
+		if let Some(next) = replica.compute_next_scheduled_restore(now) {
 			replica
 				.update_status_field(client, "nextScheduledRestore", Time(next))
 				.await?;
