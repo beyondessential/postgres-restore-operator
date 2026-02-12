@@ -266,6 +266,13 @@ async fn reconcile_restoring(
 
 		update_restore_status(client, namespace, name, status_patch).await?;
 
+		// Delete the completed Job (and its pods) to free resources and
+		// release the PVC reference. The ttlSecondsAfterFinished on the
+		// Job spec acts as a safety net in case this deletion fails.
+		if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+			warn!(job = %job_name, error = %e, "failed to delete completed restore job");
+		}
+
 		ctx.metrics.restores_completed_total.inc();
 
 		return Ok(Action::requeue(Duration::from_secs(5)));
@@ -275,6 +282,25 @@ async fn reconcile_restoring(
 	let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(3);
 	if failed > backoff_limit {
 		warn!(restore = name, failed = failed, "restore job failed");
+
+		// Extend the TTL to 24 hours so the failed Job's pods (and their
+		// logs) stick around long enough for someone to investigate.  We
+		// deliberately do *not* proactively delete failed Jobs the way we
+		// do for successful ones.
+		const FAILED_JOB_TTL_SECS: i32 = 86_400; // 24 hours
+		let ttl_patch = serde_json::json!({
+			"spec": { "ttlSecondsAfterFinished": FAILED_JOB_TTL_SECS }
+		});
+		if let Err(e) = jobs
+			.patch(
+				&job_name,
+				&PatchParams::apply("postgres-restore-operator").force(),
+				&Patch::Merge(&ttl_patch),
+			)
+			.await
+		{
+			warn!(job = %job_name, error = %e, "failed to extend TTL on failed restore job");
+		}
 
 		return fail_restore(
 			ctx,

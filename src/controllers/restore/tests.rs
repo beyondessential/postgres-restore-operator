@@ -5,7 +5,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use super::builders::build_deployment;
+use super::builders::{build_deployment, build_restore_job, build_version_detect_job};
 use crate::{types::*, util::TimeSpan};
 
 #[test]
@@ -88,4 +88,81 @@ fn deployment_uses_affinity_not_node_selector() {
 		pod_spec.node_selector.is_none(),
 		"pod spec must not have node_selector"
 	);
+}
+
+fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalReplica) {
+	let replica = PostgresPhysicalReplica::new(
+		"test-replica",
+		PostgresPhysicalReplicaSpec {
+			kopia_secret_ref: SecretReference {
+				name: Some("kopia-secret".to_string()),
+				namespace: None,
+			},
+			snapshot_filter: None,
+			schedule: "0 */6 * * *".into(),
+			schedule_jitter: TimeSpan(Span::new().minutes(10)),
+			minimum_ttl: None,
+			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
+			analytics_username: "analytics".to_string(),
+			storage_class: None,
+			storage_size_override: None,
+			resources: None,
+			service_annotations: None,
+			pod_annotations: None,
+			affinity: None,
+			tolerations: vec![],
+			read_only: true,
+			postgres_extra_config: None,
+			notifications: vec![],
+			overlay_database: None,
+		},
+	);
+
+	let mut restore = PostgresPhysicalRestore::new(
+		"test-restore",
+		PostgresPhysicalRestoreSpec {
+			replica: LocalObjectReference {
+				name: "test-replica".to_string(),
+			},
+			snapshot: "snap123".to_string(),
+			snapshot_size: Quantity("10Gi".to_string()),
+			storage_size: Quantity("11Gi".to_string()),
+		},
+	);
+	restore.metadata.uid = Some("uid-123".to_string());
+
+	(restore, replica)
+}
+
+#[test]
+fn restore_job_has_ttl_seconds_after_finished() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+	)
+	.unwrap();
+	let ttl = job
+		.spec
+		.as_ref()
+		.unwrap()
+		.ttl_seconds_after_finished
+		.expect("restore job must set ttlSecondsAfterFinished");
+	assert!(ttl > 0, "ttlSecondsAfterFinished must be positive");
+}
+
+#[test]
+fn version_detect_job_has_ttl_seconds_after_finished() {
+	let (restore, _replica) = test_restore_and_replica();
+	let job = build_version_detect_job(&restore, "test-version-detect", "default", "test-pvc");
+	let ttl = job
+		.spec
+		.as_ref()
+		.unwrap()
+		.ttl_seconds_after_finished
+		.expect("version-detect job must set ttlSecondsAfterFinished");
+	assert!(ttl > 0, "ttlSecondsAfterFinished must be positive");
 }

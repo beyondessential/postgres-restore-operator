@@ -111,6 +111,7 @@ echo -n "$VERSION" > /dev/termination-log
 		spec: Some(JobSpec {
 			backoff_limit: Some(2),
 			active_deadline_seconds: Some(120),
+			ttl_seconds_after_finished: Some(120),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(BTreeMap::from([
@@ -299,7 +300,8 @@ echo -n "$VERSION" > /dev/termination-log
 		},
 		spec: Some(JobSpec {
 			backoff_limit: Some(3),
-			active_deadline_seconds: Some(7200), // 2 hours
+			active_deadline_seconds: Some(7200),   // 2 hours
+			ttl_seconds_after_finished: Some(120), // safety net if operator misses deletion
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
 					labels: Some(BTreeMap::from([
