@@ -117,10 +117,7 @@ async fn drop_stale_fdw_servers(
 /// Compute a stable hash of the inputs that affect FDW reconciliation.
 ///
 /// If any of these change the FDW setup needs to be redone from scratch.
-fn compute_fdw_config_hash(
-	restore_name: &str,
-	replica: &PostgresPhysicalReplica,
-) -> String {
+fn compute_fdw_config_hash(restore_name: &str, replica: &PostgresPhysicalReplica) -> String {
 	let mut hasher = DefaultHasher::new();
 	restore_name.hash(&mut hasher);
 	replica.spec.analytics_username.hash(&mut hasher);

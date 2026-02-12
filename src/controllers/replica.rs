@@ -403,6 +403,122 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
+	// Process any existing snapshot-list job regardless of scheduling state.
+	// This runs before the in-progress / should_restore gates so that
+	// completed jobs are always cleaned up promptly.
+	let snapshot_job_name = format!("{name}-snapshot-list");
+	let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
+	let snapshot_job = jobs.get_opt(&snapshot_job_name).await?;
+
+	if let Some(ref job) = snapshot_job {
+		let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
+		let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
+		let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
+
+		if succeeded > 0 {
+			let msg = read_job_termination_message(
+				client,
+				&namespace,
+				&snapshot_job_name,
+				"snapshot-list",
+			)
+			.await;
+
+			let Some(ref raw) = msg else {
+				// Termination message not yet available (pod status
+				// may not have propagated). Retry shortly instead of
+				// deleting the job and losing the result.
+				info!(
+					replica = name,
+					job = snapshot_job_name,
+					"snapshot list job succeeded but termination message not yet available, retrying"
+				);
+				return Ok(Action::requeue(Duration::from_secs(5)));
+			};
+
+			// We have the message — safe to delete the job now.
+			if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
+				warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
+			}
+
+			// "{}" means no matching snapshots were found
+			if raw == "{}" {
+				warn!(
+					replica = name,
+					"snapshot list job returned no matching snapshots"
+				);
+			} else if let Ok(snap) = serde_json::from_str::<SnapshotInfo>(raw) {
+				replica
+					.update_status_field(client, "latestAvailableSnapshot", &snap.id)
+					.await?;
+
+				let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
+
+				if current_snapshot_id == Some(&snap.id) {
+					debug!(
+						replica = name,
+						snapshot = snap.id,
+						"latest snapshot already active, skipping"
+					);
+				} else {
+					info!(
+						replica = name,
+						snapshot = snap.id,
+						size = snap.size,
+						"new snapshot available, creating restore"
+					);
+					replica.create_restore_for_snapshot(client, &snap).await?;
+					ctx.metrics.restores_started_total.inc();
+
+					if let Err(e) = ctx
+						.recorder
+						.publish(
+							&Event {
+								type_: EventType::Normal,
+								reason: "RestoreStarted".into(),
+								note: Some(format!("Started restore from snapshot {}", snap.id)),
+								action: "Restore".into(),
+								secondary: None,
+							},
+							&replica.object_ref(&()),
+						)
+						.await
+					{
+						warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+					}
+				}
+			} else {
+				warn!(
+					replica = name,
+					raw = raw,
+					"failed to parse snapshot list job output"
+				);
+			}
+		} else if failed > backoff_limit {
+			warn!(replica = name, "snapshot list job failed");
+			// Extend the TTL to 24 hours so the failed Job's pods (and
+			// their logs) stick around long enough for someone to
+			// investigate. We deliberately do *not* proactively delete
+			// failed Jobs the way we do for successful ones.
+			const FAILED_JOB_TTL_SECS: i32 = 86_400; // 24 hours
+			let ttl_patch = serde_json::json!({
+				"spec": { "ttlSecondsAfterFinished": FAILED_JOB_TTL_SECS }
+			});
+			if let Err(e) = jobs
+				.patch(
+					&snapshot_job_name,
+					&PatchParams::apply("postgres-restore-operator").force(),
+					&Patch::Merge(&ttl_patch),
+				)
+				.await
+			{
+				warn!(job = snapshot_job_name, error = %e, "failed to extend TTL on failed snapshot list job");
+			}
+		} else {
+			return Ok(Action::requeue(Duration::from_secs(10)));
+		}
+	}
+
 	// Decide whether to trigger a new restore
 	if let Some(in_progress) = in_progress_restore {
 		let phase = in_progress.status.as_ref().and_then(|s| s.phase.as_ref());
@@ -467,7 +583,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	let should_restore = never_restored || matches!(schedule_decision, ScheduleDecision::Trigger);
 
-	if should_restore {
+	if should_restore && snapshot_job.is_none() {
 		// Check concurrent restore limit
 		let mut queue = ctx.restore_queue.write().await;
 		if !queue.can_start(ctx.max_concurrent_restores()) {
@@ -496,119 +612,11 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 		drop(queue);
 
-		// Snapshot discovery via Job
-		let snapshot_job_name = format!("{name}-snapshot-list");
-		let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
-
-		match jobs.get_opt(&snapshot_job_name).await? {
-			None => {
-				info!(replica = name, "creating snapshot list job");
-				let job = build_snapshot_list_job(
-					&replica,
-					&snapshot_job_name,
-					&namespace,
-					&ctx.kopia_image(),
-				)?;
-				jobs.create(&PostParams::default(), &job).await?;
-				return Ok(Action::requeue(Duration::from_secs(10)));
-			}
-			Some(job) => {
-				let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
-				let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
-				let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
-
-				if succeeded > 0 {
-					let msg = read_job_termination_message(
-						client,
-						&namespace,
-						&snapshot_job_name,
-						"snapshot-list",
-					)
-					.await;
-
-					let Some(ref raw) = msg else {
-						// Termination message not yet available (pod status
-						// may not have propagated). Retry shortly instead of
-						// deleting the job and losing the result.
-						info!(
-							replica = name,
-							job = snapshot_job_name,
-							"snapshot list job succeeded but termination message not yet available, retrying"
-						);
-						return Ok(Action::requeue(Duration::from_secs(5)));
-					};
-
-					// We have the message — safe to delete the job now.
-					if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
-						warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
-					}
-
-					// "{}" means no matching snapshots were found
-					if raw == "{}" {
-						warn!(
-							replica = name,
-							"snapshot list job returned no matching snapshots"
-						);
-					} else if let Ok(snap) = serde_json::from_str::<SnapshotInfo>(raw) {
-						replica
-							.update_status_field(client, "latestAvailableSnapshot", &snap.id)
-							.await?;
-
-						let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
-
-						if current_snapshot_id == Some(&snap.id) {
-							debug!(
-								replica = name,
-								snapshot = snap.id,
-								"latest snapshot already active, skipping"
-							);
-						} else {
-							info!(
-								replica = name,
-								snapshot = snap.id,
-								size = snap.size,
-								"new snapshot available, creating restore"
-							);
-							replica.create_restore_for_snapshot(client, &snap).await?;
-							ctx.metrics.restores_started_total.inc();
-
-							if let Err(e) = ctx
-								.recorder
-								.publish(
-									&Event {
-										type_: EventType::Normal,
-										reason: "RestoreStarted".into(),
-										note: Some(format!(
-											"Started restore from snapshot {}",
-											snap.id
-										)),
-										action: "Restore".into(),
-										secondary: None,
-									},
-									&replica.object_ref(&()),
-								)
-								.await
-							{
-								warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
-							}
-						}
-					} else {
-						warn!(
-							replica = name,
-							raw = raw,
-							"failed to parse snapshot list job output"
-						);
-					}
-				} else if failed > backoff_limit {
-					warn!(replica = name, "snapshot list job failed");
-					if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
-						warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
-					}
-				} else {
-					return Ok(Action::requeue(Duration::from_secs(10)));
-				}
-			}
-		}
+		info!(replica = name, "creating snapshot list job");
+		let job =
+			build_snapshot_list_job(&replica, &snapshot_job_name, &namespace, &ctx.kopia_image())?;
+		jobs.create(&PostParams::default(), &job).await?;
+		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
 	// Advance the schedule only after the restore decision has been fully
