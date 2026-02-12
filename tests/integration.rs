@@ -116,6 +116,7 @@ struct ReplicaOpts {
 	minimum_ttl: Option<TimeSpan>,
 	schedule_jitter: Option<TimeSpan>,
 	overlay_database: Option<OverlayDatabaseConfig>,
+	read_only: bool,
 }
 
 impl Default for ReplicaOpts {
@@ -125,6 +126,7 @@ impl Default for ReplicaOpts {
 			minimum_ttl: None,
 			schedule_jitter: None,
 			overlay_database: None,
+			read_only: true,
 		}
 	}
 }
@@ -150,7 +152,7 @@ fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhy
 			pod_annotations: None,
 			affinity: None,
 			tolerations: vec![],
-			read_only: true,
+			read_only: opts.read_only,
 			postgres_extra_config: None,
 			notifications: vec![],
 			overlay_database: opts.overlay_database,
@@ -1072,9 +1074,9 @@ async fn second_restore_and_switchover() {
 
 // ─── Test 7: Overlay FDW reconciliation ──────────────────────────────────────
 
-/// Helper: run kubectl exec and return stdout as a String.
-async fn kubectl_exec(ns: &str, pod: &str, cmd: &[&str]) -> String {
-	let mut args = vec!["exec", "-n", ns, pod, "--"];
+/// Helper: run kubectl exec and return (success, stdout, stderr).
+async fn try_kubectl_exec(ns: &str, target: &str, cmd: &[&str]) -> (bool, String, String) {
+	let mut args = vec!["exec", "-n", ns, target, "--"];
 	args.extend_from_slice(cmd);
 	let output = tokio::process::Command::new("kubectl")
 		.args(&args)
@@ -1083,11 +1085,14 @@ async fn kubectl_exec(ns: &str, pod: &str, cmd: &[&str]) -> String {
 		.expect("failed to run kubectl exec");
 	let stdout = String::from_utf8_lossy(&output.stdout).to_string();
 	let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-	if !output.status.success() {
-		panic!(
-			"kubectl exec failed (exit {})\nstdout: {stdout}\nstderr: {stderr}",
-			output.status
-		);
+	(output.status.success(), stdout, stderr)
+}
+
+/// Helper: run kubectl exec and return stdout, panicking on failure.
+async fn kubectl_exec(ns: &str, target: &str, cmd: &[&str]) -> String {
+	let (ok, stdout, stderr) = try_kubectl_exec(ns, target, cmd).await;
+	if !ok {
+		panic!("kubectl exec failed\nstdout: {stdout}\nstderr: {stderr}",);
 	}
 	stdout
 }
@@ -1348,6 +1353,246 @@ async fn overlay_fdw_reconciliation() {
 		"expected 1000 rows from foreign table test_data, got {row_count}"
 	);
 
+	println!("--- verifying analytics user can CREATE SCHEMA on overlay database");
+	let analytics_password = {
+		let creds: Api<Secret> = Api::namespaced(client.clone(), ns);
+		let secret = creds
+			.get("overlay-replica-creds")
+			.await
+			.expect("creds secret not found");
+		let data = secret.data.expect("creds secret has no data");
+		let pw = data.get("password").expect("no password key");
+		String::from_utf8(pw.0.clone()).expect("password not utf8")
+	};
+	kubectl_exec(
+		ns,
+		overlay_pod,
+		&[
+			"psql",
+			&format!("host=localhost dbname=app user=analytics password={analytics_password}"),
+			"-c",
+			"CREATE SCHEMA test_pgro",
+		],
+	)
+	.await;
+	kubectl_exec(
+		ns,
+		overlay_pod,
+		&[
+			"psql",
+			&format!("host=localhost dbname=app user=analytics password={analytics_password}"),
+			"-c",
+			"DROP SCHEMA test_pgro",
+		],
+	)
+	.await;
+
 	println!("--- all overlay FDW assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &["overlay-replica"]).await;
+}
+
+// ─── Test 8: Analytics user can CREATE SCHEMA when readOnly is false ─────────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn analytics_create_schema_read_write() {
+	let client = make_client().await;
+	let ns = "test-rw-schema";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["rw-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "rw-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating PostgresPhysicalReplica with readOnly: false");
+	let mut replica = build_replica(
+		"rw-replica",
+		"rw-kopia-creds",
+		ReplicaOpts {
+			read_only: false,
+			..Default::default()
+		},
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for restore Active phase");
+	let restore_name =
+		wait_for_restore_phase(&restores, "rw-replica", RestorePhase::Active, PHASE_TIMEOUT).await;
+	wait_for_replica_phase(&replicas, "rw-replica", ReplicaPhase::Ready, PHASE_TIMEOUT).await;
+
+	let deploy_target = format!("deployment/{restore_name}");
+
+	println!("--- verifying analytics user can CREATE SCHEMA on restored database");
+	kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"postgres",
+			"-c",
+			"CREATE SCHEMA test_pgro",
+		],
+	)
+	.await;
+
+	println!("--- verifying analytics user can CREATE SCHEMA on application database");
+	kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-c",
+			"CREATE SCHEMA test_pgro_app",
+		],
+	)
+	.await;
+
+	println!("--- verifying analytics user can write data");
+	kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-c",
+			"CREATE TABLE test_pgro_app.rw_test (id int); INSERT INTO test_pgro_app.rw_test VALUES (1)",
+		],
+	)
+	.await;
+
+	println!("--- all read-write assertions passed, cleaning up");
+	cleanup_namespace(&client, ns, &["rw-replica"]).await;
+}
+
+// ─── Test 9: Analytics user cannot CREATE SCHEMA when readOnly is true ───────
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn analytics_read_only_cannot_create_schema() {
+	let client = make_client().await;
+	let ns = "test-ro-schema";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &["ro-replica"]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "ro-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating PostgresPhysicalReplica with readOnly: true");
+	let mut replica = build_replica(
+		"ro-replica",
+		"ro-kopia-creds",
+		ReplicaOpts {
+			read_only: true,
+			..Default::default()
+		},
+	);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for restore Active phase");
+	let restore_name =
+		wait_for_restore_phase(&restores, "ro-replica", RestorePhase::Active, PHASE_TIMEOUT).await;
+	wait_for_replica_phase(&replicas, "ro-replica", ReplicaPhase::Ready, PHASE_TIMEOUT).await;
+
+	let deploy_target = format!("deployment/{restore_name}");
+
+	println!("--- verifying analytics user can read data");
+	kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-c",
+			"SELECT COUNT(*) FROM test_data",
+		],
+	)
+	.await;
+
+	println!("--- verifying analytics user cannot CREATE SCHEMA");
+	let (ok, stdout, stderr) = try_kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"postgres",
+			"-c",
+			"CREATE SCHEMA test_pgro",
+		],
+	)
+	.await;
+	let combined = format!("{stdout}{stderr}");
+	assert!(
+		!ok || combined.contains("permission denied") || combined.contains("ERROR"),
+		"CREATE SCHEMA should fail in read-only mode, but it succeeded.\nstdout: {stdout}\nstderr: {stderr}"
+	);
+
+	println!("--- verifying analytics user cannot write data");
+	let (ok, stdout, stderr) = try_kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-c",
+			"INSERT INTO test_data (data) VALUES ('should fail')",
+		],
+	)
+	.await;
+	let combined = format!("{stdout}{stderr}");
+	assert!(
+		!ok || combined.contains("read-only") || combined.contains("ERROR"),
+		"INSERT should fail in read-only mode, but it succeeded.\nstdout: {stdout}\nstderr: {stderr}"
+	);
+
+	println!("--- all read-only assertions passed, cleaning up");
+	cleanup_namespace(&client, ns, &["ro-replica"]).await;
 }

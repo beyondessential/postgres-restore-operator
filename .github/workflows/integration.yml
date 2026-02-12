@@ -29,10 +29,14 @@ jobs:
               full_restore_lifecycle
               invalid_kopia_secret_structure
               missing_kopia_secret_handled
+              analytics_create_schema_read_write
+              analytics_read_only_cannot_create_schema
             namespaces: >-
               test-lifecycle
               test-invalid-secret
               test-missing-secret
+              test-rw-schema
+              test-ro-schema
             needs_non_pg_snapshot: false
             needs_cnpg: false
 
