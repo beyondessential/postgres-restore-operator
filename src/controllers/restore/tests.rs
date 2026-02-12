@@ -225,8 +225,16 @@ fn read_only_mode_uses_pg_read_all_data_branch() {
 		"read-only mode must grant pg_read_all_data"
 	);
 	assert!(
-		script.contains(r#"if [ "true" = "true" ] && [ "$PG_MAJOR" -ge 14 ]"#),
-		"read-only mode must check version gate for pg_read_all_data"
+		script.contains(r#"[ "$PG_MAJOR" -ge 14 ]"#),
+		"script must check version gate for pg_read_all_data"
+	);
+	assert!(
+		script.contains(r#"if [ "true" = "true" ]"#),
+		"read-only mode must check read_only flag"
+	);
+	assert!(
+		script.contains("Read-only mode with PG >= 14, granted pg_read_all_data"),
+		"read-only mode must echo read-only confirmation"
 	);
 }
 
@@ -238,11 +246,27 @@ fn not_read_only_uses_superuser_branch() {
 	let script = get_init_script(&deploy);
 	assert!(
 		script.contains(r#"if [ "false" = "true" ]"#),
-		"non-read-only mode must have false condition so it falls through to superuser"
+		"non-read-only mode must have false condition so it falls through to write grants"
 	);
 	assert!(
 		script.contains("SUPERUSER"),
-		"script must contain superuser grant in else branch"
+		"script must contain superuser grant in PG < 14 fallback branch"
+	);
+}
+
+#[test]
+fn not_read_only_grants_write_and_create_schema() {
+	let replica = make_replica_with_opts(None, false);
+	let restore = make_restore();
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let script = get_init_script(&deploy);
+	assert!(
+		script.contains("pg_write_all_data"),
+		"non-read-only mode must grant pg_write_all_data"
+	);
+	assert!(
+		script.contains("GRANT CREATE ON DATABASE"),
+		"non-read-only mode must grant CREATE ON DATABASE"
 	);
 }
 

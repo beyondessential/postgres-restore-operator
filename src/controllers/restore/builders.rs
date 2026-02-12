@@ -520,8 +520,7 @@ pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w s
 PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
 echo "Detected PG major version: $PG_MAJOR"
 
-if [ "{read_only}" = "true" ] && [ "$PG_MAJOR" -ge 14 ]; then
-  echo "Read-only mode with PG >= 14, granting pg_read_all_data..."
+if [ "$PG_MAJOR" -ge 14 ]; then
   psql -U postgres -d postgres << SQLEOF
 DO \$\$
 BEGIN
@@ -534,8 +533,27 @@ END
 \$\$;
 GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};
 SQLEOF
+
+  if [ "{read_only}" = "true" ]; then
+    echo "Read-only mode with PG >= 14, granted pg_read_all_data"
+  else
+    echo "Read-write mode with PG >= 14, granting pg_write_all_data + CREATE ON DATABASE..."
+    psql -U postgres -d postgres << SQLEOF
+GRANT pg_write_all_data TO ${{ANALYTICS_USERNAME}};
+DO \$\$
+DECLARE
+  dbname text;
+BEGIN
+  FOR dbname IN SELECT d.datname FROM pg_database d WHERE d.datname NOT IN ('template0', 'template1')
+  LOOP
+    EXECUTE format('GRANT CREATE ON DATABASE %I TO %I', dbname, '${{ANALYTICS_USERNAME}}');
+  END LOOP;
+END
+\$\$;
+SQLEOF
+  fi
 else
-  echo "Granting superuser to analytics user..."
+  echo "PG < 14, granting superuser to analytics user..."
   psql -U postgres -d postgres << SQLEOF
 DO \$\$
 BEGIN

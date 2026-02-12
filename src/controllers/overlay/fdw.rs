@@ -589,6 +589,15 @@ pub async fn reconcile_fdw(
 		debug!(replica = %replica_name, "postgres_fdw extension already present");
 	}
 
+	// Ensure analytics user can create schemas in the overlay database
+	let analytics_user = &replica.spec.analytics_username;
+	overlay_pg
+		.batch_execute(&format!(
+			"GRANT CREATE ON DATABASE app TO {}",
+			quote_ident(analytics_user)
+		))
+		.await?;
+
 	// Ensure FDW server with correct host and dbname
 	if state.server_host.is_none() {
 		debug!(
