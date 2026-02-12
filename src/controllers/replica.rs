@@ -467,17 +467,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	let should_restore = never_restored || matches!(schedule_decision, ScheduleDecision::Trigger);
 
-	// Recompute nextScheduledRestore when a trigger fires (whether it proceeds or is skipped by TTL)
-	if matches!(
-		schedule_decision,
-		ScheduleDecision::Trigger | ScheduleDecision::SkippedByTtl
-	) && let Some(next) = replica.compute_next_scheduled_restore(now)
-	{
-		replica
-			.update_schedule_status(client, next, &current_hash)
-			.await?;
-	}
-
 	if should_restore {
 		// Check concurrent restore limit
 		let mut queue = ctx.restore_queue.write().await;
@@ -620,6 +609,20 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				}
 			}
 		}
+	}
+
+	// Advance the schedule only after the restore decision has been fully
+	// processed (or skipped by TTL).  Bumping before the should_restore
+	// block caused watch-triggered reconciliations to see the future
+	// nextScheduledRestore and skip snapshot-job processing entirely.
+	if matches!(
+		schedule_decision,
+		ScheduleDecision::Trigger | ScheduleDecision::SkippedByTtl
+	) && let Some(next) = replica.compute_next_scheduled_restore(now)
+	{
+		replica
+			.update_schedule_status(client, next, &current_hash)
+			.await?;
 	}
 
 	// Update phase based on current state
