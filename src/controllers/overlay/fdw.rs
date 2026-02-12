@@ -1,4 +1,7 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+	collections::{BTreeMap, BTreeSet},
+	hash::{DefaultHasher, Hash, Hasher},
+};
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
@@ -108,6 +111,80 @@ async fn drop_stale_fdw_servers(
 			.await?;
 		}
 	}
+	Ok(())
+}
+
+/// Compute a stable hash of the inputs that affect FDW reconciliation.
+///
+/// If any of these change the FDW setup needs to be redone from scratch.
+fn compute_fdw_config_hash(
+	restore_name: &str,
+	replica: &PostgresPhysicalReplica,
+) -> String {
+	let mut hasher = DefaultHasher::new();
+	restore_name.hash(&mut hasher);
+	replica.spec.analytics_username.hash(&mut hasher);
+	if let Some(overlay) = &replica.spec.overlay_database {
+		if let Some(mapping) = &overlay.schema_mapping {
+			let sorted: BTreeMap<_, _> = mapping.iter().collect();
+			for (k, v) in &sorted {
+				k.hash(&mut hasher);
+				v.hash(&mut hasher);
+			}
+		}
+		overlay.import_generated.hash(&mut hasher);
+	}
+	format!("{:016x}", hasher.finish())
+}
+
+/// Tracked FDW reconciliation state persisted in `_pgro.fdw_state`.
+struct FdwTrackedState {
+	config_hash: String,
+	phase: String,
+}
+
+/// Ensure the `_pgro.fdw_state` tracking table exists.
+async fn ensure_fdw_state_table(pg: &tokio_postgres::Client) -> Result<()> {
+	pg.batch_execute(
+		"CREATE TABLE IF NOT EXISTS _pgro.fdw_state ( \
+		   id integer PRIMARY KEY DEFAULT 1, \
+		   config_hash text NOT NULL, \
+		   phase text NOT NULL DEFAULT 'pending', \
+		   updated_at timestamptz NOT NULL DEFAULT now() \
+		 )",
+	)
+	.await?;
+	Ok(())
+}
+
+/// Read the current FDW reconciliation state from the tracking table.
+async fn read_fdw_state(pg: &tokio_postgres::Client) -> Result<Option<FdwTrackedState>> {
+	let row = pg
+		.query_opt(
+			"SELECT config_hash, phase FROM _pgro.fdw_state WHERE id = 1",
+			&[],
+		)
+		.await?;
+	Ok(row.map(|r| FdwTrackedState {
+		config_hash: r.get(0),
+		phase: r.get(1),
+	}))
+}
+
+/// Update the FDW reconciliation phase in the tracking table.
+async fn write_fdw_state(
+	pg: &tokio_postgres::Client,
+	config_hash: &str,
+	phase: &str,
+) -> Result<()> {
+	pg.execute(
+		"INSERT INTO _pgro.fdw_state (id, config_hash, phase, updated_at) \
+		 VALUES (1, $1, $2, now()) \
+		 ON CONFLICT (id) DO UPDATE \
+		   SET config_hash = $1, phase = $2, updated_at = now()",
+		&[&config_hash, &phase],
+	)
+	.await?;
 	Ok(())
 }
 
@@ -545,6 +622,29 @@ pub async fn reconcile_fdw(
 	.await?;
 	let overlay_pg = &overlay_conn.client;
 
+	// Ensure _pgro schema exists (needed for state tracking even before
+	// the postgres_fdw extension is installed).
+	overlay_pg
+		.batch_execute("CREATE SCHEMA IF NOT EXISTS _pgro")
+		.await?;
+
+	// Check if FDW reconciliation is already complete for this config
+	let config_hash = compute_fdw_config_hash(restore_name, replica);
+	ensure_fdw_state_table(overlay_pg).await?;
+	let tracked = read_fdw_state(overlay_pg).await?;
+	if tracked
+		.as_ref()
+		.is_some_and(|t| t.config_hash == config_hash && t.phase == "complete")
+	{
+		debug!(
+			replica = %replica_name,
+			restore = %restore_name,
+			"FDW reconciliation already complete for this config, skipping"
+		);
+		return Ok(());
+	}
+	write_fdw_state(overlay_pg, &config_hash, "pending").await?;
+
 	// Discover the main database in the restore (largest by size)
 	let restore_dbname = discover_restore_database(
 		client,
@@ -576,12 +676,9 @@ pub async fn reconcile_fdw(
 	// Drop stale servers from previous restores
 	drop_stale_fdw_servers(overlay_pg, &server_name, &replica_name).await?;
 
-	// Ensure _pgro schema and extension
+	// Ensure extension
 	if !state.has_extension {
-		debug!(replica = %replica_name, "creating _pgro schema and postgres_fdw extension");
-		overlay_pg
-			.batch_execute("CREATE SCHEMA IF NOT EXISTS _pgro")
-			.await?;
+		debug!(replica = %replica_name, "creating postgres_fdw extension");
 		overlay_pg
 			.batch_execute("CREATE EXTENSION IF NOT EXISTS postgres_fdw SCHEMA _pgro")
 			.await?;
@@ -685,6 +782,8 @@ pub async fn reconcile_fdw(
 		))
 		.await?;
 
+	write_fdw_state(overlay_pg, &config_hash, "server_configured").await?;
+
 	// Discover and replicate custom types from the restore database
 	let restore_conn = super::connect::connect_to_restore(
 		client,
@@ -711,6 +810,8 @@ pub async fn reconcile_fdw(
 
 	// Drop stale stub types from a previous restore once before the loop
 	cleanup_stale_stub_types(overlay_pg).await?;
+
+	write_fdw_state(overlay_pg, &config_hash, "importing").await?;
 
 	// Resolve expected schemas and import any that are missing
 	let schemas = resolve_fdw_schemas(
@@ -762,6 +863,8 @@ pub async fn reconcile_fdw(
 			.await?;
 		debug!(remote = %remote, local = %local, "foreign schema imported successfully");
 	}
+
+	write_fdw_state(overlay_pg, &config_hash, "complete").await?;
 
 	info!(
 		replica = %replica_name,
