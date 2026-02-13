@@ -129,11 +129,16 @@ pub async fn read_job_pod_logs(
 		.ok()?;
 
 	for pod in &pod_list.items {
-		let pod_name = pod.metadata.name.as_deref()?;
-		let statuses = pod
+		let Some(pod_name) = pod.metadata.name.as_deref() else {
+			continue;
+		};
+		let Some(statuses) = pod
 			.status
 			.as_ref()
-			.and_then(|s| s.container_statuses.as_ref())?;
+			.and_then(|s| s.container_statuses.as_ref())
+		else {
+			continue;
+		};
 
 		let is_terminated = statuses.iter().any(|cs| {
 			cs.name == container_name
@@ -148,7 +153,7 @@ pub async fn read_job_pod_logs(
 			continue;
 		}
 
-		let logs = pods
+		let Ok(logs) = pods
 			.logs(
 				pod_name,
 				&LogParams {
@@ -157,7 +162,9 @@ pub async fn read_job_pod_logs(
 				},
 			)
 			.await
-			.ok()?;
+		else {
+			continue;
+		};
 
 		if !logs.is_empty() {
 			return Some(logs);
