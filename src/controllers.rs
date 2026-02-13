@@ -1,6 +1,5 @@
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector, SecretReference};
-
-use kube::{Api, Client};
+use kube::{Api, Client, api::LogParams};
 
 pub mod overlay;
 pub mod replica;
@@ -107,6 +106,61 @@ pub async fn read_job_termination_message(
 			{
 				return msg;
 			}
+		}
+	}
+
+	None
+}
+
+/// Read the logs from a named container in a Job's pod.
+///
+/// Looks up pods by the `job-name` label, finds the first pod with a
+/// terminated container matching `container_name`, and returns its logs.
+pub async fn read_job_pod_logs(
+	client: &Client,
+	namespace: &str,
+	job_name: &str,
+	container_name: &str,
+) -> Option<String> {
+	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+	let pod_list = pods
+		.list(&kube::api::ListParams::default().labels(&format!("job-name={job_name}")))
+		.await
+		.ok()?;
+
+	for pod in &pod_list.items {
+		let pod_name = pod.metadata.name.as_deref()?;
+		let statuses = pod
+			.status
+			.as_ref()
+			.and_then(|s| s.container_statuses.as_ref())?;
+
+		let is_terminated = statuses.iter().any(|cs| {
+			cs.name == container_name
+				&& cs
+					.state
+					.as_ref()
+					.and_then(|s| s.terminated.as_ref())
+					.is_some()
+		});
+
+		if !is_terminated {
+			continue;
+		}
+
+		let logs = pods
+			.logs(
+				pod_name,
+				&LogParams {
+					container: Some(container_name.to_string()),
+					..Default::default()
+				},
+			)
+			.await
+			.ok()?;
+
+		if !logs.is_empty() {
+			return Some(logs);
 		}
 	}
 

@@ -6,8 +6,8 @@ use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, EnvVar, LocalObjectReference, PodSpec, PodTemplateSpec,
-			ResourceRequirements, Secret, Service, ServicePort, ServiceSpec,
+			Container, LocalObjectReference, PodSpec, PodTemplateSpec, ResourceRequirements,
+			Secret, Service, ServicePort, ServiceSpec,
 		},
 	},
 	apimachinery::pkg::{api::resource::Quantity, util::intstr::IntOrString},
@@ -48,7 +48,7 @@ pub fn build_snapshot_list_job(
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let replica_name = replica.name_any();
 
-	let mut env_vars = vec![
+	let env_vars = vec![
 		env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
 		env_from_secret("KOPIA_REGION", kopia_secret, "region"),
 		env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
@@ -58,31 +58,7 @@ pub fn build_snapshot_list_job(
 		env_from_secret_optional("KOPIA_DISABLE_TLS", kopia_secret, "disableTls"),
 	];
 
-	if let Some(ref filter) = replica.spec.snapshot_filter {
-		if let Some(ref pattern) = filter.host_pattern {
-			env_vars.push(EnvVar {
-				name: "FILTER_HOST_PATTERN".to_string(),
-				value: Some(pattern.clone()),
-				..Default::default()
-			});
-		}
-		if let Some(ref tags) = filter.tags {
-			let tag_str = tags
-				.iter()
-				.map(|(k, v)| format!("{k}={v}"))
-				.collect::<Vec<_>>()
-				.join(",");
-			env_vars.push(EnvVar {
-				name: "FILTER_TAGS".to_string(),
-				value: Some(tag_str),
-				..Default::default()
-			});
-		}
-	}
-
 	let script = r#"set -e
-
-apt-get update -qq && apt-get install -y -qq jq >/dev/null 2>&1
 
 ENDPOINT_ARGS=""
 if [ -n "$KOPIA_ENDPOINT" ]; then
@@ -98,41 +74,10 @@ kopia repository connect s3 \
   --access-key="$AWS_ACCESS_KEY_ID" \
   --secret-access-key="$AWS_SECRET_ACCESS_KEY" \
   --password="$KOPIA_PASSWORD" \
-  $ENDPOINT_ARGS
+  $ENDPOINT_ARGS \
+  >&2
 
-SNAP_FILE=$(mktemp)
-trap 'rm -f "$SNAP_FILE" "$SNAP_FILE.tmp" "$SNAP_FILE.latest"' EXIT
-
-kopia snapshot list --json --all 2>/dev/null > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
-
-if [ -n "$FILTER_HOST_PATTERN" ]; then
-  REGEX=$(printf '%s' "$FILTER_HOST_PATTERN" | sed 's/\./\\./g; s/\*/\.\*/g; s/\?/\./g')
-  jq -c --arg pat "^${REGEX}$" '[.[] | select(.source.host != null and (.source.host | test($pat)))]' "$SNAP_FILE" > "$SNAP_FILE.tmp" && mv "$SNAP_FILE.tmp" "$SNAP_FILE"
-fi
-
-if [ -n "$FILTER_TAGS" ]; then
-  IFS=',' read -r TAG_LIST <<EOF
-$FILTER_TAGS
-EOF
-  for tag in $TAG_LIST; do
-    KEY="${tag%%=*}"
-    VALUE="${tag#*=}"
-    jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v or .tags["tag:" + $k] == $v)]' "$SNAP_FILE" > "$SNAP_FILE.tmp" && mv "$SNAP_FILE.tmp" "$SNAP_FILE"
-  done
-fi
-
-jq -c 'sort_by(.startTime) | last // empty' "$SNAP_FILE" > "$SNAP_FILE.latest"
-
-if [ ! -s "$SNAP_FILE.latest" ] || [ "$(cat "$SNAP_FILE.latest")" = "null" ]; then
-  echo "No matching snapshots found"
-  printf '{}' > /dev/termination-log
-  exit 0
-fi
-
-ID=$(jq -r '.id' "$SNAP_FILE.latest")
-SIZE=$(jq -r '.stats.totalSize // 0' "$SNAP_FILE.latest")
-echo "Latest snapshot: id=$ID size=$SIZE"
-printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
+kopia snapshot list --json --all 2>/dev/null || echo "[]"
 "#;
 
 	Ok(Job {
