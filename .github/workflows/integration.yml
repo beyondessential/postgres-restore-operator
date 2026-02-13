@@ -126,20 +126,46 @@ jobs:
 
       - name: Pre-pull images on kind node
         run: |
-          docker pull minio/minio:latest
-          docker pull minio/mc:latest
-          docker pull kopia/kopia:0.22.3
-          docker pull postgres:16
-          docker pull postgres:16-alpine
-          docker pull alpine:latest
-          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:0.22.3 postgres:16 postgres:16-alpine alpine:latest
+          load_image() {
+            local image="$1"
+            docker pull "$image"
+            for attempt in 1 2 3; do
+              if kind load docker-image "$image"; then
+                return 0
+              fi
+              echo "kind load failed for $image (attempt $attempt/3), retrying..."
+              sleep 3
+            done
+            echo "Failed to load $image after 3 attempts"
+            return 1
+          }
+
+          load_image minio/minio:latest
+          load_image minio/mc:latest
+          load_image kopia/kopia:0.22.3
+          load_image postgres:16
+          load_image postgres:16-alpine
+          load_image alpine:latest
 
       - name: Pre-pull CNPG images
         if: matrix.needs_cnpg
         run: |
-          docker pull ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
-          docker pull ghcr.io/cloudnative-pg/postgresql:17
-          kind load docker-image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1 ghcr.io/cloudnative-pg/postgresql:17
+          load_image() {
+            local image="$1"
+            docker pull "$image"
+            for attempt in 1 2 3; do
+              if kind load docker-image "$image"; then
+                return 0
+              fi
+              echo "kind load failed for $image (attempt $attempt/3), retrying..."
+              sleep 3
+            done
+            echo "Failed to load $image after 3 attempts"
+            return 1
+          }
+
+          load_image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
+          load_image ghcr.io/cloudnative-pg/postgresql:17
 
       - name: Install CNPG operator
         if: matrix.needs_cnpg
