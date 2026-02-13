@@ -181,6 +181,19 @@ pub fn latest_snapshot(snapshots: &[Snapshot]) -> Option<&Snapshot> {
 		.max_by(|a, b| a.start_time.cmp(&b.start_time))
 }
 
+/// Parse the output of a snapshot-list job, which may contain non-JSON lines
+/// (e.g. "Connected to repository.") before the JSON array.
+///
+/// Finds the first `[` and last `]` and parses the substring between them.
+pub fn parse_snapshot_list_output(raw: &str) -> serde_json::Result<Vec<Snapshot>> {
+	let start = raw.find('[');
+	let end = raw.rfind(']');
+	match (start, end) {
+		(Some(s), Some(e)) if s <= e => serde_json::from_str(&raw[s..=e]),
+		_ => serde_json::from_str("[]"),
+	}
+}
+
 /// Builds the kopia CLI args for connecting to a repository.
 /// Used when constructing Job commands.
 pub fn kopia_connect_args(creds: &KopiaCredentials) -> Vec<String> {
@@ -409,6 +422,45 @@ mod tests {
 		assert_eq!(result.len(), 2);
 		assert_eq!(result[0].id, "a");
 		assert_eq!(result[1].id, "b");
+	}
+
+	#[test]
+	fn parse_snapshot_list_output_clean_json() {
+		let raw = r#"[{"id":"snap1","startTime":"2024-01-01T00:00:00Z"}]"#;
+		let snaps = parse_snapshot_list_output(raw).unwrap();
+		assert_eq!(snaps.len(), 1);
+		assert_eq!(snaps[0].id, "snap1");
+	}
+
+	#[test]
+	fn parse_snapshot_list_output_with_preamble() {
+		let raw =
+			"Connected to repository.\n[{\"id\":\"snap1\",\"startTime\":\"2024-01-01T00:00:00Z\"}]";
+		let snaps = parse_snapshot_list_output(raw).unwrap();
+		assert_eq!(snaps.len(), 1);
+		assert_eq!(snaps[0].id, "snap1");
+	}
+
+	#[test]
+	fn parse_snapshot_list_output_with_multiline_preamble() {
+		let raw = "Connected to repository.\nSome other info\n[{\"id\":\"snap1\",\"startTime\":\"2024-01-01T00:00:00Z\"}]\n";
+		let snaps = parse_snapshot_list_output(raw).unwrap();
+		assert_eq!(snaps.len(), 1);
+		assert_eq!(snaps[0].id, "snap1");
+	}
+
+	#[test]
+	fn parse_snapshot_list_output_empty_array() {
+		let raw = "Connected to repository.\n[]";
+		let snaps = parse_snapshot_list_output(raw).unwrap();
+		assert!(snaps.is_empty());
+	}
+
+	#[test]
+	fn parse_snapshot_list_output_no_json() {
+		let raw = "Connected to repository.\nNo snapshots found.";
+		let snaps = parse_snapshot_list_output(raw).unwrap();
+		assert!(snaps.is_empty());
 	}
 
 	#[test]

@@ -438,7 +438,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
 			}
 
-			match serde_json::from_str::<Vec<kopia::Snapshot>>(raw) {
+			match kopia::parse_snapshot_list_output(raw) {
 				Ok(all_snapshots) => {
 					let filtered = kopia::filter_snapshots(
 						&all_snapshots,
