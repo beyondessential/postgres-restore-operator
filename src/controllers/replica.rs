@@ -421,19 +421,31 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
 
 		if succeeded > 0 {
-			let logs =
-				read_job_pod_logs(client, &namespace, &snapshot_job_name, "snapshot-list").await;
+			let raw = ctx
+				.take_snapshot_result(&namespace, &name)
+				.or_else(|| {
+					debug!(
+						replica = name,
+						job = snapshot_job_name,
+						"no callback result in store, falling back to pod logs"
+					);
+					None
+				})
+				.or(
+					read_job_pod_logs(client, &namespace, &snapshot_job_name, "snapshot-list")
+						.await,
+				);
 
-			let Some(ref raw) = logs else {
+			let Some(ref raw) = raw else {
 				info!(
 					replica = name,
 					job = snapshot_job_name,
-					"snapshot list job succeeded but pod logs not yet available, retrying"
+					"snapshot list job succeeded but results not yet available, retrying"
 				);
 				return Ok(Action::requeue(Duration::from_secs(5)));
 			};
 
-			// We have the logs — safe to delete the job now.
+			// We have the data — safe to delete the job now.
 			if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
 				warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
 			}
@@ -628,8 +640,14 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		drop(queue);
 
 		info!(replica = name, "creating snapshot list job");
-		let job =
-			build_snapshot_list_job(&replica, &snapshot_job_name, &namespace, &ctx.kopia_image())?;
+		let callback_url = ctx.snapshot_callback_url(&namespace, &name);
+		let job = build_snapshot_list_job(
+			&replica,
+			&snapshot_job_name,
+			&namespace,
+			&ctx.kopia_image(),
+			callback_url.as_deref(),
+		)?;
 		jobs.create(&PostParams::default(), &job).await?;
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}

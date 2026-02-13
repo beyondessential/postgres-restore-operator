@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
 
-use axum::extract::State;
+use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use futures::StreamExt;
@@ -26,6 +26,7 @@ use postgres_restore_operator::{
 
 const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 2;
 const DEFAULT_METRICS_ADDR: &str = "[::]:8080";
+const DEFAULT_METRICS_PORT: u16 = 8080;
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
 
 /// Annotate the operator's own pod with the running version.
@@ -139,10 +140,23 @@ async fn main() -> anyhow::Result<()> {
 	let (max_concurrent_restores, kopia_image, use_port_forward) =
 		read_config(&client, &namespace).await;
 
+	let callback_base_url = if let Ok(url) = std::env::var("CALLBACK_BASE_URL") {
+		Some(url)
+	} else if let Ok(svc) = std::env::var("OPERATOR_SERVICE_NAME") {
+		let port: u16 = metrics_addr
+			.rsplit_once(':')
+			.and_then(|(_, p)| p.parse().ok())
+			.unwrap_or(DEFAULT_METRICS_PORT);
+		Some(format!("http://{svc}.{namespace}.svc:{port}"))
+	} else {
+		None
+	};
+
 	info!(
 		max_concurrent_restores,
 		kopia_image,
 		use_port_forward,
+		?callback_base_url,
 		metrics_addr,
 		operator_namespace = namespace,
 		version = env!("CARGO_PKG_VERSION"),
@@ -156,6 +170,7 @@ async fn main() -> anyhow::Result<()> {
 		max_concurrent_restores,
 		kopia_image,
 		use_port_forward,
+		callback_base_url,
 	));
 
 	// Heartbeat: a background task updates this timestamp every 5s.
@@ -253,10 +268,13 @@ async fn main() -> anyhow::Result<()> {
 		warn!("ConfigMap watcher stream ended unexpectedly");
 	});
 
-	// Start metrics server
+	// Start metrics / API server
 	let metrics_registry = ctx.metrics.registry.clone();
 	let metrics_addr_clone = metrics_addr.clone();
-	let probe_state = ProbeState { heartbeat };
+	let server_state = ServerState {
+		heartbeat,
+		ctx: ctx.clone(),
+	};
 	tokio::spawn(async move {
 		let app = Router::new()
 			.route(
@@ -274,15 +292,19 @@ async fn main() -> anyhow::Result<()> {
 			)
 			.route("/livez", get(livez))
 			.route("/readyz", get(readyz))
-			.with_state(probe_state)
+			.route(
+				"/api/v1/snapshot-results/:namespace/:replica",
+				axum::routing::post(post_snapshot_results),
+			)
+			.with_state(server_state)
 			.layer(TraceLayer::new_for_http());
 
 		let listener = tokio::net::TcpListener::bind(&metrics_addr_clone)
 			.await
-			.expect("failed to bind metrics server");
-		info!(addr = metrics_addr_clone, "metrics server listening");
+			.expect("failed to bind server");
+		info!(addr = metrics_addr_clone, "server listening");
 		if let Err(e) = axum::serve(listener, app).await {
-			tracing::error!(error = %e, "metrics/probe server exited with error");
+			tracing::error!(error = %e, "server exited with error");
 		}
 	});
 
@@ -343,13 +365,30 @@ async fn main() -> anyhow::Result<()> {
 }
 
 #[derive(Clone)]
-struct ProbeState {
+struct ServerState {
 	heartbeat: Arc<AtomicI64>,
+	ctx: Arc<Context>,
+}
+
+/// Accept snapshot-list JSON POSTed by a job.
+async fn post_snapshot_results(
+	State(state): State<ServerState>,
+	Path((namespace, replica)): Path<(String, String)>,
+	body: String,
+) -> StatusCode {
+	info!(
+		namespace = namespace,
+		replica = replica,
+		bytes = body.len(),
+		"received snapshot results callback"
+	);
+	state.ctx.store_snapshot_result(&namespace, &replica, body);
+	StatusCode::NO_CONTENT
 }
 
 /// Liveness: checks that the async runtime isn't deadlocked by verifying
 /// a background heartbeat was updated within the last 30 seconds.
-async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
+async fn livez(State(state): State<ServerState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
 	let age = Timestamp::now().as_second() - last;
 	if age <= 30 {
@@ -365,7 +404,7 @@ async fn livez(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
 }
 
 /// Readiness: checks that the heartbeat is fresh (runtime is responsive).
-async fn readyz(State(state): State<ProbeState>) -> (StatusCode, &'static str) {
+async fn readyz(State(state): State<ServerState>) -> (StatusCode, &'static str) {
 	let last = state.heartbeat.load(Ordering::Relaxed);
 	let age = Timestamp::now().as_second() - last;
 	if age <= 30 {

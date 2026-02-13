@@ -1,6 +1,9 @@
-use std::sync::{
-	Arc, RwLock,
-	atomic::{AtomicBool, AtomicUsize, Ordering},
+use std::{
+	collections::HashMap,
+	sync::{
+		Arc, Mutex, RwLock,
+		atomic::{AtomicBool, AtomicUsize, Ordering},
+	},
 };
 
 use jiff::Timestamp;
@@ -20,6 +23,13 @@ pub struct Context {
 	pub kopia_image: Arc<RwLock<String>>,
 	pub use_port_forward: Arc<AtomicBool>,
 	pub http_client: reqwest::Client,
+	/// In-memory store for snapshot-list results POSTed by jobs.
+	/// Key: `{namespace}/{replica-name}`, Value: raw JSON from kopia.
+	pub snapshot_results: Arc<Mutex<HashMap<String, String>>>,
+	/// Base URL the operator is reachable at from within the cluster,
+	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
+	/// `None` when running out-of-cluster (dev mode).
+	pub callback_base_url: Option<String>,
 }
 
 impl Context {
@@ -28,6 +38,7 @@ impl Context {
 		max_concurrent_restores: usize,
 		kopia_image: String,
 		use_port_forward: bool,
+		callback_base_url: Option<String>,
 	) -> Self {
 		let reporter = Reporter::from("postgres-restore-operator");
 		let recorder = Recorder::new(client.clone(), reporter);
@@ -41,6 +52,8 @@ impl Context {
 			kopia_image: Arc::new(RwLock::new(kopia_image)),
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
+			snapshot_results: Arc::new(Mutex::new(HashMap::new())),
+			callback_base_url,
 		}
 	}
 
@@ -54,6 +67,25 @@ impl Context {
 
 	pub fn use_port_forward(&self) -> bool {
 		self.use_port_forward.load(Ordering::Relaxed)
+	}
+
+	/// Build the full callback URL for a snapshot-list job to POST results to.
+	pub fn snapshot_callback_url(&self, namespace: &str, replica: &str) -> Option<String> {
+		self.callback_base_url
+			.as_ref()
+			.map(|base| format!("{base}/api/v1/snapshot-results/{namespace}/{replica}"))
+	}
+
+	/// Take snapshot results from the in-memory store, removing them.
+	pub fn take_snapshot_result(&self, namespace: &str, replica: &str) -> Option<String> {
+		let key = format!("{namespace}/{replica}");
+		self.snapshot_results.lock().unwrap().remove(&key)
+	}
+
+	/// Store snapshot results from a job callback.
+	pub fn store_snapshot_result(&self, namespace: &str, replica: &str, data: String) {
+		let key = format!("{namespace}/{replica}");
+		self.snapshot_results.lock().unwrap().insert(key, data);
 	}
 
 	/// Remove a restore from the queue, promote the next pending one if there

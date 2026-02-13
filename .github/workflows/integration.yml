@@ -113,7 +113,35 @@ jobs:
       - name: Create operator namespace and config
         run: |
           kubectl create namespace pgro-system
-          kubectl apply -f - <<'EOF'
+
+          # Expose the host-network operator to in-cluster jobs so the
+          # snapshot-list callback can reach it.
+          HOST_IP=$(docker inspect kind-control-plane \
+            --format '{{ .NetworkSettings.Networks.kind.Gateway }}')
+          echo "Host IP (from kind network gateway): $HOST_IP"
+
+          kubectl apply -f - <<EOF
+          apiVersion: v1
+          kind: Service
+          metadata:
+            name: postgres-restore-operator
+            namespace: pgro-system
+          spec:
+            ports:
+              - port: 8080
+                targetPort: 8080
+          ---
+          apiVersion: v1
+          kind: Endpoints
+          metadata:
+            name: postgres-restore-operator
+            namespace: pgro-system
+          subsets:
+            - addresses:
+                - ip: "$HOST_IP"
+              ports:
+                - port: 8080
+          ---
           apiVersion: v1
           kind: ConfigMap
           metadata:
@@ -243,6 +271,7 @@ jobs:
         run: |
           RUST_LOG=info,tower_http=debug \
           OPERATOR_NAMESPACE=pgro-system \
+          OPERATOR_SERVICE_NAME=postgres-restore-operator \
           KUBECONFIG="${HOME}/.kube/config" \
             ./target/debug/operator > /tmp/operator.log 2>&1 &
           echo $! > /tmp/operator.pid

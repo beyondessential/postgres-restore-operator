@@ -6,8 +6,8 @@ use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, LocalObjectReference, PodSpec, PodTemplateSpec, ResourceRequirements,
-			Secret, Service, ServicePort, ServiceSpec,
+			Container, EnvVar, LocalObjectReference, PodSpec, PodTemplateSpec,
+			ResourceRequirements, Secret, Service, ServicePort, ServiceSpec,
 		},
 	},
 	apimachinery::pkg::{api::resource::Quantity, util::intstr::IntOrString},
@@ -44,11 +44,12 @@ pub fn build_snapshot_list_job(
 	job_name: &str,
 	namespace: &str,
 	kopia_image: &str,
+	callback_url: Option<&str>,
 ) -> Result<Job> {
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let replica_name = replica.name_any();
 
-	let env_vars = vec![
+	let mut env_vars = vec![
 		env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
 		env_from_secret("KOPIA_REGION", kopia_secret, "region"),
 		env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
@@ -57,6 +58,14 @@ pub fn build_snapshot_list_job(
 		env_from_secret_optional("KOPIA_ENDPOINT", kopia_secret, "endpoint"),
 		env_from_secret_optional("KOPIA_DISABLE_TLS", kopia_secret, "disableTls"),
 	];
+
+	if let Some(url) = callback_url {
+		env_vars.push(EnvVar {
+			name: "SNAPSHOT_CALLBACK_URL".to_string(),
+			value: Some(url.to_string()),
+			..Default::default()
+		});
+	}
 
 	let script = r#"set -e
 
@@ -77,7 +86,13 @@ kopia repository connect s3 \
   $ENDPOINT_ARGS \
   >&2
 
-kopia snapshot list --json --all 2>/dev/null || echo "[]"
+SNAP_FILE=$(mktemp)
+trap 'rm -f "$SNAP_FILE"' EXIT
+kopia snapshot list --json --all 2>/dev/null > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
+cat "$SNAP_FILE"
+if [ -n "$SNAPSHOT_CALLBACK_URL" ]; then
+  curl -sf -X POST -H 'Content-Type: application/json' -d @"$SNAP_FILE" "$SNAPSHOT_CALLBACK_URL" || true
+fi
 "#;
 
 	Ok(Job {
