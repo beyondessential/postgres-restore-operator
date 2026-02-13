@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::{
 	api::{batch::v1::Job, core::v1::Secret},
-	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
+	apimachinery::pkg::apis::meta::v1::Time,
 };
 use kube::{
 	Api, Resource, ResourceExt,
@@ -127,52 +127,57 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	replica.update_connection_info(client).await?;
 
-	// Reconcile overlay database if configured
+	// Reconcile overlay database if configured, but only after the first
+	// restore exists so we know the real snapshot size.
 	if replica.spec.overlay_database.is_some() {
-		// Try to get snapshot size from active restore
 		let restores_api: Api<PostgresPhysicalRestore> =
 			Api::namespaced(client.clone(), &namespace);
-		let snapshot_size = if let Some(current_restore_name) = replica
+		let snapshot_size = match replica
 			.status
 			.as_ref()
 			.and_then(|s| s.current_restore.as_ref())
 		{
-			if let Ok(current_restore) = restores_api.get(current_restore_name).await {
-				current_restore.spec.snapshot_size.clone()
-			} else {
-				Quantity("0".to_string())
-			}
-		} else {
-			Quantity("0".to_string())
+			Some(current_restore_name) => match restores_api.get(current_restore_name).await {
+				Ok(current_restore) => Some(current_restore.spec.snapshot_size.clone()),
+				Err(_) => None,
+			},
+			None => None,
 		};
 
-		match overlay::reconcile_overlay(client, &namespace, &replica, &snapshot_size).await {
-			Ok((cluster_ready, storage_size, pg_version)) => {
-				let replicas_api: Api<PostgresPhysicalReplica> =
-					Api::namespaced(client.clone(), &namespace);
-				let cluster_name = overlay::overlay_cluster_name(&name);
-				let patch = serde_json::json!({
-					"status": {
-						"overlayClusterName": cluster_name,
-						"overlayStorageSize": storage_size,
-						"overlayPostgresVersion": pg_version,
-					}
-				});
-				replicas_api
-					.patch_status(
-						&name,
-						&PatchParams::apply("postgres-restore-operator"),
-						&Patch::Merge(&patch),
-					)
-					.await?;
+		if let Some(snapshot_size) = snapshot_size {
+			match overlay::reconcile_overlay(client, &namespace, &replica, &snapshot_size).await {
+				Ok((cluster_ready, storage_size, pg_version)) => {
+					let replicas_api: Api<PostgresPhysicalReplica> =
+						Api::namespaced(client.clone(), &namespace);
+					let cluster_name = overlay::overlay_cluster_name(&name);
+					let patch = serde_json::json!({
+						"status": {
+							"overlayClusterName": cluster_name,
+							"overlayStorageSize": storage_size,
+							"overlayPostgresVersion": pg_version,
+						}
+					});
+					replicas_api
+						.patch_status(
+							&name,
+							&PatchParams::apply("postgres-restore-operator"),
+							&Patch::Merge(&patch),
+						)
+						.await?;
 
-				if !cluster_ready {
-					info!(replica = name, "overlay cluster not yet ready, will retry");
+					if !cluster_ready {
+						info!(replica = name, "overlay cluster not yet ready, will retry");
+					}
+				}
+				Err(e) => {
+					warn!(replica = name, error = %e, "failed to reconcile overlay database");
 				}
 			}
-			Err(e) => {
-				warn!(replica = name, error = %e, "failed to reconcile overlay database");
-			}
+		} else {
+			debug!(
+				replica = name,
+				"no active restore yet, deferring overlay creation until first snapshot"
+			);
 		}
 	}
 
