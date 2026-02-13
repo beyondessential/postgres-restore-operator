@@ -276,28 +276,7 @@ async fn main() -> anyhow::Result<()> {
 		ctx: ctx.clone(),
 	};
 	tokio::spawn(async move {
-		let app = Router::new()
-			.route(
-				"/metrics",
-				get(move || {
-					let registry = metrics_registry.clone();
-					async move {
-						let mut buffer = Vec::new();
-						let encoder = prometheus::TextEncoder::new();
-						let metric_families = registry.gather();
-						encoder.encode(&metric_families, &mut buffer).unwrap();
-						String::from_utf8(buffer).unwrap()
-					}
-				}),
-			)
-			.route("/livez", get(livez))
-			.route("/readyz", get(readyz))
-			.route(
-				"/api/v1/snapshot-results/:namespace/:replica",
-				axum::routing::post(post_snapshot_results),
-			)
-			.with_state(server_state)
-			.layer(TraceLayer::new_for_http());
+		let app = build_router(server_state, metrics_registry);
 
 		let listener = tokio::net::TcpListener::bind(&metrics_addr_clone)
 			.await
@@ -370,6 +349,31 @@ struct ServerState {
 	ctx: Arc<Context>,
 }
 
+fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> Router {
+	Router::new()
+		.route(
+			"/metrics",
+			get(move || {
+				let registry = metrics_registry.clone();
+				async move {
+					let mut buffer = Vec::new();
+					let encoder = prometheus::TextEncoder::new();
+					let metric_families = registry.gather();
+					encoder.encode(&metric_families, &mut buffer).unwrap();
+					String::from_utf8(buffer).unwrap()
+				}
+			}),
+		)
+		.route("/livez", get(livez))
+		.route("/readyz", get(readyz))
+		.route(
+			"/api/v1/snapshot-results/{namespace}/{replica}",
+			axum::routing::post(post_snapshot_results),
+		)
+		.with_state(state)
+		.layer(TraceLayer::new_for_http())
+}
+
 /// Accept snapshot-list JSON POSTed by a job.
 async fn post_snapshot_results(
 	State(state): State<ServerState>,
@@ -416,5 +420,21 @@ async fn readyz(State(state): State<ServerState>) -> (StatusCode, &'static str) 
 			"readiness check failed: heartbeat stale"
 		);
 		(StatusCode::SERVICE_UNAVAILABLE, "not ready")
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn router_is_constructible() {
+		let _: Router<ServerState> = Router::new()
+			.route("/livez", get(livez))
+			.route("/readyz", get(readyz))
+			.route(
+				"/api/v1/snapshot-results/{namespace}/{replica}",
+				axum::routing::post(post_snapshot_results),
+			);
 	}
 }
