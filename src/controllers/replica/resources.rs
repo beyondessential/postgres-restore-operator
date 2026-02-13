@@ -100,11 +100,14 @@ kopia repository connect s3 \
   --password="$KOPIA_PASSWORD" \
   $ENDPOINT_ARGS
 
-SNAPSHOTS=$(kopia snapshot list --json --all 2>/dev/null || echo "[]")
+SNAP_FILE=$(mktemp)
+trap 'rm -f "$SNAP_FILE" "$SNAP_FILE.tmp" "$SNAP_FILE.latest"' EXIT
+
+kopia snapshot list --json --all 2>/dev/null > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
 
 if [ -n "$FILTER_HOST_PATTERN" ]; then
   REGEX=$(printf '%s' "$FILTER_HOST_PATTERN" | sed 's/\./\\./g; s/\*/\.\*/g; s/\?/\./g')
-  SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg pat "^${REGEX}$" '[.[] | select(.source.host != null and (.source.host | test($pat)))]')
+  jq -c --arg pat "^${REGEX}$" '[.[] | select(.source.host != null and (.source.host | test($pat)))]' "$SNAP_FILE" > "$SNAP_FILE.tmp" && mv "$SNAP_FILE.tmp" "$SNAP_FILE"
 fi
 
 if [ -n "$FILTER_TAGS" ]; then
@@ -114,20 +117,20 @@ EOF
   for tag in $TAG_LIST; do
     KEY="${tag%%=*}"
     VALUE="${tag#*=}"
-    SNAPSHOTS=$(echo "$SNAPSHOTS" | jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v or .tags["tag:" + $k] == $v)]')
+    jq -c --arg k "$KEY" --arg v "$VALUE" '[.[] | select(.tags[$k] == $v or .tags["tag:" + $k] == $v)]' "$SNAP_FILE" > "$SNAP_FILE.tmp" && mv "$SNAP_FILE.tmp" "$SNAP_FILE"
   done
 fi
 
-LATEST=$(echo "$SNAPSHOTS" | jq -c 'sort_by(.startTime) | last // empty')
+jq -c 'sort_by(.startTime) | last // empty' "$SNAP_FILE" > "$SNAP_FILE.latest"
 
-if [ -z "$LATEST" ] || [ "$LATEST" = "null" ]; then
+if [ ! -s "$SNAP_FILE.latest" ] || [ "$(cat "$SNAP_FILE.latest")" = "null" ]; then
   echo "No matching snapshots found"
   printf '{}' > /dev/termination-log
   exit 0
 fi
 
-ID=$(echo "$LATEST" | jq -r '.id')
-SIZE=$(echo "$LATEST" | jq -r '.stats.totalSize // 0')
+ID=$(jq -r '.id' "$SNAP_FILE.latest")
+SIZE=$(jq -r '.stats.totalSize // 0' "$SNAP_FILE.latest")
 echo "Latest snapshot: id=$ID size=$SIZE"
 printf '{"id":"%s","size":%s}' "$ID" "$SIZE" > /dev/termination-log
 "#;
