@@ -157,15 +157,14 @@ jobs:
           load_image() {
             local image="$1"
             docker pull --platform linux/amd64 "$image"
-            for attempt in 1 2 3; do
-              if kind load docker-image "$image"; then
-                return 0
-              fi
-              echo "kind load failed for $image (attempt $attempt/3), retrying..."
-              sleep 3
-            done
-            echo "Failed to load $image after 3 attempts"
-            return 1
+            if kind load docker-image "$image" 2>/dev/null; then
+              return 0
+            fi
+            echo "kind load docker-image failed for $image, falling back to image-archive..."
+            local archive="/tmp/$(echo "$image" | tr '/:' '_').tar"
+            docker save "$image" -o "$archive"
+            kind load image-archive "$archive"
+            rm -f "$archive"
           }
 
           load_image minio/minio:latest
@@ -181,15 +180,14 @@ jobs:
           load_image() {
             local image="$1"
             docker pull --platform linux/amd64 "$image"
-            for attempt in 1 2 3; do
-              if kind load docker-image "$image"; then
-                return 0
-              fi
-              echo "kind load failed for $image (attempt $attempt/3), retrying..."
-              sleep 3
-            done
-            echo "Failed to load $image after 3 attempts"
-            return 1
+            if kind load docker-image "$image" 2>/dev/null; then
+              return 0
+            fi
+            echo "kind load docker-image failed for $image, falling back to image-archive..."
+            local archive="/tmp/$(echo "$image" | tr '/:' '_').tar"
+            docker save "$image" -o "$archive"
+            kind load image-archive "$archive"
+            rm -f "$archive"
           }
 
           load_image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
