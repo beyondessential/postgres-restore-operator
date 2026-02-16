@@ -507,6 +507,7 @@ sed -i \
   -e '/^[[:space:]]*restore_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*archive_cleanup_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*lc_[a-z]*[[:space:]]*=/d' \
+  -e '/^[[:space:]]*default_transaction_read_only[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
 

@@ -190,6 +190,7 @@ fn init_script_strips_source_host_config_overrides() {
 		"restore_command",
 		"archive_cleanup_command",
 		"lc_[a-z]",
+		"default_transaction_read_only",
 	] {
 		assert!(
 			script.contains(setting),
