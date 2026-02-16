@@ -511,6 +511,9 @@ sed -i \
   "$PGDATA/postgresql.conf"
 echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
 
+echo "Truncating postgresql.auto.conf to discard ALTER SYSTEM overrides from source..."
+: > "$PGDATA/postgresql.auto.conf"
+
 if [ ! -f "$PGDATA/pg_ident.conf" ]; then
   echo "Creating empty pg_ident.conf..."
   touch "$PGDATA/pg_ident.conf"

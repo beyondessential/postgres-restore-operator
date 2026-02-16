@@ -205,6 +205,10 @@ fn init_script_strips_source_host_config_overrides() {
 		script.contains("UPDATE pg_database"),
 		"init script must fix database locales via pg_database update"
 	);
+	assert!(
+		script.contains("postgresql.auto.conf"),
+		"init script must truncate postgresql.auto.conf"
+	);
 }
 
 #[test]
