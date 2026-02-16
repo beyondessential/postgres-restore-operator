@@ -503,14 +503,38 @@ sed -i \
   -e '/^[[:space:]]*dynamic_shared_memory_type[[:space:]]*=/d' \
   -e '/^[[:space:]]*log_destination[[:space:]]*=/d' \
   -e '/^[[:space:]]*logging_collector[[:space:]]*=/d' \
+  -e '/^[[:space:]]*log_directory[[:space:]]*=/d' \
+  -e '/^[[:space:]]*log_filename[[:space:]]*=/d' \
+  -e '/^[[:space:]]*log_file_mode[[:space:]]*=/d' \
+  -e '/^[[:space:]]*log_rotation_age[[:space:]]*=/d' \
+  -e '/^[[:space:]]*log_rotation_size[[:space:]]*=/d' \
+  -e '/^[[:space:]]*log_truncate_on_rotation[[:space:]]*=/d' \
   -e '/^[[:space:]]*archive_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*restore_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*archive_cleanup_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*lc_[a-z]*[[:space:]]*=/d' \
   -e '/^[[:space:]]*default_transaction_read_only[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
-echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
-echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
+
+PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
+if [ "$PG_MAJOR" -ge 15 ]; then
+  echo "Configuring JSON logging (PG >= 15)..."
+  cat >> "$PGDATA/postgresql.conf" << 'LOGEOF'
+logging_collector = on
+log_destination = 'jsonlog'
+log_directory = '/pgdata/pgdata/log'
+log_filename = 'postgresql.json'
+log_file_mode = 0600
+log_rotation_age = 0
+log_rotation_size = 0
+log_truncate_on_rotation = on
+LOGEOF
+  mkdir -p /pgdata/pgdata/log
+else
+  echo "Configuring stderr logging (PG < 15)..."
+  echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
+  echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
+fi
 
 echo "Truncating postgresql.auto.conf to discard ALTER SYSTEM overrides from source..."
 : > "$PGDATA/postgresql.auto.conf"
@@ -548,7 +572,6 @@ UPDATE pg_collation
 COLLEOF
 done
 
-PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
 echo "Detected PG major version: $PG_MAJOR"
 
 if [ "$PG_MAJOR" -ge 14 ]; then
@@ -700,11 +723,18 @@ echo "Auth setup complete"
 					containers: vec![Container {
 						name: "postgres".to_string(),
 						image: Some(pg_image),
-						args: Some(vec![
-							"postgres".to_string(),
-							"-D".to_string(),
-							"/pgdata/pgdata".to_string(),
-						]),
+						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+						args: Some(vec![format!(
+							r#"if [ -d /pgdata/pgdata/log ]; then
+  postgres -D /pgdata/pgdata &
+  PG_PID=$!
+  while [ ! -f /pgdata/pgdata/log/postgresql.json ]; do sleep 0.1; done
+  tail -f /pgdata/pgdata/log/postgresql.json &
+  wait $PG_PID
+else
+  exec postgres -D /pgdata/pgdata
+fi"#
+						)]),
 						env: Some(vec![
 							EnvVar {
 								name: "PGDATA".to_string(),

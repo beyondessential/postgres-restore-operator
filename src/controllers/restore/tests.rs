@@ -186,6 +186,12 @@ fn init_script_strips_source_host_config_overrides() {
 		"dynamic_shared_memory_type",
 		"log_destination",
 		"logging_collector",
+		"log_directory",
+		"log_filename",
+		"log_file_mode",
+		"log_rotation_age",
+		"log_rotation_size",
+		"log_truncate_on_rotation",
 		"archive_command",
 		"restore_command",
 		"archive_cleanup_command",
@@ -198,8 +204,12 @@ fn init_script_strips_source_host_config_overrides() {
 		);
 	}
 	assert!(
-		script.contains("log_destination = 'stderr'\" >> \"$PGDATA/postgresql.conf\""),
-		"init script must append log_destination = stderr to postgresql.conf"
+		script.contains("log_destination = 'jsonlog'"),
+		"init script must configure jsonlog for PG >= 15"
+	);
+	assert!(
+		script.contains("log_destination = 'stderr'"),
+		"init script must configure stderr logging for PG < 15"
 	);
 	assert!(
 		script.contains("UPDATE pg_database"),
