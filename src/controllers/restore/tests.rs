@@ -188,6 +188,7 @@ fn init_script_strips_source_host_config_overrides() {
 		"archive_command",
 		"restore_command",
 		"archive_cleanup_command",
+		"lc_[a-z]",
 	] {
 		assert!(
 			script.contains(setting),

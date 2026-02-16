@@ -505,6 +505,7 @@ sed -i \
   -e '/^[[:space:]]*archive_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*restore_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*archive_cleanup_command[[:space:]]*=/d' \
+  -e '/^[[:space:]]*lc_[a-z]*[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 
 if [ ! -f "$PGDATA/pg_ident.conf" ]; then
