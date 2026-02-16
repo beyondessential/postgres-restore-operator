@@ -534,6 +534,15 @@ UPDATE pg_database
  WHERE datcollate <> 'C' OR datctype <> 'C';
 LOCALEEOF
 
+for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+  echo "Fixing collations in database: $db"
+  psql -U postgres -d "$db" << 'COLLEOF'
+UPDATE pg_collation
+   SET collcollate = 'C', collctype = 'C'
+ WHERE collname = 'default';
+COLLEOF
+done
+
 PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
 echo "Detected PG major version: $PG_MAJOR"
 
