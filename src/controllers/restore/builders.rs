@@ -522,14 +522,11 @@ if [ "$PG_MAJOR" -ge 15 ]; then
   cat >> "$PGDATA/postgresql.conf" << 'LOGEOF'
 logging_collector = on
 log_destination = 'jsonlog'
-log_directory = '/pgdata/pgdata/log'
-log_filename = 'postgresql.json'
-log_file_mode = 0600
+log_directory = '/dev'
+log_filename = 'stderr'
 log_rotation_age = 0
 log_rotation_size = 0
-log_truncate_on_rotation = on
 LOGEOF
-  mkdir -p /pgdata/pgdata/log
 else
   echo "Configuring stderr logging (PG < 15)..."
   echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
@@ -724,17 +721,7 @@ echo "Auth setup complete"
 						name: "postgres".to_string(),
 						image: Some(pg_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![format!(
-							r#"if [ -d /pgdata/pgdata/log ]; then
-  postgres -D /pgdata/pgdata &
-  PG_PID=$!
-  while [ ! -f /pgdata/pgdata/log/postgresql.json ]; do sleep 0.1; done
-  tail -f /pgdata/pgdata/log/postgresql.json &
-  wait $PG_PID
-else
-  exec postgres -D /pgdata/pgdata
-fi"#
-						)]),
+						args: Some(vec!["exec postgres -D /pgdata/pgdata".to_string()]),
 						env: Some(vec![
 							EnvVar {
 								name: "PGDATA".to_string(),
