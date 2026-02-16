@@ -90,15 +90,11 @@ jobs:
       - name: Generate CRDs
         run: cargo run --bin gen-crds > crds.yaml
 
-      - name: Disable Docker containerd image store
+      - name: Install crane
         run: |
-          # Newer runner images enable the containerd snapshotter by default,
-          # which breaks `kind load docker-image` (docker save emits a
-          # multi-arch manifest index referencing blobs that were never pulled).
-          sudo mkdir -p /etc/docker
-          echo '{"features":{"containerd-snapshotter":false}}' | sudo tee /etc/docker/daemon.json
-          sudo systemctl restart docker
-          docker info | grep -i storage
+          CRANE_VERSION=v0.20.3
+          curl -fsSL "https://github.com/google/go-containerregistry/releases/download/${CRANE_VERSION}/go-containerregistry_Linux_x86_64.tar.gz" \
+            | sudo tar -xzf - -C /usr/local/bin crane
 
       - name: Install kind
         run: |
@@ -164,20 +160,34 @@ jobs:
 
       - name: Pre-pull images on kind node
         run: |
-          docker pull minio/minio:latest
-          docker pull minio/mc:latest
-          docker pull kopia/kopia:0.22.3
-          docker pull postgres:16
-          docker pull postgres:16-alpine
-          docker pull alpine:latest
-          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:0.22.3 postgres:16 postgres:16-alpine alpine:latest
+          load_image() {
+            local image="$1"
+            local archive="/tmp/$(echo "$image" | tr '/:' '_').tar"
+            crane pull --platform linux/amd64 "$image" "$archive"
+            kind load image-archive "$archive"
+            rm -f "$archive"
+          }
+
+          load_image minio/minio:latest
+          load_image minio/mc:latest
+          load_image kopia/kopia:0.22.3
+          load_image postgres:16
+          load_image postgres:16-alpine
+          load_image alpine:latest
 
       - name: Pre-pull CNPG images
         if: matrix.needs_cnpg
         run: |
-          docker pull ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
-          docker pull ghcr.io/cloudnative-pg/postgresql:17
-          kind load docker-image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1 ghcr.io/cloudnative-pg/postgresql:17
+          load_image() {
+            local image="$1"
+            local archive="/tmp/$(echo "$image" | tr '/:' '_').tar"
+            crane pull --platform linux/amd64 "$image" "$archive"
+            kind load image-archive "$archive"
+            rm -f "$archive"
+          }
+
+          load_image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
+          load_image ghcr.io/cloudnative-pg/postgresql:17
 
       - name: Install CNPG operator
         if: matrix.needs_cnpg
