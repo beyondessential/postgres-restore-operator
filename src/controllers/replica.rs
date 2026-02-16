@@ -283,7 +283,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.as_ref()
 			.and_then(|s| s.overlay_fdw_restore.as_ref());
 
-		if let Some(current) = current_restore {
+		if let Some(current) = current_restore.filter(|_| active_restore.is_some()) {
 			debug!(
 				replica = name,
 				current_restore = %current,
