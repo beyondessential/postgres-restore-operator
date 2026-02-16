@@ -184,7 +184,7 @@ fn init_script_strips_source_host_config_overrides() {
 		"ident_file",
 		"data_directory",
 		"dynamic_shared_memory_type",
-		"log_destination",
+		"logging_collector",
 		"archive_command",
 		"restore_command",
 		"archive_cleanup_command",
@@ -195,6 +195,10 @@ fn init_script_strips_source_host_config_overrides() {
 			"init script must strip {setting} from postgresql.conf"
 		);
 	}
+	assert!(
+		script.contains("log_destination = 'stderr'"),
+		"init script must rewrite log_destination to stderr"
+	);
 }
 
 #[test]
