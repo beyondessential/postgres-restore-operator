@@ -534,7 +534,7 @@ pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w s
 echo "Fixing database locales incompatible with this OS..."
 psql -U postgres -d postgres << 'LOCALEEOF'
 UPDATE pg_database
-   SET datcollate = 'C', datctype = 'C'
+   SET datcollate = 'C', datctype = 'C', datcollversion = NULL
  WHERE datcollate <> 'C' OR datctype <> 'C';
 LOCALEEOF
 
