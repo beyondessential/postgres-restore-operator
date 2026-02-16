@@ -200,6 +200,10 @@ fn init_script_strips_source_host_config_overrides() {
 		script.contains("log_destination = 'stderr'\" >> \"$PGDATA/postgresql.conf\""),
 		"init script must append log_destination = stderr to postgresql.conf"
 	);
+	assert!(
+		script.contains("UPDATE pg_database"),
+		"init script must fix database locales via pg_database update"
+	);
 }
 
 #[test]

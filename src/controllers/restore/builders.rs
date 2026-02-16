@@ -527,6 +527,13 @@ HBAEOF
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
 
+echo "Fixing database locales incompatible with this OS..."
+psql -U postgres -d postgres << 'LOCALEEOF'
+UPDATE pg_database
+   SET datcollate = 'C', datctype = 'C'
+ WHERE datcollate <> 'C' OR datctype <> 'C';
+LOCALEEOF
+
 PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
 echo "Detected PG major version: $PG_MAJOR"
 
