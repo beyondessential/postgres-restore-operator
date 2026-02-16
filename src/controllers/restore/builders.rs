@@ -469,7 +469,7 @@ EXTRACONFEOF"#
 	};
 
 	let init_script = format!(
-		r#"set -e
+		r#"set -ex
 PGDATA=/pgdata/pgdata
 
 chmod 0750 "$PGDATA"
