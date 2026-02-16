@@ -90,6 +90,15 @@ jobs:
       - name: Generate CRDs
         run: cargo run --bin gen-crds > crds.yaml
 
+      - name: Disable Docker containerd image store
+        run: |
+          # Newer runner images enable the containerd snapshotter by default,
+          # which breaks `kind load docker-image` (docker save emits a
+          # multi-arch manifest index referencing blobs that were never pulled).
+          sudo mkdir -p /etc/docker
+          echo '{}' | sudo tee /etc/docker/daemon.json
+          sudo systemctl restart docker
+
       - name: Install kind
         run: |
           curl -fsSLo ./kind https://kind.sigs.k8s.io/dl/v0.27.0/kind-linux-amd64
@@ -154,44 +163,20 @@ jobs:
 
       - name: Pre-pull images on kind node
         run: |
-          load_image() {
-            local image="$1"
-            docker pull --platform linux/amd64 "$image"
-            if kind load docker-image "$image" 2>/dev/null; then
-              return 0
-            fi
-            echo "kind load docker-image failed for $image, falling back to image-archive..."
-            local archive="/tmp/$(echo "$image" | tr '/:' '_').tar"
-            docker save "$image" -o "$archive"
-            kind load image-archive "$archive"
-            rm -f "$archive"
-          }
-
-          load_image minio/minio:latest
-          load_image minio/mc:latest
-          load_image kopia/kopia:0.22.3
-          load_image postgres:16
-          load_image postgres:16-alpine
-          load_image alpine:latest
+          docker pull minio/minio:latest
+          docker pull minio/mc:latest
+          docker pull kopia/kopia:0.22.3
+          docker pull postgres:16
+          docker pull postgres:16-alpine
+          docker pull alpine:latest
+          kind load docker-image minio/minio:latest minio/mc:latest kopia/kopia:0.22.3 postgres:16 postgres:16-alpine alpine:latest
 
       - name: Pre-pull CNPG images
         if: matrix.needs_cnpg
         run: |
-          load_image() {
-            local image="$1"
-            docker pull --platform linux/amd64 "$image"
-            if kind load docker-image "$image" 2>/dev/null; then
-              return 0
-            fi
-            echo "kind load docker-image failed for $image, falling back to image-archive..."
-            local archive="/tmp/$(echo "$image" | tr '/:' '_').tar"
-            docker save "$image" -o "$archive"
-            kind load image-archive "$archive"
-            rm -f "$archive"
-          }
-
-          load_image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
-          load_image ghcr.io/cloudnative-pg/postgresql:17
+          docker pull ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1
+          docker pull ghcr.io/cloudnative-pg/postgresql:17
+          kind load docker-image ghcr.io/cloudnative-pg/cloudnative-pg:1.25.1 ghcr.io/cloudnative-pg/postgresql:17
 
       - name: Install CNPG operator
         if: matrix.needs_cnpg
