@@ -118,7 +118,7 @@ data: {}
 apiVersion: v1
 kind: Service
 metadata:
-    name: postgres-restore-operator-metrics
+    name: postgres-restore-operator
     namespace: pgro-system
     labels:
         app.kubernetes.io/name: postgres-restore-operator
@@ -129,9 +129,9 @@ metadata:
         prometheus.io/scrape: "true"
 spec:
     ports:
-        - name: metrics
+        - name: http
           port: 8080
-          targetPort: metrics
+          targetPort: http
     selector:
         app.kubernetes.io/name: postgres-restore-operator
         app.kubernetes.io/component: controller
@@ -178,21 +178,21 @@ spec:
                             fieldRef:
                                 fieldPath: metadata.namespace
                       - name: OPERATOR_SERVICE_NAME
-                        value: postgres-restore-operator-metrics
+                        value: postgres-restore-operator
                   ports:
-                      - name: metrics
+                      - name: http
                         containerPort: 8080
                         protocol: TCP
                   readinessProbe:
                       httpGet:
                           path: /readyz
-                          port: metrics
+                          port: http
                       initialDelaySeconds: 5
                       periodSeconds: 10
                   livenessProbe:
                       httpGet:
                           path: /livez
-                          port: metrics
+                          port: http
                       initialDelaySeconds: 15
                       periodSeconds: 20
                   resources:
