@@ -155,7 +155,7 @@ fn restore_job_has_ttl_seconds_after_finished() {
 }
 
 #[test]
-fn init_script_strips_dynamic_shared_memory_type() {
+fn init_script_strips_source_host_config_overrides() {
 	let (mut restore, replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("16".to_string()),
@@ -179,10 +179,21 @@ fn init_script_strips_dynamic_shared_memory_type() {
 		.find(|c| c.name == "setup-auth")
 		.expect("must have setup-auth init container");
 	let script = setup_auth.args.as_ref().unwrap().first().unwrap();
-	assert!(
-		script.contains("dynamic_shared_memory_type"),
-		"init script must strip dynamic_shared_memory_type from postgresql.conf"
-	);
+	for setting in [
+		"hba_file",
+		"ident_file",
+		"data_directory",
+		"dynamic_shared_memory_type",
+		"log_destination",
+		"archive_command",
+		"restore_command",
+		"archive_cleanup_command",
+	] {
+		assert!(
+			script.contains(setting),
+			"init script must strip {setting} from postgresql.conf"
+		);
+	}
 }
 
 #[test]

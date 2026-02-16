@@ -501,6 +501,10 @@ sed -i \
   -e '/^[[:space:]]*ident_file[[:space:]]*=/d' \
   -e '/^[[:space:]]*data_directory[[:space:]]*=/d' \
   -e '/^[[:space:]]*dynamic_shared_memory_type[[:space:]]*=/d' \
+  -e '/^[[:space:]]*log_destination[[:space:]]*=/d' \
+  -e '/^[[:space:]]*archive_command[[:space:]]*=/d' \
+  -e '/^[[:space:]]*restore_command[[:space:]]*=/d' \
+  -e '/^[[:space:]]*archive_cleanup_command[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 
 if [ ! -f "$PGDATA/pg_ident.conf" ]; then
