@@ -155,6 +155,37 @@ fn restore_job_has_ttl_seconds_after_finished() {
 }
 
 #[test]
+fn init_script_strips_dynamic_shared_memory_type() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let init_containers = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap()
+		.init_containers
+		.as_ref()
+		.unwrap();
+	let setup_auth = init_containers
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("must have setup-auth init container");
+	let script = setup_auth.args.as_ref().unwrap().first().unwrap();
+	assert!(
+		script.contains("dynamic_shared_memory_type"),
+		"init script must strip dynamic_shared_memory_type from postgresql.conf"
+	);
+}
+
+#[test]
 fn version_detect_job_has_ttl_seconds_after_finished() {
 	let (restore, _replica) = test_restore_and_replica();
 	let job = build_version_detect_job(&restore, "test-version-detect", "default", "test-pvc");

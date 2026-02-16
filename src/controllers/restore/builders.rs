@@ -500,6 +500,7 @@ sed -i \
   -e '/^[[:space:]]*hba_file[[:space:]]*=/d' \
   -e '/^[[:space:]]*ident_file[[:space:]]*=/d' \
   -e '/^[[:space:]]*data_directory[[:space:]]*=/d' \
+  -e '/^[[:space:]]*dynamic_shared_memory_type[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 
 if [ ! -f "$PGDATA/pg_ident.conf" ]; then
