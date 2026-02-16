@@ -177,6 +177,8 @@ spec:
                         valueFrom:
                             fieldRef:
                                 fieldPath: metadata.namespace
+                      - name: OPERATOR_SERVICE_NAME
+                        value: postgres-restore-operator-metrics
                   ports:
                       - name: metrics
                         containerPort: 8080
