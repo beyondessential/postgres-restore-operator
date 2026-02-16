@@ -437,6 +437,20 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				);
 
 			let Some(ref raw) = raw else {
+				let completion_time = job.status.as_ref().and_then(|s| s.completion_time.as_ref());
+				let stale = completion_time
+					.is_some_and(|t| now.duration_since(t.0) > SignedDuration::from_secs(60));
+				if stale {
+					warn!(
+						replica = name,
+						job = snapshot_job_name,
+						"snapshot list job results unreadable after 60s, deleting stale job"
+					);
+					if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
+						warn!(job = snapshot_job_name, error = %e, "failed to delete stale snapshot list job");
+					}
+					return Ok(Action::requeue(Duration::from_secs(10)));
+				}
 				info!(
 					replica = name,
 					job = snapshot_job_name,
