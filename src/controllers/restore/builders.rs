@@ -510,6 +510,7 @@ sed -i \
   -e '/^[[:space:]]*default_transaction_read_only[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
+echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
 
 echo "Truncating postgresql.auto.conf to discard ALTER SYSTEM overrides from source..."
 : > "$PGDATA/postgresql.auto.conf"
