@@ -646,7 +646,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			&snapshot_job_name,
 			&namespace,
 			&ctx.kopia_image(),
-			callback_url.as_deref(),
+			&callback_url,
 		)?;
 		jobs.create(&PostParams::default(), &job).await?;
 		return Ok(Action::requeue(Duration::from_secs(10)));

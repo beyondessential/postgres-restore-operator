@@ -44,7 +44,7 @@ pub fn build_snapshot_list_job(
 	job_name: &str,
 	namespace: &str,
 	kopia_image: &str,
-	callback_url: Option<&str>,
+	callback_url: &str,
 ) -> Result<Job> {
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let replica_name = replica.name_any();
@@ -59,13 +59,11 @@ pub fn build_snapshot_list_job(
 		env_from_secret_optional("KOPIA_DISABLE_TLS", kopia_secret, "disableTls"),
 	];
 
-	if let Some(url) = callback_url {
-		env_vars.push(EnvVar {
-			name: "SNAPSHOT_CALLBACK_URL".to_string(),
-			value: Some(url.to_string()),
-			..Default::default()
-		});
-	}
+	env_vars.push(EnvVar {
+		name: "SNAPSHOT_CALLBACK_URL".to_string(),
+		value: Some(callback_url.to_string()),
+		..Default::default()
+	});
 
 	let script = r#"set -e
 

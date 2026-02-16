@@ -141,22 +141,25 @@ async fn main() -> anyhow::Result<()> {
 		read_config(&client, &namespace).await;
 
 	let callback_base_url = if let Ok(url) = std::env::var("CALLBACK_BASE_URL") {
-		Some(url)
+		url
 	} else if let Ok(svc) = std::env::var("OPERATOR_SERVICE_NAME") {
 		let port: u16 = metrics_addr
 			.rsplit_once(':')
 			.and_then(|(_, p)| p.parse().ok())
 			.unwrap_or(DEFAULT_METRICS_PORT);
-		Some(format!("http://{svc}.{namespace}.svc:{port}"))
+		format!("http://{svc}.{namespace}.svc:{port}")
 	} else {
-		None
+		panic!(
+			"either CALLBACK_BASE_URL or OPERATOR_SERVICE_NAME must be set \
+			 so that snapshot-list jobs can POST results back to the operator"
+		);
 	};
 
 	info!(
 		max_concurrent_restores,
 		kopia_image,
 		use_port_forward,
-		?callback_base_url,
+		%callback_base_url,
 		metrics_addr,
 		operator_namespace = namespace,
 		version = env!("CARGO_PKG_VERSION"),
@@ -444,7 +447,7 @@ mod tests {
 			DEFAULT_MAX_CONCURRENT_RESTORES,
 			DEFAULT_KOPIA_IMAGE.to_string(),
 			false,
-			None,
+			"http://test.svc:8080".to_string(),
 		));
 		let heartbeat = Arc::new(AtomicI64::new(Timestamp::now().as_second()));
 		let state = ServerState { heartbeat, ctx };

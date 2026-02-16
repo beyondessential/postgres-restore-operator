@@ -28,8 +28,7 @@ pub struct Context {
 	pub snapshot_results: Arc<Mutex<HashMap<String, String>>>,
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
-	/// `None` when running out-of-cluster (dev mode).
-	pub callback_base_url: Option<String>,
+	pub callback_base_url: String,
 }
 
 impl Context {
@@ -38,7 +37,7 @@ impl Context {
 		max_concurrent_restores: usize,
 		kopia_image: String,
 		use_port_forward: bool,
-		callback_base_url: Option<String>,
+		callback_base_url: String,
 	) -> Self {
 		let reporter = Reporter::from("postgres-restore-operator");
 		let recorder = Recorder::new(client.clone(), reporter);
@@ -70,10 +69,11 @@ impl Context {
 	}
 
 	/// Build the full callback URL for a snapshot-list job to POST results to.
-	pub fn snapshot_callback_url(&self, namespace: &str, replica: &str) -> Option<String> {
-		self.callback_base_url
-			.as_ref()
-			.map(|base| format!("{base}/api/v1/snapshot-results/{namespace}/{replica}"))
+	pub fn snapshot_callback_url(&self, namespace: &str, replica: &str) -> String {
+		format!(
+			"{}/api/v1/snapshot-results/{namespace}/{replica}",
+			self.callback_base_url
+		)
 	}
 
 	/// Take snapshot results from the in-memory store, removing them.
