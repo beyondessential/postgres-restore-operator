@@ -96,8 +96,9 @@ jobs:
           # which breaks `kind load docker-image` (docker save emits a
           # multi-arch manifest index referencing blobs that were never pulled).
           sudo mkdir -p /etc/docker
-          echo '{}' | sudo tee /etc/docker/daemon.json
+          echo '{"features":{"containerd-snapshotter":false}}' | sudo tee /etc/docker/daemon.json
           sudo systemctl restart docker
+          docker info | grep -i storage
 
       - name: Install kind
         run: |
