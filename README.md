@@ -4,7 +4,7 @@ Monitors a Kopia backup repository for "physical" backups of PostgreSQL database
 
 > [!WARNING]
 > This is an internal project of BES.au, used in our data and analytics infrastructure, as well as for backup operations and testing purposes.
-> As such no guarantees are made about stability beyond our internal usage.
+> As such no guarantees are made about stability beyond our internals.
 
 ## Install
 
