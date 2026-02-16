@@ -427,14 +427,29 @@ async fn readyz(State(state): State<ServerState>) -> (StatusCode, &'static str) 
 mod tests {
 	use super::*;
 
-	#[test]
-	fn router_is_constructible() {
-		let _: Router<ServerState> = Router::new()
-			.route("/livez", get(livez))
-			.route("/readyz", get(readyz))
-			.route(
-				"/api/v1/snapshot-results/{namespace}/{replica}",
-				axum::routing::post(post_snapshot_results),
-			);
+	fn dummy_client() -> kube::Client {
+		let svc = tower::service_fn(|_req: http::Request<kube::client::Body>| async {
+			Ok::<_, std::convert::Infallible>(http::Response::new(http_body_util::Empty::<
+				bytes::Bytes,
+			>::new()))
+		});
+		kube::Client::new(svc, "default")
+	}
+
+	#[tokio::test]
+	async fn router_is_constructible() {
+		let client = dummy_client();
+		let ctx = Arc::new(Context::new(
+			client,
+			DEFAULT_MAX_CONCURRENT_RESTORES,
+			DEFAULT_KOPIA_IMAGE.to_string(),
+			false,
+			None,
+		));
+		let heartbeat = Arc::new(AtomicI64::new(Timestamp::now().as_second()));
+		let state = ServerState { heartbeat, ctx };
+		let registry = prometheus::Registry::new();
+
+		let _router = build_router(state, registry);
 	}
 }

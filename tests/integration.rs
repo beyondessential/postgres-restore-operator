@@ -1214,11 +1214,8 @@ async fn overlay_fdw_reconciliation() {
 					.status
 					.as_ref()
 					.and_then(|s| s.overlay_fdw_restore.as_ref());
-				if fdw_restore.is_some() {
-					println!(
-						"[overlay-replica] overlayFdwRestore = {}",
-						fdw_restore.unwrap()
-					);
+				if let Some(restore) = fdw_restore {
+					println!("[overlay-replica] overlayFdwRestore = {restore}");
 					return;
 				}
 				println!("[overlay-replica] overlayFdwRestore not set yet");

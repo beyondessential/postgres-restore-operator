@@ -91,7 +91,13 @@ trap 'rm -f "$SNAP_FILE"' EXIT
 kopia snapshot list --json --all 2>/dev/null > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
 cat "$SNAP_FILE"
 if [ -n "$SNAPSHOT_CALLBACK_URL" ]; then
-  curl -sf -X POST -H 'Content-Type: application/json' -d @"$SNAP_FILE" "$SNAPSHOT_CALLBACK_URL" || true
+  SNAP_SIZE=$(wc -c < "$SNAP_FILE")
+  echo "Posting snapshot results (${SNAP_SIZE} bytes) to $SNAPSHOT_CALLBACK_URL" >&2
+  HTTP_CODE=$(curl -s -o /dev/stderr -w '%{http_code}' -X POST \
+    -H 'Content-Type: application/json' \
+    -d @"$SNAP_FILE" \
+    "$SNAPSHOT_CALLBACK_URL" 2>&1) || true
+  echo "Callback response: HTTP $HTTP_CODE" >&2
 fi
 "#;
 
