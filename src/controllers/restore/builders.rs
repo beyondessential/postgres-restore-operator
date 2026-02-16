@@ -721,7 +721,9 @@ echo "Auth setup complete"
 						name: "postgres".to_string(),
 						image: Some(pg_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec!["exec postgres -D /pgdata/pgdata".to_string()]),
+						args: Some(vec![
+							"exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}".to_string(),
+						]),
 						env: Some(vec![
 							EnvVar {
 								name: "PGDATA".to_string(),
