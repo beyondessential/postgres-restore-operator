@@ -184,6 +184,7 @@ fn init_script_strips_source_host_config_overrides() {
 		"ident_file",
 		"data_directory",
 		"dynamic_shared_memory_type",
+		"log_destination",
 		"logging_collector",
 		"archive_command",
 		"restore_command",
@@ -196,8 +197,8 @@ fn init_script_strips_source_host_config_overrides() {
 		);
 	}
 	assert!(
-		script.contains("log_destination = 'stderr'"),
-		"init script must rewrite log_destination to stderr"
+		script.contains("log_destination = 'stderr'\" >> \"$PGDATA/postgresql.conf\""),
+		"init script must append log_destination = stderr to postgresql.conf"
 	);
 }
 
