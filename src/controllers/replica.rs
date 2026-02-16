@@ -568,6 +568,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.and_then(|s| s.last_restore_completed_at.as_ref())
 			.is_none();
 
+	// Detect when the active Restore CR referenced in status has been deleted
+	let active_restore_deleted = active_restore.is_none()
+		&& in_progress_restore.is_none()
+		&& replica
+			.status
+			.as_ref()
+			.and_then(|s| s.current_restore.as_ref())
+			.is_some();
+
 	// Detect if the schedule or jitter has changed since we last computed nextScheduledRestore
 	let current_hash = replica.schedule_input_hash();
 	let schedule_changed = replica
@@ -606,9 +615,18 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		);
 	}
 
+	if active_restore_deleted {
+		info!(
+			replica = name,
+			"active restore CR was deleted, triggering immediate replacement"
+		);
+	}
+
 	let schedule_decision = replica.check_schedule();
 
-	let should_restore = never_restored || matches!(schedule_decision, ScheduleDecision::Trigger);
+	let should_restore = never_restored
+		|| active_restore_deleted
+		|| matches!(schedule_decision, ScheduleDecision::Trigger);
 
 	if should_restore && snapshot_job.is_none() {
 		// Check concurrent restore limit
