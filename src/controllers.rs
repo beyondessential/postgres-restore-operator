@@ -1,5 +1,6 @@
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector, SecretReference};
 use kube::{Api, Client, api::LogParams};
+use tracing::debug;
 
 pub mod overlay;
 pub mod replica;
@@ -123,10 +124,21 @@ pub async fn read_job_pod_logs(
 	container_name: &str,
 ) -> Option<String> {
 	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-	let pod_list = pods
+	let pod_list = match pods
 		.list(&kube::api::ListParams::default().labels(&format!("job-name={job_name}")))
 		.await
-		.ok()?;
+	{
+		Ok(list) => list,
+		Err(e) => {
+			debug!(job = job_name, error = %e, "failed to list pods for job");
+			return None;
+		}
+	};
+
+	if pod_list.items.is_empty() {
+		debug!(job = job_name, "no pods found for job");
+		return None;
+	}
 
 	for pod in &pod_list.items {
 		let Some(pod_name) = pod.metadata.name.as_deref() else {
@@ -137,6 +149,11 @@ pub async fn read_job_pod_logs(
 			.as_ref()
 			.and_then(|s| s.container_statuses.as_ref())
 		else {
+			debug!(
+				pod = pod_name,
+				job = job_name,
+				"pod has no container statuses"
+			);
 			continue;
 		};
 
@@ -150,10 +167,16 @@ pub async fn read_job_pod_logs(
 		});
 
 		if !is_terminated {
+			debug!(
+				pod = pod_name,
+				job = job_name,
+				container = container_name,
+				"container not yet terminated, skipping"
+			);
 			continue;
 		}
 
-		let Ok(logs) = pods
+		match pods
 			.logs(
 				pod_name,
 				&LogParams {
@@ -162,12 +185,22 @@ pub async fn read_job_pod_logs(
 				},
 			)
 			.await
-		else {
-			continue;
-		};
-
-		if !logs.is_empty() {
-			return Some(logs);
+		{
+			Ok(logs) if !logs.is_empty() => {
+				debug!(
+					pod = pod_name,
+					job = job_name,
+					bytes = logs.len(),
+					"read pod logs successfully"
+				);
+				return Some(logs);
+			}
+			Ok(_) => {
+				debug!(pod = pod_name, job = job_name, "pod logs are empty");
+			}
+			Err(e) => {
+				debug!(pod = pod_name, job = job_name, error = %e, "failed to read pod logs");
+			}
 		}
 	}
 
