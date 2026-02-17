@@ -5,8 +5,7 @@ updates:
     schedule:
       interval: weekly
     commit-message:
-      prefix: ci
-      include: scope
+      prefix: deps
   - package-ecosystem: cargo
     directory: /
     schedule:
@@ -17,4 +16,3 @@ updates:
       deps:
         patterns:
           - "*"
-
