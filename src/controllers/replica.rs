@@ -389,6 +389,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 					);
 					return Ok(Action::requeue(Duration::from_secs(30)));
 				}
+				Err(Error::InvalidOverlayConfig(msg)) => {
+					warn!(
+						replica = name,
+						restore = current,
+						strategy = ?overlay_config.strategy,
+						error = msg,
+						"overlay reconciliation permanently failed, continuing with scheduling"
+					);
+				}
 				Err(e) => {
 					warn!(
 						replica = name,
