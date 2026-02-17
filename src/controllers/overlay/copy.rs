@@ -22,7 +22,7 @@ use crate::{
 
 use super::common::{
 	compute_config_hash, discover_restore_database, ensure_state_table, migrate_from_fdw_state,
-	quote_ident, read_state, resolve_schemas, write_state,
+	quote_ident, read_state, write_state,
 };
 
 const MAX_COPY_RETRIES: i32 = 3;
@@ -39,7 +39,7 @@ fn copy_job_name(replica_name: &str) -> String {
 /// Credentials and hosts are injected as environment variables:
 ///   READER_USER, READER_PASSWORD, RESTORE_HOST, RESTORE_DBNAME,
 ///   OVERLAY_USER, OVERLAY_PASSWORD, OVERLAY_HOST, COPY_CALLBACK_URL
-fn build_copy_script(schemas: &[(String, String)]) -> String {
+fn build_copy_script(schemas: Option<&[(String, String)]>) -> String {
 	let mut script = String::from(
 		r#"#!/bin/bash
 set -o pipefail
@@ -74,41 +74,79 @@ copy_schemas() {
 "#,
 	);
 
-	for (remote, local) in schemas {
-		let remote_quoted = quote_ident(remote);
-		let local_quoted = quote_ident(local);
+	match schemas {
+		Some(schemas) => {
+			for (remote, local) in schemas {
+				let remote_quoted = quote_ident(remote);
+				let local_quoted = quote_ident(local);
 
-		script.push_str(&format!(
-			"\n  echo 'Dropping existing local schema {local_quoted}...'\n\
-			   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
-			     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
-			     -c 'DROP SCHEMA IF EXISTS {local_quoted} CASCADE;'\n\
-			   echo 'Copying schema {remote_quoted} from restore...'\n\
-			   PGPASSWORD=\"$READER_PASSWORD\" pg_dump \
-			     -h \"$RESTORE_HOST\" \
-			     -p 5432 \
-			     -U \"$READER_USER\" \
-			     -d \"$RESTORE_DBNAME\" \
-			     -n {remote_quoted} \
-			     --no-owner \
-			     --no-privileges \
-			     --no-comments \
-			     --no-publications \
-			     --no-subscriptions \
-			     --no-security-labels \
-			     --no-tablespaces \
-			   | PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
-			     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
-			     -v ON_ERROR_STOP=1 --quiet\n"
-		));
+				script.push_str(&format!(
+					"\n  echo 'Dropping existing local schema {local_quoted}...'\n\
+					   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
+					     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
+					     -c 'DROP SCHEMA IF EXISTS {local_quoted} CASCADE;'\n\
+					   echo 'Copying schema {remote_quoted} from restore...'\n\
+					   PGPASSWORD=\"$READER_PASSWORD\" pg_dump \
+					     -h \"$RESTORE_HOST\" \
+					     -p 5432 \
+					     -U \"$READER_USER\" \
+					     -d \"$RESTORE_DBNAME\" \
+					     -n {remote_quoted} \
+					     --no-owner \
+					     --no-privileges \
+					     --no-comments \
+					     --no-publications \
+					     --no-subscriptions \
+					     --no-security-labels \
+					     --no-tablespaces \
+					   | PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
+					     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
+					     -v ON_ERROR_STOP=1 --quiet\n"
+				));
 
-		if remote != local {
-			script.push_str(&format!(
-				"  echo 'Renaming schema {remote_quoted} to {local_quoted}...'\n\
-				   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
-				     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
-				     -c 'ALTER SCHEMA {remote_quoted} RENAME TO {local_quoted};'\n"
-			));
+				if remote != local {
+					script.push_str(&format!(
+						"  echo 'Renaming schema {remote_quoted} to {local_quoted}...'\n\
+						   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
+						     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
+						     -c 'ALTER SCHEMA {remote_quoted} RENAME TO {local_quoted};'\n"
+					));
+				}
+			}
+		}
+		None => {
+			script.push_str(
+				r#"
+  echo 'Dropping existing user schemas in overlay...'
+  SCHEMAS=$(PGPASSWORD="$OVERLAY_PASSWORD" psql \
+    -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
+    -t -A -c "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg_%' AND schema_name NOT IN ('information_schema', '_pgro')")
+  for schema in $SCHEMAS; do
+    echo "  Dropping schema $schema..."
+    PGPASSWORD="$OVERLAY_PASSWORD" psql \
+      -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
+      -c "DROP SCHEMA IF EXISTS \"$schema\" CASCADE;"
+  done
+
+  echo 'Copying all schemas from restore...'
+  PGPASSWORD="$READER_PASSWORD" pg_dump \
+    -h "$RESTORE_HOST" \
+    -p 5432 \
+    -U "$READER_USER" \
+    -d "$RESTORE_DBNAME" \
+    --exclude-schema=_pgro \
+    --no-owner \
+    --no-privileges \
+    --no-comments \
+    --no-publications \
+    --no-subscriptions \
+    --no-security-labels \
+    --no-tablespaces \
+  | PGPASSWORD="$OVERLAY_PASSWORD" psql \
+    -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
+    -v ON_ERROR_STOP=1 --quiet
+"#,
+			);
 		}
 	}
 
@@ -141,7 +179,7 @@ exit $EXIT_CODE
 fn build_copy_job(
 	replica: &PostgresPhysicalReplica,
 	namespace: &str,
-	schemas: &[(String, String)],
+	schemas: Option<&[(String, String)]>,
 	reader_secret_name: &str,
 	superuser_secret_name: &str,
 	restore_host: &str,
@@ -427,18 +465,19 @@ pub async fn reconcile_copy(
 	)
 	.await?;
 
-	// Resolve expected schemas
-	let schemas = resolve_schemas(
-		client,
-		namespace,
-		replica,
-		restore_name,
-		&restore_dbname,
-		&reader_user,
-		&reader_password,
-		use_port_forward,
-	)
-	.await?;
+	// Resolve schema mapping: None = dump all, Some = per-schema
+	let explicit_mapping = replica
+		.spec
+		.overlay_database
+		.as_ref()
+		.and_then(|c| c.schema_mapping.as_ref());
+
+	let schemas: Option<Vec<(String, String)>> = explicit_mapping.map(|mapping| {
+		mapping
+			.iter()
+			.map(|(k, v)| (k.clone(), v.clone()))
+			.collect()
+	});
 
 	// Determine hosts: the Job runs in-cluster and always uses service DNS
 	let restore_host = format!("{restore_name}.{namespace}.svc");
@@ -456,7 +495,7 @@ pub async fn reconcile_copy(
 	let job = build_copy_job(
 		replica,
 		namespace,
-		&schemas,
+		schemas.as_deref(),
 		&reader_secret_name,
 		&superuser_secret_name,
 		&restore_host,
@@ -470,7 +509,7 @@ pub async fn reconcile_copy(
 		replica = %replica_name,
 		restore = %restore_name,
 		job = %copy_job_name(&replica_name),
-		schema_count = schemas.len(),
+		schema_count = schemas.as_ref().map(|s| s.len()),
 		attempt = current_retries + 1,
 		max_retries = MAX_COPY_RETRIES,
 		"creating copy Job"
@@ -488,7 +527,7 @@ mod tests {
 
 	#[test]
 	fn build_copy_script_same_schema() {
-		let script = build_copy_script(&[("public".into(), "public".into())]);
+		let script = build_copy_script(Some(&[("public".into(), "public".into())]));
 		assert!(script.contains("pg_dump"));
 		assert!(script.contains("-n \"public\""));
 		assert!(script.contains("PGPASSWORD=\"$READER_PASSWORD\""));
@@ -503,17 +542,17 @@ mod tests {
 
 	#[test]
 	fn build_copy_script_renamed_schema() {
-		let script = build_copy_script(&[("source".into(), "target".into())]);
+		let script = build_copy_script(Some(&[("source".into(), "target".into())]));
 		assert!(script.contains("-n \"source\""));
 		assert!(script.contains("RENAME TO \"target\""));
 	}
 
 	#[test]
 	fn build_copy_script_multiple_schemas() {
-		let script = build_copy_script(&[
+		let script = build_copy_script(Some(&[
 			("public".into(), "public".into()),
 			("data".into(), "imported".into()),
-		]);
+		]));
 		assert!(script.contains("-n \"public\""));
 		assert!(script.contains("-n \"data\""));
 		assert!(script.contains("RENAME TO \"imported\""));
@@ -522,7 +561,7 @@ mod tests {
 
 	#[test]
 	fn build_copy_script_special_schema_name() {
-		let script = build_copy_script(&[("my\"schema".into(), "my\"schema".into())]);
+		let script = build_copy_script(Some(&[("my\"schema".into(), "my\"schema".into())]));
 		assert!(script.contains("-n \"my\"\"schema\""));
 	}
 
@@ -533,14 +572,25 @@ mod tests {
 
 	#[test]
 	fn build_copy_script_reports_success() {
-		let script = build_copy_script(&[("public".into(), "public".into())]);
+		let script = build_copy_script(Some(&[("public".into(), "public".into())]));
 		assert!(script.contains("report_result 'success'"));
 	}
 
 	#[test]
 	fn build_copy_script_reports_error() {
-		let script = build_copy_script(&[("public".into(), "public".into())]);
+		let script = build_copy_script(Some(&[("public".into(), "public".into())]));
 		assert!(script.contains("report_result \"$(printf '%s' \"$OUTPUT\" | tail -c 8192)\""));
+	}
+
+	#[test]
+	fn build_copy_script_all_schemas() {
+		let script = build_copy_script(None);
+		assert!(script.contains("pg_dump"));
+		assert!(script.contains("--exclude-schema=_pgro"));
+		assert!(script.contains("Dropping existing user schemas"));
+		assert!(script.contains("NOT IN ('information_schema', '_pgro')"));
+		assert!(script.contains("sync_extensions"));
+		assert!(script.contains("ON_ERROR_STOP=1"));
 	}
 
 	#[test]
@@ -577,10 +627,11 @@ mod tests {
 			status: None,
 		};
 
+		let schemas = vec![("public".into(), "public".into())];
 		let job = build_copy_job(
 			&replica,
 			"test-ns",
-			&[("public".into(), "public".into())],
+			Some(&schemas),
 			"reader-secret",
 			"superuser-secret",
 			"restore.test-ns.svc",
