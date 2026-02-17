@@ -437,7 +437,7 @@ pub async fn reconcile_fdw(
 		);
 		return Ok(());
 	}
-	write_state(overlay_pg, &config_hash, "pending", 0).await?;
+	write_state(overlay_pg, &config_hash, "pending", 0, None).await?;
 
 	// Discover the main database in the restore (largest by size)
 	let restore_dbname = discover_restore_database(
@@ -576,7 +576,7 @@ pub async fn reconcile_fdw(
 		))
 		.await?;
 
-	write_state(overlay_pg, &config_hash, "server_configured", 0).await?;
+	write_state(overlay_pg, &config_hash, "server_configured", 0, None).await?;
 
 	// Discover and replicate custom types from the restore database
 	let restore_conn = super::connect::connect_to_restore(
@@ -605,7 +605,7 @@ pub async fn reconcile_fdw(
 	// Drop stale stub types from a previous restore once before the loop
 	cleanup_stale_stub_types(overlay_pg).await?;
 
-	write_state(overlay_pg, &config_hash, "importing", 0).await?;
+	write_state(overlay_pg, &config_hash, "importing", 0, None).await?;
 
 	// Resolve expected schemas and import any that are missing
 	let schemas = resolve_schemas(
@@ -658,7 +658,7 @@ pub async fn reconcile_fdw(
 		debug!(remote = %remote, local = %local, "foreign schema imported successfully");
 	}
 
-	write_state(overlay_pg, &config_hash, "complete", 0).await?;
+	write_state(overlay_pg, &config_hash, "complete", 0, None).await?;
 
 	info!(
 		replica = %replica_name,

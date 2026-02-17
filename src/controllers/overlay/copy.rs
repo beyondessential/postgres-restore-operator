@@ -201,6 +201,10 @@ pub async fn reconcile_copy(
 			.as_ref()
 			.map(|t| t.updated_at)
 			.unwrap_or(Timestamp::UNIX_EPOCH);
+		let last_error = tracked
+			.as_ref()
+			.and_then(|t| t.last_error.as_deref())
+			.unwrap_or("unknown");
 		let elapsed = Timestamp::now().duration_since(last_attempt);
 
 		if elapsed < SignedDuration::from_secs(RETRY_COOLDOWN_SECS) {
@@ -209,11 +213,12 @@ pub async fn reconcile_copy(
 				replica = %replica_name,
 				restore = %restore_name,
 				cooldown_remaining_secs = remaining,
+				last_error = last_error,
 				"copy strategy exhausted {MAX_COPY_RETRIES} retries, waiting for cooldown"
 			);
 			return Err(Error::InvalidOverlayConfig(format!(
 				"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore {restore_name}, \
-				 will reset in {remaining}s"
+				 will reset in {remaining}s (last error: {last_error})"
 			)));
 		}
 
@@ -222,7 +227,7 @@ pub async fn reconcile_copy(
 			restore = %restore_name,
 			"retry cooldown elapsed, resetting copy retry counter"
 		);
-		write_state(overlay_pg, &config_hash, "pending", 0).await?;
+		write_state(overlay_pg, &config_hash, "pending", 0, None).await?;
 		current_retries = 0;
 	}
 
@@ -275,7 +280,7 @@ pub async fn reconcile_copy(
 	// Now that all preparatory steps succeeded, increment the retry
 	// counter. Only actual copy exec failures should consume retries.
 	let retries = current_retries + 1;
-	write_state(overlay_pg, &config_hash, "importing", retries).await?;
+	write_state(overlay_pg, &config_hash, "importing", retries, None).await?;
 
 	info!(
 		replica = %replica_name,
@@ -316,21 +321,30 @@ pub async fn reconcile_copy(
 				debug!(remote = %remote, local = %local, "schema copied successfully");
 			}
 			Err(e) => {
+				let err_msg = e.to_string();
 				warn!(
 					replica = %replica_name,
 					remote = %remote,
 					local = %local,
-					error = %e,
+					error = %err_msg,
 					attempt = retries,
 					max_retries = MAX_COPY_RETRIES,
 					"schema copy failed"
 				);
+				let _ = write_state(
+					overlay_pg,
+					&config_hash,
+					"importing",
+					retries,
+					Some(&err_msg),
+				)
+				.await;
 				return Err(e);
 			}
 		}
 	}
 
-	write_state(overlay_pg, &config_hash, "complete", retries).await?;
+	write_state(overlay_pg, &config_hash, "complete", retries, None).await?;
 
 	info!(
 		replica = %replica_name,

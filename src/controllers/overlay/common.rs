@@ -23,6 +23,7 @@ pub struct TrackedState {
 	pub phase: String,
 	pub retries: i32,
 	pub updated_at: Timestamp,
+	pub last_error: Option<String>,
 }
 
 /// Ensure the `_pgro.overlay_state` tracking table exists.
@@ -33,15 +34,17 @@ pub async fn ensure_state_table(pg: &tokio_postgres::Client) -> Result<()> {
 		   config_hash text NOT NULL, \
 		   phase text NOT NULL DEFAULT 'pending', \
 		   retries integer NOT NULL DEFAULT 0, \
-		   updated_at timestamptz NOT NULL DEFAULT now() \
+		   updated_at timestamptz NOT NULL DEFAULT now(), \
+		   last_error text \
 		 )",
 	)
 	.await?;
 
-	// Migrate: add retries column if missing (existing deployments with old fdw_state table)
+	// Migrate: add columns if missing (existing deployments with old fdw_state table)
 	pg.batch_execute(
 		"DO $$ BEGIN \
 		   ALTER TABLE _pgro.overlay_state ADD COLUMN IF NOT EXISTS retries integer NOT NULL DEFAULT 0; \
+		   ALTER TABLE _pgro.overlay_state ADD COLUMN IF NOT EXISTS last_error text; \
 		 EXCEPTION WHEN undefined_table THEN NULL; \
 		 END $$",
 	)
@@ -74,7 +77,8 @@ pub async fn read_state(pg: &tokio_postgres::Client) -> Result<Option<TrackedSta
 	let row = pg
 		.query_opt(
 			"SELECT config_hash, phase, retries, \
-			   EXTRACT(EPOCH FROM updated_at)::bigint AS updated_epoch \
+			   EXTRACT(EPOCH FROM updated_at)::bigint AS updated_epoch, \
+			   last_error \
 			 FROM _pgro.overlay_state WHERE id = 1",
 			&[],
 		)
@@ -86,6 +90,7 @@ pub async fn read_state(pg: &tokio_postgres::Client) -> Result<Option<TrackedSta
 			phase: r.get(1),
 			retries: r.get(2),
 			updated_at: Timestamp::from_second(epoch).unwrap_or(Timestamp::UNIX_EPOCH),
+			last_error: r.get(4),
 		}
 	}))
 }
@@ -96,13 +101,14 @@ pub async fn write_state(
 	config_hash: &str,
 	phase: &str,
 	retries: i32,
+	last_error: Option<&str>,
 ) -> Result<()> {
 	pg.execute(
-		"INSERT INTO _pgro.overlay_state (id, config_hash, phase, retries, updated_at) \
-		 VALUES (1, $1, $2, $3, now()) \
+		"INSERT INTO _pgro.overlay_state (id, config_hash, phase, retries, updated_at, last_error) \
+		 VALUES (1, $1, $2, $3, now(), $4) \
 		 ON CONFLICT (id) DO UPDATE \
-		   SET config_hash = $1, phase = $2, retries = $3, updated_at = now()",
-		&[&config_hash, &phase, &retries],
+		   SET config_hash = $1, phase = $2, retries = $3, updated_at = now(), last_error = $4",
+		&[&config_hash, &phase, &retries, &last_error],
 	)
 	.await?;
 	Ok(())
