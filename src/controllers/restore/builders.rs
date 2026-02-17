@@ -518,22 +518,11 @@ sed -i \
   -e '/^[[:space:]]*default_transaction_read_only[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 
+echo "Configuring stderr logging..."
+echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
+echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
+
 PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
-if [ "$PG_MAJOR" -ge 15 ]; then
-  echo "Configuring JSON logging (PG >= 15)..."
-  cat >> "$PGDATA/postgresql.conf" << 'LOGEOF'
-logging_collector = on
-log_destination = 'jsonlog'
-log_directory = '/dev'
-log_filename = 'stderr'
-log_rotation_age = 0
-log_rotation_size = 0
-LOGEOF
-else
-  echo "Configuring stderr logging (PG < 15)..."
-  echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
-  echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
-fi
 
 echo "Truncating postgresql.auto.conf to discard ALTER SYSTEM overrides from source..."
 : > "$PGDATA/postgresql.auto.conf"

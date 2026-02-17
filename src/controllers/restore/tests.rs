@@ -204,12 +204,12 @@ fn init_script_strips_source_host_config_overrides() {
 		);
 	}
 	assert!(
-		script.contains("log_destination = 'jsonlog'"),
-		"init script must configure jsonlog for PG >= 15"
+		script.contains("log_destination = 'stderr'"),
+		"init script must configure stderr logging"
 	);
 	assert!(
-		script.contains("log_destination = 'stderr'"),
-		"init script must configure stderr logging for PG < 15"
+		script.contains("logging_collector = off"),
+		"init script must disable logging_collector"
 	);
 	assert!(
 		script.contains("UPDATE pg_database"),
