@@ -69,8 +69,10 @@ jobs:
           - name: overlay
             tests: >-
               overlay_fdw_reconciliation
+              overlay_copy_reconciliation
             namespaces: >-
               test-overlay
+              test-overlay-copy
             needs_non_pg_snapshot: false
             needs_cnpg: true
 
