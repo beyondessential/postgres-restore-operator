@@ -81,6 +81,11 @@ pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>)
 		.namespace()
 		.ok_or_else(|| Error::MissingNamespace(name.clone()))?;
 
+	ctx.last_reconcile.store(
+		jiff::Timestamp::now().as_second(),
+		std::sync::atomic::Ordering::Relaxed,
+	);
+
 	ctx.metrics
 		.reconciliations_total
 		.with_label_values(&["restore"])

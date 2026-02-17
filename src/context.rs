@@ -1,6 +1,6 @@
 use std::sync::{
 	Arc, RwLock,
-	atomic::{AtomicBool, AtomicUsize, Ordering},
+	atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 };
 
 use jiff::Timestamp;
@@ -27,6 +27,9 @@ pub struct Context {
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
 	pub callback_base_url: String,
+	/// Unix timestamp of the last successful entry into a reconcile function.
+	/// Used by `/livez` to detect a stuck reconciliation loop.
+	pub last_reconcile: Arc<AtomicI64>,
 }
 
 impl Context {
@@ -52,6 +55,7 @@ impl Context {
 			snapshot_results: Arc::new(CallbackStore::default()),
 			copy_results: Arc::new(CallbackStore::default()),
 			callback_base_url,
+			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
 		}
 	}
 

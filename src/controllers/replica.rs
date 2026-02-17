@@ -54,6 +54,8 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.namespace()
 		.ok_or_else(|| Error::MissingNamespace(name.clone()))?;
 	let now = Timestamp::now();
+	ctx.last_reconcile
+		.store(now.as_second(), std::sync::atomic::Ordering::Relaxed);
 
 	ctx.metrics
 		.reconciliations_total

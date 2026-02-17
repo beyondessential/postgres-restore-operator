@@ -416,20 +416,37 @@ async fn post_copy_results(
 }
 
 /// Liveness: checks that the async runtime isn't deadlocked by verifying
-/// a background heartbeat was updated within the last 30 seconds.
+/// a background heartbeat was updated within the last 30 seconds, and that
+/// the reconciliation loop has run at least once in the last 5 minutes.
 async fn livez(State(state): State<ServerState>) -> (StatusCode, &'static str) {
-	let last = state.heartbeat.load(Ordering::Relaxed);
-	let age = Timestamp::now().as_second() - last;
-	if age <= 30 {
-		debug!(heartbeat_age_secs = age, "livez ok");
-		(StatusCode::OK, "ok")
-	} else {
+	let now = Timestamp::now().as_second();
+
+	let heartbeat_last = state.heartbeat.load(Ordering::Relaxed);
+	let heartbeat_age = now - heartbeat_last;
+	if heartbeat_age > 30 {
 		tracing::warn!(
-			heartbeat_age_secs = age,
+			heartbeat_age_secs = heartbeat_age,
 			"liveness check failed: heartbeat stale"
 		);
-		(StatusCode::INTERNAL_SERVER_ERROR, "heartbeat stale")
+		return (StatusCode::INTERNAL_SERVER_ERROR, "heartbeat stale");
 	}
+
+	let reconcile_last = state.ctx.last_reconcile.load(Ordering::Relaxed);
+	let reconcile_age = now - reconcile_last;
+	if reconcile_age > 300 {
+		tracing::warn!(
+			reconcile_age_secs = reconcile_age,
+			"liveness check failed: no reconciliation in the last 5 minutes"
+		);
+		return (StatusCode::INTERNAL_SERVER_ERROR, "reconcile loop stale");
+	}
+
+	debug!(
+		heartbeat_age_secs = heartbeat_age,
+		reconcile_age_secs = reconcile_age,
+		"livez ok"
+	);
+	(StatusCode::OK, "ok")
 }
 
 /// Readiness: checks that the heartbeat is fresh (runtime is responsive).
