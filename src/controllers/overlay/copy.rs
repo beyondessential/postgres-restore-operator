@@ -55,8 +55,23 @@ report_result() {
   fi
 }
 
+sync_extensions() {
+  echo 'Syncing extensions from restore to overlay...'
+  EXTENSIONS=$(PGPASSWORD="$READER_PASSWORD" psql \
+    -h "$RESTORE_HOST" -p 5432 -U "$READER_USER" -d "$RESTORE_DBNAME" \
+    -t -A -c "SELECT extname FROM pg_extension WHERE extname NOT IN ('plpgsql')")
+  for ext in $EXTENSIONS; do
+    echo "  Creating extension $ext..."
+    PGPASSWORD="$OVERLAY_PASSWORD" psql \
+      -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
+      -c "CREATE EXTENSION IF NOT EXISTS \"$ext\";"
+  done
+  echo 'Extension sync complete.'
+}
+
 copy_schemas() {
   set -e
+  sync_extensions
 "#,
 	);
 
@@ -504,6 +519,8 @@ mod tests {
 		assert!(script.contains("COPY_CALLBACK_URL"));
 		assert!(script.contains("report_result"));
 		assert!(!script.contains("RENAME"));
+		assert!(script.contains("sync_extensions"));
+		assert!(script.contains("CREATE EXTENSION IF NOT EXISTS"));
 	}
 
 	#[test]
