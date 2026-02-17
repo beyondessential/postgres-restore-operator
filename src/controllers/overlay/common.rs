@@ -3,6 +3,7 @@ use std::{
 	hash::{DefaultHasher, Hash, Hasher},
 };
 
+use jiff::Timestamp;
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
 	Api, Client, ResourceExt,
@@ -21,6 +22,7 @@ pub struct TrackedState {
 	pub config_hash: String,
 	pub phase: String,
 	pub retries: i32,
+	pub updated_at: Timestamp,
 }
 
 /// Ensure the `_pgro.overlay_state` tracking table exists.
@@ -71,14 +73,20 @@ pub async fn migrate_from_fdw_state(pg: &tokio_postgres::Client) -> Result<()> {
 pub async fn read_state(pg: &tokio_postgres::Client) -> Result<Option<TrackedState>> {
 	let row = pg
 		.query_opt(
-			"SELECT config_hash, phase, retries FROM _pgro.overlay_state WHERE id = 1",
+			"SELECT config_hash, phase, retries, \
+			   EXTRACT(EPOCH FROM updated_at)::bigint AS updated_epoch \
+			 FROM _pgro.overlay_state WHERE id = 1",
 			&[],
 		)
 		.await?;
-	Ok(row.map(|r| TrackedState {
-		config_hash: r.get(0),
-		phase: r.get(1),
-		retries: r.get(2),
+	Ok(row.map(|r| {
+		let epoch: i64 = r.get(3);
+		TrackedState {
+			config_hash: r.get(0),
+			phase: r.get(1),
+			retries: r.get(2),
+			updated_at: Timestamp::from_second(epoch).unwrap_or(Timestamp::UNIX_EPOCH),
+		}
 	}))
 }
 

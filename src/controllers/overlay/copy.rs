@@ -1,3 +1,4 @@
+use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, Client, ResourceExt, api::AttachParams};
 use tokio::io::AsyncReadExt;
@@ -14,6 +15,7 @@ use super::common::{
 };
 
 const MAX_COPY_RETRIES: i32 = 3;
+const RETRY_COOLDOWN_SECS: i64 = 300; // 5 minutes
 
 /// Execute a command inside a pod via the Kubernetes exec API and return
 /// the combined stdout+stderr output. Returns an error if the command
@@ -188,18 +190,40 @@ pub async fn reconcile_copy(
 	}
 
 	// Check retry count
-	let current_retries = tracked
+	let mut current_retries = tracked
 		.as_ref()
 		.filter(|t| t.config_hash == config_hash)
 		.map(|t| t.retries)
 		.unwrap_or(0);
 
 	if current_retries >= MAX_COPY_RETRIES {
-		let msg = format!(
-			"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore {restore_name}"
+		let last_attempt = tracked
+			.as_ref()
+			.map(|t| t.updated_at)
+			.unwrap_or(Timestamp::UNIX_EPOCH);
+		let elapsed = Timestamp::now().duration_since(last_attempt);
+
+		if elapsed < SignedDuration::from_secs(RETRY_COOLDOWN_SECS) {
+			let remaining = RETRY_COOLDOWN_SECS - elapsed.as_secs();
+			warn!(
+				replica = %replica_name,
+				restore = %restore_name,
+				cooldown_remaining_secs = remaining,
+				"copy strategy exhausted {MAX_COPY_RETRIES} retries, waiting for cooldown"
+			);
+			return Err(Error::InvalidOverlayConfig(format!(
+				"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore {restore_name}, \
+				 will reset in {remaining}s"
+			)));
+		}
+
+		info!(
+			replica = %replica_name,
+			restore = %restore_name,
+			"retry cooldown elapsed, resetting copy retry counter"
 		);
-		warn!(replica = %replica_name, %msg);
-		return Err(Error::InvalidOverlayConfig(msg));
+		write_state(overlay_pg, &config_hash, "pending", 0).await?;
+		current_retries = 0;
 	}
 
 	// Discover the main database in the restore.
