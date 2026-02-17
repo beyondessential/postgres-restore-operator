@@ -64,7 +64,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Generate CRDs
         run: cargo run --bin gen-crds > crds.yaml
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: crds
           path: crds.yaml

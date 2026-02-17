@@ -61,7 +61,7 @@ jobs:
           mkdir -p artifacts/${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/operator artifacts/${{ matrix.arch }}/
 
-      - uses: actions/upload-artifact@v5
+      - uses: actions/upload-artifact@v6
         with:
           name: binaries-${{ matrix.arch }}
           path: artifacts/${{ matrix.arch }}/
