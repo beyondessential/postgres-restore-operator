@@ -1,14 +1,15 @@
-use std::{
-	collections::{BTreeMap, BTreeSet},
-	hash::{DefaultHasher, Hash, Hasher},
-};
+use std::collections::BTreeSet;
 
-use k8s_openapi::{ByteString, api::core::v1::Secret};
-use kube::{
-	Api, Client, ResourceExt,
-	api::{ObjectMeta, PostParams},
-};
+use k8s_openapi::api::core::v1::Secret;
+use kube::{Api, Client, ResourceExt};
 use tracing::{debug, info, warn};
+
+use crate::{error::Result, types::PostgresPhysicalReplica};
+
+use super::common::{
+	compute_config_hash, discover_restore_database, ensure_state_table, migrate_from_fdw_state,
+	quote_ident, quote_literal, read_state, resolve_schemas, write_state,
+};
 
 /// A custom domain type discovered from the remote database.
 struct RemoteDomain {
@@ -23,12 +24,6 @@ struct RemoteEnum {
 	name: String,
 	labels: Vec<String>,
 }
-
-use crate::{
-	controllers::replica::generate_password,
-	error::{Error, Result},
-	types::PostgresPhysicalReplica,
-};
 
 /// Captured FDW state from the overlay database.
 struct FdwState {
@@ -112,205 +107,6 @@ async fn drop_stale_fdw_servers(
 		}
 	}
 	Ok(())
-}
-
-/// Compute a stable hash of the inputs that affect FDW reconciliation.
-///
-/// If any of these change the FDW setup needs to be redone from scratch.
-fn compute_fdw_config_hash(restore_name: &str, replica: &PostgresPhysicalReplica) -> String {
-	let mut hasher = DefaultHasher::new();
-	restore_name.hash(&mut hasher);
-	replica.spec.analytics_username.hash(&mut hasher);
-	if let Some(overlay) = &replica.spec.overlay_database {
-		if let Some(mapping) = &overlay.schema_mapping {
-			let sorted: BTreeMap<_, _> = mapping.iter().collect();
-			for (k, v) in &sorted {
-				k.hash(&mut hasher);
-				v.hash(&mut hasher);
-			}
-		}
-		overlay.import_generated.hash(&mut hasher);
-	}
-	format!("{:016x}", hasher.finish())
-}
-
-/// Tracked FDW reconciliation state persisted in `_pgro.fdw_state`.
-struct FdwTrackedState {
-	config_hash: String,
-	phase: String,
-}
-
-/// Ensure the `_pgro.fdw_state` tracking table exists.
-async fn ensure_fdw_state_table(pg: &tokio_postgres::Client) -> Result<()> {
-	pg.batch_execute(
-		"CREATE TABLE IF NOT EXISTS _pgro.fdw_state ( \
-		   id integer PRIMARY KEY DEFAULT 1, \
-		   config_hash text NOT NULL, \
-		   phase text NOT NULL DEFAULT 'pending', \
-		   updated_at timestamptz NOT NULL DEFAULT now() \
-		 )",
-	)
-	.await?;
-	Ok(())
-}
-
-/// Read the current FDW reconciliation state from the tracking table.
-async fn read_fdw_state(pg: &tokio_postgres::Client) -> Result<Option<FdwTrackedState>> {
-	let row = pg
-		.query_opt(
-			"SELECT config_hash, phase FROM _pgro.fdw_state WHERE id = 1",
-			&[],
-		)
-		.await?;
-	Ok(row.map(|r| FdwTrackedState {
-		config_hash: r.get(0),
-		phase: r.get(1),
-	}))
-}
-
-/// Update the FDW reconciliation phase in the tracking table.
-async fn write_fdw_state(
-	pg: &tokio_postgres::Client,
-	config_hash: &str,
-	phase: &str,
-) -> Result<()> {
-	pg.execute(
-		"INSERT INTO _pgro.fdw_state (id, config_hash, phase, updated_at) \
-		 VALUES (1, $1, $2, now()) \
-		 ON CONFLICT (id) DO UPDATE \
-		   SET config_hash = $1, phase = $2, updated_at = now()",
-		&[&config_hash, &phase],
-	)
-	.await?;
-	Ok(())
-}
-
-/// Connect to the restore's `postgres` database and find the largest
-/// non-system database by size. This is the database whose schemas we
-/// import via FDW into the overlay's `app` database.
-async fn discover_restore_database(
-	client: &Client,
-	namespace: &str,
-	restore_name: &str,
-	fdw_user: &str,
-	fdw_password: &str,
-	use_port_forward: bool,
-) -> Result<String> {
-	let conn = super::connect::connect_to_restore(
-		client,
-		namespace,
-		restore_name,
-		"postgres",
-		fdw_user,
-		fdw_password,
-		use_port_forward,
-	)
-	.await?;
-	let pg = &conn.client;
-
-	let row = pg
-		.query_opt(
-			"SELECT datname FROM pg_database \
-			 WHERE datname NOT IN ('postgres', 'template0', 'template1') \
-			 ORDER BY pg_database_size(datname) DESC \
-			 LIMIT 1",
-			&[],
-		)
-		.await?;
-
-	match row {
-		Some(r) => {
-			let name: String = r.get(0);
-			debug!(
-				restore = restore_name,
-				database = %name,
-				"discovered main database in restore by size"
-			);
-			Ok(name)
-		}
-		None => Err(Error::MissingField(
-			"no non-system databases found in restore".into(),
-		)),
-	}
-}
-
-/// Resolve which schemas to import via FDW.
-///
-/// Uses the explicit `schema_mapping` from the spec if present, otherwise
-/// discovers user schemas from the restore database.
-#[expect(
-	clippy::too_many_arguments,
-	reason = "internal helper with tightly-coupled params"
-)]
-async fn resolve_fdw_schemas(
-	client: &Client,
-	namespace: &str,
-	replica: &PostgresPhysicalReplica,
-	restore_name: &str,
-	restore_dbname: &str,
-	fdw_user: &str,
-	fdw_password: &str,
-	use_port_forward: bool,
-) -> Result<Vec<(String, String)>> {
-	let replica_name = replica.name_any();
-	if let Some(mapping) = replica
-		.spec
-		.overlay_database
-		.as_ref()
-		.and_then(|c| c.schema_mapping.as_ref())
-	{
-		let result: Vec<_> = mapping
-			.iter()
-			.map(|(k, v)| (k.clone(), v.clone()))
-			.collect();
-		debug!(
-			replica = %replica_name,
-			schema_count = result.len(),
-			"using explicit schema mapping from spec"
-		);
-		debug!(schemas = ?result, "explicit schema mapping entries");
-		return Ok(result);
-	}
-
-	debug!(
-		replica = %replica_name,
-		restore = restore_name,
-		restore_dbname = restore_dbname,
-		"no explicit schema mapping, discovering schemas from restore database"
-	);
-	let conn = super::connect::connect_to_restore(
-		client,
-		namespace,
-		restore_name,
-		restore_dbname,
-		fdw_user,
-		fdw_password,
-		use_port_forward,
-	)
-	.await?;
-
-	let rows = conn
-		.client
-		.query(
-			"SELECT schema_name FROM information_schema.schemata \
-			 WHERE schema_name NOT LIKE 'pg_%' AND schema_name != 'information_schema'",
-			&[],
-		)
-		.await?;
-	let result: Vec<_> = rows
-		.iter()
-		.map(|row| {
-			let name: String = row.get(0);
-			(name.clone(), name)
-		})
-		.collect();
-	debug!(
-		replica = %replica_name,
-		schema_count = result.len(),
-		"discovered schemas from restore database"
-	);
-	debug!(schemas = ?result, "discovered schema entries");
-	Ok(result)
 }
 
 /// Discover all custom domains from the remote database.
@@ -585,7 +381,7 @@ pub async fn reconcile_fdw(
 ) -> Result<()> {
 	let replica_name = replica.name_any();
 	let cluster_name = super::overlay_cluster_name(&replica_name);
-	let fdw_secret_name = super::overlay_fdw_secret_name(&replica_name);
+	let reader_secret_name = super::overlay_reader_secret_name(&replica_name);
 	let superuser_secret_name = format!("{cluster_name}-superuser");
 	let server_name = super::overlay_fdw_server_name(restore_name);
 	let restore_host = format!("{restore_name}.{namespace}.svc");
@@ -600,14 +396,14 @@ pub async fn reconcile_fdw(
 	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
 	debug!(
 		superuser_secret = %superuser_secret_name,
-		fdw_secret = %fdw_secret_name,
+		reader_secret = %reader_secret_name,
 		"fetching secrets for FDW reconciliation"
 	);
 	let su_secret = secrets.get(&superuser_secret_name).await?;
-	let fdw_secret = secrets.get(&fdw_secret_name).await?;
+	let reader_secret = secrets.get(&reader_secret_name).await?;
 
-	let fdw_user = super::connect::read_secret_field(&fdw_secret, "username")?;
-	let fdw_password = super::connect::read_secret_field(&fdw_secret, "password")?;
+	let reader_user = super::connect::read_secret_field(&reader_secret, "username")?;
+	let reader_password = super::connect::read_secret_field(&reader_secret, "password")?;
 
 	let overlay_conn = super::connect::connect_overlay(
 		client,
@@ -626,9 +422,10 @@ pub async fn reconcile_fdw(
 		.await?;
 
 	// Check if FDW reconciliation is already complete for this config
-	let config_hash = compute_fdw_config_hash(restore_name, replica);
-	ensure_fdw_state_table(overlay_pg).await?;
-	let tracked = read_fdw_state(overlay_pg).await?;
+	let config_hash = compute_config_hash(restore_name, replica);
+	ensure_state_table(overlay_pg).await?;
+	migrate_from_fdw_state(overlay_pg).await?;
+	let tracked = read_state(overlay_pg).await?;
 	if tracked
 		.as_ref()
 		.is_some_and(|t| t.config_hash == config_hash && t.phase == "complete")
@@ -640,15 +437,15 @@ pub async fn reconcile_fdw(
 		);
 		return Ok(());
 	}
-	write_fdw_state(overlay_pg, &config_hash, "pending").await?;
+	write_state(overlay_pg, &config_hash, "pending", 0).await?;
 
 	// Discover the main database in the restore (largest by size)
 	let restore_dbname = discover_restore_database(
 		client,
 		namespace,
 		restore_name,
-		&fdw_user,
-		&fdw_password,
+		&reader_user,
+		&reader_password,
 		use_port_forward,
 	)
 	.await?;
@@ -769,17 +566,17 @@ pub async fn reconcile_fdw(
 			))
 			.await?;
 	}
-	debug!(server = %server_name, fdw_user = %fdw_user, "creating PUBLIC user mapping");
+	debug!(server = %server_name, reader_user = %reader_user, "creating PUBLIC user mapping");
 	overlay_pg
 		.batch_execute(&format!(
 			"CREATE USER MAPPING FOR PUBLIC SERVER {server_name} \
 			 OPTIONS (user {}, password {})",
-			quote_literal(&fdw_user),
-			quote_literal(&fdw_password),
+			quote_literal(&reader_user),
+			quote_literal(&reader_password),
 		))
 		.await?;
 
-	write_fdw_state(overlay_pg, &config_hash, "server_configured").await?;
+	write_state(overlay_pg, &config_hash, "server_configured", 0).await?;
 
 	// Discover and replicate custom types from the restore database
 	let restore_conn = super::connect::connect_to_restore(
@@ -787,8 +584,8 @@ pub async fn reconcile_fdw(
 		namespace,
 		restore_name,
 		&restore_dbname,
-		&fdw_user,
-		&fdw_password,
+		&reader_user,
+		&reader_password,
 		use_port_forward,
 	)
 	.await?;
@@ -808,17 +605,17 @@ pub async fn reconcile_fdw(
 	// Drop stale stub types from a previous restore once before the loop
 	cleanup_stale_stub_types(overlay_pg).await?;
 
-	write_fdw_state(overlay_pg, &config_hash, "importing").await?;
+	write_state(overlay_pg, &config_hash, "importing", 0).await?;
 
 	// Resolve expected schemas and import any that are missing
-	let schemas = resolve_fdw_schemas(
+	let schemas = resolve_schemas(
 		client,
 		namespace,
 		replica,
 		restore_name,
 		&restore_dbname,
-		&fdw_user,
-		&fdw_password,
+		&reader_user,
+		&reader_password,
 		use_port_forward,
 	)
 	.await?;
@@ -861,7 +658,7 @@ pub async fn reconcile_fdw(
 		debug!(remote = %remote, local = %local, "foreign schema imported successfully");
 	}
 
-	write_fdw_state(overlay_pg, &config_hash, "complete").await?;
+	write_state(overlay_pg, &config_hash, "complete", 0).await?;
 
 	info!(
 		replica = %replica_name,
@@ -871,93 +668,4 @@ pub async fn reconcile_fdw(
 	);
 
 	Ok(())
-}
-
-/// Ensure the FDW credentials Secret exists.
-pub async fn ensure_fdw_credentials(
-	client: &Client,
-	namespace: &str,
-	replica_name: &str,
-	replica: &PostgresPhysicalReplica,
-) -> Result<()> {
-	let secret_name = super::overlay_fdw_secret_name(replica_name);
-	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-
-	if secrets.get_opt(&secret_name).await?.is_some() {
-		debug!(
-			replica = replica_name,
-			secret = secret_name,
-			"FDW credentials secret already exists, skipping creation"
-		);
-		return Ok(());
-	}
-
-	info!(
-		replica = replica_name,
-		secret = secret_name,
-		"creating overlay FDW credentials secret"
-	);
-
-	let password = generate_password();
-	let secret = Secret {
-		metadata: ObjectMeta {
-			name: Some(secret_name.clone()),
-			namespace: Some(namespace.to_string()),
-			labels: Some(BTreeMap::from([(
-				"pgro.bes.au/replica".to_string(),
-				replica_name.to_string(),
-			)])),
-			owner_references: Some(vec![replica.owner_reference()]),
-			..Default::default()
-		},
-		data: Some(BTreeMap::from([
-			(
-				"username".to_string(),
-				ByteString("fdw_reader".as_bytes().to_vec()),
-			),
-			(
-				"password".to_string(),
-				ByteString(password.as_bytes().to_vec()),
-			),
-		])),
-		..Default::default()
-	};
-
-	secrets.create(&PostParams::default(), &secret).await?;
-	Ok(())
-}
-
-/// Escape a SQL identifier by double-quoting it.
-fn quote_ident(s: &str) -> String {
-	format!("\"{}\"", s.replace('"', "\"\""))
-}
-
-/// Escape a SQL string literal by single-quoting it.
-fn quote_literal(s: &str) -> String {
-	format!("'{}'", s.replace('\'', "''"))
-}
-
-#[cfg(test)]
-mod tests {
-	use super::*;
-
-	#[test]
-	fn quote_ident_plain() {
-		assert_eq!(quote_ident("public"), "\"public\"");
-	}
-
-	#[test]
-	fn quote_ident_with_quotes() {
-		assert_eq!(quote_ident("my\"schema"), "\"my\"\"schema\"");
-	}
-
-	#[test]
-	fn quote_literal_plain() {
-		assert_eq!(quote_literal("hello"), "'hello'");
-	}
-
-	#[test]
-	fn quote_literal_with_quotes() {
-		assert_eq!(quote_literal("it's"), "'it''s'");
-	}
 }

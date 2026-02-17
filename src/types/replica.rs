@@ -93,7 +93,7 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub notifications: Vec<NotificationConfig>,
 
-	/// Optional overlay database configuration (FDW-based persistent database)
+	/// Optional overlay database configuration (persistent database via CNPG)
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub overlay_database: Option<OverlayDatabaseConfig>,
 }
@@ -111,9 +111,27 @@ fn default_analytics_username() -> String {
 	"analytics".to_string()
 }
 
+/// Strategy for populating the overlay database from the restore.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash)]
+#[serde(rename_all = "lowercase")]
+pub enum OverlayStrategy {
+	/// Use Foreign Data Wrappers to create foreign tables pointing at the
+	/// restore. The restore must remain running for queries to work.
+	#[default]
+	Fdw,
+	/// Use pg_dump | psql to copy schema + data from the restore into the
+	/// overlay. Tolerates PostgreSQL version differences and does not
+	/// require the restore to stay alive after the copy completes.
+	Copy,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct OverlayDatabaseConfig {
+	/// Strategy for populating the overlay from the restore.
+	#[serde(default)]
+	pub strategy: OverlayStrategy,
+
 	/// PostgreSQL major version for the CNPG cluster.
 	/// If absent, resolved from the CNPG image catalog (see image_catalog).
 	/// Falls back to a hardcoded default (17) if no catalog is available.
@@ -157,11 +175,21 @@ pub struct OverlayDatabaseConfig {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub schema_mapping: Option<HashMap<String, String>>,
 
-	/// Include GENERATED expressions when importing foreign schemas.
+	/// Include GENERATED expressions when importing foreign schemas (FDW only).
 	/// Requires that all functions used in generated columns exist on the
-	/// overlay database. Defaults to false.
+	/// overlay database. Defaults to false. Ignored for copy strategy.
 	#[serde(default)]
 	pub import_generated: bool,
+
+	/// When false and strategy is `copy`, delete the restore Deployment and
+	/// PVC after a successful copy. The restore CR is kept for bookkeeping.
+	/// Ignored for `fdw` strategy (the restore must stay alive).
+	#[serde(default = "default_retain_restore")]
+	pub retain_restore: bool,
+}
+
+fn default_retain_restore() -> bool {
+	true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -326,9 +354,13 @@ pub struct PostgresPhysicalReplicaStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub overlay_cluster_name: Option<String>,
 
-	/// Name of the restore whose schemas are currently imported via FDW
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub overlay_fdw_restore: Option<String>,
+	/// Name of the restore whose schemas are currently imported into the overlay
+	#[serde(
+		default,
+		skip_serializing_if = "Option::is_none",
+		alias = "overlayFdwRestore"
+	)]
+	pub overlay_restore: Option<String>,
 
 	/// Hash of the schedule inputs used to compute `nextScheduledRestore`,
 	/// so we only recompute when the inputs actually change.

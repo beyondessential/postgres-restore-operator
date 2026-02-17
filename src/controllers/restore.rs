@@ -507,7 +507,8 @@ async fn reconcile_ready(
 	// once currentRestore is set (i.e. after switchover), creating a deadlock
 	// for the first restore.
 	if replica.spec.overlay_database.is_some() {
-		overlay::fdw::ensure_fdw_credentials(client, namespace, replica_name, &replica).await?;
+		overlay::common::ensure_reader_credentials(client, namespace, replica_name, &replica)
+			.await?;
 	}
 
 	// Apply desired deployment (creates or updates to converge on operator upgrades)

@@ -15,7 +15,7 @@ use postgres_restore_operator::util::TimeSpan;
 use tokio::time::{sleep, timeout};
 
 use postgres_restore_operator::types::{
-	OverlayDatabaseConfig, PostgresPhysicalReplica, PostgresPhysicalReplicaSpec,
+	OverlayDatabaseConfig, OverlayStrategy, PostgresPhysicalReplica, PostgresPhysicalReplicaSpec,
 	PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
 };
 
@@ -1155,6 +1155,7 @@ async fn overlay_fdw_reconciliation() {
 		"overlay-kopia-creds",
 		ReplicaOpts {
 			overlay_database: Some(OverlayDatabaseConfig {
+				strategy: OverlayStrategy::Fdw,
 				postgres_version: Some(17),
 				image_catalog: None,
 				storage_size_override: Some(Quantity("2Gi".into())),
@@ -1165,6 +1166,7 @@ async fn overlay_fdw_reconciliation() {
 				service_annotations: None,
 				schema_mapping: None,
 				import_generated: false,
+				retain_restore: true,
 			}),
 			..Default::default()
 		},
@@ -1206,25 +1208,22 @@ async fn overlay_fdw_reconciliation() {
 	let overlay_pod = "overlay-replica-overlay-1";
 	wait_for_pod_ready(ns, overlay_pod, LONG_PHASE_TIMEOUT).await;
 
-	println!("--- waiting for overlayFdwRestore status to be set");
+	println!("--- waiting for overlayRestore status to be set");
 	timeout(PHASE_TIMEOUT, async {
 		loop {
 			if let Ok(r) = replicas.get("overlay-replica").await {
-				let fdw_restore = r
-					.status
-					.as_ref()
-					.and_then(|s| s.overlay_fdw_restore.as_ref());
-				if let Some(restore) = fdw_restore {
-					println!("[overlay-replica] overlayFdwRestore = {restore}");
+				let overlay_restore = r.status.as_ref().and_then(|s| s.overlay_restore.as_ref());
+				if let Some(restore) = overlay_restore {
+					println!("[overlay-replica] overlayRestore = {restore}");
 					return;
 				}
-				println!("[overlay-replica] overlayFdwRestore not set yet");
+				println!("[overlay-replica] overlayRestore not set yet");
 			}
 			sleep(POLL_INTERVAL).await;
 		}
 	})
 	.await
-	.expect("timed out waiting for overlayFdwRestore to be set");
+	.expect("timed out waiting for overlayRestore to be set");
 
 	println!("--- verifying replica status fields");
 	let replica = replicas
@@ -1234,9 +1233,9 @@ async fn overlay_fdw_reconciliation() {
 	let status = replica.status.as_ref().expect("replica has no status");
 
 	assert_eq!(
-		status.overlay_fdw_restore.as_deref(),
+		status.overlay_restore.as_deref(),
 		Some(restore_name.as_str()),
-		"overlayFdwRestore should match currentRestore"
+		"overlayRestore should match currentRestore"
 	);
 	assert!(
 		status.overlay_cluster_name.is_some(),

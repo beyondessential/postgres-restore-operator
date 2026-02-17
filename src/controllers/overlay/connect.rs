@@ -104,7 +104,7 @@ pub async fn find_pod_by_label(
 }
 
 /// Find the IP of a running pod that matches the given label selector.
-async fn find_pod_ip_by_label(
+pub async fn find_pod_ip_by_label(
 	client: &Client,
 	namespace: &str,
 	label_selector: &str,

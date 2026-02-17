@@ -101,7 +101,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `readOnly` | `bool` | No | `true` | Set the restored database to read-only mode. |
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
-| `overlayDatabase` | `OverlayDatabaseConfig` | No | — | Optional overlay database configuration (FDW-based persistent database via CNPG). |
+| `overlayDatabase` | `OverlayDatabaseConfig` | No | — | Optional overlay database configuration (persistent database via CNPG). |
 
 Using the `overlayDatabase` requires the CloudNative-PG operator to be installed and configured.
 Installing the CNPG cluster-level catalogs is optional but recommended.
@@ -150,11 +150,14 @@ Additional fields for `target: graphQL`:
 
 #### OverlayDatabaseConfig
 
-Configures an overlay database backed by a CNPG Cluster that uses Foreign Data Wrappers to import schemas from the restored replica.
+Configures an overlay database backed by a CNPG Cluster that imports schemas from the restored replica.
+Two strategies are available: `fdw` (Foreign Data Wrappers, the default) and `copy` (`pg_dump | psql`).
+The `copy` strategy tolerates PostgreSQL version differences and does not require the restore to stay alive after the copy completes.
 This can be used to persistently write data in other schemas in the overlay without interfacing between two databases.
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
+| `strategy` | `"fdw"` \| `"copy"` | No | `"fdw"` | Strategy for populating the overlay from the restore. `fdw` creates foreign tables (restore must stay alive). `copy` uses `pg_dump \| psql` to copy data (tolerates version differences, restore can be discarded). |
 | `postgresVersion` | `uint32` | No | Resolved from image catalog, or `17` | PostgreSQL major version for the CNPG cluster. |
 | `imageCatalog` | `ImageCatalogRef` | No | ClusterImageCatalog | CNPG image catalog for PG version discovery and image resolution. |
 | `storageSizeOverride` | `Quantity` | No | Auto-sized | Override for the overlay PVC size. Auto-sizing: `5Gi + ceil(snapshotSize / 10)`, ratchets up only. |
@@ -164,7 +167,8 @@ This can be used to persistently write data in other schemas in the overlay with
 | `tolerations` | `[]Toleration` | No | `[]` | Tolerations for the overlay database pods. |
 | `serviceAnnotations` | `map[string]string` | No | — | Annotations for the overlay database's `-rw` Service. |
 | `schemaMapping` | `map[string]string` | No | All schemas | Schema import mapping. Key = remote schema, Value = local schema in overlay DB. If absent, all user schemas are imported at their original names. |
-| `importGenerated` | `bool` | No | `false` | Include `GENERATED` column expressions when importing foreign schemas. Requires that all functions used in generated columns exist on the overlay database. |
+| `importGenerated` | `bool` | No | `false` | Include `GENERATED` column expressions when importing foreign schemas (FDW only). Ignored for `copy` strategy. |
+| `retainRestore` | `bool` | No | `true` | When `false` and strategy is `copy`, delete the restore Deployment and PVC after a successful copy. The restore CR is kept for bookkeeping. Ignored for `fdw` strategy. |
 
 #### ImageCatalogRef
 
@@ -189,7 +193,7 @@ This can be used to persistently write data in other schemas in the overlay with
 | `notifications` | `[]NotificationStatus` | Status of each configured notification target. |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions. |
 | `overlayClusterName` | `string` | Name of the CNPG Cluster CR for the overlay database. |
-| `overlayFdwRestore` | `string` | Name of the restore whose schemas are currently imported via FDW. |
+| `overlayRestore` | `string` | Name of the restore whose schemas are currently imported into the overlay. |
 | `overlayStorageSize` | `Quantity` | Current (possibly ratcheted) storage size of the overlay PVC. |
 | `overlayPostgresVersion` | `uint32` | Resolved PG major version used for the overlay cluster. |
 

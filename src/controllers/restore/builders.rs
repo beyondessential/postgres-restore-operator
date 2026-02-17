@@ -429,27 +429,29 @@ pub fn build_deployment(
 	let read_only = replica.spec.read_only.to_string();
 
 	let has_overlay = replica.spec.overlay_database.is_some();
-	let fdw_secret = SecretReference {
-		name: Some(overlay::overlay_fdw_secret_name(&restore.spec.replica.name)),
+	let reader_secret = SecretReference {
+		name: Some(overlay::overlay_reader_secret_name(
+			&restore.spec.replica.name,
+		)),
 		namespace: Some(namespace.to_string()),
 	};
 
-	let fdw_user_block = if has_overlay {
+	let reader_user_block = if has_overlay {
 		r#"
-if [ -n "$FDW_USERNAME" ] && [ -n "$FDW_PASSWORD" ]; then
-  echo "Creating FDW read-only user..."
-  psql -U postgres -d postgres << FDWEOF
+if [ -n "$READER_USERNAME" ] && [ -n "$READER_PASSWORD" ]; then
+  echo "Creating overlay read-only user..."
+  psql -U postgres -d postgres << READEREOF
 DO \$\$
 BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${FDW_USERNAME}') THEN
-    CREATE ROLE ${FDW_USERNAME} WITH LOGIN PASSWORD '${FDW_PASSWORD}';
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${READER_USERNAME}') THEN
+    CREATE ROLE ${READER_USERNAME} WITH LOGIN PASSWORD '${READER_PASSWORD}';
   ELSE
-    ALTER ROLE ${FDW_USERNAME} WITH PASSWORD '${FDW_PASSWORD}';
+    ALTER ROLE ${READER_USERNAME} WITH PASSWORD '${READER_PASSWORD}';
   END IF;
 END
 \$\$;
-GRANT pg_read_all_data TO ${FDW_USERNAME};
-FDWEOF
+GRANT pg_read_all_data TO ${READER_USERNAME};
+READEREOF
 fi
 "#
 		.to_string()
@@ -617,7 +619,7 @@ END
 \$\$;
 SQLEOF
 fi
-{fdw_user_block}
+{reader_user_block}
 echo "Stopping temporary postgres..."
 pg_ctl -D "$PGDATA" -w stop
 
@@ -655,8 +657,16 @@ echo "Auth setup complete"
 	];
 
 	if has_overlay {
-		init_env.push(env_from_secret("FDW_USERNAME", &fdw_secret, "username"));
-		init_env.push(env_from_secret("FDW_PASSWORD", &fdw_secret, "password"));
+		init_env.push(env_from_secret(
+			"READER_USERNAME",
+			&reader_secret,
+			"username",
+		));
+		init_env.push(env_from_secret(
+			"READER_PASSWORD",
+			&reader_secret,
+			"password",
+		));
 	}
 
 	Ok(Deployment {

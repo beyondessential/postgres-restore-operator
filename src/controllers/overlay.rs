@@ -5,7 +5,9 @@ use tracing::{debug, warn};
 use crate::{error::Result, types::PostgresPhysicalReplica};
 
 mod cnpg;
-mod connect;
+pub mod common;
+pub mod connect;
+pub mod copy;
 pub mod fdw;
 mod storage;
 
@@ -13,8 +15,8 @@ pub fn overlay_cluster_name(replica_name: &str) -> String {
 	format!("{replica_name}-overlay")
 }
 
-pub fn overlay_fdw_secret_name(replica_name: &str) -> String {
-	format!("{replica_name}-overlay-fdw-creds")
+pub fn overlay_reader_secret_name(replica_name: &str) -> String {
+	format!("{replica_name}-overlay-reader-creds")
 }
 
 fn overlay_fdw_server_name(restore_name: &str) -> String {
@@ -22,7 +24,7 @@ fn overlay_fdw_server_name(restore_name: &str) -> String {
 	format!("fdw_{sanitized}")
 }
 
-/// Full overlay reconciliation: version resolution, cluster creation, FDW credentials.
+/// Full overlay reconciliation: version resolution, cluster creation, reader credentials.
 ///
 /// `snapshot_size` is a Kubernetes quantity string (e.g. "10Gi") from the
 /// active restore's spec.
@@ -64,7 +66,7 @@ pub async fn reconcile_overlay(
 		"resolved overlay parameters"
 	);
 
-	fdw::ensure_fdw_credentials(client, namespace, &replica_name, replica).await?;
+	common::ensure_reader_credentials(client, namespace, &replica_name, replica).await?;
 
 	let cluster_ready =
 		cnpg::ensure_cnpg_cluster(client, namespace, replica, storage_size, pg_version).await?;

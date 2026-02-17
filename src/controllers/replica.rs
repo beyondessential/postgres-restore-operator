@@ -269,49 +269,68 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
-	// Reconcile FDW state for overlay databases.
-	// Always verify and fix the actual FDW state inside the overlay database
+	// Reconcile overlay database state (FDW or copy strategy).
+	// Always verify and fix the actual state inside the overlay database
 	// rather than relying solely on the status field, which can become stale
 	// if the overlay cluster is reset.
-	if replica.spec.overlay_database.is_some() {
+	if let Some(overlay_config) = &replica.spec.overlay_database {
+		use crate::types::OverlayStrategy;
+
 		let current_restore = replica
 			.status
 			.as_ref()
 			.and_then(|s| s.current_restore.as_ref());
-		let fdw_restore = replica
+		let overlay_restore = replica
 			.status
 			.as_ref()
-			.and_then(|s| s.overlay_fdw_restore.as_ref());
+			.and_then(|s| s.overlay_restore.as_ref());
 
 		if let Some(current) = current_restore.filter(|_| active_restore.is_some()) {
 			debug!(
 				replica = name,
 				current_restore = %current,
-				fdw_restore = ?fdw_restore,
-				"reconciling FDW state in overlay database"
+				overlay_restore = ?overlay_restore,
+				strategy = ?overlay_config.strategy,
+				"reconciling overlay state"
 			);
 
-			match overlay::fdw::reconcile_fdw(
-				client,
-				&namespace,
-				&replica,
-				current,
-				ctx.use_port_forward(),
-			)
-			.await
-			{
+			let result = match overlay_config.strategy {
+				OverlayStrategy::Fdw => {
+					overlay::fdw::reconcile_fdw(
+						client,
+						&namespace,
+						&replica,
+						current,
+						ctx.use_port_forward(),
+					)
+					.await
+				}
+				OverlayStrategy::Copy => {
+					overlay::copy::reconcile_copy(
+						client,
+						&namespace,
+						&replica,
+						current,
+						ctx.use_port_forward(),
+					)
+					.await
+				}
+			};
+
+			match result {
 				Ok(()) => {
-					if fdw_restore.as_ref() != Some(&current) {
+					if overlay_restore.as_ref() != Some(&current) {
 						info!(
 							replica = name,
 							restore = current,
-							"FDW reconciled, updating overlayFdwRestore status"
+							strategy = ?overlay_config.strategy,
+							"overlay reconciled, updating overlayRestore status"
 						);
 						let replicas: Api<PostgresPhysicalReplica> =
 							Api::namespaced(client.clone(), &namespace);
 						let patch = serde_json::json!({
 							"status": {
-								"overlayFdwRestore": current,
+								"overlayRestore": current,
 							}
 						});
 						replicas
@@ -321,15 +340,49 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 								&Patch::Merge(&patch),
 							)
 							.await?;
-						debug!(replica = name, "overlayFdwRestore status patched");
+						debug!(replica = name, "overlayRestore status patched");
+					}
+
+					// Copy strategy: clean up restore resources if retainRestore is false
+					if overlay_config.strategy == OverlayStrategy::Copy
+						&& !overlay_config.retain_restore
+					{
+						debug!(
+							replica = name,
+							restore = current,
+							"retainRestore=false, cleaning up restore deployment and PVC"
+						);
+						let deployments: Api<k8s_openapi::api::apps::v1::Deployment> =
+							Api::namespaced(client.clone(), &namespace);
+						let pvcs: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+							Api::namespaced(client.clone(), &namespace);
+						let pvc_name = format!("{current}-data");
+
+						if let Err(e) = deployments.delete(current, &Default::default()).await {
+							warn!(
+								replica = name,
+								restore = current,
+								error = %e,
+								"failed to delete restore deployment after copy"
+							);
+						}
+						if let Err(e) = pvcs.delete(&pvc_name, &Default::default()).await {
+							warn!(
+								replica = name,
+								pvc = pvc_name,
+								error = %e,
+								"failed to delete restore PVC after copy"
+							);
+						}
 					}
 				}
 				Err(e) => {
 					warn!(
 						replica = name,
 						restore = current,
+						strategy = ?overlay_config.strategy,
 						error = ?e,
-						"FDW reconciliation failed, will retry"
+						"overlay reconciliation failed, will retry"
 					);
 					return Ok(Action::requeue(Duration::from_secs(30)));
 				}
@@ -337,7 +390,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		} else {
 			debug!(
 				replica = name,
-				"no current restore set, skipping FDW reconciliation"
+				"no current restore set, skipping overlay reconciliation"
 			);
 		}
 	}
