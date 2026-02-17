@@ -393,7 +393,7 @@ async fn post_snapshot_results(
 		bytes = body.len(),
 		"received snapshot results callback"
 	);
-	state.ctx.store_snapshot_result(&namespace, &replica, body);
+	state.ctx.snapshot_results.store(&namespace, &replica, body);
 	StatusCode::NO_CONTENT
 }
 
@@ -411,7 +411,7 @@ async fn post_copy_results(
 		bytes = body.len(),
 		"received copy results callback"
 	);
-	state.ctx.store_copy_result(&namespace, &replica, body);
+	state.ctx.copy_results.store(&namespace, &replica, body);
 	StatusCode::NO_CONTENT
 }
 

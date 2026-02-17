@@ -16,7 +16,10 @@ use kube::{
 use rand::RngExt;
 use tracing::{debug, info, warn};
 
-use super::overlay;
+use super::{
+	jobs::{JobStatus, classify_job},
+	overlay,
+};
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -479,134 +482,136 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	let snapshot_job = jobs.get_opt(&snapshot_job_name).await?;
 
 	if let Some(ref job) = snapshot_job {
-		let succeeded = job.status.as_ref().and_then(|s| s.succeeded).unwrap_or(0);
-		let failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0);
-		let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
+		match classify_job(job) {
+			JobStatus::Succeeded => {
+				let raw = ctx.snapshot_results.take(&namespace, &name);
 
-		if succeeded > 0 {
-			let raw = ctx.take_snapshot_result(&namespace, &name);
-
-			let Some(ref raw) = raw else {
-				let completion_time = job.status.as_ref().and_then(|s| s.completion_time.as_ref());
-				let stale = completion_time
-					.is_some_and(|t| now.duration_since(t.0) > SignedDuration::from_secs(60));
-				if stale {
-					warn!(
-						replica = name,
-						job = snapshot_job_name,
-						"snapshot list job results unreadable after 60s, deleting stale job"
-					);
-					if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
-						warn!(job = snapshot_job_name, error = %e, "failed to delete stale snapshot list job");
-					}
-					return Ok(Action::requeue(Duration::from_secs(10)));
-				}
-				info!(
-					replica = name,
-					job = snapshot_job_name,
-					"snapshot list job succeeded but results not yet available, retrying"
-				);
-				return Ok(Action::requeue(Duration::from_secs(5)));
-			};
-
-			// We have the data — safe to delete the job now.
-			if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
-				warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
-			}
-
-			match kopia::parse_snapshot_list_output(raw) {
-				Ok(all_snapshots) => {
-					let filtered = kopia::filter_snapshots(
-						&all_snapshots,
-						replica.spec.snapshot_filter.as_ref(),
-					);
-					let latest = kopia::latest_snapshot(&filtered);
-
-					if let Some(snap) = latest {
-						let size = snap.total_size_bytes();
-						replica
-							.update_status_field(client, "latestAvailableSnapshot", &snap.id)
-							.await?;
-
-						let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
-
-						if current_snapshot_id == Some(&snap.id) {
-							debug!(
-								replica = name,
-								snapshot = snap.id,
-								"latest snapshot already active, skipping"
-							);
-						} else {
-							info!(
-								replica = name,
-								snapshot = snap.id,
-								size,
-								"new snapshot available, creating restore"
-							);
-							let info = SnapshotInfo {
-								id: snap.id.clone(),
-								size,
-							};
-							replica.create_restore_for_snapshot(client, &info).await?;
-							ctx.metrics.restores_started_total.inc();
-
-							if let Err(e) = ctx
-								.recorder
-								.publish(
-									&Event {
-										type_: EventType::Normal,
-										reason: "RestoreStarted".into(),
-										note: Some(format!(
-											"Started restore from snapshot {}",
-											snap.id
-										)),
-										action: "Restore".into(),
-										secondary: None,
-									},
-									&replica.object_ref(&()),
-								)
-								.await
-							{
-								warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
-							}
-						}
-					} else {
+				let Some(ref raw) = raw else {
+					let completion_time =
+						job.status.as_ref().and_then(|s| s.completion_time.as_ref());
+					let stale = completion_time
+						.is_some_and(|t| now.duration_since(t.0) > SignedDuration::from_secs(60));
+					if stale {
 						warn!(
 							replica = name,
-							"snapshot list job returned no matching snapshots"
+							job = snapshot_job_name,
+							"snapshot list job results unreadable after 60s, deleting stale job"
+						);
+						if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
+							warn!(job = snapshot_job_name, error = %e, "failed to delete stale snapshot list job");
+						}
+						return Ok(Action::requeue(Duration::from_secs(10)));
+					}
+					info!(
+						replica = name,
+						job = snapshot_job_name,
+						"snapshot list job succeeded but results not yet available, retrying"
+					);
+					return Ok(Action::requeue(Duration::from_secs(5)));
+				};
+
+				// We have the data — safe to delete the job now.
+				if let Err(e) = jobs.delete(&snapshot_job_name, &Default::default()).await {
+					warn!(job = snapshot_job_name, error = %e, "failed to delete snapshot list job");
+				}
+
+				match kopia::parse_snapshot_list_output(raw) {
+					Ok(all_snapshots) => {
+						let filtered = kopia::filter_snapshots(
+							&all_snapshots,
+							replica.spec.snapshot_filter.as_ref(),
+						);
+						let latest = kopia::latest_snapshot(&filtered);
+
+						if let Some(snap) = latest {
+							let size = snap.total_size_bytes();
+							replica
+								.update_status_field(client, "latestAvailableSnapshot", &snap.id)
+								.await?;
+
+							let current_snapshot_id =
+								active_restore.map(|r| r.spec.snapshot.as_str());
+
+							if current_snapshot_id == Some(&snap.id) {
+								debug!(
+									replica = name,
+									snapshot = snap.id,
+									"latest snapshot already active, skipping"
+								);
+							} else {
+								info!(
+									replica = name,
+									snapshot = snap.id,
+									size,
+									"new snapshot available, creating restore"
+								);
+								let info = SnapshotInfo {
+									id: snap.id.clone(),
+									size,
+								};
+								replica.create_restore_for_snapshot(client, &info).await?;
+								ctx.metrics.restores_started_total.inc();
+
+								if let Err(e) = ctx
+									.recorder
+									.publish(
+										&Event {
+											type_: EventType::Normal,
+											reason: "RestoreStarted".into(),
+											note: Some(format!(
+												"Started restore from snapshot {}",
+												snap.id
+											)),
+											action: "Restore".into(),
+											secondary: None,
+										},
+										&replica.object_ref(&()),
+									)
+									.await
+								{
+									warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+								}
+							}
+						} else {
+							warn!(
+								replica = name,
+								"snapshot list job returned no matching snapshots"
+							);
+						}
+					}
+					Err(e) => {
+						warn!(
+							replica = name,
+							error = %e,
+							"failed to parse snapshot list job output"
 						);
 					}
 				}
-				Err(e) => {
-					warn!(
-						replica = name,
-						error = %e,
-						"failed to parse snapshot list job output"
-					);
+			}
+			JobStatus::Failed => {
+				warn!(replica = name, "snapshot list job failed");
+				// Extend the TTL to 24 hours so the failed Job's pods (and
+				// their logs) stick around long enough for someone to
+				// investigate. We deliberately do *not* proactively delete
+				// failed Jobs the way we do for successful ones.
+				const FAILED_JOB_TTL_SECS: i32 = 86_400; // 24 hours
+				let ttl_patch = serde_json::json!({
+					"spec": { "ttlSecondsAfterFinished": FAILED_JOB_TTL_SECS }
+				});
+				if let Err(e) = jobs
+					.patch(
+						&snapshot_job_name,
+						&PatchParams::apply("postgres-restore-operator").force(),
+						&Patch::Merge(&ttl_patch),
+					)
+					.await
+				{
+					warn!(job = snapshot_job_name, error = %e, "failed to extend TTL on failed snapshot list job");
 				}
 			}
-		} else if failed > backoff_limit {
-			warn!(replica = name, "snapshot list job failed");
-			// Extend the TTL to 24 hours so the failed Job's pods (and
-			// their logs) stick around long enough for someone to
-			// investigate. We deliberately do *not* proactively delete
-			// failed Jobs the way we do for successful ones.
-			const FAILED_JOB_TTL_SECS: i32 = 86_400; // 24 hours
-			let ttl_patch = serde_json::json!({
-				"spec": { "ttlSecondsAfterFinished": FAILED_JOB_TTL_SECS }
-			});
-			if let Err(e) = jobs
-				.patch(
-					&snapshot_job_name,
-					&PatchParams::apply("postgres-restore-operator").force(),
-					&Patch::Merge(&ttl_patch),
-				)
-				.await
-			{
-				warn!(job = snapshot_job_name, error = %e, "failed to extend TTL on failed snapshot list job");
+			JobStatus::Active => {
+				return Ok(Action::requeue(Duration::from_secs(10)));
 			}
-		} else {
-			return Ok(Action::requeue(Duration::from_secs(10)));
 		}
 	}
 

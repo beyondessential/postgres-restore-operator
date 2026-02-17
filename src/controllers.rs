@@ -1,7 +1,7 @@
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector, SecretReference};
 use kube::{Api, Client};
-use tracing::debug;
 
+pub mod jobs;
 pub mod overlay;
 pub mod replica;
 pub mod restore;

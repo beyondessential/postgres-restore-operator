@@ -4,8 +4,7 @@ use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::api::{
 	batch::v1::{Job, JobSpec},
 	core::v1::{
-		Container, EnvVar, EnvVarSource, PodSecurityContext, PodSpec, PodTemplateSpec,
-		ResourceRequirements, Secret, SecretKeySelector,
+		Container, PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements, Secret,
 	},
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -17,6 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
 	context::Context,
+	controllers::jobs::{JobStatus, classify_job, env_from_secret_name, env_literal},
 	error::{Error, Result},
 	types::PostgresPhysicalReplica,
 };
@@ -119,30 +119,6 @@ exit $EXIT_CODE
 	script
 }
 
-/// Build an `EnvVar` that references a key in a named Kubernetes Secret.
-fn env_from_named_secret(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
-	EnvVar {
-		name: env_name.to_string(),
-		value_from: Some(EnvVarSource {
-			secret_key_ref: Some(SecretKeySelector {
-				name: secret_name.to_string(),
-				key: key.to_string(),
-				optional: Some(false),
-			}),
-			..Default::default()
-		}),
-		..Default::default()
-	}
-}
-
-fn env_literal(name: &str, value: &str) -> EnvVar {
-	EnvVar {
-		name: name.to_string(),
-		value: Some(value.to_string()),
-		..Default::default()
-	}
-}
-
 /// Build the copy Job spec.
 #[expect(
 	clippy::too_many_arguments,
@@ -208,18 +184,10 @@ fn build_copy_job(
 						command: Some(vec!["bash".to_string(), "-c".to_string()]),
 						args: Some(vec![script]),
 						env: Some(vec![
-							env_from_named_secret("READER_USER", reader_secret_name, "username"),
-							env_from_named_secret(
-								"READER_PASSWORD",
-								reader_secret_name,
-								"password",
-							),
-							env_from_named_secret(
-								"OVERLAY_USER",
-								superuser_secret_name,
-								"username",
-							),
-							env_from_named_secret(
+							env_from_secret_name("READER_USER", reader_secret_name, "username"),
+							env_from_secret_name("READER_PASSWORD", reader_secret_name, "password"),
+							env_from_secret_name("OVERLAY_USER", superuser_secret_name, "username"),
+							env_from_secret_name(
 								"OVERLAY_PASSWORD",
 								superuser_secret_name,
 								"password",
@@ -249,37 +217,6 @@ fn build_copy_job(
 		}),
 		..Default::default()
 	}
-}
-
-/// Determine the Job status.
-enum JobStatus {
-	Active,
-	Succeeded,
-	Failed,
-}
-
-fn classify_job(job: &Job) -> JobStatus {
-	let status = match &job.status {
-		Some(s) => s,
-		None => return JobStatus::Active,
-	};
-	if status.succeeded.unwrap_or(0) > 0 {
-		return JobStatus::Succeeded;
-	}
-	let failed = status.failed.unwrap_or(0);
-	let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(0);
-	if failed > backoff_limit {
-		return JobStatus::Failed;
-	}
-	// Check for active deadline exceeded or other terminal conditions
-	if let Some(conditions) = &status.conditions {
-		for cond in conditions {
-			if cond.type_ == "Failed" && cond.status == "True" {
-				return JobStatus::Failed;
-			}
-		}
-	}
-	JobStatus::Active
 }
 
 /// Reconcile overlay state using the copy strategy.
@@ -407,7 +344,8 @@ pub async fn reconcile_copy(
 				}
 				JobStatus::Failed => {
 					let last_error = ctx
-						.take_copy_result(namespace, &replica_name)
+						.copy_results
+						.take(namespace, &replica_name)
 						.unwrap_or_else(|| "no callback received".to_string());
 
 					current_retries += 1;
@@ -711,63 +649,5 @@ mod tests {
 		assert_eq!(owner_refs.len(), 1);
 		assert_eq!(owner_refs[0].kind, "PostgresPhysicalReplica");
 		assert_eq!(owner_refs[0].name, "test-replica");
-	}
-
-	#[test]
-	fn classify_active_job() {
-		let job = Job::default();
-		assert!(matches!(classify_job(&job), JobStatus::Active));
-	}
-
-	#[test]
-	fn classify_succeeded_job() {
-		let mut job = Job::default();
-		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
-			succeeded: Some(1),
-			..Default::default()
-		});
-		assert!(matches!(classify_job(&job), JobStatus::Succeeded));
-	}
-
-	#[test]
-	fn classify_failed_job() {
-		let mut job = Job::default();
-		job.spec = Some(JobSpec {
-			backoff_limit: Some(3),
-			..Default::default()
-		});
-		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
-			failed: Some(4),
-			..Default::default()
-		});
-		assert!(matches!(classify_job(&job), JobStatus::Failed));
-	}
-
-	#[test]
-	fn classify_failed_job_via_condition() {
-		let mut job = Job::default();
-		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
-			conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
-				type_: "Failed".into(),
-				status: "True".into(),
-				..Default::default()
-			}]),
-			..Default::default()
-		});
-		assert!(matches!(classify_job(&job), JobStatus::Failed));
-	}
-
-	#[test]
-	fn classify_still_active_with_some_failures() {
-		let mut job = Job::default();
-		job.spec = Some(JobSpec {
-			backoff_limit: Some(3),
-			..Default::default()
-		});
-		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
-			failed: Some(1),
-			..Default::default()
-		});
-		assert!(matches!(classify_job(&job), JobStatus::Active));
 	}
 }

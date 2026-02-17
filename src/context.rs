@@ -1,16 +1,13 @@
-use std::{
-	collections::HashMap,
-	sync::{
-		Arc, Mutex, RwLock,
-		atomic::{AtomicBool, AtomicUsize, Ordering},
-	},
+use std::sync::{
+	Arc, RwLock,
+	atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
 use jiff::Timestamp;
 use kube::Client;
 use kube::runtime::events::{Recorder, Reporter};
 
-use crate::metrics::Metrics;
+use crate::{controllers::jobs::CallbackStore, metrics::Metrics};
 
 pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 
@@ -24,11 +21,9 @@ pub struct Context {
 	pub use_port_forward: Arc<AtomicBool>,
 	pub http_client: reqwest::Client,
 	/// In-memory store for snapshot-list results POSTed by jobs.
-	/// Key: `{namespace}/{replica-name}`, Value: raw JSON from kopia.
-	pub snapshot_results: Arc<Mutex<HashMap<String, String>>>,
+	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for overlay copy results POSTed by jobs.
-	/// Key: `{namespace}/{replica-name}`, Value: plain-text result body.
-	pub copy_results: Arc<Mutex<HashMap<String, String>>>,
+	pub copy_results: Arc<CallbackStore>,
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
 	pub callback_base_url: String,
@@ -54,8 +49,8 @@ impl Context {
 			kopia_image: Arc::new(RwLock::new(kopia_image)),
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
-			snapshot_results: Arc::new(Mutex::new(HashMap::new())),
-			copy_results: Arc::new(Mutex::new(HashMap::new())),
+			snapshot_results: Arc::new(CallbackStore::default()),
+			copy_results: Arc::new(CallbackStore::default()),
 			callback_base_url,
 		}
 	}
@@ -86,30 +81,6 @@ impl Context {
 			"{}/api/v1/copy-results/{namespace}/{replica}",
 			self.callback_base_url
 		)
-	}
-
-	/// Take snapshot results from the in-memory store, removing them.
-	pub fn take_snapshot_result(&self, namespace: &str, replica: &str) -> Option<String> {
-		let key = format!("{namespace}/{replica}");
-		self.snapshot_results.lock().unwrap().remove(&key)
-	}
-
-	/// Store snapshot results from a job callback.
-	pub fn store_snapshot_result(&self, namespace: &str, replica: &str, data: String) {
-		let key = format!("{namespace}/{replica}");
-		self.snapshot_results.lock().unwrap().insert(key, data);
-	}
-
-	/// Take copy results from the in-memory store, removing them.
-	pub fn take_copy_result(&self, namespace: &str, replica: &str) -> Option<String> {
-		let key = format!("{namespace}/{replica}");
-		self.copy_results.lock().unwrap().remove(&key)
-	}
-
-	/// Store copy results from a job callback.
-	pub fn store_copy_result(&self, namespace: &str, replica: &str, data: String) {
-		let key = format!("{namespace}/{replica}");
-		self.copy_results.lock().unwrap().insert(key, data);
 	}
 
 	/// Remove a restore from the queue, promote the next pending one if there
