@@ -202,10 +202,9 @@ pub async fn reconcile_copy(
 		return Err(Error::InvalidOverlayConfig(msg));
 	}
 
-	let retries = current_retries + 1;
-	write_state(overlay_pg, &config_hash, "pending", retries).await?;
-
-	// Discover the main database in the restore
+	// Discover the main database in the restore.
+	// Preparatory steps are not counted as retries — only actual copy
+	// exec failures consume retry budget.
 	let restore_dbname = discover_restore_database(
 		client,
 		namespace,
@@ -224,8 +223,6 @@ pub async fn reconcile_copy(
 			quote_ident(analytics_user)
 		))
 		.await?;
-
-	write_state(overlay_pg, &config_hash, "importing", retries).await?;
 
 	// Resolve expected schemas
 	let schemas = resolve_schemas(
@@ -251,11 +248,18 @@ pub async fn reconcile_copy(
 	// Determine the overlay pod to exec into
 	let overlay_pod = format!("{cluster_name}-1");
 
+	// Now that all preparatory steps succeeded, increment the retry
+	// counter. Only actual copy exec failures should consume retries.
+	let retries = current_retries + 1;
+	write_state(overlay_pg, &config_hash, "importing", retries).await?;
+
 	info!(
 		replica = %replica_name,
 		restore = %restore_name,
 		overlay_pod = %overlay_pod,
 		schema_count = schemas.len(),
+		attempt = retries,
+		max_retries = MAX_COPY_RETRIES,
 		"copying schemas via pg_dump | psql"
 	);
 
