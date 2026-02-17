@@ -1,6 +1,5 @@
 use std::collections::BTreeMap;
 
-use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::api::{
 	batch::v1::{Job, JobSpec},
 	core::v1::{
@@ -27,7 +26,7 @@ use super::common::{
 };
 
 const MAX_COPY_RETRIES: i32 = 3;
-const RETRY_COOLDOWN_SECS: i64 = 300; // 5 minutes
+
 const COPY_JOB_CONTAINER: &str = "copy";
 
 fn copy_job_name(replica_name: &str) -> String {
@@ -171,7 +170,7 @@ fn build_copy_job(
 			..Default::default()
 		},
 		spec: Some(JobSpec {
-			backoff_limit: Some(3),
+			backoff_limit: Some(0),
 			active_deadline_seconds: Some(7200), // 2 hours
 			ttl_seconds_after_finished: Some(300),
 			template: PodTemplateSpec {
@@ -372,6 +371,25 @@ pub async fn reconcile_copy(
 						last_error = %last_error,
 						"copy Job failed"
 					);
+					if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+						warn!(job = %job_name, error = %e, "failed to delete failed copy Job");
+					}
+
+					if current_retries >= MAX_COPY_RETRIES {
+						write_state(
+							overlay_pg,
+							&config_hash,
+							"failed",
+							current_retries,
+							Some(&last_error),
+						)
+						.await?;
+						return Err(Error::InvalidOverlayConfig(format!(
+							"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore \
+							 {restore_name} (last error: {last_error})"
+						)));
+					}
+
 					write_state(
 						overlay_pg,
 						&config_hash,
@@ -380,62 +398,22 @@ pub async fn reconcile_copy(
 						Some(&last_error),
 					)
 					.await?;
-
-					if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
-						warn!(job = %job_name, error = %e, "failed to delete failed copy Job");
-					}
-
-					// If we just exhausted the retry budget, enter cooldown
-					// immediately. The `tracked` variable read at the start
-					// of this function is stale, so we cannot rely on its
-					// `updated_at` for an accurate elapsed calculation.
-					if current_retries >= MAX_COPY_RETRIES {
-						return Err(Error::InvalidOverlayConfig(format!(
-							"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore \
-							 {restore_name}, entering {RETRY_COOLDOWN_SECS}s cooldown \
-							 (last error: {last_error})"
-						)));
-					}
 					// Otherwise fall through to create a new Job
 				}
 			}
 		}
 	}
 
-	// Check retry/cooldown budget
+	// Check retry budget — once exhausted, stay failed until config changes
 	if current_retries >= MAX_COPY_RETRIES {
-		let last_attempt = tracked
-			.as_ref()
-			.map(|t| t.updated_at)
-			.unwrap_or(Timestamp::UNIX_EPOCH);
 		let last_error = tracked
 			.as_ref()
 			.and_then(|t| t.last_error.as_deref())
 			.unwrap_or("unknown");
-		let elapsed = Timestamp::now().duration_since(last_attempt);
-
-		if elapsed < SignedDuration::from_secs(RETRY_COOLDOWN_SECS) {
-			let remaining = RETRY_COOLDOWN_SECS - elapsed.as_secs();
-			warn!(
-				replica = %replica_name,
-				restore = %restore_name,
-				cooldown_remaining_secs = remaining,
-				last_error = last_error,
-				"copy strategy exhausted {MAX_COPY_RETRIES} retries, waiting for cooldown"
-			);
-			return Err(Error::InvalidOverlayConfig(format!(
-				"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore {restore_name}, \
-				 will reset in {remaining}s (last error: {last_error})"
-			)));
-		}
-
-		info!(
-			replica = %replica_name,
-			restore = %restore_name,
-			"retry cooldown elapsed, resetting copy retry counter"
-		);
-		write_state(overlay_pg, &config_hash, "pending", 0, None).await?;
-		current_retries = 0;
+		return Err(Error::InvalidOverlayConfig(format!(
+			"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore {restore_name} \
+			 (last error: {last_error})"
+		)));
 	}
 
 	// Discover the main database in the restore
@@ -621,7 +599,7 @@ mod tests {
 		assert_eq!(labels.get("pgro.bes.au/component").unwrap(), "overlay-copy");
 
 		let spec = job.spec.as_ref().unwrap();
-		assert_eq!(spec.backoff_limit, Some(3));
+		assert_eq!(spec.backoff_limit, Some(0));
 
 		let pod_spec = spec.template.spec.as_ref().unwrap();
 		let container = &pod_spec.containers[0];
