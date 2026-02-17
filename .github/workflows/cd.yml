@@ -84,13 +84,13 @@ jobs:
         run: echo "version=$(cargo pkgid | cut -d# -f2)" >> "$GITHUB_OUTPUT"
 
       - name: Download AMD64 binaries
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: binaries-amd64
           path: .github/build-context/amd64/
 
       - name: Download ARM64 binaries
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@v7
         with:
           name: binaries-arm64
           path: .github/build-context/arm64/
