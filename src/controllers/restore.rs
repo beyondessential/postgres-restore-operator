@@ -101,10 +101,7 @@ pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>)
 			// Just wait.
 			Ok(Action::requeue(Duration::from_secs(10)))
 		}
-		Some(RestorePhase::Active) => {
-			// Serving traffic, nothing to do
-			Ok(Action::requeue(Duration::from_secs(300)))
-		}
+		Some(RestorePhase::Active) => reconcile_active(&restore, &ctx, &name, &namespace).await,
 		Some(RestorePhase::Failed) => {
 			// Nothing to do, waiting for cleanup or manual intervention
 			Ok(Action::requeue(Duration::from_secs(300)))
@@ -386,6 +383,58 @@ async fn ensure_restore_service(
 
 	services.create(&PostParams::default(), &service).await?;
 	Ok(())
+}
+
+/// Keep the restore deployment in sync while it is actively serving.
+///
+/// This is intentionally lightweight: it SSA-patches the deployment so that
+/// credential renames, image changes, or config tweaks introduced by an
+/// operator upgrade are applied without requiring a manual restart.
+async fn reconcile_active(
+	restore: &PostgresPhysicalRestore,
+	ctx: &Context,
+	name: &str,
+	namespace: &str,
+) -> Result<Action> {
+	let client = &ctx.client;
+	let replica_name = &restore.spec.replica.name;
+
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let replica = match replicas.get_opt(replica_name).await? {
+		Some(r) => r,
+		None => return Ok(Action::requeue(Duration::from_secs(300))),
+	};
+
+	// Ensure the reader credentials secret exists (name may have changed
+	// across operator upgrades).
+	if replica.spec.overlay_database.is_some() {
+		overlay::common::ensure_reader_credentials(client, namespace, replica_name, &replica)
+			.await?;
+	}
+
+	// SSA-patch the deployment to converge on any spec changes.
+	if restore
+		.status
+		.as_ref()
+		.and_then(|s| s.postgres_version.as_ref())
+		.is_some()
+	{
+		let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+		let desired = build_deployment(restore, name, namespace, &replica)?;
+		let mut patch_value = serde_json::to_value(&desired)?;
+		patch_value["apiVersion"] = serde_json::json!("apps/v1");
+		patch_value["kind"] = serde_json::json!("Deployment");
+
+		deployments
+			.patch(
+				name,
+				&PatchParams::apply("postgres-restore-operator").force(),
+				&Patch::Apply(&patch_value),
+			)
+			.await?;
+	}
+
+	Ok(Action::requeue(Duration::from_secs(300)))
 }
 
 async fn reconcile_ready(
