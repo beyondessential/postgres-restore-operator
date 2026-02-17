@@ -1,10 +1,22 @@
+use std::collections::BTreeMap;
+
 use jiff::{SignedDuration, Timestamp};
-use k8s_openapi::api::core::v1::Secret;
-use kube::{Api, Client, ResourceExt, api::AttachParams};
-use tokio::io::AsyncReadExt;
+use k8s_openapi::api::{
+	batch::v1::{Job, JobSpec},
+	core::v1::{
+		Container, EnvVar, EnvVarSource, PodSecurityContext, PodSpec, PodTemplateSpec,
+		ResourceRequirements, Secret, SecretKeySelector,
+	},
+};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+use kube::{
+	Api, Client, ResourceExt,
+	api::{ObjectMeta, PostParams},
+};
 use tracing::{debug, info, warn};
 
 use crate::{
+	context::Context,
 	error::{Error, Result},
 	types::PostgresPhysicalReplica,
 };
@@ -16,129 +28,273 @@ use super::common::{
 
 const MAX_COPY_RETRIES: i32 = 3;
 const RETRY_COOLDOWN_SECS: i64 = 300; // 5 minutes
+const COPY_JOB_CONTAINER: &str = "copy";
 
-/// Execute a command inside a pod via the Kubernetes exec API and return
-/// the combined stdout+stderr output. Returns an error if the command
-/// exits with a non-zero status.
-async fn exec_in_pod(
-	client: &Client,
-	namespace: &str,
-	pod_name: &str,
-	command: &[&str],
-) -> Result<String> {
-	let pods: Api<k8s_openapi::api::core::v1::Pod> = Api::namespaced(client.clone(), namespace);
-	let attach = AttachParams {
-		stdout: true,
-		stderr: true,
-		stdin: false,
-		tty: false,
-		..Default::default()
-	};
-
-	let owned_command: Vec<String> = command.iter().map(|s| (*s).to_owned()).collect();
-	let mut process = pods.exec(pod_name, owned_command, &attach).await?;
-
-	let status_future = process.take_status().ok_or_else(|| {
-		Error::MissingField("exec process did not provide a status channel".into())
-	})?;
-
-	let mut stdout_buf = Vec::new();
-	if let Some(mut stdout) = process.stdout() {
-		stdout
-			.read_to_end(&mut stdout_buf)
-			.await
-			.map_err(|e| Error::MissingField(format!("failed to read exec stdout: {e}")))?;
-	}
-
-	let mut stderr_buf = Vec::new();
-	if let Some(mut stderr) = process.stderr() {
-		stderr
-			.read_to_end(&mut stderr_buf)
-			.await
-			.map_err(|e| Error::MissingField(format!("failed to read exec stderr: {e}")))?;
-	}
-
-	let status = status_future
-		.await
-		.ok_or_else(|| Error::MissingField("exec process did not return a status".into()))?;
-
-	let stdout_str = String::from_utf8_lossy(&stdout_buf);
-	let stderr_str = String::from_utf8_lossy(&stderr_buf);
-
-	if status.status.as_deref() != Some("Success") {
-		let reason = status
-			.message
-			.as_deref()
-			.or(status.reason.as_deref())
-			.unwrap_or("unknown");
-		return Err(Error::MissingField(format!(
-			"exec in pod {pod_name} failed ({reason})\nstdout: {stdout_str}\nstderr: {stderr_str}"
-		)));
-	}
-
-	Ok(stdout_str.into_owned())
+fn copy_job_name(replica_name: &str) -> String {
+	format!("{replica_name}-overlay-copy")
 }
 
-/// Build the shell command that copies a single schema from the restore
-/// database into the overlay via `pg_dump | psql`.
-fn build_copy_command(
-	restore_host: &str,
-	restore_dbname: &str,
-	reader_user: &str,
-	reader_password: &str,
-	remote_schema: &str,
-	local_schema: &str,
-) -> String {
-	let remote_quoted = quote_ident(remote_schema);
-	let local_quoted = quote_ident(local_schema);
+/// Build the shell script that copies schemas from the restore database
+/// into the overlay via `pg_dump | psql`.
+///
+/// Credentials and hosts are injected as environment variables:
+///   READER_USER, READER_PASSWORD, RESTORE_HOST, RESTORE_DBNAME,
+///   OVERLAY_USER, OVERLAY_PASSWORD, OVERLAY_HOST, COPY_CALLBACK_URL
+fn build_copy_script(schemas: &[(String, String)]) -> String {
+	let mut script = String::from(
+		r#"#!/bin/bash
+set -o pipefail
 
-	// Shell-escape the password for use in PGPASSWORD env var.
-	// We use single quotes and escape any embedded single quotes.
-	let escaped_password = reader_password.replace('\'', "'\\''");
+report_result() {
+  local body="$1"
+  if [ -n "$COPY_CALLBACK_URL" ]; then
+    curl -sf -X POST --max-time 10 \
+      -H 'Content-Type: text/plain' \
+      --data-binary "$body" \
+      "$COPY_CALLBACK_URL" 2>/dev/null || true
+  fi
+}
 
-	let mut script = format!(
-		"set -eo pipefail\n\
-		 echo 'Dropping existing local schema {local_quoted}...'\n\
-		 psql -U postgres -d app -c 'DROP SCHEMA IF EXISTS {local_quoted} CASCADE;'\n\
-		 echo 'Copying schema {remote_quoted} from restore...'\n\
-		 PGPASSWORD='{escaped_password}' pg_dump \
-		   -h {restore_host} \
-		   -p 5432 \
-		   -U {reader_user} \
-		   -d {restore_dbname} \
-		   -n {remote_quoted} \
-		   --no-owner \
-		   --no-privileges \
-		   --no-comments \
-		   --no-publications \
-		   --no-subscriptions \
-		   --no-security-labels \
-		   --no-tablespaces \
-		 | psql -U postgres -d app -v ON_ERROR_STOP=1 --quiet\n"
+copy_schemas() {
+  set -e
+"#,
 	);
 
-	if remote_schema != local_schema {
+	for (remote, local) in schemas {
+		let remote_quoted = quote_ident(remote);
+		let local_quoted = quote_ident(local);
+
 		script.push_str(&format!(
-			"echo 'Renaming schema {remote_quoted} to {local_quoted}...'\n\
-			 psql -U postgres -d app -c 'ALTER SCHEMA {remote_quoted} RENAME TO {local_quoted};'\n"
+			"\n  echo 'Dropping existing local schema {local_quoted}...'\n\
+			   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
+			     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
+			     -c 'DROP SCHEMA IF EXISTS {local_quoted} CASCADE;'\n\
+			   echo 'Copying schema {remote_quoted} from restore...'\n\
+			   PGPASSWORD=\"$READER_PASSWORD\" pg_dump \
+			     -h \"$RESTORE_HOST\" \
+			     -p 5432 \
+			     -U \"$READER_USER\" \
+			     -d \"$RESTORE_DBNAME\" \
+			     -n {remote_quoted} \
+			     --no-owner \
+			     --no-privileges \
+			     --no-comments \
+			     --no-publications \
+			     --no-subscriptions \
+			     --no-security-labels \
+			     --no-tablespaces \
+			   | PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
+			     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
+			     -v ON_ERROR_STOP=1 --quiet\n"
 		));
+
+		if remote != local {
+			script.push_str(&format!(
+				"  echo 'Renaming schema {remote_quoted} to {local_quoted}...'\n\
+				   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
+				     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
+				     -c 'ALTER SCHEMA {remote_quoted} RENAME TO {local_quoted};'\n"
+			));
+		}
 	}
 
-	script.push_str("echo 'Schema copy complete.'\n");
+	script.push_str(
+		r#"
+  echo 'All schema copies complete.'
+}
+
+OUTPUT=$(copy_schemas 2>&1)
+EXIT_CODE=$?
+
+if [ $EXIT_CODE -eq 0 ]; then
+  report_result 'success'
+else
+  echo "$OUTPUT" >&2
+  report_result "$(printf '%s' "$OUTPUT" | tail -c 8192)"
+fi
+
+exit $EXIT_CODE
+"#,
+	);
 	script
+}
+
+/// Build an `EnvVar` that references a key in a named Kubernetes Secret.
+fn env_from_named_secret(env_name: &str, secret_name: &str, key: &str) -> EnvVar {
+	EnvVar {
+		name: env_name.to_string(),
+		value_from: Some(EnvVarSource {
+			secret_key_ref: Some(SecretKeySelector {
+				name: secret_name.to_string(),
+				key: key.to_string(),
+				optional: Some(false),
+			}),
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
+fn env_literal(name: &str, value: &str) -> EnvVar {
+	EnvVar {
+		name: name.to_string(),
+		value: Some(value.to_string()),
+		..Default::default()
+	}
+}
+
+/// Build the copy Job spec.
+#[expect(
+	clippy::too_many_arguments,
+	reason = "internal builder with tightly-coupled params"
+)]
+fn build_copy_job(
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	schemas: &[(String, String)],
+	reader_secret_name: &str,
+	superuser_secret_name: &str,
+	restore_host: &str,
+	restore_dbname: &str,
+	overlay_host: &str,
+	callback_url: &str,
+	pg_version: i32,
+) -> Job {
+	let replica_name = replica.name_any();
+	let job_name = copy_job_name(&replica_name);
+	let image = format!("ghcr.io/cloudnative-pg/postgresql:{pg_version}");
+	let script = build_copy_script(schemas);
+
+	Job {
+		metadata: ObjectMeta {
+			name: Some(job_name),
+			namespace: Some(namespace.to_string()),
+			labels: Some(BTreeMap::from([
+				("pgro.bes.au/replica".to_string(), replica_name.clone()),
+				(
+					"pgro.bes.au/component".to_string(),
+					"overlay-copy".to_string(),
+				),
+			])),
+			owner_references: Some(vec![replica.owner_reference()]),
+			..Default::default()
+		},
+		spec: Some(JobSpec {
+			backoff_limit: Some(3),
+			active_deadline_seconds: Some(7200), // 2 hours
+			ttl_seconds_after_finished: Some(300),
+			template: PodTemplateSpec {
+				metadata: Some(ObjectMeta {
+					labels: Some(BTreeMap::from([
+						("pgro.bes.au/replica".to_string(), replica_name),
+						(
+							"pgro.bes.au/component".to_string(),
+							"overlay-copy".to_string(),
+						),
+					])),
+					..Default::default()
+				}),
+				spec: Some(PodSpec {
+					restart_policy: Some("Never".to_string()),
+					security_context: Some(PodSecurityContext {
+						run_as_non_root: Some(true),
+						run_as_user: Some(26), // postgres UID in CNPG image
+						run_as_group: Some(26),
+						..Default::default()
+					}),
+					containers: vec![Container {
+						name: COPY_JOB_CONTAINER.to_string(),
+						image: Some(image),
+						command: Some(vec!["bash".to_string(), "-c".to_string()]),
+						args: Some(vec![script]),
+						env: Some(vec![
+							env_from_named_secret("READER_USER", reader_secret_name, "username"),
+							env_from_named_secret(
+								"READER_PASSWORD",
+								reader_secret_name,
+								"password",
+							),
+							env_from_named_secret(
+								"OVERLAY_USER",
+								superuser_secret_name,
+								"username",
+							),
+							env_from_named_secret(
+								"OVERLAY_PASSWORD",
+								superuser_secret_name,
+								"password",
+							),
+							env_literal("RESTORE_HOST", restore_host),
+							env_literal("RESTORE_DBNAME", restore_dbname),
+							env_literal("OVERLAY_HOST", overlay_host),
+							env_literal("COPY_CALLBACK_URL", callback_url),
+						]),
+						resources: Some(ResourceRequirements {
+							requests: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("100m".to_string())),
+								("memory".to_string(), Quantity("128Mi".to_string())),
+							])),
+							limits: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("1".to_string())),
+								("memory".to_string(), Quantity("512Mi".to_string())),
+							])),
+							..Default::default()
+						}),
+						..Default::default()
+					}],
+					..Default::default()
+				}),
+			},
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
+/// Determine the Job status.
+enum JobStatus {
+	Active,
+	Succeeded,
+	Failed,
+}
+
+fn classify_job(job: &Job) -> JobStatus {
+	let status = match &job.status {
+		Some(s) => s,
+		None => return JobStatus::Active,
+	};
+	if status.succeeded.unwrap_or(0) > 0 {
+		return JobStatus::Succeeded;
+	}
+	let failed = status.failed.unwrap_or(0);
+	let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(0);
+	if failed > backoff_limit {
+		return JobStatus::Failed;
+	}
+	// Check for active deadline exceeded or other terminal conditions
+	if let Some(conditions) = &status.conditions {
+		for cond in conditions {
+			if cond.type_ == "Failed" && cond.status == "True" {
+				return JobStatus::Failed;
+			}
+		}
+	}
+	JobStatus::Active
 }
 
 /// Reconcile overlay state using the copy strategy.
 ///
-/// Connects to the overlay and restore databases, then exec's
-/// `pg_dump | psql` inside the overlay CNPG pod to copy each schema.
+/// Creates a Kubernetes Job that runs `pg_dump | psql` to copy schemas
+/// from the restore database into the overlay. Returns `true` when the
+/// copy is complete, `false` when it is still in progress.
 pub async fn reconcile_copy(
 	client: &Client,
+	ctx: &Context,
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
 	restore_name: &str,
 	use_port_forward: bool,
-) -> Result<()> {
+) -> Result<bool> {
 	let replica_name = replica.name_any();
 	let cluster_name = super::overlay_cluster_name(&replica_name);
 	let reader_secret_name = super::overlay_reader_secret_name(&replica_name);
@@ -186,16 +342,114 @@ pub async fn reconcile_copy(
 			restore = %restore_name,
 			"copy reconciliation already complete for this config, skipping"
 		);
-		return Ok(());
+		return Ok(true);
 	}
 
-	// Check retry count
 	let mut current_retries = tracked
 		.as_ref()
 		.filter(|t| t.config_hash == config_hash)
 		.map(|t| t.retries)
 		.unwrap_or(0);
 
+	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+	let job_name = copy_job_name(&replica_name);
+
+	// Check for an existing copy Job
+	if let Some(job) = jobs.get_opt(&job_name).await? {
+		// If the config changed, delete the stale Job
+		let job_config_matches = tracked
+			.as_ref()
+			.is_some_and(|t| t.config_hash == config_hash);
+		if !job_config_matches {
+			info!(
+				replica = %replica_name,
+				job = %job_name,
+				"config changed, deleting stale copy Job"
+			);
+			if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+				warn!(job = %job_name, error = %e, "failed to delete stale copy Job");
+			}
+			write_state(overlay_pg, &config_hash, "pending", 0, None).await?;
+			current_retries = 0;
+			// Fall through to create a new Job
+		} else {
+			match classify_job(&job) {
+				JobStatus::Active => {
+					debug!(
+						replica = %replica_name,
+						job = %job_name,
+						"copy Job is still running"
+					);
+					return Ok(false);
+				}
+				JobStatus::Succeeded => {
+					info!(
+						replica = %replica_name,
+						restore = %restore_name,
+						"copy Job succeeded"
+					);
+					write_state(overlay_pg, &config_hash, "complete", current_retries, None)
+						.await?;
+					if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+						warn!(job = %job_name, error = %e, "failed to delete completed copy Job");
+					}
+
+					// Ensure analytics user can create schemas
+					let analytics_user = &replica.spec.analytics_username;
+					overlay_pg
+						.batch_execute(&format!(
+							"GRANT CREATE ON DATABASE app TO {}",
+							quote_ident(analytics_user)
+						))
+						.await?;
+
+					return Ok(true);
+				}
+				JobStatus::Failed => {
+					let last_error = ctx
+						.take_copy_result(namespace, &replica_name)
+						.unwrap_or_else(|| "no callback received".to_string());
+
+					current_retries += 1;
+					warn!(
+						replica = %replica_name,
+						restore = %restore_name,
+						attempt = current_retries,
+						max_retries = MAX_COPY_RETRIES,
+						last_error = %last_error,
+						"copy Job failed"
+					);
+					write_state(
+						overlay_pg,
+						&config_hash,
+						"importing",
+						current_retries,
+						Some(&last_error),
+					)
+					.await?;
+
+					if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+						warn!(job = %job_name, error = %e, "failed to delete failed copy Job");
+					}
+
+					// If we just exhausted the retry budget, enter cooldown
+					// immediately. The `tracked` variable read at the start
+					// of this function is stale, so we cannot rely on its
+					// `updated_at` for an accurate elapsed calculation.
+					if current_retries >= MAX_COPY_RETRIES {
+						return Err(Error::InvalidOverlayConfig(format!(
+							"copy strategy exhausted {MAX_COPY_RETRIES} retries for restore \
+							 {restore_name}, entering {RETRY_COOLDOWN_SECS}s cooldown \
+							 (last error: {last_error})"
+						)));
+					}
+					// Otherwise fall through to create a new Job
+				}
+			}
+		}
+	}
+
+	// Check retry/cooldown budget
 	if current_retries >= MAX_COPY_RETRIES {
 		let last_attempt = tracked
 			.as_ref()
@@ -231,9 +485,7 @@ pub async fn reconcile_copy(
 		current_retries = 0;
 	}
 
-	// Discover the main database in the restore.
-	// Preparatory steps are not counted as retries — only actual copy
-	// exec failures consume retry budget.
+	// Discover the main database in the restore
 	let restore_dbname = discover_restore_database(
 		client,
 		namespace,
@@ -243,15 +495,6 @@ pub async fn reconcile_copy(
 		use_port_forward,
 	)
 	.await?;
-
-	// Ensure analytics user can create schemas in the overlay database
-	let analytics_user = &replica.spec.analytics_username;
-	overlay_pg
-		.batch_execute(&format!(
-			"GRANT CREATE ON DATABASE app TO {}",
-			quote_ident(analytics_user)
-		))
-		.await?;
 
 	// Resolve expected schemas
 	let schemas = resolve_schemas(
@@ -266,94 +509,46 @@ pub async fn reconcile_copy(
 	)
 	.await?;
 
-	// Determine the restore service host
-	let restore_host = if use_port_forward {
-		let label_selector = format!("pgro.bes.au/restore={restore_name}");
-		super::connect::find_pod_ip_by_label(client, namespace, &label_selector).await?
-	} else {
-		format!("{restore_name}.{namespace}.svc")
-	};
+	// Determine hosts: the Job runs in-cluster and always uses service DNS
+	let restore_host = format!("{restore_name}.{namespace}.svc");
+	let overlay_host = format!("{cluster_name}-rw.{namespace}.svc");
 
-	// Determine the overlay pod to exec into
-	let overlay_pod = format!("{cluster_name}-1");
+	// Resolve the PG version for the Job image
+	let pg_version = replica
+		.status
+		.as_ref()
+		.and_then(|s| s.overlay_postgres_version)
+		.unwrap_or(17) as i32;
 
-	// Now that all preparatory steps succeeded, increment the retry
-	// counter. Only actual copy exec failures should consume retries.
-	let retries = current_retries + 1;
-	write_state(overlay_pg, &config_hash, "importing", retries, None).await?;
+	let callback_url = ctx.copy_callback_url(namespace, &replica_name);
+
+	let job = build_copy_job(
+		replica,
+		namespace,
+		&schemas,
+		&reader_secret_name,
+		&superuser_secret_name,
+		&restore_host,
+		&restore_dbname,
+		&overlay_host,
+		&callback_url,
+		pg_version,
+	);
 
 	info!(
 		replica = %replica_name,
 		restore = %restore_name,
-		overlay_pod = %overlay_pod,
+		job = %copy_job_name(&replica_name),
 		schema_count = schemas.len(),
-		attempt = retries,
+		attempt = current_retries + 1,
 		max_retries = MAX_COPY_RETRIES,
-		"copying schemas via pg_dump | psql"
+		"creating copy Job"
 	);
 
-	for (remote, local) in &schemas {
-		debug!(
-			remote = %remote,
-			local = %local,
-			"copying schema from restore to overlay"
-		);
+	jobs.create(&PostParams::default(), &job).await?;
+	write_state(overlay_pg, &config_hash, "importing", current_retries, None).await?;
 
-		let script = build_copy_command(
-			&restore_host,
-			&restore_dbname,
-			&reader_user,
-			&reader_password,
-			remote,
-			local,
-		);
-
-		match exec_in_pod(client, namespace, &overlay_pod, &["bash", "-c", &script]).await {
-			Ok(output) => {
-				if !output.is_empty() {
-					debug!(
-						remote = %remote,
-						local = %local,
-						output = %output.trim(),
-						"pg_dump | psql output"
-					);
-				}
-				debug!(remote = %remote, local = %local, "schema copied successfully");
-			}
-			Err(e) => {
-				let err_msg = e.to_string();
-				warn!(
-					replica = %replica_name,
-					remote = %remote,
-					local = %local,
-					error = %err_msg,
-					attempt = retries,
-					max_retries = MAX_COPY_RETRIES,
-					"schema copy failed"
-				);
-				let _ = write_state(
-					overlay_pg,
-					&config_hash,
-					"importing",
-					retries,
-					Some(&err_msg),
-				)
-				.await;
-				return Err(e);
-			}
-		}
-	}
-
-	write_state(overlay_pg, &config_hash, "complete", retries, None).await?;
-
-	info!(
-		replica = %replica_name,
-		restore = %restore_name,
-		total_schemas = schemas.len(),
-		"copy reconciliation complete"
-	);
-
-	Ok(())
+	Ok(false)
 }
 
 #[cfg(test)]
@@ -361,47 +556,218 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn build_copy_command_same_schema() {
-		let cmd = build_copy_command(
-			"restore-host.ns.svc",
-			"myapp",
-			"overlay_reader",
-			"secret123",
-			"public",
-			"public",
+	fn build_copy_script_same_schema() {
+		let script = build_copy_script(&[("public".into(), "public".into())]);
+		assert!(script.contains("pg_dump"));
+		assert!(script.contains("-n \"public\""));
+		assert!(script.contains("PGPASSWORD=\"$READER_PASSWORD\""));
+		assert!(script.contains("PGPASSWORD=\"$OVERLAY_PASSWORD\""));
+		assert!(script.contains("ON_ERROR_STOP=1"));
+		assert!(script.contains("COPY_CALLBACK_URL"));
+		assert!(script.contains("report_result"));
+		assert!(!script.contains("RENAME"));
+	}
+
+	#[test]
+	fn build_copy_script_renamed_schema() {
+		let script = build_copy_script(&[("source".into(), "target".into())]);
+		assert!(script.contains("-n \"source\""));
+		assert!(script.contains("RENAME TO \"target\""));
+	}
+
+	#[test]
+	fn build_copy_script_multiple_schemas() {
+		let script = build_copy_script(&[
+			("public".into(), "public".into()),
+			("data".into(), "imported".into()),
+		]);
+		assert!(script.contains("-n \"public\""));
+		assert!(script.contains("-n \"data\""));
+		assert!(script.contains("RENAME TO \"imported\""));
+		assert!(!script.contains("RENAME TO \"public\""));
+	}
+
+	#[test]
+	fn build_copy_script_special_schema_name() {
+		let script = build_copy_script(&[("my\"schema".into(), "my\"schema".into())]);
+		assert!(script.contains("-n \"my\"\"schema\""));
+	}
+
+	#[test]
+	fn copy_job_name_format() {
+		assert_eq!(copy_job_name("my-replica"), "my-replica-overlay-copy");
+	}
+
+	#[test]
+	fn build_copy_script_reports_success() {
+		let script = build_copy_script(&[("public".into(), "public".into())]);
+		assert!(script.contains("report_result 'success'"));
+	}
+
+	#[test]
+	fn build_copy_script_reports_error() {
+		let script = build_copy_script(&[("public".into(), "public".into())]);
+		assert!(script.contains("report_result \"$(printf '%s' \"$OUTPUT\" | tail -c 8192)\""));
+	}
+
+	#[test]
+	fn build_copy_job_structure() {
+		use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
+
+		let replica = PostgresPhysicalReplica {
+			metadata: K8sObjectMeta {
+				name: Some("test-replica".into()),
+				namespace: Some("default".into()),
+				uid: Some("test-uid".into()),
+				..Default::default()
+			},
+			spec: crate::types::PostgresPhysicalReplicaSpec {
+				kopia_secret_ref: Default::default(),
+				snapshot_filter: None,
+				schedule: "0 * * * *".into(),
+				schedule_jitter: crate::util::TimeSpan(jiff::Span::new()),
+				minimum_ttl: None,
+				switchover_grace_period: crate::util::TimeSpan(jiff::Span::new()),
+				analytics_username: "analytics".into(),
+				storage_class: None,
+				storage_size_override: None,
+				resources: None,
+				service_annotations: None,
+				pod_annotations: None,
+				affinity: None,
+				tolerations: vec![],
+				read_only: true,
+				postgres_extra_config: None,
+				notifications: vec![],
+				overlay_database: None,
+			},
+			status: None,
+		};
+
+		let job = build_copy_job(
+			&replica,
+			"test-ns",
+			&[("public".into(), "public".into())],
+			"reader-secret",
+			"superuser-secret",
+			"restore.test-ns.svc",
+			"mydb",
+			"overlay-rw.test-ns.svc",
+			"http://operator.svc:8080/api/v1/copy-results/test-ns/test-replica",
+			17,
 		);
-		assert!(cmd.contains("pg_dump"));
-		assert!(cmd.contains("-n \"public\""));
-		assert!(cmd.contains("-d myapp"));
-		assert!(cmd.contains("-h restore-host.ns.svc"));
-		assert!(cmd.contains("PGPASSWORD='secret123'"));
-		assert!(cmd.contains("ON_ERROR_STOP=1"));
-		assert!(!cmd.contains("RENAME"));
-	}
 
-	#[test]
-	fn build_copy_command_renamed_schema() {
-		let cmd = build_copy_command(
-			"restore.ns.svc",
-			"myapp",
-			"overlay_reader",
-			"pass",
-			"source",
-			"target",
+		let meta = &job.metadata;
+		assert_eq!(meta.name.as_deref(), Some("test-replica-overlay-copy"));
+		assert_eq!(meta.namespace.as_deref(), Some("test-ns"));
+
+		let labels = meta.labels.as_ref().unwrap();
+		assert_eq!(labels.get("pgro.bes.au/replica").unwrap(), "test-replica");
+		assert_eq!(labels.get("pgro.bes.au/component").unwrap(), "overlay-copy");
+
+		let spec = job.spec.as_ref().unwrap();
+		assert_eq!(spec.backoff_limit, Some(3));
+
+		let pod_spec = spec.template.spec.as_ref().unwrap();
+		let container = &pod_spec.containers[0];
+		assert_eq!(container.name, "copy");
+		assert_eq!(
+			container.image.as_deref(),
+			Some("ghcr.io/cloudnative-pg/postgresql:17")
 		);
-		assert!(cmd.contains("-n \"source\""));
-		assert!(cmd.contains("RENAME TO \"target\""));
+
+		let env = container.env.as_ref().unwrap();
+		let env_names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+		assert!(env_names.contains(&"READER_USER"));
+		assert!(env_names.contains(&"READER_PASSWORD"));
+		assert!(env_names.contains(&"OVERLAY_USER"));
+		assert!(env_names.contains(&"OVERLAY_PASSWORD"));
+		assert!(env_names.contains(&"RESTORE_HOST"));
+		assert!(env_names.contains(&"RESTORE_DBNAME"));
+		assert!(env_names.contains(&"OVERLAY_HOST"));
+		assert!(env_names.contains(&"COPY_CALLBACK_URL"));
+
+		let restore_host_env = env.iter().find(|e| e.name == "RESTORE_HOST").unwrap();
+		assert_eq!(
+			restore_host_env.value.as_deref(),
+			Some("restore.test-ns.svc")
+		);
+
+		let dbname_env = env.iter().find(|e| e.name == "RESTORE_DBNAME").unwrap();
+		assert_eq!(dbname_env.value.as_deref(), Some("mydb"));
+
+		let reader_user_env = env.iter().find(|e| e.name == "READER_USER").unwrap();
+		let secret_ref = reader_user_env
+			.value_from
+			.as_ref()
+			.unwrap()
+			.secret_key_ref
+			.as_ref()
+			.unwrap();
+		assert_eq!(secret_ref.name, "reader-secret");
+		assert_eq!(secret_ref.key, "username");
+
+		let owner_refs = meta.owner_references.as_ref().unwrap();
+		assert_eq!(owner_refs.len(), 1);
+		assert_eq!(owner_refs[0].kind, "PostgresPhysicalReplica");
+		assert_eq!(owner_refs[0].name, "test-replica");
 	}
 
 	#[test]
-	fn build_copy_command_escapes_password() {
-		let cmd = build_copy_command("host", "db", "user", "it's a test", "public", "public");
-		assert!(cmd.contains("PGPASSWORD='it'\\''s a test'"));
+	fn classify_active_job() {
+		let job = Job::default();
+		assert!(matches!(classify_job(&job), JobStatus::Active));
 	}
 
 	#[test]
-	fn build_copy_command_special_schema_name() {
-		let cmd = build_copy_command("host", "db", "user", "pass", "my\"schema", "my\"schema");
-		assert!(cmd.contains("-n \"my\"\"schema\""));
+	fn classify_succeeded_job() {
+		let mut job = Job::default();
+		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
+			succeeded: Some(1),
+			..Default::default()
+		});
+		assert!(matches!(classify_job(&job), JobStatus::Succeeded));
+	}
+
+	#[test]
+	fn classify_failed_job() {
+		let mut job = Job::default();
+		job.spec = Some(JobSpec {
+			backoff_limit: Some(3),
+			..Default::default()
+		});
+		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
+			failed: Some(4),
+			..Default::default()
+		});
+		assert!(matches!(classify_job(&job), JobStatus::Failed));
+	}
+
+	#[test]
+	fn classify_failed_job_via_condition() {
+		let mut job = Job::default();
+		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
+			conditions: Some(vec![k8s_openapi::api::batch::v1::JobCondition {
+				type_: "Failed".into(),
+				status: "True".into(),
+				..Default::default()
+			}]),
+			..Default::default()
+		});
+		assert!(matches!(classify_job(&job), JobStatus::Failed));
+	}
+
+	#[test]
+	fn classify_still_active_with_some_failures() {
+		let mut job = Job::default();
+		job.spec = Some(JobSpec {
+			backoff_limit: Some(3),
+			..Default::default()
+		});
+		job.status = Some(k8s_openapi::api::batch::v1::JobStatus {
+			failed: Some(1),
+			..Default::default()
+		});
+		assert!(matches!(classify_job(&job), JobStatus::Active));
 	}
 }

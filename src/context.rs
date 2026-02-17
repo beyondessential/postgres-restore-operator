@@ -26,6 +26,9 @@ pub struct Context {
 	/// In-memory store for snapshot-list results POSTed by jobs.
 	/// Key: `{namespace}/{replica-name}`, Value: raw JSON from kopia.
 	pub snapshot_results: Arc<Mutex<HashMap<String, String>>>,
+	/// In-memory store for overlay copy results POSTed by jobs.
+	/// Key: `{namespace}/{replica-name}`, Value: plain-text result body.
+	pub copy_results: Arc<Mutex<HashMap<String, String>>>,
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
 	pub callback_base_url: String,
@@ -52,6 +55,7 @@ impl Context {
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
 			snapshot_results: Arc::new(Mutex::new(HashMap::new())),
+			copy_results: Arc::new(Mutex::new(HashMap::new())),
 			callback_base_url,
 		}
 	}
@@ -76,6 +80,14 @@ impl Context {
 		)
 	}
 
+	/// Build the callback URL for a copy job to POST results to.
+	pub fn copy_callback_url(&self, namespace: &str, replica: &str) -> String {
+		format!(
+			"{}/api/v1/copy-results/{namespace}/{replica}",
+			self.callback_base_url
+		)
+	}
+
 	/// Take snapshot results from the in-memory store, removing them.
 	pub fn take_snapshot_result(&self, namespace: &str, replica: &str) -> Option<String> {
 		let key = format!("{namespace}/{replica}");
@@ -86,6 +98,18 @@ impl Context {
 	pub fn store_snapshot_result(&self, namespace: &str, replica: &str, data: String) {
 		let key = format!("{namespace}/{replica}");
 		self.snapshot_results.lock().unwrap().insert(key, data);
+	}
+
+	/// Take copy results from the in-memory store, removing them.
+	pub fn take_copy_result(&self, namespace: &str, replica: &str) -> Option<String> {
+		let key = format!("{namespace}/{replica}");
+		self.copy_results.lock().unwrap().remove(&key)
+	}
+
+	/// Store copy results from a job callback.
+	pub fn store_copy_result(&self, namespace: &str, replica: &str, data: String) {
+		let key = format!("{namespace}/{replica}");
+		self.copy_results.lock().unwrap().insert(key, data);
 	}
 
 	/// Remove a restore from the queue, promote the next pending one if there

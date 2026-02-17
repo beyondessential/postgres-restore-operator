@@ -16,7 +16,7 @@ use kube::{
 use rand::RngExt;
 use tracing::{debug, info, warn};
 
-use super::{overlay, read_job_pod_logs};
+use super::overlay;
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -308,6 +308,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				OverlayStrategy::Copy => {
 					overlay::copy::reconcile_copy(
 						client,
+						&ctx,
 						&namespace,
 						&replica,
 						current,
@@ -318,7 +319,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			};
 
 			match result {
-				Ok(()) => {
+				Ok(true) => {
 					if overlay_restore.as_ref() != Some(&current) {
 						info!(
 							replica = name,
@@ -375,6 +376,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							);
 						}
 					}
+				}
+				Ok(false) => {
+					debug!(
+						replica = name,
+						restore = current,
+						strategy = ?overlay_config.strategy,
+						"overlay reconciliation in progress"
+					);
+					return Ok(Action::requeue(Duration::from_secs(30)));
 				}
 				Err(e) => {
 					warn!(
@@ -474,20 +484,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		let backoff_limit = job.spec.as_ref().and_then(|s| s.backoff_limit).unwrap_or(2);
 
 		if succeeded > 0 {
-			let raw = ctx
-				.take_snapshot_result(&namespace, &name)
-				.or_else(|| {
-					debug!(
-						replica = name,
-						job = snapshot_job_name,
-						"no callback result in store, falling back to pod logs"
-					);
-					None
-				})
-				.or(
-					read_job_pod_logs(client, &namespace, &snapshot_job_name, "snapshot-list")
-						.await,
-				);
+			let raw = ctx.take_snapshot_result(&namespace, &name);
 
 			let Some(ref raw) = raw else {
 				let completion_time = job.status.as_ref().and_then(|s| s.completion_time.as_ref());

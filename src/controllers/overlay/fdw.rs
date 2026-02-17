@@ -378,7 +378,7 @@ pub async fn reconcile_fdw(
 	replica: &PostgresPhysicalReplica,
 	restore_name: &str,
 	use_port_forward: bool,
-) -> Result<()> {
+) -> Result<bool> {
 	let replica_name = replica.name_any();
 	let cluster_name = super::overlay_cluster_name(&replica_name);
 	let reader_secret_name = super::overlay_reader_secret_name(&replica_name);
@@ -435,7 +435,7 @@ pub async fn reconcile_fdw(
 			restore = %restore_name,
 			"FDW reconciliation already complete for this config, skipping"
 		);
-		return Ok(());
+		return Ok(true);
 	}
 	write_state(overlay_pg, &config_hash, "pending", 0, None).await?;
 
@@ -667,5 +667,5 @@ pub async fn reconcile_fdw(
 		"FDW reconciliation complete"
 	);
 
-	Ok(())
+	Ok(true)
 }

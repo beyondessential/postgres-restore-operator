@@ -1,5 +1,5 @@
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector, SecretReference};
-use kube::{Api, Client, api::LogParams};
+use kube::{Api, Client};
 use tracing::debug;
 
 pub mod overlay;
@@ -106,100 +106,6 @@ pub async fn read_job_termination_message(
 				&& !m.is_empty()
 			{
 				return msg;
-			}
-		}
-	}
-
-	None
-}
-
-/// Read the logs from a named container in a Job's pod.
-///
-/// Looks up pods by the `job-name` label, finds the first pod with a
-/// terminated container matching `container_name`, and returns its logs.
-pub async fn read_job_pod_logs(
-	client: &Client,
-	namespace: &str,
-	job_name: &str,
-	container_name: &str,
-) -> Option<String> {
-	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
-	let pod_list = match pods
-		.list(&kube::api::ListParams::default().labels(&format!("job-name={job_name}")))
-		.await
-	{
-		Ok(list) => list,
-		Err(e) => {
-			debug!(job = job_name, error = %e, "failed to list pods for job");
-			return None;
-		}
-	};
-
-	if pod_list.items.is_empty() {
-		debug!(job = job_name, "no pods found for job");
-		return None;
-	}
-
-	for pod in &pod_list.items {
-		let Some(pod_name) = pod.metadata.name.as_deref() else {
-			continue;
-		};
-		let Some(statuses) = pod
-			.status
-			.as_ref()
-			.and_then(|s| s.container_statuses.as_ref())
-		else {
-			debug!(
-				pod = pod_name,
-				job = job_name,
-				"pod has no container statuses"
-			);
-			continue;
-		};
-
-		let is_terminated = statuses.iter().any(|cs| {
-			cs.name == container_name
-				&& cs
-					.state
-					.as_ref()
-					.and_then(|s| s.terminated.as_ref())
-					.is_some()
-		});
-
-		if !is_terminated {
-			debug!(
-				pod = pod_name,
-				job = job_name,
-				container = container_name,
-				"container not yet terminated, skipping"
-			);
-			continue;
-		}
-
-		match pods
-			.logs(
-				pod_name,
-				&LogParams {
-					container: Some(container_name.to_string()),
-					..Default::default()
-				},
-			)
-			.await
-		{
-			Ok(logs) if !logs.is_empty() => {
-				debug!(
-					pod = pod_name,
-					job = job_name,
-					bytes = logs.len(),
-					"read pod logs successfully"
-				);
-				return Some(logs);
-			}
-			Ok(_) => {
-				debug!(pod = pod_name, job = job_name, "pod logs are empty");
-			}
-			Err(e) => {
-				debug!(pod = pod_name, job = job_name, error = %e, "failed to read pod logs");
 			}
 		}
 	}
