@@ -124,13 +124,6 @@ pub fn compute_config_hash(restore_name: &str, replica: &PostgresPhysicalReplica
 	replica.spec.analytics_username.hash(&mut hasher);
 	if let Some(overlay) = &replica.spec.overlay_database {
 		overlay.strategy.hash(&mut hasher);
-		if let Some(mapping) = &overlay.schema_mapping {
-			let sorted: BTreeMap<_, _> = mapping.iter().collect();
-			for (k, v) in &sorted {
-				k.hash(&mut hasher);
-				v.hash(&mut hasher);
-			}
-		}
 		overlay.import_generated.hash(&mut hasher);
 	}
 	format!("{:016x}", hasher.finish())
@@ -185,10 +178,7 @@ pub async fn discover_restore_database(
 	}
 }
 
-/// Resolve which schemas to import.
-///
-/// Uses the explicit `schema_mapping` from the spec if present, otherwise
-/// discovers user schemas from the restore database.
+/// Discover user schemas from the restore database.
 #[expect(
 	clippy::too_many_arguments,
 	reason = "internal helper with tightly-coupled params"
@@ -204,30 +194,12 @@ pub async fn resolve_schemas(
 	use_port_forward: bool,
 ) -> Result<Vec<(String, String)>> {
 	let replica_name = replica.name_any();
-	if let Some(mapping) = replica
-		.spec
-		.overlay_database
-		.as_ref()
-		.and_then(|c| c.schema_mapping.as_ref())
-	{
-		let result: Vec<_> = mapping
-			.iter()
-			.map(|(k, v)| (k.clone(), v.clone()))
-			.collect();
-		debug!(
-			replica = %replica_name,
-			schema_count = result.len(),
-			"using explicit schema mapping from spec"
-		);
-		debug!(schemas = ?result, "explicit schema mapping entries");
-		return Ok(result);
-	}
 
 	debug!(
 		replica = %replica_name,
 		restore = restore_name,
 		restore_dbname = restore_dbname,
-		"no explicit schema mapping, discovering schemas from restore database"
+		"discovering schemas from restore database"
 	);
 	let conn = super::connect::connect_to_restore(
 		client,
@@ -392,7 +364,6 @@ mod tests {
 						affinity: None,
 						tolerations: vec![],
 						service_annotations: None,
-						schema_mapping: None,
 						import_generated: false,
 						retain_restore: true,
 					}),
