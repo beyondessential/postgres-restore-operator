@@ -33,15 +33,97 @@ fn copy_job_name(replica_name: &str) -> String {
 	format!("{replica_name}-overlay-copy")
 }
 
-/// Build the shell script that copies schemas from the restore database
-/// into the overlay via `pg_dump | psql`.
+/// Sync extensions from the restore database into the overlay.
+///
+/// Queries the restore for all installed extensions (excluding `plpgsql`)
+/// and creates them in the overlay if they don't already exist.
+async fn sync_extensions(
+	overlay_pg: &tokio_postgres::Client,
+	restore_pg: &tokio_postgres::Client,
+) -> Result<()> {
+	let rows = restore_pg
+		.query(
+			"SELECT extname FROM pg_extension WHERE extname != 'plpgsql'",
+			&[],
+		)
+		.await?;
+
+	for row in &rows {
+		let ext: String = row.get(0);
+		info!(extension = %ext, "creating extension in overlay");
+		overlay_pg
+			.execute(
+				&format!("CREATE EXTENSION IF NOT EXISTS {}", quote_ident(&ext)),
+				&[],
+			)
+			.await?;
+	}
+
+	Ok(())
+}
+
+/// Prepare the overlay database for a copy operation.
+///
+/// Drops all user schemas and syncs extensions from the restore. This runs
+/// in the operator before the pg_dump Job is created, so the Job only
+/// needs to do the actual data transfer.
+async fn prepare_overlay_for_copy(
+	overlay_pg: &tokio_postgres::Client,
+	restore_pg: &tokio_postgres::Client,
+) -> Result<()> {
+	let rows = overlay_pg
+		.query(
+			"SELECT schema_name FROM information_schema.schemata \
+			 WHERE schema_name NOT LIKE 'pg_%' \
+			   AND schema_name NOT IN ('information_schema', '_pgro')",
+			&[],
+		)
+		.await?;
+	for row in &rows {
+		let schema: String = row.get(0);
+		info!(schema = %schema, "dropping user schema in overlay");
+		overlay_pg
+			.execute(
+				&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&schema)),
+				&[],
+			)
+			.await?;
+	}
+	overlay_pg
+		.execute("CREATE SCHEMA IF NOT EXISTS public", &[])
+		.await?;
+
+	sync_extensions(overlay_pg, restore_pg).await?;
+	Ok(())
+}
+
+/// Finalize the overlay after a successful copy Job.
+///
+/// Grants the analytics user permission to create schemas.
+async fn finalize_copy(overlay_pg: &tokio_postgres::Client, analytics_user: &str) -> Result<()> {
+	overlay_pg
+		.execute(
+			&format!(
+				"GRANT CREATE ON DATABASE app TO {}",
+				quote_ident(analytics_user)
+			),
+			&[],
+		)
+		.await?;
+
+	Ok(())
+}
+
+/// Shell script that runs `pg_dump | psql` to transfer data.
+///
+/// All preparatory SQL (extension sync, schema drops) and post-copy SQL
+/// (grants) are handled by the operator. This script only does the actual
+/// data transfer and reports the result via callback.
 ///
 /// Credentials and hosts are injected as environment variables:
 ///   READER_USER, READER_PASSWORD, RESTORE_HOST, RESTORE_DBNAME,
 ///   OVERLAY_USER, OVERLAY_PASSWORD, OVERLAY_HOST, COPY_CALLBACK_URL
-fn build_copy_script(schemas: Option<&[(String, String)]>) -> String {
-	let mut script = String::from(
-		r#"#!/bin/bash
+static COPY_SCRIPT: &str = r#"#!/bin/bash
 set -o pipefail
 
 report_result() {
@@ -54,126 +136,27 @@ report_result() {
   fi
 }
 
-sync_extensions() {
-  echo 'Syncing extensions from restore to overlay...'
-  EXTENSIONS=$(PGPASSWORD="$READER_PASSWORD" psql \
-    -h "$RESTORE_HOST" -p 5432 -U "$READER_USER" -d "$RESTORE_DBNAME" \
-    -t -A -c "SELECT extname FROM pg_extension WHERE extname NOT IN ('plpgsql')")
-  for ext in $EXTENSIONS; do
-    echo "  Creating extension $ext..."
-    PGPASSWORD="$OVERLAY_PASSWORD" psql \
-      -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
-      -c "CREATE EXTENSION IF NOT EXISTS \"$ext\";"
-  done
-  echo 'Extension sync complete.'
-}
-
-copy_schemas() {
-  set -e
-"#,
-	);
-
-	match schemas {
-		Some(schemas) => {
-			for (_remote, local) in schemas {
-				let local_quoted = quote_ident(local);
-
-				script.push_str(&format!(
-					"\n  echo 'Dropping existing local schema {local_quoted}...'\n\
-					   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
-					     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
-					     -c 'DROP SCHEMA IF EXISTS {local_quoted} CASCADE;'\n"
-				));
-			}
-
-			script.push_str("  sync_extensions\n");
-
-			for (remote, local) in schemas {
-				let remote_quoted = quote_ident(remote);
-				let local_quoted = quote_ident(local);
-
-				script.push_str(&format!(
-					"\n  echo 'Copying schema {remote_quoted} from restore...'\n\
-					   PGPASSWORD=\"$READER_PASSWORD\" pg_dump \
-					     -h \"$RESTORE_HOST\" \
-					     -p 5432 \
-					     -U \"$READER_USER\" \
-					     -d \"$RESTORE_DBNAME\" \
-					     -n {remote_quoted} \
-					     --no-owner \
-					     --no-privileges \
-					     --no-comments \
-					     --no-publications \
-					     --no-subscriptions \
-					     --no-security-labels \
-					     --no-tablespaces \
-					   | PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
-					     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
-					     -v ON_ERROR_STOP=1 --quiet\n"
-				));
-
-				if remote != local {
-					script.push_str(&format!(
-						"  echo 'Renaming schema {remote_quoted} to {local_quoted}...'\n\
-						   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
-						     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
-						     -c 'ALTER SCHEMA {remote_quoted} RENAME TO {local_quoted};'\n"
-					));
-				}
-			}
-		}
-		None => {
-			script.push_str(
-				r#"
-  echo 'Dropping existing user schemas in overlay...'
-  SCHEMAS=$(PGPASSWORD="$OVERLAY_PASSWORD" psql \
-    -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
-    -t -A -c "SELECT schema_name FROM information_schema.schemata WHERE schema_name NOT LIKE 'pg_%' AND schema_name NOT IN ('information_schema', '_pgro')")
-  for schema in $SCHEMAS; do
-    echo "  Dropping schema $schema..."
-    PGPASSWORD="$OVERLAY_PASSWORD" psql \
-      -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
-      -c "DROP SCHEMA IF EXISTS \"$schema\" CASCADE;"
-  done
-
-  echo 'Recreating public schema...'
-  PGPASSWORD="$OVERLAY_PASSWORD" psql \
-    -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
-    -c 'CREATE SCHEMA IF NOT EXISTS public;'
-
-  sync_extensions
-
-  echo 'Copying all schemas from restore...'
-  PGPASSWORD="$READER_PASSWORD" pg_dump \
-    -h "$RESTORE_HOST" \
-    -p 5432 \
-    -U "$READER_USER" \
-    -d "$RESTORE_DBNAME" \
-    --exclude-schema=_pgro \
-    --no-owner \
-    --no-privileges \
-    --no-comments \
-    --no-publications \
-    --no-subscriptions \
-    --no-security-labels \
-    --no-tablespaces \
-  | PGPASSWORD="$OVERLAY_PASSWORD" psql \
-    -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
-    -v ON_ERROR_STOP=1 --quiet
-"#,
-			);
-		}
-	}
-
-	script.push_str(
-		r#"
-  echo 'All schema copies complete.'
-}
-
-OUTPUT=$(copy_schemas 2>&1)
+echo 'Starting pg_dump | psql...'
+OUTPUT=$(PGPASSWORD="$READER_PASSWORD" pg_dump \
+  -h "$RESTORE_HOST" \
+  -p 5432 \
+  -U "$READER_USER" \
+  -d "$RESTORE_DBNAME" \
+  --exclude-schema=_pgro \
+  --no-owner \
+  --no-privileges \
+  --no-comments \
+  --no-publications \
+  --no-subscriptions \
+  --no-security-labels \
+  --no-tablespaces \
+| PGPASSWORD="$OVERLAY_PASSWORD" psql \
+  -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
+  -v ON_ERROR_STOP=1 --quiet 2>&1)
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -eq 0 ]; then
+  echo 'pg_dump | psql completed successfully.'
   report_result 'success'
 else
   echo "$OUTPUT" >&2
@@ -181,10 +164,7 @@ else
 fi
 
 exit $EXIT_CODE
-"#,
-	);
-	script
-}
+"#;
 
 /// Build the copy Job spec.
 #[expect(
@@ -194,7 +174,6 @@ exit $EXIT_CODE
 fn build_copy_job(
 	replica: &PostgresPhysicalReplica,
 	namespace: &str,
-	schemas: Option<&[(String, String)]>,
 	reader_secret_name: &str,
 	superuser_secret_name: &str,
 	restore_host: &str,
@@ -206,7 +185,7 @@ fn build_copy_job(
 	let replica_name = replica.name_any();
 	let job_name = copy_job_name(&replica_name);
 	let image = format!("ghcr.io/cloudnative-pg/postgresql:{pg_version}");
-	let script = build_copy_script(schemas);
+	let script = COPY_SCRIPT.to_string();
 
 	Job {
 		metadata: ObjectMeta {
@@ -224,7 +203,7 @@ fn build_copy_job(
 		},
 		spec: Some(JobSpec {
 			backoff_limit: Some(0),
-			active_deadline_seconds: Some(7200), // 2 hours
+			active_deadline_seconds: Some(7200),
 			ttl_seconds_after_finished: Some(300),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
@@ -241,7 +220,7 @@ fn build_copy_job(
 					restart_policy: Some("Never".to_string()),
 					security_context: Some(PodSecurityContext {
 						run_as_non_root: Some(true),
-						run_as_user: Some(26), // postgres UID in CNPG image
+						run_as_user: Some(26),
 						run_as_group: Some(26),
 						..Default::default()
 					}),
@@ -288,9 +267,11 @@ fn build_copy_job(
 
 /// Reconcile overlay state using the copy strategy.
 ///
-/// Creates a Kubernetes Job that runs `pg_dump | psql` to copy schemas
-/// from the restore database into the overlay. Returns `true` when the
-/// copy is complete, `false` when it is still in progress.
+/// Preparatory SQL (extension sync, schema drops) and post-copy SQL
+/// (grants) run directly in the operator via tokio-postgres.
+/// Only the `pg_dump | psql` data transfer runs in a Kubernetes Job.
+///
+/// Returns `true` when the copy is complete, `false` when still in progress.
 pub async fn reconcile_copy(
 	client: &Client,
 	ctx: &Context,
@@ -317,7 +298,6 @@ pub async fn reconcile_copy(
 	let reader_user = super::connect::read_secret_field(&reader_secret, "username")?;
 	let reader_password = super::connect::read_secret_field(&reader_secret, "password")?;
 
-	// Connect to overlay to manage state tracking
 	let overlay_conn = super::connect::connect_overlay(
 		client,
 		&cluster_name,
@@ -360,7 +340,6 @@ pub async fn reconcile_copy(
 
 	// Check for an existing copy Job
 	if let Some(job) = jobs.get_opt(&job_name).await? {
-		// If the config changed, delete the stale Job
 		let job_config_matches = tracked
 			.as_ref()
 			.is_some_and(|t| t.config_hash == config_hash);
@@ -375,7 +354,6 @@ pub async fn reconcile_copy(
 			}
 			write_state(overlay_pg, &config_hash, "pending", 0, None).await?;
 			current_retries = 0;
-			// Fall through to create a new Job
 		} else {
 			match classify_job(&job) {
 				JobStatus::Active => {
@@ -390,22 +368,16 @@ pub async fn reconcile_copy(
 					info!(
 						replica = %replica_name,
 						restore = %restore_name,
-						"copy Job succeeded"
+						"copy Job succeeded, finalizing"
 					);
+
+					finalize_copy(overlay_pg, &replica.spec.analytics_username).await?;
+
 					write_state(overlay_pg, &config_hash, "complete", current_retries, None)
 						.await?;
 					if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
 						warn!(job = %job_name, error = %e, "failed to delete completed copy Job");
 					}
-
-					// Ensure analytics user can create schemas
-					let analytics_user = &replica.spec.analytics_username;
-					overlay_pg
-						.batch_execute(&format!(
-							"GRANT CREATE ON DATABASE app TO {}",
-							quote_ident(analytics_user)
-						))
-						.await?;
 
 					return Ok(true);
 				}
@@ -446,18 +418,16 @@ pub async fn reconcile_copy(
 					write_state(
 						overlay_pg,
 						&config_hash,
-						"importing",
+						"pending",
 						current_retries,
 						Some(&last_error),
 					)
 					.await?;
-					// Otherwise fall through to create a new Job
 				}
 			}
 		}
 	}
 
-	// Check retry budget — once exhausted, stay failed until config changes
 	if current_retries >= MAX_COPY_RETRIES {
 		let last_error = tracked
 			.as_ref()
@@ -469,7 +439,6 @@ pub async fn reconcile_copy(
 		)));
 	}
 
-	// Discover the main database in the restore
 	let restore_dbname = discover_restore_database(
 		client,
 		namespace,
@@ -480,25 +449,28 @@ pub async fn reconcile_copy(
 	)
 	.await?;
 
-	// Resolve schema mapping: None = dump all, Some = per-schema
-	let explicit_mapping = replica
-		.spec
-		.overlay_database
-		.as_ref()
-		.and_then(|c| c.schema_mapping.as_ref());
+	// Connect to restore database for pre-copy preparation
+	let restore_conn = super::connect::connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		&restore_dbname,
+		&reader_user,
+		&reader_password,
+		use_port_forward,
+	)
+	.await?;
 
-	let schemas: Option<Vec<(String, String)>> = explicit_mapping.map(|mapping| {
-		mapping
-			.iter()
-			.map(|(k, v)| (k.clone(), v.clone()))
-			.collect()
-	});
+	info!(
+		replica = %replica_name,
+		restore = %restore_name,
+		"preparing overlay for copy (extensions, schema drops)"
+	);
+	prepare_overlay_for_copy(overlay_pg, &restore_conn.client).await?;
 
-	// Determine hosts: the Job runs in-cluster and always uses service DNS
 	let restore_host = format!("{restore_name}.{namespace}.svc");
 	let overlay_host = format!("{cluster_name}-rw.{namespace}.svc");
 
-	// Resolve the PG version for the Job image
 	let pg_version = replica
 		.status
 		.as_ref()
@@ -510,7 +482,6 @@ pub async fn reconcile_copy(
 	let job = build_copy_job(
 		replica,
 		namespace,
-		schemas.as_deref(),
 		&reader_secret_name,
 		&superuser_secret_name,
 		&restore_host,
@@ -524,7 +495,6 @@ pub async fn reconcile_copy(
 		replica = %replica_name,
 		restore = %restore_name,
 		job = %copy_job_name(&replica_name),
-		schema_count = schemas.as_ref().map(|s| s.len()),
 		attempt = current_retries + 1,
 		max_retries = MAX_COPY_RETRIES,
 		"creating copy Job"
@@ -541,48 +511,8 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn build_copy_script_same_schema() {
-		let script = build_copy_script(Some(&[("public".into(), "public".into())]));
-		assert!(script.contains("-n \"public\""));
-		assert!(!script.contains("RENAME"));
-	}
-
-	#[test]
-	fn build_copy_script_renamed_schema() {
-		let script = build_copy_script(Some(&[("source".into(), "target".into())]));
-		assert!(script.contains("-n \"source\""));
-		assert!(script.contains("RENAME TO \"target\""));
-	}
-
-	#[test]
-	fn build_copy_script_multiple_schemas() {
-		let script = build_copy_script(Some(&[
-			("public".into(), "public".into()),
-			("data".into(), "imported".into()),
-		]));
-		assert!(script.contains("-n \"public\""));
-		assert!(script.contains("-n \"data\""));
-		assert!(script.contains("RENAME TO \"imported\""));
-		assert!(!script.contains("RENAME TO \"public\""));
-	}
-
-	#[test]
-	fn build_copy_script_special_schema_name() {
-		let script = build_copy_script(Some(&[("my\"schema".into(), "my\"schema".into())]));
-		assert!(script.contains("-n \"my\"\"schema\""));
-	}
-
-	#[test]
 	fn copy_job_name_format() {
 		assert_eq!(copy_job_name("my-replica"), "my-replica-overlay-copy");
-	}
-
-	#[test]
-	fn build_copy_script_all_schemas() {
-		let script = build_copy_script(None);
-		assert!(script.contains("--exclude-schema=_pgro"));
-		assert!(script.contains("Dropping existing user schemas"));
-		assert!(script.contains("NOT IN ('information_schema', '_pgro')"));
 	}
 
 	#[test]
@@ -619,11 +549,9 @@ mod tests {
 			status: None,
 		};
 
-		let schemas = vec![("public".into(), "public".into())];
 		let job = build_copy_job(
 			&replica,
 			"test-ns",
-			Some(&schemas),
 			"reader-secret",
 			"superuser-secret",
 			"restore.test-ns.svc",
