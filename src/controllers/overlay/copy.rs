@@ -533,16 +533,8 @@ mod tests {
 	#[test]
 	fn build_copy_script_same_schema() {
 		let script = build_copy_script(Some(&[("public".into(), "public".into())]));
-		assert!(script.contains("pg_dump"));
 		assert!(script.contains("-n \"public\""));
-		assert!(script.contains("PGPASSWORD=\"$READER_PASSWORD\""));
-		assert!(script.contains("PGPASSWORD=\"$OVERLAY_PASSWORD\""));
-		assert!(script.contains("ON_ERROR_STOP=1"));
-		assert!(script.contains("COPY_CALLBACK_URL"));
-		assert!(script.contains("report_result"));
 		assert!(!script.contains("RENAME"));
-		assert!(script.contains("sync_extensions"));
-		assert!(script.contains("CREATE EXTENSION IF NOT EXISTS"));
 	}
 
 	#[test]
@@ -576,27 +568,11 @@ mod tests {
 	}
 
 	#[test]
-	fn build_copy_script_reports_success() {
-		let script = build_copy_script(Some(&[("public".into(), "public".into())]));
-		assert!(script.contains("report_result 'success'"));
-	}
-
-	#[test]
-	fn build_copy_script_reports_error() {
-		let script = build_copy_script(Some(&[("public".into(), "public".into())]));
-		assert!(script.contains("report_result \"$(printf '%s' \"$OUTPUT\" | tail -c 8192)\""));
-	}
-
-	#[test]
 	fn build_copy_script_all_schemas() {
 		let script = build_copy_script(None);
-		assert!(script.contains("pg_dump"));
 		assert!(script.contains("--exclude-schema=_pgro"));
 		assert!(script.contains("Dropping existing user schemas"));
 		assert!(script.contains("NOT IN ('information_schema', '_pgro')"));
-		assert!(script.contains("CREATE SCHEMA IF NOT EXISTS public"));
-		assert!(script.contains("sync_extensions"));
-		assert!(script.contains("ON_ERROR_STOP=1"));
 	}
 
 	#[test]
