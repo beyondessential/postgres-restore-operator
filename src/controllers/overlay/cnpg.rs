@@ -491,7 +491,7 @@ mod tests {
 			.get("storage")
 			.unwrap();
 		let current_pq: ParsedQuantity = current.try_into().unwrap();
-		assert!(!(current_pq < desired_pq));
+		assert!(current_pq >= desired_pq);
 	}
 
 	#[test]
@@ -512,6 +512,6 @@ mod tests {
 			.get("storage")
 			.unwrap();
 		let current_pq: ParsedQuantity = current.try_into().unwrap();
-		assert!(!(current_pq < desired_pq));
+		assert!(current_pq >= desired_pq);
 	}
 }

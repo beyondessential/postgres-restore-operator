@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use futures::StreamExt;
 use jiff::Timestamp;
+use k8s_openapi::api::batch::v1::Job;
 use k8s_openapi::api::core::v1::{ConfigMap, Pod};
 use kube::api::Patch;
 use kube::runtime::reflector::ObjectRef;
@@ -307,6 +308,12 @@ async fn main() -> anyhow::Result<()> {
 				namespace.map(|ns| ObjectRef::new(&replica_name).within(&ns))
 			},
 		)
+		.watches(Api::<Job>::all(client.clone()), Config::default(), |job| {
+			let labels = job.metadata.labels.as_ref()?;
+			let replica_name = labels.get("pgro.bes.au/replica")?;
+			let namespace = job.metadata.namespace.as_ref()?;
+			Some(ObjectRef::new(replica_name).within(namespace))
+		})
 		.run(
 			controllers::replica::reconcile,
 			controllers::replica::error_policy,
