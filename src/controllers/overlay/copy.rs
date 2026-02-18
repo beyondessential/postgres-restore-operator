@@ -353,7 +353,7 @@ pub async fn reconcile_copy(
 				warn!(job = %job_name, error = %e, "failed to delete stale copy Job");
 			}
 			write_state(overlay_pg, &config_hash, "pending", 0, None).await?;
-			current_retries = 0;
+			return Ok(false);
 		} else {
 			match classify_job(&job) {
 				JobStatus::Active => {
@@ -423,6 +423,7 @@ pub async fn reconcile_copy(
 						Some(&last_error),
 					)
 					.await?;
+					return Ok(false);
 				}
 			}
 		}
