@@ -134,6 +134,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	// Reconcile overlay database if configured, but only after the first
 	// restore exists so we know the real snapshot size.
+	let mut overlay_cluster_ready = false;
 	if replica.spec.overlay_database.is_some() {
 		let restores_api: Api<PostgresPhysicalRestore> =
 			Api::namespaced(client.clone(), &namespace);
@@ -170,6 +171,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 						)
 						.await?;
 
+					overlay_cluster_ready = cluster_ready;
 					if !cluster_ready {
 						info!(replica = name, "overlay cluster not yet ready, will retry");
 					}
@@ -278,7 +280,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	// Always verify and fix the actual state inside the overlay database
 	// rather than relying solely on the status field, which can become stale
 	// if the overlay cluster is reset.
-	if let Some(overlay_config) = &replica.spec.overlay_database {
+	if let Some(overlay_config) = replica
+		.spec
+		.overlay_database
+		.as_ref()
+		.filter(|_| overlay_cluster_ready)
+	{
 		use crate::types::OverlayStrategy;
 
 		let current_restore = replica
