@@ -70,22 +70,30 @@ sync_extensions() {
 
 copy_schemas() {
   set -e
-  sync_extensions
 "#,
 	);
 
 	match schemas {
 		Some(schemas) => {
-			for (remote, local) in schemas {
-				let remote_quoted = quote_ident(remote);
+			for (_remote, local) in schemas {
 				let local_quoted = quote_ident(local);
 
 				script.push_str(&format!(
 					"\n  echo 'Dropping existing local schema {local_quoted}...'\n\
 					   PGPASSWORD=\"$OVERLAY_PASSWORD\" psql \
 					     -h \"$OVERLAY_HOST\" -p 5432 -U \"$OVERLAY_USER\" -d app \
-					     -c 'DROP SCHEMA IF EXISTS {local_quoted} CASCADE;'\n\
-					   echo 'Copying schema {remote_quoted} from restore...'\n\
+					     -c 'DROP SCHEMA IF EXISTS {local_quoted} CASCADE;'\n"
+				));
+			}
+
+			script.push_str("  sync_extensions\n");
+
+			for (remote, local) in schemas {
+				let remote_quoted = quote_ident(remote);
+				let local_quoted = quote_ident(local);
+
+				script.push_str(&format!(
+					"\n  echo 'Copying schema {remote_quoted} from restore...'\n\
 					   PGPASSWORD=\"$READER_PASSWORD\" pg_dump \
 					     -h \"$RESTORE_HOST\" \
 					     -p 5432 \
@@ -132,6 +140,8 @@ copy_schemas() {
   PGPASSWORD="$OVERLAY_PASSWORD" psql \
     -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
     -c 'CREATE SCHEMA IF NOT EXISTS public;'
+
+  sync_extensions
 
   echo 'Copying all schemas from restore...'
   PGPASSWORD="$READER_PASSWORD" pg_dump \
