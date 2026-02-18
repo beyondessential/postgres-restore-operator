@@ -30,6 +30,7 @@ use scheduling::ScheduleDecision;
 
 mod resources;
 mod scheduling;
+mod schema_migration;
 mod status;
 
 #[cfg(test)]
@@ -121,6 +122,46 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			return Ok(Action::requeue(Duration::from_secs(60)));
 		}
 	};
+
+	// Validate mutual exclusivity: overlay_database and persistent_schemas cannot both be set
+	if replica.spec.overlay_database.is_some() && replica.spec.persistent_schemas.is_some() {
+		warn!(
+			replica = name,
+			"invalid configuration: both overlay_database and persistent_schemas are set"
+		);
+
+		replica
+			.update_condition(
+				client,
+				"ConfigValid",
+				"False",
+				"ConfigConflict",
+				"Cannot configure both overlay_database and persistent_schemas - they are mutually exclusive. \
+				 Choose one: overlay_database for FDW/Copy strategies, or persistent_schemas for schema migration.",
+			)
+			.await?;
+
+		// Skip reconciliation - return with requeue to allow user to fix
+		return Ok(Action::requeue(Duration::from_secs(300)));
+	}
+
+	// Clear any previous ConfigValid=False condition if config is now valid
+	if replica
+		.status
+		.as_ref()
+		.and_then(|s| s.conditions.iter().find(|c| c.type_ == "ConfigValid"))
+		.is_some_and(|c| c.status == "False")
+	{
+		replica
+			.update_condition(
+				client,
+				"ConfigValid",
+				"True",
+				"ConfigValid",
+				"Configuration is valid",
+			)
+			.await?;
+	}
 
 	replica.ensure_credentials_secret(client).await?;
 

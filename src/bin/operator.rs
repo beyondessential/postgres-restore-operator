@@ -384,6 +384,10 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			"/api/v1/copy-results/{namespace}/{replica}",
 			axum::routing::post(post_copy_results),
 		)
+		.route(
+			"/api/v1/schema-migration-results/{namespace}/{replica}",
+			axum::routing::post(post_schema_migration_results),
+		)
 		.with_state(state)
 		.layer(TraceLayer::new_for_http())
 }
@@ -419,6 +423,24 @@ async fn post_copy_results(
 		"received copy results callback"
 	);
 	state.ctx.copy_results.store(&namespace, &replica, body);
+	StatusCode::NO_CONTENT
+}
+
+async fn post_schema_migration_results(
+	State(state): State<ServerState>,
+	Path((namespace, replica)): Path<(String, String)>,
+	body: String,
+) -> StatusCode {
+	info!(
+		namespace = namespace,
+		replica = replica,
+		bytes = body.len(),
+		"received schema migration results callback"
+	);
+	state
+		.ctx
+		.schema_migration_results
+		.store(&namespace, &replica, body);
 	StatusCode::NO_CONTENT
 }
 

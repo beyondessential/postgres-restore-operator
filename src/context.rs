@@ -24,6 +24,8 @@ pub struct Context {
 	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for overlay copy results POSTed by jobs.
 	pub copy_results: Arc<CallbackStore>,
+	/// In-memory store for schema migration results POSTed by jobs.
+	pub schema_migration_results: Arc<CallbackStore>,
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
 	pub callback_base_url: String,
@@ -54,6 +56,7 @@ impl Context {
 			http_client: reqwest::Client::new(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			copy_results: Arc::new(CallbackStore::default()),
+			schema_migration_results: Arc::new(CallbackStore::default()),
 			callback_base_url,
 			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
 		}
@@ -83,6 +86,14 @@ impl Context {
 	pub fn copy_callback_url(&self, namespace: &str, replica: &str) -> String {
 		format!(
 			"{}/api/v1/copy-results/{namespace}/{replica}",
+			self.callback_base_url
+		)
+	}
+
+	/// Build the callback URL for a schema migration job to POST results to.
+	pub fn schema_migration_callback_url(&self, namespace: &str, replica: &str) -> String {
+		format!(
+			"{}/api/v1/schema-migration-results/{namespace}/{replica}",
 			self.callback_base_url
 		)
 	}
