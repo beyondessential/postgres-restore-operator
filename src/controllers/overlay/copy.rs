@@ -143,7 +143,7 @@ echo "Source: $RESTORE_HOST:5432/$RESTORE_DBNAME"
 echo "Destination: $OVERLAY_HOST:5432/app"
 echo ""
 
-OUTPUT=$(PGPASSWORD="$READER_PASSWORD" pg_dump \
+PGPASSWORD="$READER_PASSWORD" pg_dump \
   -h "$RESTORE_HOST" \
   -p 5432 \
   -U "$READER_USER" \
@@ -159,7 +159,7 @@ OUTPUT=$(PGPASSWORD="$READER_PASSWORD" pg_dump \
   --verbose \
 | PGPASSWORD="$OVERLAY_PASSWORD" psql \
   -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
-  -v ON_ERROR_STOP=1 --quiet 2>&1)
+  -v ON_ERROR_STOP=1 --quiet
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -eq 0 ]; then
@@ -168,9 +168,8 @@ if [ $EXIT_CODE -eq 0 ]; then
   report_result 'success'
 else
   echo ""
-  echo "=== Copy operation failed ===" >&2
-  echo "$OUTPUT" >&2
-  report_result "$(printf '%s' "$OUTPUT" | tail -c 8192)"
+  echo "=== Copy operation failed with exit code $EXIT_CODE ===" >&2
+  report_result "Copy failed with exit code $EXIT_CODE"
 fi
 
 exit $EXIT_CODE
