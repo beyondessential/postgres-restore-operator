@@ -138,7 +138,11 @@ report_result() {
   fi
 }
 
-echo 'Starting pg_dump | psql...'
+echo "=== Starting overlay copy operation ==="
+echo "Source: $RESTORE_HOST:5432/$RESTORE_DBNAME"
+echo "Destination: $OVERLAY_HOST:5432/app"
+echo ""
+
 OUTPUT=$(PGPASSWORD="$READER_PASSWORD" pg_dump \
   -h "$RESTORE_HOST" \
   -p 5432 \
@@ -152,15 +156,19 @@ OUTPUT=$(PGPASSWORD="$READER_PASSWORD" pg_dump \
   --no-subscriptions \
   --no-security-labels \
   --no-tablespaces \
+  --verbose \
 | PGPASSWORD="$OVERLAY_PASSWORD" psql \
   -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
   -v ON_ERROR_STOP=1 --quiet 2>&1)
 EXIT_CODE=$?
 
 if [ $EXIT_CODE -eq 0 ]; then
-  echo 'pg_dump | psql completed successfully.'
+  echo ""
+  echo "=== Copy operation completed successfully ==="
   report_result 'success'
 else
+  echo ""
+  echo "=== Copy operation failed ===" >&2
   echo "$OUTPUT" >&2
   report_result "$(printf '%s' "$OUTPUT" | tail -c 8192)"
 fi
