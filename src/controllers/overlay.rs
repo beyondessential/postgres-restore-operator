@@ -2,7 +2,10 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::{Client, ResourceExt};
 use tracing::{debug, warn};
 
-use crate::{error::Result, types::PostgresPhysicalReplica};
+use crate::{
+	error::Result,
+	types::{OverlayStrategy, PostgresPhysicalReplica},
+};
 
 mod cnpg;
 pub mod common;
@@ -50,7 +53,10 @@ pub async fn reconcile_overlay(
 
 	let computed_size = match &overlay_config.storage_size_override {
 		Some(override_size) => override_size.clone(),
-		None => storage::compute_overlay_storage_size(snapshot_size),
+		None => match overlay_config.strategy {
+			OverlayStrategy::Fdw => storage::compute_fdw_overlay_storage_size(snapshot_size),
+			OverlayStrategy::Copy => storage::compute_copy_overlay_storage_size(snapshot_size),
+		},
 	};
 
 	let current_size = replica
