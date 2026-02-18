@@ -1,14 +1,15 @@
 use std::collections::BTreeMap;
 
 use k8s_openapi::{
-	api::core::v1::Service,
+	api::core::v1::{PersistentVolumeClaim, Service},
 	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::OwnerReference},
 };
 use kube::{
 	Api, Client, ResourceExt,
-	api::{DynamicObject, Patch, PatchParams},
+	api::{DynamicObject, ListParams, Patch, PatchParams},
 };
-use tracing::{debug, info};
+use kube_quantity::ParsedQuantity;
+use tracing::{debug, info, warn};
 
 use crate::{
 	error::{Error, Result},
@@ -219,6 +220,19 @@ pub async fn ensure_cnpg_cluster(
 		);
 		Ok(true)
 	} else {
+		if status
+			.phase
+			.as_deref()
+			.is_some_and(|p| p == "Not enough disk space")
+		{
+			warn!(
+				replica = replica_name,
+				cluster = cluster_name,
+				"overlay cluster stuck: not enough disk space, attempting PVC expansion"
+			);
+			expand_cluster_pvcs(client, namespace, &cluster_name, storage_size).await?;
+		}
+
 		info!(
 			replica = replica_name,
 			cluster = cluster_name,
@@ -227,6 +241,110 @@ pub async fn ensure_cnpg_cluster(
 		);
 		Ok(false)
 	}
+}
+
+/// Expand PVCs belonging to a CNPG cluster when their requested storage is
+/// below the desired size. This handles the case where a CNPG cluster gets
+/// stuck in "Not enough disk space" because the PVC is smaller than what PGRO
+/// computed as necessary.
+///
+/// CNPG labels its PVCs with `cnpg.io/cluster=<name>`. We list those PVCs,
+/// compare each one's requested storage against `desired_size`, and patch any
+/// that are too small.
+async fn expand_cluster_pvcs(
+	client: &Client,
+	namespace: &str,
+	cluster_name: &str,
+	desired_size: &Quantity,
+) -> Result<()> {
+	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+	let label_selector = format!("cnpg.io/cluster={cluster_name}");
+	let pvc_list = pvcs
+		.list(&ListParams::default().labels(&label_selector))
+		.await?;
+
+	let desired_pq: ParsedQuantity = match desired_size.try_into() {
+		Ok(pq) => pq,
+		Err(_) => {
+			warn!(
+				cluster = cluster_name,
+				desired = ?desired_size,
+				"could not parse desired storage size, skipping PVC expansion"
+			);
+			return Ok(());
+		}
+	};
+
+	for pvc in &pvc_list.items {
+		let pvc_name = pvc.name_any();
+		let current_request = pvc
+			.spec
+			.as_ref()
+			.and_then(|s| s.resources.as_ref())
+			.and_then(|r| r.requests.as_ref())
+			.and_then(|r| r.get("storage"));
+
+		let needs_expansion = match current_request {
+			Some(current) => {
+				let current_pq: std::result::Result<ParsedQuantity, _> = current.try_into();
+				match current_pq {
+					Ok(c) => c < desired_pq,
+					Err(_) => false,
+				}
+			}
+			None => false,
+		};
+
+		if needs_expansion {
+			info!(
+				cluster = cluster_name,
+				pvc = pvc_name,
+				current = ?current_request,
+				desired = ?desired_size,
+				"expanding PVC to match required overlay storage size"
+			);
+			let patch = serde_json::json!({
+				"spec": {
+					"resources": {
+						"requests": {
+							"storage": desired_size
+						}
+					}
+				}
+			});
+			match pvcs
+				.patch(&pvc_name, &PatchParams::default(), &Patch::Merge(&patch))
+				.await
+			{
+				Ok(_) => {
+					info!(
+						cluster = cluster_name,
+						pvc = pvc_name,
+						new_size = ?desired_size,
+						"PVC expansion patch applied"
+					);
+				}
+				Err(e) => {
+					warn!(
+						cluster = cluster_name,
+						pvc = pvc_name,
+						error = %e,
+						"failed to expand PVC (storage class may not support volume expansion)"
+					);
+				}
+			}
+		} else {
+			debug!(
+				cluster = cluster_name,
+				pvc = pvc_name,
+				current = ?current_request,
+				desired = ?desired_size,
+				"PVC already at or above desired size"
+			);
+		}
+	}
+
+	Ok(())
 }
 
 /// Apply user-specified annotations to the CNPG-generated `-rw` Service.
@@ -293,6 +411,9 @@ pub async fn ensure_overlay_service_annotations(
 
 #[cfg(test)]
 mod tests {
+	use k8s_openapi::api::core::v1::{PersistentVolumeClaimSpec, VolumeResourceRequirements};
+	use kube::api::ObjectMeta;
+
 	use super::*;
 
 	#[test]
@@ -309,5 +430,88 @@ mod tests {
 			msg.contains("13"),
 			"error should mention the bad version: {msg}"
 		);
+	}
+
+	fn make_pvc(name: &str, storage: &str) -> PersistentVolumeClaim {
+		PersistentVolumeClaim {
+			metadata: ObjectMeta {
+				name: Some(name.to_string()),
+				..Default::default()
+			},
+			spec: Some(PersistentVolumeClaimSpec {
+				resources: Some(VolumeResourceRequirements {
+					requests: Some(BTreeMap::from([(
+						"storage".to_string(),
+						Quantity(storage.into()),
+					)])),
+					..Default::default()
+				}),
+				..Default::default()
+			}),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn pvc_needs_expansion_when_smaller() {
+		let pvc = make_pvc("test-1", "5Gi");
+		let desired = Quantity("10Gi".into());
+		let desired_pq: ParsedQuantity = (&desired).try_into().unwrap();
+		let current = pvc
+			.spec
+			.as_ref()
+			.unwrap()
+			.resources
+			.as_ref()
+			.unwrap()
+			.requests
+			.as_ref()
+			.unwrap()
+			.get("storage")
+			.unwrap();
+		let current_pq: ParsedQuantity = current.try_into().unwrap();
+		assert!(current_pq < desired_pq);
+	}
+
+	#[test]
+	fn pvc_no_expansion_when_equal() {
+		let pvc = make_pvc("test-1", "10Gi");
+		let desired = Quantity("10Gi".into());
+		let desired_pq: ParsedQuantity = (&desired).try_into().unwrap();
+		let current = pvc
+			.spec
+			.as_ref()
+			.unwrap()
+			.resources
+			.as_ref()
+			.unwrap()
+			.requests
+			.as_ref()
+			.unwrap()
+			.get("storage")
+			.unwrap();
+		let current_pq: ParsedQuantity = current.try_into().unwrap();
+		assert!(!(current_pq < desired_pq));
+	}
+
+	#[test]
+	fn pvc_no_expansion_when_larger() {
+		let pvc = make_pvc("test-1", "20Gi");
+		let desired = Quantity("10Gi".into());
+		let desired_pq: ParsedQuantity = (&desired).try_into().unwrap();
+		let current = pvc
+			.spec
+			.as_ref()
+			.unwrap()
+			.resources
+			.as_ref()
+			.unwrap()
+			.requests
+			.as_ref()
+			.unwrap()
+			.get("storage")
+			.unwrap();
+		let current_pq: ParsedQuantity = current.try_into().unwrap();
+		assert!(!(current_pq < desired_pq));
 	}
 }
