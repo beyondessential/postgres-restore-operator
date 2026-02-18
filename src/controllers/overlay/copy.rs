@@ -492,10 +492,19 @@ pub async fn reconcile_copy(
 		pg_version,
 	);
 
+	if jobs.get_opt(&job_name).await?.is_some() {
+		warn!(
+			replica = %replica_name,
+			job = %job_name,
+			"copy Job already exists, waiting for cleanup"
+		);
+		return Ok(false);
+	}
+
 	info!(
 		replica = %replica_name,
 		restore = %restore_name,
-		job = %copy_job_name(&replica_name),
+		job = %job_name,
 		attempt = current_retries + 1,
 		max_retries = MAX_COPY_RETRIES,
 		"creating copy Job"
