@@ -119,6 +119,7 @@ pub async fn write_state(
 /// If any of these change the setup needs to be redone from scratch.
 pub fn compute_config_hash(restore_name: &str, replica: &PostgresPhysicalReplica) -> String {
 	let mut hasher = DefaultHasher::new();
+	env!("CARGO_PKG_VERSION").hash(&mut hasher);
 	restore_name.hash(&mut hasher);
 	replica.spec.analytics_username.hash(&mut hasher);
 	if let Some(overlay) = &replica.spec.overlay_database {
