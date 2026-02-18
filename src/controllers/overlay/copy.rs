@@ -128,6 +128,11 @@ copy_schemas() {
       -c "DROP SCHEMA IF EXISTS \"$schema\" CASCADE;"
   done
 
+  echo 'Recreating public schema...'
+  PGPASSWORD="$OVERLAY_PASSWORD" psql \
+    -h "$OVERLAY_HOST" -p 5432 -U "$OVERLAY_USER" -d app \
+    -c 'CREATE SCHEMA IF NOT EXISTS public;'
+
   echo 'Copying all schemas from restore...'
   PGPASSWORD="$READER_PASSWORD" pg_dump \
     -h "$RESTORE_HOST" \
@@ -589,6 +594,7 @@ mod tests {
 		assert!(script.contains("--exclude-schema=_pgro"));
 		assert!(script.contains("Dropping existing user schemas"));
 		assert!(script.contains("NOT IN ('information_schema', '_pgro')"));
+		assert!(script.contains("CREATE SCHEMA IF NOT EXISTS public"));
 		assert!(script.contains("sync_extensions"));
 		assert!(script.contains("ON_ERROR_STOP=1"));
 	}
