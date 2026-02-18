@@ -64,14 +64,16 @@ async fn sync_extensions(
 
 /// Prepare the overlay database for a copy operation.
 ///
-/// Drops all user schemas and syncs extensions from the restore. This runs
-/// in the operator before the pg_dump Job is created, so the Job only
-/// needs to do the actual data transfer.
+/// Drops only schemas that exist in the restore (so they can be re-imported
+/// fresh), preserving any schemas the user created directly in the overlay.
+/// Also syncs extensions from the restore. This runs in the operator before
+/// the pg_dump Job is created, so the Job only needs to do the actual data
+/// transfer.
 async fn prepare_overlay_for_copy(
 	overlay_pg: &tokio_postgres::Client,
 	restore_pg: &tokio_postgres::Client,
 ) -> Result<()> {
-	let rows = overlay_pg
+	let rows = restore_pg
 		.query(
 			"SELECT schema_name FROM information_schema.schemata \
 			 WHERE schema_name NOT LIKE 'pg_%' \
@@ -81,7 +83,7 @@ async fn prepare_overlay_for_copy(
 		.await?;
 	for row in &rows {
 		let schema: String = row.get(0);
-		info!(schema = %schema, "dropping user schema in overlay");
+		info!(schema = %schema, "dropping restore-sourced schema in overlay");
 		overlay_pg
 			.execute(
 				&format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(&schema)),
