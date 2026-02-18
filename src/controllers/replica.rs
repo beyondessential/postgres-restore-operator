@@ -6,7 +6,7 @@ use k8s_openapi::{
 	apimachinery::pkg::apis::meta::v1::Time,
 };
 use kube::{
-	Api, Resource, ResourceExt,
+	Api, Client, Resource, ResourceExt,
 	api::{Patch, PatchParams, PostParams},
 	runtime::{
 		controller::Action,
@@ -251,44 +251,21 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	});
 
 	// Handle schema migration for persistent_schemas configuration
-	if replica.spec.persistent_schemas.is_some() {
-		if let Some(switching) = switching_restore {
-			let migration_complete = reconcile_schema_migration(
-				client,
-				ctx,
-				&replica,
-				&namespace,
-				switching,
-				active_restore,
-			)
-			.await?;
+	if replica.spec.persistent_schemas.is_some()
+		&& let Some(switching) = switching_restore
+	{
+		let migration_complete = reconcile_schema_migration(
+			client,
+			&ctx,
+			&replica,
+			&namespace,
+			switching,
+			active_restore,
+		)
+		.await?;
 
-			if !migration_complete {
-				// Migration still in progress, wait
-				return Ok(Action::requeue(Duration::from_secs(30)));
-			}
-			// Migration complete, proceed to switchover below
-		}
-	}
-
-	// Handle schema migration for persistent_schemas configuration
-	if replica.spec.persistent_schemas.is_some() {
-		if let Some(switching) = switching_restore {
-			let migration_complete = reconcile_schema_migration(
-				client,
-				ctx,
-				&replica,
-				&namespace,
-				switching,
-				active_restore,
-			)
-			.await?;
-
-			if !migration_complete {
-				// Migration still in progress, wait
-				return Ok(Action::requeue(Duration::from_secs(30)));
-			}
-			// Migration complete, proceed to switchover below
+		if !migration_complete {
+			return Ok(Action::requeue(Duration::from_secs(30)));
 		}
 	}
 
@@ -904,7 +881,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 /// in progress, or `Err` on permanent failure.
 async fn reconcile_schema_migration(
 	client: &Client,
-	ctx: &Context,
+	ctx: &Arc<Context>,
 	replica: &PostgresPhysicalReplica,
 	namespace: &str,
 	new_restore: &PostgresPhysicalRestore,

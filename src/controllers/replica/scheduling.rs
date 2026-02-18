@@ -184,6 +184,7 @@ mod tests {
 				postgres_extra_config: None,
 				notifications: Vec::new(),
 				overlay_database: None,
+				persistent_schemas: None,
 			},
 			status: Some(PostgresPhysicalReplicaStatus {
 				next_scheduled_restore: next_scheduled.map(Time),

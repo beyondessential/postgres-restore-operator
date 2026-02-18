@@ -367,6 +367,7 @@ mod tests {
 						import_generated: false,
 						retain_restore: true,
 					}),
+					persistent_schemas: None,
 				},
 				status: None,
 			}

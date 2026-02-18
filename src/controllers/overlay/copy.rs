@@ -564,6 +564,7 @@ mod tests {
 				postgres_extra_config: None,
 				notifications: vec![],
 				overlay_database: None,
+				persistent_schemas: None,
 			},
 			status: None,
 		};

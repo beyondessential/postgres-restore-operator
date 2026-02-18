@@ -4,12 +4,11 @@ use k8s_openapi::api::{
 	batch::v1::{Job, JobSpec},
 	core::v1::{Container, PodSecurityContext, PodSpec, PodTemplateSpec, ResourceRequirements},
 };
-use kube::api::ObjectMeta;
+use kube::{ResourceExt, api::ObjectMeta};
 use tracing::info;
 
 use crate::{
 	controllers::jobs::{env_from_secret_name, env_literal},
-	error::Result,
 	types::PostgresPhysicalReplica,
 };
 

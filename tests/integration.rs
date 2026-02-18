@@ -156,6 +156,7 @@ fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhy
 			postgres_extra_config: None,
 			notifications: vec![],
 			overlay_database: opts.overlay_database,
+			persistent_schemas: None,
 		},
 	)
 }

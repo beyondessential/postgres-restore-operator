@@ -34,6 +34,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			postgres_extra_config: None,
 			notifications: vec![],
 			overlay_database: None,
+			persistent_schemas: None,
 		},
 	);
 	replica.spec.affinity = Some(Affinity {
@@ -115,6 +116,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			postgres_extra_config: None,
 			notifications: vec![],
 			overlay_database: None,
+			persistent_schemas: None,
 		},
 	);
 
