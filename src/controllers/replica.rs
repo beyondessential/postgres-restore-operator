@@ -250,6 +250,48 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		)
 	});
 
+	// Handle schema migration for persistent_schemas configuration
+	if replica.spec.persistent_schemas.is_some() {
+		if let Some(switching) = switching_restore {
+			let migration_complete = reconcile_schema_migration(
+				client,
+				ctx,
+				&replica,
+				&namespace,
+				switching,
+				active_restore,
+			)
+			.await?;
+
+			if !migration_complete {
+				// Migration still in progress, wait
+				return Ok(Action::requeue(Duration::from_secs(30)));
+			}
+			// Migration complete, proceed to switchover below
+		}
+	}
+
+	// Handle schema migration for persistent_schemas configuration
+	if replica.spec.persistent_schemas.is_some() {
+		if let Some(switching) = switching_restore {
+			let migration_complete = reconcile_schema_migration(
+				client,
+				ctx,
+				&replica,
+				&namespace,
+				switching,
+				active_restore,
+			)
+			.await?;
+
+			if !migration_complete {
+				// Migration still in progress, wait
+				return Ok(Action::requeue(Duration::from_secs(30)));
+			}
+			// Migration complete, proceed to switchover below
+		}
+	}
+
 	// Handle switchover: if a restore is in Switching phase, update Service selector
 	if let Some(switching) = switching_restore {
 		let switching_name = switching.name_any();
@@ -473,39 +515,54 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.as_ref()
 		.and_then(|s| s.previous_restore.clone())
 	{
-		let grace_period =
-			SignedDuration::try_from(replica.spec.switchover_grace_period.0).unwrap_or_default();
-		let last_completed = replica
-			.status
-			.as_ref()
-			.and_then(|s| s.last_restore_completed_at.as_ref());
+		// For persistent_schemas: Don't start grace period countdown until migration completes
+		let migration_complete = if replica.spec.persistent_schemas.is_some() {
+			replica
+				.status
+				.as_ref()
+				.and_then(|s| s.schema_migration_phase.as_ref())
+				.is_some_and(|p| p == "complete")
+		} else {
+			true // For overlay strategies or no persistence config, always allow grace period
+		};
 
-		if let Some(completed_at) = last_completed {
-			let elapsed = now.duration_since(completed_at.0);
-			if elapsed > grace_period {
-				info!(
-					replica = name,
-					restore = prev_name,
-					"cleaning up previous restore after grace period"
-				);
-				if let Err(e) = restores.delete(&prev_name, &Default::default()).await {
-					warn!(restore = prev_name, error = %e, "failed to delete previous restore");
-				}
-				// Clear previousRestore from status
-				let replicas: Api<PostgresPhysicalReplica> =
-					Api::namespaced(client.clone(), &namespace);
-				let patch = serde_json::json!({
-					"status": {
-						"previousRestore": null,
+		if migration_complete {
+			let grace_period = SignedDuration::try_from(replica.spec.switchover_grace_period.0)
+				.unwrap_or_default();
+			let last_completed = replica
+				.status
+				.as_ref()
+				.and_then(|s| s.last_restore_completed_at.as_ref());
+
+			if let Some(completed_at) = last_completed {
+				let elapsed = now.duration_since(completed_at.0);
+				if elapsed > grace_period {
+					info!(
+						replica = name,
+						restore = prev_name,
+						"cleaning up previous restore after grace period"
+					);
+					if let Err(e) = restores.delete(&prev_name, &Default::default()).await {
+						warn!(restore = prev_name, error = %e, "failed to delete previous restore");
 					}
-				});
-				replicas
-					.patch_status(
-						&name,
-						&PatchParams::apply("postgres-restore-operator"),
-						&Patch::Merge(&patch),
-					)
-					.await?;
+					// Clear previousRestore from status
+					let replicas: Api<PostgresPhysicalReplica> =
+						Api::namespaced(client.clone(), &namespace);
+					let patch = serde_json::json!({
+						"status": {
+							"previousRestore": null,
+							"schemaMigrationJob": null,
+							"schemaMigrationPhase": null,
+						}
+					});
+					replicas
+						.patch_status(
+							&name,
+							&PatchParams::apply("postgres-restore-operator"),
+							&Patch::Merge(&patch),
+						)
+						.await?;
+				}
 			}
 		}
 	}
@@ -835,6 +892,227 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.await?;
 
 	Ok(Action::requeue(Duration::from_secs(300)))
+}
+
+/// Reconcile schema migration for persistent_schemas configuration.
+///
+/// This function manages the migration of specified schemas from the previous
+/// restore to the new restore during switchover. It creates and monitors a
+/// Kubernetes Job that runs pg_dump|psql to transfer the schemas.
+///
+/// Returns `Ok(true)` when migration is complete (or skipped), `Ok(false)` when
+/// in progress, or `Err` on permanent failure.
+async fn reconcile_schema_migration(
+	client: &Client,
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	new_restore: &PostgresPhysicalRestore,
+	old_restore_opt: Option<&PostgresPhysicalRestore>,
+) -> Result<bool> {
+	let replica_name = replica.name_any();
+	let new_restore_name = new_restore.name_any();
+
+	let persistent_config =
+		replica.spec.persistent_schemas.as_ref().ok_or_else(|| {
+			Error::InvalidOverlayConfig("missing persistent_schemas config".into())
+		})?;
+
+	// Edge case: First restore, no previous restore to migrate from
+	let old_restore = match old_restore_opt {
+		Some(r) => r,
+		None => {
+			info!(replica = %replica_name, "first restore, skipping schema migration");
+			return Ok(true); // Allow switchover to proceed
+		}
+	};
+
+	let old_restore_name = old_restore.name_any();
+
+	// Edge case: No persistent schemas configured
+	if persistent_config.schemas.is_empty() {
+		info!(replica = %replica_name, "no persistent schemas configured, skipping migration");
+		return Ok(true);
+	}
+
+	// Check if migration already complete in status
+	if replica
+		.status
+		.as_ref()
+		.and_then(|s| s.schema_migration_phase.as_ref())
+		.is_some_and(|p| p == "complete")
+	{
+		debug!(replica = %replica_name, "migration already complete in status");
+		return Ok(true);
+	}
+
+	// Check if migration Job exists
+	let job_name = schema_migration::migration_job_name(&replica_name);
+	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+
+	if let Some(job) = jobs.get_opt(&job_name).await? {
+		match classify_job(&job) {
+			JobStatus::Active => {
+				debug!(replica = %replica_name, job = %job_name, "migration Job still running");
+				return Ok(false);
+			}
+			JobStatus::Succeeded => {
+				info!(replica = %replica_name, "migration Job succeeded");
+
+				// Update status
+				let replicas: Api<PostgresPhysicalReplica> =
+					Api::namespaced(client.clone(), namespace);
+				let patch = serde_json::json!({
+					"status": {
+						"schemaMigrationJob": null,
+						"schemaMigrationPhase": "complete",
+					}
+				});
+				replicas
+					.patch_status(
+						&replica_name,
+						&PatchParams::apply("postgres-restore-operator"),
+						&Patch::Merge(&patch),
+					)
+					.await?;
+
+				// Clean up Job
+				if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+					warn!(job = %job_name, error = %e, "failed to delete completed migration Job");
+				}
+
+				return Ok(true);
+			}
+			JobStatus::Failed => {
+				let last_error = ctx
+					.schema_migration_results
+					.take(namespace, &replica_name)
+					.unwrap_or_else(|| "no callback received".to_string());
+
+				warn!(
+					replica = %replica_name,
+					source = %old_restore_name,
+					target = %new_restore_name,
+					error = %last_error,
+					"migration Job failed"
+				);
+
+				// Delete failed Job
+				if let Err(e) = jobs.delete(&job_name, &Default::default()).await {
+					warn!(job = %job_name, error = %e, "failed to delete failed Job");
+				}
+
+				// Update status with error
+				let replicas: Api<PostgresPhysicalReplica> =
+					Api::namespaced(client.clone(), namespace);
+				let patch = serde_json::json!({
+					"status": {
+						"schemaMigrationJob": null,
+						"schemaMigrationPhase": format!("failed: {}", last_error),
+					}
+				});
+				replicas
+					.patch_status(
+						&replica_name,
+						&PatchParams::apply("postgres-restore-operator"),
+						&Patch::Merge(&patch),
+					)
+					.await?;
+
+				// Strategy: Keep old restore active, fail the new restore
+				return Err(Error::InvalidOverlayConfig(format!(
+					"schema migration failed: {}",
+					last_error
+				)));
+			}
+		}
+	}
+
+	// No Job exists, need to create it
+	info!(
+		replica = %replica_name,
+		source = %old_restore_name,
+		target = %new_restore_name,
+		schemas = ?persistent_config.schemas,
+		"creating schema migration Job"
+	);
+
+	// Discover database names
+	let reader_secret_name = replica.creds_secret_name();
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let reader_secret = secrets.get(&reader_secret_name).await?;
+	let reader_user = overlay::connect::read_secret_field(&reader_secret, "username")?;
+	let reader_password = overlay::connect::read_secret_field(&reader_secret, "password")?;
+
+	let source_dbname = overlay::common::discover_restore_database(
+		client,
+		namespace,
+		&old_restore_name,
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let target_dbname = overlay::common::discover_restore_database(
+		client,
+		namespace,
+		&new_restore_name,
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	// Get target superuser secret for write access
+	let target_superuser_secret_name = format!("{new_restore_name}-app-user");
+
+	let pg_version = new_restore
+		.status
+		.as_ref()
+		.and_then(|s| s.postgres_version.as_ref())
+		.and_then(|v| v.split('.').next())
+		.and_then(|v| v.parse::<i32>().ok())
+		.unwrap_or(17);
+
+	let callback_url = ctx.schema_migration_callback_url(namespace, &replica_name);
+
+	let timeout_seconds = persistent_config.migration_timeout_seconds;
+
+	let job = schema_migration::build_schema_migration_job(
+		replica,
+		namespace,
+		&old_restore_name,
+		&new_restore_name,
+		&source_dbname,
+		&target_dbname,
+		&persistent_config.schemas,
+		&reader_secret_name,
+		&target_superuser_secret_name,
+		&callback_url,
+		pg_version,
+		timeout_seconds,
+	);
+
+	jobs.create(&PostParams::default(), &job).await?;
+
+	// Update status
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let patch = serde_json::json!({
+		"status": {
+			"schemaMigrationJob": job_name,
+			"schemaMigrationPhase": "active",
+		}
+	});
+	replicas
+		.patch_status(
+			&replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+
+	Ok(false) // Job created, not complete yet
 }
 
 pub fn error_policy(

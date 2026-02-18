@@ -349,4 +349,281 @@ mod tests {
 		assert_eq!(owner_refs[0].kind, "PostgresPhysicalReplica");
 		assert_eq!(owner_refs[0].name, "test-replica");
 	}
+
+	#[test]
+	fn build_migration_job_single_schema() {
+		use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
+
+		let replica = PostgresPhysicalReplica {
+			metadata: K8sObjectMeta {
+				name: Some("test-replica".into()),
+				namespace: Some("default".into()),
+				uid: Some("test-uid".into()),
+				..Default::default()
+			},
+			spec: crate::types::PostgresPhysicalReplicaSpec {
+				kopia_secret_ref: Default::default(),
+				snapshot_filter: None,
+				schedule: "0 * * * *".into(),
+				schedule_jitter: crate::util::TimeSpan(jiff::Span::new()),
+				minimum_ttl: None,
+				switchover_grace_period: crate::util::TimeSpan(jiff::Span::new()),
+				analytics_username: "analytics".into(),
+				storage_class: None,
+				storage_size_override: None,
+				resources: None,
+				service_annotations: None,
+				pod_annotations: None,
+				affinity: None,
+				tolerations: vec![],
+				read_only: true,
+				postgres_extra_config: None,
+				notifications: vec![],
+				overlay_database: None,
+				persistent_schemas: Some(crate::types::PersistentSchemasConfig {
+					schemas: vec!["myschema".into()],
+					migration_timeout_seconds: 7200,
+				}),
+			},
+			status: None,
+		};
+
+		let job = build_schema_migration_job(
+			&replica,
+			"test-ns",
+			"old-restore",
+			"new-restore",
+			"mydb",
+			"mydb",
+			&["myschema".to_string()],
+			"reader-secret",
+			"superuser-secret",
+			"http://operator.svc:8080/callback",
+			17,
+			3600,
+		);
+
+		let spec = job.spec.as_ref().unwrap();
+		let pod_spec = spec.template.spec.as_ref().unwrap();
+		let container = &pod_spec.containers[0];
+		let env = container.env.as_ref().unwrap();
+
+		let schemas_env = env.iter().find(|e| e.name == "SCHEMAS").unwrap();
+		assert_eq!(schemas_env.value.as_deref(), Some("myschema"));
+	}
+
+	#[test]
+	fn build_migration_job_multiple_schemas() {
+		use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
+
+		let replica = PostgresPhysicalReplica {
+			metadata: K8sObjectMeta {
+				name: Some("test-replica".into()),
+				namespace: Some("default".into()),
+				uid: Some("test-uid".into()),
+				..Default::default()
+			},
+			spec: crate::types::PostgresPhysicalReplicaSpec {
+				kopia_secret_ref: Default::default(),
+				snapshot_filter: None,
+				schedule: "0 * * * *".into(),
+				schedule_jitter: crate::util::TimeSpan(jiff::Span::new()),
+				minimum_ttl: None,
+				switchover_grace_period: crate::util::TimeSpan(jiff::Span::new()),
+				analytics_username: "analytics".into(),
+				storage_class: None,
+				storage_size_override: None,
+				resources: None,
+				service_annotations: None,
+				pod_annotations: None,
+				affinity: None,
+				tolerations: vec![],
+				read_only: true,
+				postgres_extra_config: None,
+				notifications: vec![],
+				overlay_database: None,
+				persistent_schemas: Some(crate::types::PersistentSchemasConfig {
+					schemas: vec!["s1".into(), "s2".into(), "s3".into()],
+					migration_timeout_seconds: 7200,
+				}),
+			},
+			status: None,
+		};
+
+		let schemas = vec!["s1".to_string(), "s2".to_string(), "s3".to_string()];
+		let job = build_schema_migration_job(
+			&replica,
+			"test-ns",
+			"old-restore",
+			"new-restore",
+			"mydb",
+			"mydb",
+			&schemas,
+			"reader-secret",
+			"superuser-secret",
+			"http://operator.svc:8080/callback",
+			17,
+			7200,
+		);
+
+		let spec = job.spec.as_ref().unwrap();
+		let pod_spec = spec.template.spec.as_ref().unwrap();
+		let container = &pod_spec.containers[0];
+		let env = container.env.as_ref().unwrap();
+
+		let schemas_env = env.iter().find(|e| e.name == "SCHEMAS").unwrap();
+		assert_eq!(schemas_env.value.as_deref(), Some("s1,s2,s3"));
+	}
+
+	#[test]
+	fn build_migration_job_custom_timeout() {
+		use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
+
+		let replica = PostgresPhysicalReplica {
+			metadata: K8sObjectMeta {
+				name: Some("test-replica".into()),
+				namespace: Some("default".into()),
+				uid: Some("test-uid".into()),
+				..Default::default()
+			},
+			spec: crate::types::PostgresPhysicalReplicaSpec {
+				kopia_secret_ref: Default::default(),
+				snapshot_filter: None,
+				schedule: "0 * * * *".into(),
+				schedule_jitter: crate::util::TimeSpan(jiff::Span::new()),
+				minimum_ttl: None,
+				switchover_grace_period: crate::util::TimeSpan(jiff::Span::new()),
+				analytics_username: "analytics".into(),
+				storage_class: None,
+				storage_size_override: None,
+				resources: None,
+				service_annotations: None,
+				pod_annotations: None,
+				affinity: None,
+				tolerations: vec![],
+				read_only: true,
+				postgres_extra_config: None,
+				notifications: vec![],
+				overlay_database: None,
+				persistent_schemas: Some(crate::types::PersistentSchemasConfig {
+					schemas: vec!["myschema".into()],
+					migration_timeout_seconds: 10800,
+				}),
+			},
+			status: None,
+		};
+
+		let job = build_schema_migration_job(
+			&replica,
+			"test-ns",
+			"old-restore",
+			"new-restore",
+			"mydb",
+			"mydb",
+			&["myschema".to_string()],
+			"reader-secret",
+			"superuser-secret",
+			"http://operator.svc:8080/callback",
+			17,
+			10800,
+		);
+
+		let spec = job.spec.as_ref().unwrap();
+		assert_eq!(spec.active_deadline_seconds, Some(10800));
+	}
+
+	#[test]
+	fn build_migration_job_pg_version() {
+		use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta as K8sObjectMeta;
+
+		let replica = PostgresPhysicalReplica {
+			metadata: K8sObjectMeta {
+				name: Some("test-replica".into()),
+				namespace: Some("default".into()),
+				uid: Some("test-uid".into()),
+				..Default::default()
+			},
+			spec: crate::types::PostgresPhysicalReplicaSpec {
+				kopia_secret_ref: Default::default(),
+				snapshot_filter: None,
+				schedule: "0 * * * *".into(),
+				schedule_jitter: crate::util::TimeSpan(jiff::Span::new()),
+				minimum_ttl: None,
+				switchover_grace_period: crate::util::TimeSpan(jiff::Span::new()),
+				analytics_username: "analytics".into(),
+				storage_class: None,
+				storage_size_override: None,
+				resources: None,
+				service_annotations: None,
+				pod_annotations: None,
+				affinity: None,
+				tolerations: vec![],
+				read_only: true,
+				postgres_extra_config: None,
+				notifications: vec![],
+				overlay_database: None,
+				persistent_schemas: Some(crate::types::PersistentSchemasConfig {
+					schemas: vec!["myschema".into()],
+					migration_timeout_seconds: 7200,
+				}),
+			},
+			status: None,
+		};
+
+		let job_pg16 = build_schema_migration_job(
+			&replica,
+			"test-ns",
+			"old-restore",
+			"new-restore",
+			"mydb",
+			"mydb",
+			&["myschema".to_string()],
+			"reader-secret",
+			"superuser-secret",
+			"http://operator.svc:8080/callback",
+			16,
+			7200,
+		);
+
+		let spec = job_pg16.spec.as_ref().unwrap();
+		let pod_spec = spec.template.spec.as_ref().unwrap();
+		let container = &pod_spec.containers[0];
+		assert_eq!(
+			container.image.as_deref(),
+			Some("ghcr.io/cloudnative-pg/postgresql:16")
+		);
+
+		let job_pg17 = build_schema_migration_job(
+			&replica,
+			"test-ns",
+			"old-restore",
+			"new-restore",
+			"mydb",
+			"mydb",
+			&["myschema".to_string()],
+			"reader-secret",
+			"superuser-secret",
+			"http://operator.svc:8080/callback",
+			17,
+			7200,
+		);
+
+		let spec = job_pg17.spec.as_ref().unwrap();
+		let pod_spec = spec.template.spec.as_ref().unwrap();
+		let container = &pod_spec.containers[0];
+		assert_eq!(
+			container.image.as_deref(),
+			Some("ghcr.io/cloudnative-pg/postgresql:17")
+		);
+	}
+
+	#[test]
+	fn migration_script_contains_required_commands() {
+		assert!(MIGRATION_SCRIPT.contains("pg_dump"));
+		assert!(MIGRATION_SCRIPT.contains("psql"));
+		assert!(MIGRATION_SCRIPT.contains("--schema="));
+		assert!(MIGRATION_SCRIPT.contains("ON_ERROR_STOP"));
+		assert!(MIGRATION_SCRIPT.contains("MIGRATION_CALLBACK_URL"));
+		assert!(!MIGRATION_SCRIPT.contains("--no-comments"));
+	}
 }
