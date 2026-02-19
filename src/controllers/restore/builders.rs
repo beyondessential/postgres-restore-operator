@@ -426,7 +426,10 @@ pub fn build_deployment(
 	let pg_image = format!("postgres:{pg_version}");
 	let pg_alpine_image = format!("postgres:{pg_version}-alpine");
 
-	let read_only = replica.spec.read_only.to_string();
+	// persistent_schemas needs write access to receive the migrated data
+	let effective_read_only =
+		replica.spec.read_only && replica.spec.persistent_schemas.is_none();
+	let read_only = effective_read_only.to_string();
 
 	let has_overlay = replica.spec.overlay_database.is_some();
 	let reader_secret = SecretReference {
