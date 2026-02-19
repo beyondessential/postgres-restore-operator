@@ -395,6 +395,13 @@ pub struct PostgresPhysicalReplicaStatus {
 	/// Used to size the next restore PVC.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub persistent_schema_data_size: Option<Quantity>,
+
+	/// Number of consecutive restore failures for this replica.
+	/// Reset to 0 on a successful restore. After 3 consecutive failures
+	/// the operator stops scheduling new restores until the condition is
+	/// cleared (e.g. by a spec change or manual intervention).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub consecutive_restore_failures: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]

@@ -46,6 +46,38 @@ async fn fail_restore(
 		info!(promoted = %promoted_name, "promoted queued restore after failure");
 	}
 
+	// Increment consecutiveRestoreFailures on the parent replica
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
+	if let Ok(replica) = replicas.get(replica_name).await {
+		let current = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.consecutive_restore_failures)
+			.unwrap_or(0);
+		let new_count = current + 1;
+		let patch = serde_json::json!({
+			"status": {
+				"consecutiveRestoreFailures": new_count,
+			}
+		});
+		if let Err(e) = replicas
+			.patch_status(
+				replica_name,
+				&PatchParams::apply("postgres-restore-operator"),
+				&Patch::Merge(&patch),
+			)
+			.await
+		{
+			warn!(replica = replica_name, error = %e, "failed to increment consecutiveRestoreFailures");
+		} else {
+			info!(
+				replica = replica_name,
+				consecutive_failures = new_count,
+				"incremented consecutive restore failure count"
+			);
+		}
+	}
+
 	ctx.metrics.restores_failed_total.inc();
 
 	let replica_ref = ObjectReference {
@@ -285,13 +317,26 @@ async fn reconcile_restoring(
 	if failed > backoff_limit {
 		warn!(restore = name, failed = failed, "restore job failed");
 
-		// Extend the TTL to 24 hours so the failed Job's pods (and their
-		// logs) stick around long enough for someone to investigate.  We
-		// deliberately do *not* proactively delete failed Jobs the way we
-		// do for successful ones.
-		const FAILED_JOB_TTL_SECS: i32 = 86_400; // 24 hours
+		// Set a TTL on the failed Job so its pods (and their logs) stick
+		// around long enough for investigation. The first failure for a
+		// replica gets 24 hours; subsequent consecutive failures get only
+		// 10 minutes to avoid accumulating PVCs held by pod references.
+		let consecutive_failures = {
+			let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+			replicas
+				.get(replica_name)
+				.await
+				.ok()
+				.and_then(|r| r.status.as_ref()?.consecutive_restore_failures)
+				.unwrap_or(0)
+		};
+		let failed_job_ttl_secs: i32 = if consecutive_failures > 0 {
+			600 // 10 minutes for retries
+		} else {
+			86_400 // 24 hours for the first failure
+		};
 		let ttl_patch = serde_json::json!({
-			"spec": { "ttlSecondsAfterFinished": FAILED_JOB_TTL_SECS }
+			"spec": { "ttlSecondsAfterFinished": failed_job_ttl_secs }
 		});
 		if let Err(e) = jobs
 			.patch(

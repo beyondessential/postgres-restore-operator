@@ -200,6 +200,7 @@ This can be used to persistently write data in other schemas in the overlay with
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
 | `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, or `failed: <reason>`). |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
+| `consecutiveRestoreFailures` | `uint32` | Number of consecutive restore failures. Reset to 0 on success. After 3 consecutive failures the operator stops scheduling new restores until the condition is cleared. |
 
 ---
 

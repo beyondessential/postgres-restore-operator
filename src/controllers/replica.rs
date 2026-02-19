@@ -1,8 +1,11 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::{
-	api::{batch::v1::Job, core::v1::Secret},
+	api::{
+		batch::v1::Job,
+		core::v1::{Pod, Secret},
+	},
 	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
 };
 use kube::{
@@ -301,6 +304,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				"currentRestore": switching_name,
 				"previousRestore": previous_restore,
 				"lastRestoreCompletedAt": Time(now),
+				"consecutiveRestoreFailures": 0,
 			}
 		});
 		replicas
@@ -310,6 +314,28 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				&Patch::Merge(&patch),
 			)
 			.await?;
+
+		// Clear the scheduling-suspended condition if it was set
+		if replica
+			.status
+			.as_ref()
+			.and_then(|s| {
+				s.conditions
+					.iter()
+					.find(|c| c.type_ == "RestoreSchedulingSuspended")
+			})
+			.is_some_and(|c| c.status == "True")
+		{
+			replica
+				.update_condition(
+					client,
+					"RestoreSchedulingSuspended",
+					"False",
+					"RestoreSucceeded",
+					"Consecutive failure counter reset after successful restore",
+				)
+				.await?;
+		}
 
 		ctx.metrics.switchovers_total.inc();
 
@@ -547,12 +573,17 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// Clean up failed restores (ownerReferences will cascade-delete their PVCs)
+	// Clean up failed restores.
+	// We explicitly delete associated pods before deleting the restore CR
+	// because Kubernetes cascade deletion can leave pods orphaned, and the
+	// pvc-protection finalizer blocks PVC deletion while any pod still
+	// references the PVC.
 	let failed_restores: Vec<_> = restore_list
 		.items
 		.iter()
 		.filter(|r| r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Failed))
 		.collect();
+	let pods: Api<Pod> = Api::namespaced(client.clone(), &namespace);
 	for failed in &failed_restores {
 		let failed_name = failed.name_any();
 		if let Some(created_at) = failed.status.as_ref().and_then(|s| s.created_at.as_ref()) {
@@ -563,9 +594,66 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 					restore = failed_name,
 					"cleaning up failed restore"
 				);
+
+				// Delete pods by label first so PVC protection finalizers can resolve
+				if let Ok(pod_list) = pods
+					.list(
+						&kube::api::ListParams::default()
+							.labels(&format!("pgro.bes.au/restore={failed_name}")),
+					)
+					.await
+				{
+					for pod in &pod_list.items {
+						let pod_name = pod.metadata.name.as_deref().unwrap_or("");
+						if let Err(e) = pods.delete(pod_name, &Default::default()).await {
+							warn!(pod = pod_name, error = %e, "failed to delete pod for failed restore");
+						}
+					}
+				}
+
 				if let Err(e) = restores.delete(&failed_name, &Default::default()).await {
 					warn!(restore = failed_name, error = %e, "failed to delete failed restore");
 				}
+			}
+		}
+	}
+
+	// Sweep for orphaned restore pods: pods with a pgro.bes.au/restore label
+	// but no ownerReferences. These can be left behind when cascade deletion
+	// from a restore CR fails to propagate to the Job's pods.
+	let known_restores: HashSet<String> = restore_list.items.iter().map(|r| r.name_any()).collect();
+	if let Ok(all_restore_pods) = pods
+		.list(&kube::api::ListParams::default().labels(&format!("pgro.bes.au/replica={name}")))
+		.await
+	{
+		for pod in &all_restore_pods.items {
+			let has_owner = pod
+				.metadata
+				.owner_references
+				.as_ref()
+				.is_some_and(|refs| !refs.is_empty());
+			if has_owner {
+				continue;
+			}
+			let restore_label = pod
+				.metadata
+				.labels
+				.as_ref()
+				.and_then(|l| l.get("pgro.bes.au/restore"));
+			let Some(restore_name) = restore_label else {
+				continue;
+			};
+			if known_restores.contains(restore_name) {
+				continue;
+			}
+			let pod_name = pod.metadata.name.as_deref().unwrap_or("");
+			info!(
+				pod = pod_name,
+				restore = %restore_name,
+				"deleting orphaned restore pod"
+			);
+			if let Err(e) = pods.delete(pod_name, &Default::default()).await {
+				warn!(pod = pod_name, error = %e, "failed to delete orphaned pod");
 			}
 		}
 	}
@@ -788,6 +876,35 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	}
 
 	let schedule_decision = replica.check_schedule();
+
+	let consecutive_failures = replica
+		.status
+		.as_ref()
+		.and_then(|s| s.consecutive_restore_failures)
+		.unwrap_or(0);
+
+	const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+	if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+		warn!(
+			replica = name,
+			consecutive_failures,
+			"restore scheduling suspended after {MAX_CONSECUTIVE_FAILURES} consecutive failures"
+		);
+		replica
+			.update_condition(
+				client,
+				"RestoreSchedulingSuspended",
+				"True",
+				"ConsecutiveFailures",
+				&format!(
+					"Scheduling suspended after {consecutive_failures} consecutive restore failures. \
+					 Fix the underlying issue and reset by updating the spec or clearing \
+					 .status.consecutiveRestoreFailures."
+				),
+			)
+			.await?;
+		return Ok(Action::requeue(Duration::from_secs(300)));
+	}
 
 	let should_restore = never_restored
 		|| active_restore_deleted
