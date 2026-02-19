@@ -25,12 +25,6 @@ jobs:
       matrix:
         include:
           - name: lifecycle
-            tests: >-
-              full_restore_lifecycle
-              invalid_kopia_secret_structure
-              missing_kopia_secret_handled
-              analytics_create_schema_read_write
-              analytics_read_only_cannot_create_schema
             namespaces: >-
               test-lifecycle
               test-invalid-secret
@@ -40,10 +34,7 @@ jobs:
             needs_non_pg_snapshot: false
             needs_cnpg: false
 
-          - name: error-paths
-            tests: >-
-              restore_fails_for_non_postgres_data
-              snapshot_job_fails_for_wrong_bucket
+          - name: error_paths
             namespaces: >-
               test-non-pg-data
               test-wrong-bucket
@@ -51,34 +42,25 @@ jobs:
             needs_cnpg: false
 
           - name: ttls
-            tests: >-
-              minimum_ttl_prevents_premature_restore
             namespaces: >-
               test-min-ttl
             needs_non_pg_snapshot: true
             needs_cnpg: false
 
           - name: switchover
-            tests: >-
-              second_restore_and_switchover
             namespaces: >-
               test-switchover
             needs_non_pg_snapshot: false
             needs_cnpg: false
 
           - name: overlay
-            tests: >-
-              overlay_fdw_reconciliation
-              overlay_copy_reconciliation
             namespaces: >-
               test-overlay
               test-overlay-copy
             needs_non_pg_snapshot: false
             needs_cnpg: true
 
-          - name: persistent-schemas
-            tests: >-
-              persistent_schemas_migration
+          - name: persistent_schemas
             namespaces: >-
               test-persistent-schemas
             needs_non_pg_snapshot: false
@@ -296,11 +278,7 @@ jobs:
 
       - name: Run integration tests
         run: |
-          for test in ${{ matrix.tests }}; do
-            echo "::group::Running $test"
-            cargo test --test integration -- --ignored --nocapture --exact "$test"
-            echo "::endgroup::"
-          done
+          cargo test --test "${{ matrix.name }}" -- --test-threads 1 --include-ignored --nocapture
         env:
           RUST_LOG: info
 
