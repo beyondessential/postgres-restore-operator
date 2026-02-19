@@ -17,6 +17,8 @@ use crate::{
 	types::PostgresPhysicalReplica,
 };
 
+pub const DEFAULT_PG_VERSION: i32 = 18;
+
 /// Tracked overlay reconciliation state persisted in `_pgro.overlay_state`.
 pub struct TrackedState {
 	pub config_hash: String,

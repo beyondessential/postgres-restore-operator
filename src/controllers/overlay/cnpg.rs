@@ -23,13 +23,14 @@ use crate::{
 	},
 };
 
-const DEFAULT_PG_VERSION: i32 = 17;
+use super::common::DEFAULT_PG_VERSION;
+
 const MIN_OVERLAY_PG_VERSION: i32 = 14;
 
 /// Resolution order:
 /// 1. Explicit `postgres_version` in config
 /// 2. Highest major from CNPG image catalog
-/// 3. Hardcoded default "17"
+/// 3. Hardcoded default "18"
 ///
 /// Returns an error if the resolved version is below 14 (required for
 /// `pg_read_all_data` / `pg_write_all_data`).

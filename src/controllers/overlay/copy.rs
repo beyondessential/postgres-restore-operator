@@ -21,8 +21,8 @@ use crate::{
 };
 
 use super::common::{
-	compute_config_hash, discover_restore_database, ensure_state_table, migrate_from_fdw_state,
-	quote_ident, read_state, write_state,
+	DEFAULT_PG_VERSION, compute_config_hash, discover_restore_database, ensure_state_table,
+	migrate_from_fdw_state, quote_ident, read_state, write_state,
 };
 
 const MAX_COPY_RETRIES: i32 = 3;
@@ -485,7 +485,7 @@ pub async fn reconcile_copy(
 		.status
 		.as_ref()
 		.and_then(|s| s.overlay_postgres_version)
-		.unwrap_or(17) as i32;
+		.unwrap_or(DEFAULT_PG_VERSION as u32) as i32;
 
 	let callback_url = ctx.copy_callback_url(namespace, &replica_name);
 

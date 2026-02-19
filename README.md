@@ -159,7 +159,7 @@ This can be used to persistently write data in other schemas in the overlay with
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `strategy` | `"fdw"` \| `"copy"` | No | `"fdw"` | Strategy for populating the overlay from the restore. `fdw` creates foreign tables (restore must stay alive). `copy` uses `pg_dump \| psql` to copy data (tolerates version differences, restore can be discarded). |
-| `postgresVersion` | `uint32` | No | Resolved from image catalog, or `17` | PostgreSQL major version for the CNPG cluster. |
+| `postgresVersion` | `uint32` | No | Resolved from image catalog, or `18` | PostgreSQL major version for the CNPG cluster. |
 | `imageCatalog` | `ImageCatalogRef` | No | ClusterImageCatalog | CNPG image catalog for PG version discovery and image resolution. |
 | `storageSizeOverride` | `Quantity` | No | Auto-sized | Override for the overlay PVC size. Auto-sizing: `5Gi + ceil(snapshotSize / 10)`, ratchets up only. |
 | `storageClass` | `string` | No | — | Storage class for the overlay database PVC. |
@@ -205,6 +205,8 @@ Copies the specified schemas from the previous (active) restore into the new res
 | `overlayRestore` | `string` | Name of the restore whose schemas are currently imported into the overlay. |
 | `overlayStorageSize` | `Quantity` | Current (possibly ratcheted) storage size of the overlay PVC. |
 | `overlayPostgresVersion` | `uint32` | Resolved PG major version used for the overlay cluster. |
+| `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
+| `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, or `failed: <reason>`). |
 
 ---
 

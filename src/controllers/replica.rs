@@ -19,6 +19,7 @@ use tracing::{debug, info, warn};
 use super::{
 	jobs::{JobStatus, classify_job},
 	overlay,
+	overlay::common::DEFAULT_PG_VERSION,
 };
 use crate::{
 	context::Context,
@@ -1050,7 +1051,7 @@ async fn reconcile_schema_migration(
 		.and_then(|s| s.postgres_version.as_ref())
 		.and_then(|v| v.split('.').next())
 		.and_then(|v| v.parse::<i32>().ok())
-		.unwrap_or(17);
+		.unwrap_or(DEFAULT_PG_VERSION);
 
 	let callback_url = ctx.schema_migration_callback_url(namespace, &replica_name);
 
