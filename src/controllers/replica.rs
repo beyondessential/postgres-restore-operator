@@ -1093,8 +1093,10 @@ async fn reconcile_schema_migration(
 	)
 	.await?;
 
-	// Get target superuser secret for write access
-	let target_superuser_secret_name = format!("{new_restore_name}-app-user");
+	// The analytics user already has pg_write_all_data + CREATE ON DATABASE
+	// when persistent_schemas is configured (read_only is effectively false),
+	// so we reuse the replica creds secret for write access to the target.
+	let target_superuser_secret_name = reader_secret_name.clone();
 
 	let pg_version = new_restore
 		.status
