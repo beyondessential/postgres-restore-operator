@@ -103,6 +103,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `overlayDatabase` | `OverlayDatabaseConfig` | No | — | Optional overlay database configuration (persistent database via CNPG). Mutually exclusive with `persistentSchemas`. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the old restore to the new restore on each switchover. Mutually exclusive with `overlayDatabase`. |
+| `storageSizeMaximum` | `Quantity` | No | `2Ti` | Maximum allowed PVC size. The restore will fail if the computed size exceeds this limit. |
 
 Using the `overlayDatabase` requires the CloudNative-PG operator to be installed and configured.
 Installing the CNPG cluster-level catalogs is optional but recommended.
@@ -198,6 +199,7 @@ This can be used to persistently write data in other schemas in the overlay with
 | `overlayPostgresVersion` | `uint32` | Resolved PG major version used for the overlay cluster. |
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
 | `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, or `failed: <reason>`). |
+| `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
 
 ---
 

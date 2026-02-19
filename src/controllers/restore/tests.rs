@@ -35,6 +35,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			notifications: vec![],
 			overlay_database: None,
 			persistent_schemas: None,
+			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);
 	replica.spec.affinity = Some(Affinity {
@@ -117,6 +118,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			notifications: vec![],
 			overlay_database: None,
 			persistent_schemas: None,
+			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);
 

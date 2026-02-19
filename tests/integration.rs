@@ -157,6 +157,7 @@ fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> PostgresPhy
 			notifications: vec![],
 			overlay_database: opts.overlay_database,
 			persistent_schemas: None,
+			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	)
 }

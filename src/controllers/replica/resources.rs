@@ -190,9 +190,7 @@ impl PostgresPhysicalReplica {
 					} else {
 						ten_percent
 					};
-					snapshot_bytes
-						+ overhead
-						+ ParsedQuantity::try_from("5Gi").unwrap()
+					snapshot_bytes + overhead + ParsedQuantity::try_from("5Gi").unwrap()
 				} else {
 					snapshot_bytes * Decimal::new(11, 1) // 1.1x
 				};

@@ -1067,8 +1067,7 @@ async fn reconcile_schema_migration(
 	);
 
 	// Store the measured size in the replica status
-	let schema_data_quantity =
-		Quantity(format!("{schema_data_bytes}"));
+	let schema_data_quantity = Quantity(format!("{schema_data_bytes}"));
 	let replicas_for_size: Api<PostgresPhysicalReplica> =
 		Api::namespaced(client.clone(), namespace);
 	let size_patch = serde_json::json!({

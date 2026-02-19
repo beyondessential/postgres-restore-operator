@@ -555,6 +555,9 @@ mod tests {
 				analytics_username: "analytics".into(),
 				storage_class: None,
 				storage_size_override: None,
+				storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
+					"2Ti".to_string(),
+				),
 				resources: None,
 				service_annotations: None,
 				pod_annotations: None,

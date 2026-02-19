@@ -256,6 +256,9 @@ mod tests {
 				read_only: true,
 				postgres_extra_config: None,
 				notifications: vec![],
+				storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
+					"2Ti".to_string(),
+				),
 				overlay_database: None,
 				persistent_schemas: Some(schemas.into_iter().map(String::from).collect()),
 			},
