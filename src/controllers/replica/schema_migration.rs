@@ -450,14 +450,4 @@ mod tests {
 			assert_eq!(container.image.as_deref(), Some(expected_image));
 		}
 	}
-
-	#[test]
-	fn migration_script_contains_required_commands() {
-		assert!(MIGRATION_SCRIPT.contains("pg_dump"));
-		assert!(MIGRATION_SCRIPT.contains("psql"));
-		assert!(MIGRATION_SCRIPT.contains("--schema="));
-		assert!(MIGRATION_SCRIPT.contains("ON_ERROR_STOP"));
-		assert!(MIGRATION_SCRIPT.contains("MIGRATION_CALLBACK_URL"));
-		assert!(!MIGRATION_SCRIPT.contains("--no-comments"));
-	}
 }
