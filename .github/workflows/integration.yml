@@ -76,6 +76,14 @@ jobs:
             needs_non_pg_snapshot: false
             needs_cnpg: true
 
+          - name: persistent-schemas
+            tests: >-
+              persistent_schemas_migration
+            namespaces: >-
+              test-persistent-schemas
+            needs_non_pg_snapshot: false
+            needs_cnpg: false
+
     steps:
       - uses: actions/checkout@v6
 
