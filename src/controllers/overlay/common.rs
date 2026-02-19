@@ -292,6 +292,36 @@ pub async fn ensure_reader_credentials(
 	Ok(())
 }
 
+/// Query the on-disk size of the given database (bytes) via `pg_database_size()`.
+pub async fn measure_database_size(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	dbname: &str,
+	user: &str,
+	password: &str,
+	use_port_forward: bool,
+) -> Result<u64> {
+	let conn = super::connect::connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		dbname,
+		user,
+		password,
+		use_port_forward,
+	)
+	.await?;
+
+	let row = conn
+		.client
+		.query_one("SELECT pg_database_size(current_database())", &[])
+		.await?;
+
+	let size: i64 = row.get(0);
+	Ok(size as u64)
+}
+
 /// Escape a SQL identifier by double-quoting it.
 pub fn quote_ident(s: &str) -> String {
 	format!("\"{}\"", s.replace('"', "\"\""))

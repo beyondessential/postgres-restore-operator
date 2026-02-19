@@ -3,7 +3,7 @@ use std::{sync::Arc, time::Duration};
 use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::{
 	api::{batch::v1::Job, core::v1::Secret},
-	apimachinery::pkg::apis::meta::v1::Time,
+	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
 };
 use kube::{
 	Api, Client, Resource, ResourceExt,
@@ -13,7 +13,9 @@ use kube::{
 		events::{Event, EventType},
 	},
 };
+use kube_quantity::ParsedQuantity;
 use rand::RngExt;
+use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
 use super::{
@@ -1031,6 +1033,56 @@ async fn reconcile_schema_migration(
 		ctx.use_port_forward(),
 	)
 	.await?;
+
+	// Measure the actual on-disk database size of the source restore and
+	// compute how much the persistent schemas have grown beyond the original
+	// snapshot.  This delta is stored in the replica status so the next
+	// restore PVC can be sized accordingly.
+	let db_size_bytes = overlay::common::measure_database_size(
+		client,
+		namespace,
+		&old_restore_name,
+		&source_dbname,
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let snapshot_size_bytes: ParsedQuantity = old_restore
+		.spec
+		.snapshot_size
+		.clone()
+		.try_into()
+		.unwrap_or_else(|_| ParsedQuantity::from(Decimal::ZERO));
+	let snapshot_bytes_f64 = snapshot_size_bytes.to_bytes_f64().unwrap_or(0.0);
+	let schema_data_bytes = (db_size_bytes as f64 - snapshot_bytes_f64).max(0.0) as u64;
+
+	info!(
+		replica = %replica_name,
+		db_size_bytes,
+		snapshot_bytes = %snapshot_bytes_f64,
+		schema_data_bytes,
+		"measured persistent schema data delta"
+	);
+
+	// Store the measured size in the replica status
+	let schema_data_quantity =
+		Quantity(format!("{schema_data_bytes}"));
+	let replicas_for_size: Api<PostgresPhysicalReplica> =
+		Api::namespaced(client.clone(), namespace);
+	let size_patch = serde_json::json!({
+		"status": {
+			"persistentSchemaDataSize": schema_data_quantity,
+		}
+	});
+	replicas_for_size
+		.patch_status(
+			&replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&size_patch),
+		)
+		.await?;
 
 	let target_dbname = overlay::common::discover_restore_database(
 		client,

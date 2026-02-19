@@ -18,7 +18,7 @@ use kube::{
 };
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
-use tracing::{info, warn};
+use tracing::info;
 
 use super::generate_password;
 use crate::{
@@ -168,35 +168,43 @@ impl PostgresPhysicalReplica {
 		let timestamp = Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
 		let restore_name = format!("{replica_name}-{timestamp}");
 
-		let max_pvc_size = ParsedQuantity::try_from("2Ti").unwrap();
+		let max_pvc_size = ParsedQuantity::try_from(self.spec.storage_size_maximum.clone())
+			.unwrap_or_else(|_| ParsedQuantity::try_from("2Ti").unwrap());
 
 		let snapshot_bytes = snapshot.bytes();
 		let storage_size = match &self.spec.storage_size_override {
 			Some(override_size) => override_size.clone(),
 			None => {
-				let mut computed_size = snapshot_bytes.clone() * Decimal::new(11, 1); // 1.1
-
-				// persistent schemas are migrated into the restore PVC, so we
-				// need extra headroom: another 10% of the snapshot + 5Gi flat.
-				if self.spec.persistent_schemas.is_some() {
-					let extra = snapshot_bytes * Decimal::new(1, 1) // 0.1
-						+ ParsedQuantity::try_from("5Gi").unwrap();
-					computed_size += extra;
-				}
+				let computed_size = if self.spec.persistent_schemas.is_some() {
+					// Persistent schemas are migrated into the restore PVC.
+					// Formula: snapshot + max(10% of snapshot, last measured delta) + 5Gi
+					let ten_percent = snapshot_bytes.clone() * Decimal::new(1, 1);
+					let measured = self
+						.status
+						.as_ref()
+						.and_then(|s| s.persistent_schema_data_size.as_ref())
+						.and_then(|q| ParsedQuantity::try_from(q.clone()).ok())
+						.unwrap_or_else(|| ParsedQuantity::from(Decimal::ZERO));
+					let overhead = if measured > ten_percent {
+						measured
+					} else {
+						ten_percent
+					};
+					snapshot_bytes
+						+ overhead
+						+ ParsedQuantity::try_from("5Gi").unwrap()
+				} else {
+					snapshot_bytes * Decimal::new(11, 1) // 1.1x
+				};
 
 				if computed_size > max_pvc_size {
-					warn!(
-						replica = self.name_any(),
-						snapshot = snapshot.id,
-						?computed_size,
-						?max_pvc_size,
-						"computed PVC size exceeds ceiling, capping"
-					);
-					max_pvc_size
-				} else {
-					computed_size
+					return Err(crate::error::Error::StorageLimitExceeded {
+						computed: computed_size.into(),
+						maximum: max_pvc_size.into(),
+					});
 				}
-				.into()
+
+				computed_size.into()
 			}
 		};
 

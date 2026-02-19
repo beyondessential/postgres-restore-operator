@@ -101,6 +101,15 @@ pub struct PostgresPhysicalReplicaSpec {
 	/// Mutually exclusive with overlay_database.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub persistent_schemas: Option<Vec<String>>,
+
+	/// Maximum allowed size for the restore PVC. The restore will fail if the
+	/// computed size exceeds this limit. Defaults to 2Ti.
+	#[serde(default = "default_storage_size_maximum")]
+	pub storage_size_maximum: Quantity,
+}
+
+fn default_storage_size_maximum() -> Quantity {
+	Quantity("2Ti".to_string())
 }
 
 fn default_read_only() -> bool {
@@ -381,6 +390,11 @@ pub struct PostgresPhysicalReplicaStatus {
 	/// Phase of schema migration: pending, active, complete, failed
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub schema_migration_phase: Option<String>,
+
+	/// Measured size of persistent schema data from the last successful migration (bytes).
+	/// Used to size the next restore PVC.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub persistent_schema_data_size: Option<Quantity>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
