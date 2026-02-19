@@ -101,7 +101,8 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `readOnly` | `bool` | No | `true` | Set the restored database to read-only mode. |
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
-| `overlayDatabase` | `OverlayDatabaseConfig` | No | — | Optional overlay database configuration (persistent database via CNPG). |
+| `overlayDatabase` | `OverlayDatabaseConfig` | No | — | Optional overlay database configuration (persistent database via CNPG). Mutually exclusive with `persistentSchemas`. |
+| `persistentSchemas` | `PersistentSchemasConfig` | No | — | Migrate specific schemas from the old restore to the new restore on each switchover. Mutually exclusive with `overlayDatabase`. |
 
 Using the `overlayDatabase` requires the CloudNative-PG operator to be installed and configured.
 Installing the CNPG cluster-level catalogs is optional but recommended.
@@ -175,6 +176,15 @@ This can be used to persistently write data in other schemas in the overlay with
 |-------|------|----------|---------|-------------|
 | `name` | `string` | Yes | — | Name of the image catalog resource. |
 | `kind` | `string` | No | `"ClusterImageCatalog"` | Kind of the image catalog (`ClusterImageCatalog` or `ImageCatalog`). |
+
+#### PersistentSchemasConfig
+
+Copies the specified schemas from the previous (active) restore into the new restore during each switchover. The old restore is kept alive until the migration Job completes, then deleted. Mutually exclusive with `overlayDatabase`.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `schemas` | `[]string` | Yes | — | List of schema names to copy from the old restore to the new one. |
+| `migrationTimeoutSeconds` | `int32` | No | `7200` | Maximum time in seconds for the migration Job before it is considered failed. |
 
 #### Status
 
