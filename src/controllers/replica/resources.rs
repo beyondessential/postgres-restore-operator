@@ -174,7 +174,16 @@ impl PostgresPhysicalReplica {
 		let storage_size = match &self.spec.storage_size_override {
 			Some(override_size) => override_size.clone(),
 			None => {
-				let computed_size = snapshot_bytes * Decimal::new(11, 1); // 1.1
+				let mut computed_size = snapshot_bytes.clone() * Decimal::new(11, 1); // 1.1
+
+				// persistent schemas are migrated into the restore PVC, so we
+				// need extra headroom: another 10% of the snapshot + 5Gi flat.
+				if self.spec.persistent_schemas.is_some() {
+					let extra = snapshot_bytes * Decimal::new(1, 1) // 0.1
+						+ ParsedQuantity::try_from("5Gi").unwrap();
+					computed_size += extra;
+				}
+
 				if computed_size > max_pvc_size {
 					warn!(
 						replica = self.name_any(),
