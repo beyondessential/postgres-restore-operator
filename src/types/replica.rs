@@ -97,10 +97,10 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub overlay_database: Option<OverlayDatabaseConfig>,
 
-	/// Schema migration configuration for persistent schemas between restores.
+	/// List of schema names to migrate from the previous restore to the new restore on each switchover.
 	/// Mutually exclusive with overlay_database.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub persistent_schemas: Option<PersistentSchemasConfig>,
+	pub persistent_schemas: Option<Vec<String>>,
 }
 
 fn default_read_only() -> bool {
@@ -128,24 +128,6 @@ pub enum OverlayStrategy {
 	/// overlay. Tolerates PostgreSQL version differences and does not
 	/// require the restore to stay alive after the copy completes.
 	Copy,
-}
-
-/// Configuration for migrating schemas between restores.
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct PersistentSchemasConfig {
-	/// List of schema names to migrate from the previous restore to the new restore.
-	/// These schemas are copied during switchover before the old restore is deleted.
-	pub schemas: Vec<String>,
-
-	/// Timeout for the migration job in seconds.
-	/// Defaults to 7200 (2 hours).
-	#[serde(default = "default_migration_timeout")]
-	pub migration_timeout_seconds: i32,
-}
-
-fn default_migration_timeout() -> i32 {
-	7200
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

@@ -891,7 +891,7 @@ async fn reconcile_schema_migration(
 	let replica_name = replica.name_any();
 	let new_restore_name = new_restore.name_any();
 
-	let persistent_config =
+	let schemas =
 		replica.spec.persistent_schemas.as_ref().ok_or_else(|| {
 			Error::InvalidOverlayConfig("missing persistent_schemas config".into())
 		})?;
@@ -908,7 +908,7 @@ async fn reconcile_schema_migration(
 	let old_restore_name = old_restore.name_any();
 
 	// Edge case: No persistent schemas configured
-	if persistent_config.schemas.is_empty() {
+	if schemas.is_empty() {
 		info!(replica = %replica_name, "no persistent schemas configured, skipping migration");
 		return Ok(true);
 	}
@@ -1011,7 +1011,7 @@ async fn reconcile_schema_migration(
 		replica = %replica_name,
 		source = %old_restore_name,
 		target = %new_restore_name,
-		schemas = ?persistent_config.schemas,
+		schemas = ?schemas,
 		"creating schema migration Job"
 	);
 
@@ -1055,8 +1055,6 @@ async fn reconcile_schema_migration(
 
 	let callback_url = ctx.schema_migration_callback_url(namespace, &replica_name);
 
-	let timeout_seconds = persistent_config.migration_timeout_seconds;
-
 	let job = schema_migration::build_schema_migration_job(
 		replica,
 		namespace,
@@ -1064,12 +1062,11 @@ async fn reconcile_schema_migration(
 		&new_restore_name,
 		&source_dbname,
 		&target_dbname,
-		&persistent_config.schemas,
+		schemas,
 		&reader_secret_name,
 		&target_superuser_secret_name,
 		&callback_url,
 		pg_version,
-		timeout_seconds,
 	);
 
 	jobs.create(&PostParams::default(), &job).await?;
