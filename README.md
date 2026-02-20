@@ -93,6 +93,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `analyticsUsername` | `string` | No | `"analytics"` | Username created for analytics connections. |
 | `storageClass` | `string` | No | — | Kubernetes StorageClass for the restore PVCs. |
 | `storageSizeOverride` | `Quantity` | No | — | Override dynamic sizing with a fixed PVC size. When absent, PVC size is calculated from snapshot size. |
+| `storageSizeMaximum` | `Quantity` | No | `2Ti` | Maximum allowed PVC size. The restore will fail if the computed size exceeds this limit. |
 | `resources` | `ResourceRequirements` | No | — | CPU/memory resource requirements for the PostgreSQL pods. |
 | `serviceAnnotations` | `map[string]string` | No | — | Annotations applied to the Service. |
 | `podAnnotations` | `map[string]string` | No | — | Annotations applied to the PostgreSQL pods. |
@@ -103,7 +104,6 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `overlayDatabase` | `OverlayDatabaseConfig` | No | — | Optional overlay database configuration (persistent database via CNPG). Mutually exclusive with `persistentSchemas`. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the old restore to the new restore on each switchover. Mutually exclusive with `overlayDatabase`. |
-| `storageSizeMaximum` | `Quantity` | No | `2Ti` | Maximum allowed PVC size. The restore will fail if the computed size exceeds this limit. |
 
 Using the `overlayDatabase` requires the CloudNative-PG operator to be installed and configured.
 Installing the CNPG cluster-level catalogs is optional but recommended.
