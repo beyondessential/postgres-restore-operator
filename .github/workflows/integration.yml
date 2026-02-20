@@ -25,7 +25,6 @@ jobs:
       matrix:
         include:
           - name: lifecycle
-            test_threads: 1
             namespaces: >-
               test-lifecycle
               test-invalid-secret
@@ -36,7 +35,6 @@ jobs:
             needs_cnpg: false
 
           - name: error_paths
-            test_threads: 1
             namespaces: >-
               test-non-pg-data
               test-wrong-bucket
@@ -44,21 +42,18 @@ jobs:
             needs_cnpg: false
 
           - name: ttls
-            test_threads: 1
             namespaces: >-
               test-min-ttl
             needs_non_pg_snapshot: true
             needs_cnpg: false
 
           - name: switchover
-            test_threads: 1
             namespaces: >-
               test-switchover
             needs_non_pg_snapshot: false
             needs_cnpg: false
 
           - name: overlay
-            test_threads: 2
             namespaces: >-
               test-overlay
               test-overlay-copy
@@ -66,7 +61,6 @@ jobs:
             needs_cnpg: true
 
           - name: persistent_schemas
-            test_threads: 1
             namespaces: >-
               test-persistent-schemas
             needs_non_pg_snapshot: false
@@ -284,7 +278,7 @@ jobs:
 
       - name: Run integration tests
         run: |
-          cargo test --test "${{ matrix.name }}" -- --test-threads ${{ matrix.test_threads }} --include-ignored --nocapture
+          cargo test --test "${{ matrix.name }}" -- --include-ignored --nocapture
         env:
           RUST_LOG: info
 
