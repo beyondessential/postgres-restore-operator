@@ -146,6 +146,8 @@ metadata:
         app.kubernetes.io/component: controller
 spec:
     replicas: 1
+    strategy:
+        type: Recreate
     selector:
         matchLabels:
             app.kubernetes.io/name: postgres-restore-operator
