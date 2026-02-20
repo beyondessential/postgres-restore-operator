@@ -618,15 +618,16 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// Sweep for orphaned restore pods: pods with a pgro.bes.au/restore label
-	// but no ownerReferences. These can be left behind when cascade deletion
-	// from a restore CR fails to propagate to the Job's pods.
+	// Sweep for orphaned pods: pods with a pgro.bes.au/replica label but no
+	// ownerReferences. These can be left behind when cascade deletion from a
+	// restore CR (or the replica CR for snapshot-list jobs) fails to
+	// propagate to the Job's pods.
 	let known_restores: HashSet<String> = restore_list.items.iter().map(|r| r.name_any()).collect();
-	if let Ok(all_restore_pods) = pods
+	if let Ok(all_replica_pods) = pods
 		.list(&kube::api::ListParams::default().labels(&format!("pgro.bes.au/replica={name}")))
 		.await
 	{
-		for pod in &all_restore_pods.items {
+		for pod in &all_replica_pods.items {
 			let has_owner = pod
 				.metadata
 				.owner_references
@@ -635,23 +636,26 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			if has_owner {
 				continue;
 			}
-			let restore_label = pod
-				.metadata
-				.labels
-				.as_ref()
-				.and_then(|l| l.get("pgro.bes.au/restore"));
-			let Some(restore_name) = restore_label else {
-				continue;
-			};
-			if known_restores.contains(restore_name) {
+			let labels = pod.metadata.labels.as_ref();
+			let restore_label = labels.and_then(|l| l.get("pgro.bes.au/restore"));
+			let job_type_label = labels.and_then(|l| l.get("pgro.bes.au/job-type"));
+
+			// Skip pods whose restore CR still exists
+			if let Some(restore_name) = restore_label
+				&& known_restores.contains(restore_name)
+			{
 				continue;
 			}
+
 			let pod_name = pod.metadata.name.as_deref().unwrap_or("");
-			info!(
-				pod = pod_name,
-				restore = %restore_name,
-				"deleting orphaned restore pod"
-			);
+			let reason = if let Some(restore_name) = restore_label {
+				format!("restore {restore_name} no longer exists")
+			} else if let Some(job_type) = job_type_label {
+				format!("orphaned {job_type} pod")
+			} else {
+				"orphaned pod with no restore or job-type label".to_string()
+			};
+			info!(pod = pod_name, reason, "deleting orphaned pod");
 			if let Err(e) = pods.delete(pod_name, &Default::default()).await {
 				warn!(pod = pod_name, error = %e, "failed to delete orphaned pod");
 			}
