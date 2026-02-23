@@ -889,24 +889,36 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 	if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-		warn!(
-			replica = name,
-			consecutive_failures,
-			"restore scheduling suspended after {MAX_CONSECUTIVE_FAILURES} consecutive failures"
-		);
-		replica
-			.update_condition(
-				client,
-				"RestoreSchedulingSuspended",
-				"True",
-				"ConsecutiveFailures",
-				&format!(
-					"Scheduling suspended after {consecutive_failures} consecutive restore failures. \
-					 Fix the underlying issue and reset by updating the spec or clearing \
-					 .status.consecutiveRestoreFailures."
-				),
-			)
-			.await?;
+		let already_suspended = replica
+			.status
+			.as_ref()
+			.and_then(|s| {
+				s.conditions
+					.iter()
+					.find(|c| c.type_ == "RestoreSchedulingSuspended")
+			})
+			.is_some_and(|c| c.status == "True");
+
+		if !already_suspended {
+			warn!(
+				replica = name,
+				consecutive_failures,
+				"restore scheduling suspended after {MAX_CONSECUTIVE_FAILURES} consecutive failures"
+			);
+			replica
+				.update_condition(
+					client,
+					"RestoreSchedulingSuspended",
+					"True",
+					"ConsecutiveFailures",
+					&format!(
+						"Scheduling suspended after {consecutive_failures} consecutive restore failures. \
+						 Fix the underlying issue and reset by updating the spec or clearing \
+						 .status.consecutiveRestoreFailures."
+					),
+				)
+				.await?;
+		}
 		return Ok(Action::requeue(Duration::from_secs(300)));
 	}
 
