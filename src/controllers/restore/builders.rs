@@ -539,10 +539,12 @@ sed -i \
   -e '/^[[:space:]]*archive_cleanup_command[[:space:]]*=/d' \
   -e '/^[[:space:]]*lc_[a-z]*[[:space:]]*=/d' \
   -e '/^[[:space:]]*default_transaction_read_only[[:space:]]*=/d' \
+  -e '/^[[:space:]]*password_encryption[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 
 echo "Configuring stderr logging..."
 echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
+echo "password_encryption = 'scram-sha-256'" >> "$PGDATA/postgresql.conf"
 echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
 
 PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
