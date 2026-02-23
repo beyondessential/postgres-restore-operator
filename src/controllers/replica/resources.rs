@@ -86,7 +86,7 @@ kopia repository connect s3 \
 
 SNAP_FILE=$(mktemp)
 trap 'rm -f "$SNAP_FILE"' EXIT
-kopia snapshot list --json --all 2>/dev/null > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
+kopia snapshot list --json --all > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
 cat "$SNAP_FILE"
 if [ -n "$SNAPSHOT_CALLBACK_URL" ]; then
   SNAP_SIZE=$(wc -c < "$SNAP_FILE")
