@@ -459,6 +459,8 @@ for lang in \
   localedef -i en_US -f CP1258 "${lang}.1258" 2>/dev/null || true
   localedef -i en_US -f UTF-8  "${lang}.65001" 2>/dev/null || true
 done
+echo "Copying locale archive to shared volume..."
+cp /usr/lib/locale/locale-archive /locale-data/locale-archive
 "#
 	.to_string();
 
@@ -758,7 +760,11 @@ echo "Auth setup complete"
 									..Default::default()
 								},
 							),
-							volume_mounts: None,
+							volume_mounts: Some(vec![VolumeMount {
+								name: "locale-data".to_string(),
+								mount_path: "/locale-data".to_string(),
+								..Default::default()
+							}]),
 							resources: Some(ResourceRequirements {
 								requests: Some(BTreeMap::from([
 									("cpu".to_string(), Quantity("50m".to_string())),
@@ -773,12 +779,27 @@ echo "Auth setup complete"
 							image: Some(pg_image.clone()),
 							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 							args: Some(vec![init_script]),
-							env: Some(init_env),
-							volume_mounts: Some(vec![VolumeMount {
-								name: "pgdata".to_string(),
-								mount_path: "/pgdata".to_string(),
-								..Default::default()
-							}]),
+							env: Some({
+								let mut env = init_env;
+								env.push(EnvVar {
+									name: "LOCPATH".to_string(),
+									value: Some("/locale-data".to_string()),
+									..Default::default()
+								});
+								env
+							}),
+							volume_mounts: Some(vec![
+								VolumeMount {
+									name: "pgdata".to_string(),
+									mount_path: "/pgdata".to_string(),
+									..Default::default()
+								},
+								VolumeMount {
+									name: "locale-data".to_string(),
+									mount_path: "/locale-data".to_string(),
+									..Default::default()
+								},
+							]),
 							resources: Some(ResourceRequirements {
 								requests: Some(BTreeMap::from([
 									("cpu".to_string(), Quantity("100m".to_string())),
@@ -827,6 +848,11 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 								value: Some("scram-sha-256".to_string()),
 								..Default::default()
 							},
+							EnvVar {
+								name: "LOCPATH".to_string(),
+								value: Some("/locale-data".to_string()),
+								..Default::default()
+							},
 						]),
 						ports: Some(vec![ContainerPort {
 							name: Some("postgres".to_string()),
@@ -834,11 +860,18 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							protocol: Some("TCP".to_string()),
 							..Default::default()
 						}]),
-						volume_mounts: Some(vec![VolumeMount {
-							name: "pgdata".to_string(),
-							mount_path: "/pgdata".to_string(),
-							..Default::default()
-						}]),
+						volume_mounts: Some(vec![
+							VolumeMount {
+								name: "pgdata".to_string(),
+								mount_path: "/pgdata".to_string(),
+								..Default::default()
+							},
+							VolumeMount {
+								name: "locale-data".to_string(),
+								mount_path: "/locale-data".to_string(),
+								..Default::default()
+							},
+						]),
 						readiness_probe: Some(Probe {
 							exec: Some(ExecAction {
 								command: Some(vec![
@@ -874,16 +907,25 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 						resources: replica.spec.resources.clone(),
 						..Default::default()
 					}],
-					volumes: Some(vec![Volume {
-						name: "pgdata".to_string(),
-						persistent_volume_claim: Some(
-							k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-								claim_name: pvc_name,
-								read_only: Some(false),
-							},
-						),
-						..Default::default()
-					}]),
+					volumes: Some(vec![
+						Volume {
+							name: "pgdata".to_string(),
+							persistent_volume_claim: Some(
+								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+									claim_name: pvc_name,
+									read_only: Some(false),
+								},
+							),
+							..Default::default()
+						},
+						Volume {
+							name: "locale-data".to_string(),
+							empty_dir: Some(
+								k8s_openapi::api::core::v1::EmptyDirVolumeSource::default(),
+							),
+							..Default::default()
+						},
+					]),
 					affinity: replica.spec.affinity.clone(),
 					tolerations: Some(replica.spec.tolerations.clone()),
 					..Default::default()
