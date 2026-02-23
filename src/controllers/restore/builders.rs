@@ -543,6 +543,8 @@ host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
 echo "Checking for incompatible locales..."
+export LOCPATH=/tmp/locales
+mkdir -p "$LOCPATH"
 pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]*//' | sort -u | while IFS= read -r loc; do
   if locale -a 2>/dev/null | grep -qxF "$loc"; then
     continue
@@ -562,7 +564,7 @@ pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]
     *) charset="UTF-8" ;;
   esac
   echo "Creating locale '$loc' (charset: $charset) so PostgreSQL can start..."
-  localedef -i en_US -f "$charset" "$loc" 2>/dev/null || true
+  localedef -i en_US -f "$charset" --no-archive "$LOCPATH/$loc" || true
 done
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
