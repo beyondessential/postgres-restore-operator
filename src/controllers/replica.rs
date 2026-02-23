@@ -221,10 +221,28 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 					overlay_cluster_ready = cluster_ready;
 					if !cluster_ready {
 						info!(replica = name, "overlay cluster not yet ready, will retry");
+						replica
+							.update_condition(
+								client,
+								"OverlayReady",
+								"False",
+								"ClusterNotReady",
+								"Overlay CNPG cluster is not yet ready",
+							)
+							.await?;
 					}
 				}
 				Err(e) => {
 					warn!(replica = name, error = %e, "failed to reconcile overlay database");
+					replica
+						.update_condition(
+							client,
+							"OverlayReady",
+							"False",
+							"ProvisioningFailed",
+							&format!("Failed to reconcile overlay cluster: {e}"),
+						)
+						.await?;
 				}
 			}
 		} else {
@@ -421,6 +439,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 			match result {
 				Ok(true) => {
+					replica
+						.update_condition(
+							client,
+							"OverlayReady",
+							"True",
+							"Reconciled",
+							"Overlay database is reconciled and ready",
+						)
+						.await?;
 					if overlay_restore.as_ref() != Some(&current) {
 						info!(
 							replica = name,
@@ -485,6 +512,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 						strategy = ?overlay_config.strategy,
 						"overlay reconciliation in progress"
 					);
+					replica
+						.update_condition(
+							client,
+							"OverlayReady",
+							"False",
+							"ReconciliationInProgress",
+							"Overlay database reconciliation is in progress",
+						)
+						.await?;
 					return Ok(Action::requeue(Duration::from_secs(30)));
 				}
 				Err(Error::InvalidOverlayConfig(msg)) => {
@@ -495,6 +531,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 						error = msg,
 						"overlay reconciliation permanently failed, continuing with scheduling"
 					);
+					replica
+						.update_condition(
+							client,
+							"OverlayReady",
+							"False",
+							"ConfigInvalid",
+							&format!("Overlay configuration is invalid: {msg}"),
+						)
+						.await?;
 				}
 				Err(e) => {
 					warn!(
@@ -504,6 +549,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 						error = ?e,
 						"overlay reconciliation failed, will retry"
 					);
+					replica
+						.update_condition(
+							client,
+							"OverlayReady",
+							"False",
+							"ReconciliationFailed",
+							&format!("Overlay reconciliation failed: {e}"),
+						)
+						.await?;
 					return Ok(Action::requeue(Duration::from_secs(30)));
 				}
 			}
@@ -716,6 +770,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							replica
 								.update_status_field(client, "latestAvailableSnapshot", &snap.id)
 								.await?;
+							replica
+								.update_condition(
+									client,
+									"SnapshotAvailable",
+									"True",
+									"SnapshotFound",
+									&format!("Snapshot {} available ({size} bytes)", snap.id),
+								)
+								.await?;
 
 							let current_snapshot_id =
 								active_restore.map(|r| r.spec.snapshot.as_str());
@@ -765,6 +828,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 								replica = name,
 								"snapshot list job returned no matching snapshots"
 							);
+							replica
+								.update_condition(
+									client,
+									"SnapshotAvailable",
+									"False",
+									"NoMatchingSnapshots",
+									"Snapshot list job returned no snapshots matching the configured filter",
+								)
+								.await?;
 						}
 					}
 					Err(e) => {
@@ -773,6 +845,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							error = %e,
 							"failed to parse snapshot list job output"
 						);
+						replica
+							.update_condition(
+								client,
+								"SnapshotAvailable",
+								"False",
+								"ParseError",
+								&format!("Failed to parse snapshot list output: {e}"),
+							)
+							.await?;
 					}
 				}
 			}
@@ -796,6 +877,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				{
 					warn!(job = snapshot_job_name, error = %e, "failed to extend TTL on failed snapshot list job");
 				}
+				replica
+					.update_condition(
+						client,
+						"SnapshotAvailable",
+						"False",
+						"JobFailed",
+						"Snapshot list job failed, check job logs for details",
+					)
+					.await?;
 			}
 			JobStatus::Active => {
 				return Ok(Action::requeue(Duration::from_secs(10)));

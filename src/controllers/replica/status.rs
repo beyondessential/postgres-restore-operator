@@ -1,5 +1,8 @@
 use jiff::Timestamp;
-use k8s_openapi::{api::core::v1::Secret, apimachinery::pkg::apis::meta::v1::Time};
+use k8s_openapi::{
+	api::core::v1::Secret,
+	apimachinery::pkg::apis::meta::v1::{Condition, Time},
+};
 use kube::{
 	Api, Client, ResourceExt,
 	api::{Patch, PatchParams},
@@ -56,31 +59,49 @@ impl PostgresPhysicalReplica {
 		reason: &str,
 		message: &str,
 	) -> Result<()> {
-		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(
-			client.clone(),
-			self.metadata
-				.namespace
-				.as_deref()
-				.expect("PostgresPhysicalReplica is a namespaced resource"),
-		);
-		let now = Timestamp::now();
+		let ns = self
+			.metadata
+			.namespace
+			.as_deref()
+			.expect("PostgresPhysicalReplica is a namespaced resource");
+		let name = self
+			.metadata
+			.name
+			.as_deref()
+			.expect("cannot be called on new resource");
+		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+
+		let current = replicas.get(name).await?;
+		let mut conditions = current.status.map(|s| s.conditions).unwrap_or_default();
+		let now = Time(Timestamp::now());
+
+		if let Some(existing) = conditions.iter_mut().find(|c| c.type_ == type_) {
+			if existing.status != status {
+				existing.last_transition_time = now;
+			}
+			existing.status = status.to_string();
+			existing.reason = reason.to_string();
+			existing.message = message.to_string();
+			existing.observed_generation = current.metadata.generation;
+		} else {
+			conditions.push(Condition {
+				type_: type_.to_string(),
+				status: status.to_string(),
+				reason: reason.to_string(),
+				message: message.to_string(),
+				last_transition_time: now,
+				observed_generation: current.metadata.generation,
+			});
+		}
+
 		let patch = serde_json::json!({
 			"status": {
-				"conditions": [{
-					"type": type_,
-					"status": status,
-					"reason": reason,
-					"message": message,
-					"lastTransitionTime": Time(now),
-				}]
+				"conditions": conditions,
 			}
 		});
 		replicas
 			.patch_status(
-				self.metadata
-					.name
-					.as_deref()
-					.expect("cannot be called on new resource"),
+				name,
 				&PatchParams::apply("postgres-restore-operator"),
 				&Patch::Merge(&patch),
 			)
