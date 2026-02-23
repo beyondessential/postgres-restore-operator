@@ -543,7 +543,7 @@ host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
 echo "Checking for incompatible locales..."
-pg_controldata "$PGDATA" | grep -E '^\s*LC_(COLLATE|CTYPE)' | sed 's/.*:\s*//' | sort -u | while IFS= read -r loc; do
+pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]*//' | sort -u | while IFS= read -r loc; do
   if locale -a 2>/dev/null | grep -qxF "$loc"; then
     continue
   fi
