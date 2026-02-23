@@ -292,3 +292,173 @@ async fn persistent_schemas_migration() {
 	println!("--- all persistent schema migration assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &[replica_name]).await;
 }
+
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn persistent_schemas_conflict_fails_restore() {
+	let client = make_client().await;
+	let ns = "test-ps-conflict";
+	let replica_name = "ps-conflict-replica";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "ps-conflict-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	// Configure persistent_schemas with "public", which already exists in the
+	// snapshot's database. This should cause the second restore to fail when
+	// the operator detects the conflict before migration.
+	println!("--- creating replica with persistent_schemas: [\"public\"]");
+	let mut replica = build_replica(
+		replica_name,
+		"ps-conflict-kopia-creds",
+		ReplicaOpts {
+			read_only: false,
+			..Default::default()
+		},
+	);
+	replica.spec.persistent_schemas = Some(vec!["public".to_string()]);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for first restore to become Active");
+	let first_restore_name =
+		wait_for_restore_phase(&restores, replica_name, RestorePhase::Active, PHASE_TIMEOUT).await;
+	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
+	println!("--- first restore active: {first_restore_name}");
+
+	// Capture snapshot details from the first restore to create a second one
+	let first_restore_obj = restores
+		.get(&first_restore_name)
+		.await
+		.expect("failed to get first restore");
+	let snapshot_id = first_restore_obj.spec.snapshot.clone();
+	let snapshot_size = first_restore_obj.spec.snapshot_size.clone();
+	let storage_size = first_restore_obj.spec.storage_size.clone();
+
+	let replica_obj = replicas
+		.get(replica_name)
+		.await
+		.expect("failed to get replica");
+	let replica_uid = replica_obj.uid().expect("replica has no UID");
+
+	// Manually create a second restore from the same snapshot to trigger switchover.
+	// The "public" schema will already exist in this snapshot, so migration should
+	// be blocked and the restore should fail.
+	let second_restore_name = format!("{replica_name}-conflict");
+	println!("--- creating second restore: {second_restore_name}");
+
+	let second_restore = PostgresPhysicalRestore::new(
+		&second_restore_name,
+		PostgresPhysicalRestoreSpec {
+			replica: LocalObjectReference {
+				name: replica_name.into(),
+			},
+			snapshot: snapshot_id,
+			snapshot_size,
+			storage_size,
+		},
+	);
+
+	let mut restore_value = serde_json::to_value(&second_restore).unwrap();
+	if let Some(meta) = restore_value
+		.as_object_mut()
+		.and_then(|o| o.get_mut("metadata"))
+		.and_then(|m| m.as_object_mut())
+	{
+		meta.insert(
+			"namespace".to_string(),
+			serde_json::Value::String(ns.to_string()),
+		);
+		meta.insert(
+			"labels".to_string(),
+			serde_json::json!({ "pgro.bes.au/replica": replica_name }),
+		);
+		meta.insert(
+			"ownerReferences".to_string(),
+			serde_json::json!([{
+				"apiVersion": "pgro.bes.au/v1alpha1",
+				"kind": "PostgresPhysicalReplica",
+				"name": replica_name,
+				"uid": replica_uid,
+				"controller": true,
+				"blockOwnerDeletion": true,
+			}]),
+		);
+	}
+
+	let second_restore_resource: PostgresPhysicalRestore =
+		serde_json::from_value(restore_value).unwrap();
+	restores
+		.create(&PostParams::default(), &second_restore_resource)
+		.await
+		.expect("failed to create second restore");
+
+	println!("--- waiting for second restore to reach Failed phase (schema conflict)");
+	timeout(LONG_PHASE_TIMEOUT, async {
+		loop {
+			if let Ok(restore) = restores.get(&second_restore_name).await {
+				let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
+				println!("[{second_restore_name}] phase: {phase:?}");
+				if phase == Some(&RestorePhase::Failed) {
+					return;
+				}
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for second restore to fail due to schema conflict");
+
+	println!("--- verifying first restore is still Active");
+	let first_restore_after = restores
+		.get(&first_restore_name)
+		.await
+		.expect("failed to get first restore after conflict");
+	assert_eq!(
+		first_restore_after
+			.status
+			.as_ref()
+			.and_then(|s| s.phase.as_ref()),
+		Some(&RestorePhase::Active),
+		"first restore should remain Active after schema conflict"
+	);
+
+	println!("--- verifying replica still points to first restore");
+	let replica_after = replicas
+		.get(replica_name)
+		.await
+		.expect("failed to get replica after conflict");
+	let status = replica_after
+		.status
+		.as_ref()
+		.expect("replica has no status");
+	assert_eq!(
+		status.current_restore.as_deref(),
+		Some(first_restore_name.as_str()),
+		"currentRestore should still be the first restore"
+	);
+
+	println!("--- verifying consecutiveRestoreFailures was incremented");
+	assert!(
+		status.consecutive_restore_failures.unwrap_or(0) >= 1,
+		"consecutiveRestoreFailures should be at least 1 after schema conflict"
+	);
+
+	println!("--- persistent schema conflict correctly prevented switchover, cleaning up");
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+}

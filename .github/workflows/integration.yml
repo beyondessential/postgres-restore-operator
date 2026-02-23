@@ -63,6 +63,7 @@ jobs:
           - name: persistent_schemas
             namespaces: >-
               test-persistent-schemas
+              test-ps-conflict
             needs_non_pg_snapshot: false
             needs_cnpg: false
 

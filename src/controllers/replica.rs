@@ -19,7 +19,7 @@ use kube::{
 use kube_quantity::ParsedQuantity;
 use rand::RngExt;
 use rust_decimal::Decimal;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use super::{
 	jobs::{JobStatus, classify_job},
@@ -1214,6 +1214,82 @@ async fn reconcile_schema_migration(
 	)
 	.await?;
 
+	// Check that none of the persistent schemas already exist in the snapshot.
+	// If they do, the pg_dump|psql migration would conflict, so we must fail
+	// the restore instead of attempting migration.
+	let conflicting = check_snapshot_schema_conflicts(
+		client,
+		namespace,
+		&new_restore_name,
+		&target_dbname,
+		&reader_user,
+		&reader_password,
+		schemas,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	if !conflicting.is_empty() {
+		let msg = format!(
+			"persistent schemas already present in snapshot: {}",
+			conflicting.join(", ")
+		);
+		error!(
+			replica = %replica_name,
+			restore = %new_restore_name,
+			conflicting_schemas = ?conflicting,
+			"failing restore: persistent schemas found in snapshot"
+		);
+
+		// Mark the new restore as Failed
+		new_restore
+			.update_phase(client, RestorePhase::Failed)
+			.await?;
+
+		// Increment consecutiveRestoreFailures on the replica
+		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+		let current_failures = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.consecutive_restore_failures)
+			.unwrap_or(0);
+		let patch = serde_json::json!({
+			"status": {
+				"consecutiveRestoreFailures": current_failures + 1,
+				"schemaMigrationPhase": null,
+				"schemaMigrationJob": null,
+			}
+		});
+		replicas
+			.patch_status(
+				&replica_name,
+				&PatchParams::apply("postgres-restore-operator"),
+				&Patch::Merge(&patch),
+			)
+			.await?;
+
+		ctx.metrics.restores_failed_total.inc();
+
+		if let Err(e) = ctx
+			.recorder
+			.publish(
+				&Event {
+					type_: EventType::Warning,
+					reason: "RestoreFailed".into(),
+					note: Some(format!("Restore {new_restore_name} failed: {msg}")),
+					action: "Restore".into(),
+					secondary: Some(new_restore.object_ref(&())),
+				},
+				&replica.object_ref(&()),
+			)
+			.await
+		{
+			warn!(replica = %replica_name, error = %e, "failed to publish RestoreFailed event");
+		}
+
+		return Err(Error::InvalidOverlayConfig(msg));
+	}
+
 	// The analytics user already has pg_write_all_data + CREATE ON DATABASE
 	// when persistent_schemas is configured (read_only is effectively false),
 	// so we reuse the replica creds secret for write access to the target.
@@ -1262,6 +1338,47 @@ async fn reconcile_schema_migration(
 		.await?;
 
 	Ok(false) // Job created, not complete yet
+}
+
+/// Check whether any of the persistent schemas already exist in the snapshot
+/// (i.e. in the new restore database before migration). Returns the list of
+/// schema names that were found.
+#[expect(
+	clippy::too_many_arguments,
+	reason = "internal helper with tightly-coupled params"
+)]
+async fn check_snapshot_schema_conflicts(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	dbname: &str,
+	user: &str,
+	password: &str,
+	schemas: &[String],
+	use_port_forward: bool,
+) -> Result<Vec<String>> {
+	let conn = overlay::connect::connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		dbname,
+		user,
+		password,
+		use_port_forward,
+	)
+	.await?;
+
+	let rows = conn
+		.client
+		.query(
+			"SELECT schema_name FROM information_schema.schemata \
+			 WHERE schema_name = ANY($1)",
+			&[&schemas],
+		)
+		.await?;
+
+	let found: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+	Ok(found)
 }
 
 pub fn error_policy(
