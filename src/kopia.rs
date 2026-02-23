@@ -213,6 +213,7 @@ pub fn kopia_connect_args(creds: &KopiaCredentials) -> Vec<String> {
 		"repository".to_string(),
 		"connect".to_string(),
 		"s3".to_string(),
+		"--readonly".to_string(),
 		format!("--bucket={}", creds.bucket),
 		format!("--region={}", creds.region),
 		format!("--access-key={}", creds.access_key_id),
@@ -624,6 +625,7 @@ mod tests {
 		assert!(args.contains(&"--access-key=ak".to_string()));
 		assert!(args.contains(&"--secret-access-key=sk".to_string()));
 		assert!(args.contains(&"--password=rp".to_string()));
+		assert!(args.contains(&"--readonly".to_string()));
 		assert!(!args.iter().any(|a| a.starts_with("--endpoint")));
 		assert!(!args.contains(&"--disable-tls".to_string()));
 	}
