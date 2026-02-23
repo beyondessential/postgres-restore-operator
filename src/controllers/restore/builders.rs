@@ -565,14 +565,20 @@ host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
-echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
-  | postgres --single -D "$PGDATA" postgres
+if [ "$PG_MAJOR" -ge 13 ]; then
+  echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
+    | postgres --single -D "$PGDATA" postgres
+else
+  echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
+    | postgres --single -D "$PGDATA" postgres
+fi
 LOCALE_CHANGED=1
 
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
 
 echo "Fixing database locales (post-startup fallback)..."
+if [ "$PG_MAJOR" -ge 13 ]; then
 LOCALE_CHANGED=$(psql -U postgres -d postgres -At << 'LOCALEEOF'
 WITH updated AS (
   UPDATE pg_database
@@ -583,6 +589,18 @@ WITH updated AS (
 SELECT count(*) FROM updated;
 LOCALEEOF
 )
+else
+LOCALE_CHANGED=$(psql -U postgres -d postgres -At << 'LOCALEEOF'
+WITH updated AS (
+  UPDATE pg_database
+     SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8'
+   WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST')
+  RETURNING 1
+)
+SELECT count(*) FROM updated;
+LOCALEEOF
+)
+fi
 
 for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
   echo "Fixing collations in database: $db"
