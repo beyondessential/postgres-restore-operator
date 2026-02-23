@@ -542,28 +542,28 @@ host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
-echo "Checking for Windows-style locales in pg_database catalog..."
-PG_DB_FILE="$PGDATA/global/1262"
-if [ -f "$PG_DB_FILE" ]; then
-  strings "$PG_DB_FILE" | grep -E '^[A-Z][a-z]+_.*\.[0-9]+$' | sort -u | while IFS= read -r loc; do
-    codepage=$(echo "$loc" | grep -oE '[0-9]+$')
-    case "$codepage" in
-      1250) charset="CP1250" ;;
-      1251) charset="CP1251" ;;
-      1252) charset="CP1252" ;;
-      1253) charset="CP1253" ;;
-      1254) charset="CP1254" ;;
-      1255) charset="CP1255" ;;
-      1256) charset="CP1256" ;;
-      1257) charset="CP1257" ;;
-      1258) charset="CP1258" ;;
-      65001) charset="UTF-8" ;;
-      *) charset="UTF-8" ;;
-    esac
-    echo "Creating locale '$loc' (charset: $charset) so PostgreSQL can start..."
-    localedef -i en_US -f "$charset" "$loc" 2>/dev/null || true
-  done
-fi
+echo "Checking for incompatible locales..."
+pg_controldata "$PGDATA" | grep -E '^\s*LC_(COLLATE|CTYPE)' | sed 's/.*:\s*//' | sort -u | while IFS= read -r loc; do
+  if locale -a 2>/dev/null | grep -qxF "$loc"; then
+    continue
+  fi
+  codepage=$(echo "$loc" | grep -oE '[0-9]+$')
+  case "$codepage" in
+    1250) charset="CP1250" ;;
+    1251) charset="CP1251" ;;
+    1252) charset="CP1252" ;;
+    1253) charset="CP1253" ;;
+    1254) charset="CP1254" ;;
+    1255) charset="CP1255" ;;
+    1256) charset="CP1256" ;;
+    1257) charset="CP1257" ;;
+    1258) charset="CP1258" ;;
+    65001) charset="UTF-8" ;;
+    *) charset="UTF-8" ;;
+  esac
+  echo "Creating locale '$loc' (charset: $charset) so PostgreSQL can start..."
+  localedef -i en_US -f "$charset" "$loc" 2>/dev/null || true
+done
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
 echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
