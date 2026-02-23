@@ -544,6 +544,9 @@ host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
+if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
+  echo "postgres:x:$(id -u):$(id -g):PostgreSQL:/tmp:/bin/sh" >> /etc/passwd
+fi
 echo "UPDATE pg_database SET datcollate = 'C', datctype = 'C', datcollversion = NULL WHERE datcollate <> 'C' OR datctype <> 'C';" \
   | postgres --single -D "$PGDATA" postgres
 
