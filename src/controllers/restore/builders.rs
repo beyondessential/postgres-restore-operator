@@ -426,30 +426,38 @@ pub fn build_deployment(
 	let pg_image = format!("postgres:{pg_version}");
 
 	let locale_script = r#"set -ex
-PGDATA=/pgdata/pgdata
-
-echo "Creating any missing locales found in cluster..."
-pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]*//' | sort -u | while IFS= read -r loc; do
-  if locale -a 2>/dev/null | grep -qxF "$loc"; then
-    echo "Locale '$loc' already exists"
-    continue
-  fi
-  codepage=$(echo "$loc" | grep -oE '[0-9]+$')
-  case "$codepage" in
-    1250) charset="CP1250" ;;
-    1251) charset="CP1251" ;;
-    1252) charset="CP1252" ;;
-    1253) charset="CP1253" ;;
-    1254) charset="CP1254" ;;
-    1255) charset="CP1255" ;;
-    1256) charset="CP1256" ;;
-    1257) charset="CP1257" ;;
-    1258) charset="CP1258" ;;
-    65001) charset="UTF-8" ;;
-    *) charset="UTF-8" ;;
-  esac
-  echo "Creating locale '$loc' (charset: $charset)..."
-  localedef -i en_US -f "$charset" "$loc" || true
+echo "Creating Windows-compatible locales..."
+for lang in \
+  "English_United States" \
+  "English_United Kingdom" \
+  "French_France" \
+  "German_Germany" \
+  "Spanish_Spain" \
+  "Italian_Italy" \
+  "Portuguese_Brazil" \
+  "Dutch_Netherlands" \
+  "Swedish_Sweden" \
+  "Norwegian_Norway" \
+  "Danish_Denmark" \
+  "Finnish_Finland" \
+  "Polish_Poland" \
+  "Czech_Czechia" \
+  "Turkish_Turkey" \
+  "Russian_Russia" \
+  "Japanese_Japan" \
+  "Korean_Korea" \
+  "Chinese_China" \
+; do
+  localedef -i en_US -f CP1250 "${lang}.1250" 2>/dev/null || true
+  localedef -i en_US -f CP1251 "${lang}.1251" 2>/dev/null || true
+  localedef -i en_US -f CP1252 "${lang}.1252" 2>/dev/null || true
+  localedef -i en_US -f CP1253 "${lang}.1253" 2>/dev/null || true
+  localedef -i en_US -f CP1254 "${lang}.1254" 2>/dev/null || true
+  localedef -i en_US -f CP1255 "${lang}.1255" 2>/dev/null || true
+  localedef -i en_US -f CP1256 "${lang}.1256" 2>/dev/null || true
+  localedef -i en_US -f CP1257 "${lang}.1257" 2>/dev/null || true
+  localedef -i en_US -f CP1258 "${lang}.1258" 2>/dev/null || true
+  localedef -i en_US -f UTF-8  "${lang}.65001" 2>/dev/null || true
 done
 "#
 	.to_string();
@@ -750,12 +758,7 @@ echo "Auth setup complete"
 									..Default::default()
 								},
 							),
-							volume_mounts: Some(vec![VolumeMount {
-								name: "pgdata".to_string(),
-								mount_path: "/pgdata".to_string(),
-								read_only: Some(true),
-								..Default::default()
-							}]),
+							volume_mounts: None,
 							resources: Some(ResourceRequirements {
 								requests: Some(BTreeMap::from([
 									("cpu".to_string(), Quantity("50m".to_string())),
