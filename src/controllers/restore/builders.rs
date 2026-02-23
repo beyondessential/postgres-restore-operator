@@ -425,6 +425,34 @@ pub fn build_deployment(
 
 	let pg_image = format!("postgres:{pg_version}");
 
+	let locale_script = r#"set -ex
+PGDATA=/pgdata/pgdata
+
+echo "Checking for incompatible locales..."
+pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]*//' | sort -u | while IFS= read -r loc; do
+  if locale -a 2>/dev/null | grep -qxF "$loc"; then
+    continue
+  fi
+  codepage=$(echo "$loc" | grep -oE '[0-9]+$')
+  case "$codepage" in
+    1250) charset="CP1250" ;;
+    1251) charset="CP1251" ;;
+    1252) charset="CP1252" ;;
+    1253) charset="CP1253" ;;
+    1254) charset="CP1254" ;;
+    1255) charset="CP1255" ;;
+    1256) charset="CP1256" ;;
+    1257) charset="CP1257" ;;
+    1258) charset="CP1258" ;;
+    65001) charset="UTF-8" ;;
+    *) charset="UTF-8" ;;
+  esac
+  echo "Creating locale '$loc' (charset: $charset) so PostgreSQL can start..."
+  localedef -i en_US -f "$charset" "$loc" || true
+done
+"#
+	.to_string();
+
 	// persistent_schemas needs write access to receive the migrated data
 	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
 	let read_only = effective_read_only.to_string();
@@ -541,31 +569,6 @@ local   all             all                                     trust
 host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
-
-echo "Checking for incompatible locales..."
-export LOCPATH=/tmp/locales
-mkdir -p "$LOCPATH"
-pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]*//' | sort -u | while IFS= read -r loc; do
-  if locale -a 2>/dev/null | grep -qxF "$loc"; then
-    continue
-  fi
-  codepage=$(echo "$loc" | grep -oE '[0-9]+$')
-  case "$codepage" in
-    1250) charset="CP1250" ;;
-    1251) charset="CP1251" ;;
-    1252) charset="CP1252" ;;
-    1253) charset="CP1253" ;;
-    1254) charset="CP1254" ;;
-    1255) charset="CP1255" ;;
-    1256) charset="CP1256" ;;
-    1257) charset="CP1257" ;;
-    1258) charset="CP1258" ;;
-    65001) charset="UTF-8" ;;
-    *) charset="UTF-8" ;;
-  esac
-  echo "Creating locale '$loc' (charset: $charset) so PostgreSQL can start..."
-  localedef -i en_US -f "$charset" --no-archive "$LOCPATH/$loc" || true
-done
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
 echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
@@ -733,30 +736,59 @@ echo "Auth setup complete"
 						fs_group: Some(999),
 						..Default::default()
 					}),
-					init_containers: Some(vec![Container {
-						name: "setup-auth".to_string(),
-						image: Some(pg_image.clone()),
-						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![init_script]),
-						env: Some(init_env),
-						volume_mounts: Some(vec![VolumeMount {
-							name: "pgdata".to_string(),
-							mount_path: "/pgdata".to_string(),
+					init_containers: Some(vec![
+						Container {
+							name: "fix-locale".to_string(),
+							image: Some(pg_image.clone()),
+							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+							args: Some(vec![locale_script]),
+							security_context: Some(
+								k8s_openapi::api::core::v1::SecurityContext {
+									run_as_user: Some(0),
+									run_as_group: Some(0),
+									..Default::default()
+								},
+							),
+							volume_mounts: Some(vec![VolumeMount {
+								name: "pgdata".to_string(),
+								mount_path: "/pgdata".to_string(),
+								read_only: Some(true),
+								..Default::default()
+							}]),
+							resources: Some(ResourceRequirements {
+								requests: Some(BTreeMap::from([
+									("cpu".to_string(), Quantity("50m".to_string())),
+									("memory".to_string(), Quantity("64Mi".to_string())),
+								])),
+								..Default::default()
+							}),
 							..Default::default()
-						}]),
-						resources: Some(ResourceRequirements {
-							requests: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("100m".to_string())),
-								("memory".to_string(), Quantity("128Mi".to_string())),
-							])),
-							limits: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("500m".to_string())),
-								("memory".to_string(), Quantity("256Mi".to_string())),
-							])),
+						},
+						Container {
+							name: "setup-auth".to_string(),
+							image: Some(pg_image.clone()),
+							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+							args: Some(vec![init_script]),
+							env: Some(init_env),
+							volume_mounts: Some(vec![VolumeMount {
+								name: "pgdata".to_string(),
+								mount_path: "/pgdata".to_string(),
+								..Default::default()
+							}]),
+							resources: Some(ResourceRequirements {
+								requests: Some(BTreeMap::from([
+									("cpu".to_string(), Quantity("100m".to_string())),
+									("memory".to_string(), Quantity("128Mi".to_string())),
+								])),
+								limits: Some(BTreeMap::from([
+									("cpu".to_string(), Quantity("500m".to_string())),
+									("memory".to_string(), Quantity("256Mi".to_string())),
+								])),
+								..Default::default()
+							}),
 							..Default::default()
-						}),
-						..Default::default()
-					}]),
+						},
+					]),
 					containers: vec![Container {
 						name: "postgres".to_string(),
 						image: Some(pg_image),
