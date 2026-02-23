@@ -818,12 +818,25 @@ if [ -f /pgdata/needs-reindex ]; then
   (
     while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
     for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
-      echo "Background reindex after locale change: $db"
-      if [ "$PG_MAJOR" -ge 14 ]; then
-        psql -U postgres -d "$db" -c "REINDEX DATABASE CONCURRENTLY \"$db\";" 2>&1 || true
-      else
-        psql -U postgres -d "$db" -c "REINDEX DATABASE \"$db\";" 2>&1 || true
-      fi
+      INDEXES=$(psql -U postgres -d "$db" -At -c "
+        SELECT DISTINCT indexrelid::regclass::text
+        FROM pg_index i
+        JOIN pg_attribute a ON a.attrelid = i.indexrelid
+        WHERE a.attcollation <> 0 AND i.indisvalid;
+      ")
+      COUNT=$(echo "$INDEXES" | grep -c . || true)
+      echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
+      N=0
+      echo "$INDEXES" | while IFS= read -r idx; do
+        [ -z "$idx" ] && continue
+        N=$((N + 1))
+        echo "  [$N/$COUNT] $db: $idx"
+        if [ "$PG_MAJOR" -ge 14 ]; then
+          psql -U postgres -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 || true
+        else
+          psql -U postgres -d "$db" -c "REINDEX INDEX $idx;" 2>&1 || true
+        fi
+      done
     done
     rm -f /pgdata/needs-reindex
     echo "Background reindex complete"
