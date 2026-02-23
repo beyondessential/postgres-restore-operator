@@ -863,11 +863,9 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 						readiness_probe: Some(Probe {
 							exec: Some(ExecAction {
 								command: Some(vec![
-									"pg_isready".to_string(),
-									"-U".to_string(),
-									"postgres".to_string(),
-									"-d".to_string(),
-									"postgres".to_string(),
+									"/bin/sh".to_string(),
+									"-c".to_string(),
+									"pg_isready -U postgres -d postgres && [ ! -f /pgdata/needs-reindex ]".to_string(),
 								]),
 							}),
 							initial_delay_seconds: Some(5),
