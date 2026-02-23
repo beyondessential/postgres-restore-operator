@@ -141,10 +141,6 @@ fi
 								("cpu".to_string(), Quantity("50m".to_string())),
 								("memory".to_string(), Quantity("64Mi".to_string())),
 							])),
-							limits: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("200m".to_string())),
-								("memory".to_string(), Quantity("128Mi".to_string())),
-							])),
 							..Default::default()
 						}),
 						..Default::default()
