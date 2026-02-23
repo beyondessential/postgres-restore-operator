@@ -424,7 +424,6 @@ pub fn build_deployment(
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
 	let pg_image = format!("postgres:{pg_version}");
-	let pg_alpine_image = format!("postgres:{pg_version}-alpine");
 
 	// persistent_schemas needs write access to receive the migrated data
 	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
@@ -544,17 +543,13 @@ host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
-if echo "UPDATE pg_database SET datcollate = 'C', datctype = 'C', datcollversion = NULL WHERE datcollate <> 'C' OR datctype <> 'C';" \
-     | postgres --single -D "$PGDATA" postgres 2>&1; then
-  echo "Locale fix applied via single-user mode"
-else
-  echo "Single-user mode unavailable, will fix locales after startup"
-fi
+echo "UPDATE pg_database SET datcollate = 'C', datctype = 'C', datcollversion = NULL WHERE datcollate <> 'C' OR datctype <> 'C';" \
+  | postgres --single -D "$PGDATA" postgres
 
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
 
-echo "Fixing database locales incompatible with this OS..."
+echo "Fixing database locales (post-startup fallback)..."
 psql -U postgres -d postgres << 'LOCALEEOF'
 UPDATE pg_database
    SET datcollate = 'C', datctype = 'C', datcollversion = NULL
@@ -704,7 +699,7 @@ echo "Auth setup complete"
 					}),
 					init_containers: Some(vec![Container {
 						name: "setup-auth".to_string(),
-						image: Some(pg_alpine_image),
+						image: Some(pg_image.clone()),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![init_script]),
 						env: Some(init_env),
