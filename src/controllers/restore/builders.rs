@@ -568,16 +568,22 @@ fi
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
 echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8') OR datctype NOT IN ('C', 'C.UTF-8');" \
   | postgres --single -D "$PGDATA" postgres
+LOCALE_CHANGED=1
 
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
 
 echo "Fixing database locales (post-startup fallback)..."
-psql -U postgres -d postgres << 'LOCALEEOF'
-UPDATE pg_database
-   SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL
- WHERE datcollate NOT IN ('C', 'C.UTF-8') OR datctype NOT IN ('C', 'C.UTF-8');
+LOCALE_CHANGED=$(psql -U postgres -d postgres -At << 'LOCALEEOF'
+WITH updated AS (
+  UPDATE pg_database
+     SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL
+   WHERE datcollate NOT IN ('C', 'C.UTF-8') OR datctype NOT IN ('C', 'C.UTF-8')
+  RETURNING 1
+)
+SELECT count(*) FROM updated;
 LOCALEEOF
+)
 
 for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
   echo "Fixing collations in database: $db"
@@ -587,6 +593,11 @@ UPDATE pg_collation
  WHERE collname = 'default';
 COLLEOF
 done
+
+if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then
+  echo "Locale was changed, flagging for background reindex after startup"
+  touch /pgdata/needs-reindex
+fi
 
 echo "Detected PG major version: $PG_MAJOR"
 
@@ -748,9 +759,25 @@ echo "Auth setup complete"
 						name: "postgres".to_string(),
 						image: Some(pg_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![
-							"exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}".to_string(),
-						]),
+						args: Some(vec![r#"
+if [ -f /pgdata/needs-reindex ]; then
+  PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
+  (
+    while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
+    for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+      echo "Background reindex after locale change: $db"
+      if [ "$PG_MAJOR" -ge 14 ]; then
+        psql -U postgres -d "$db" -c "REINDEX DATABASE CONCURRENTLY \"$db\";" 2>&1 || true
+      else
+        psql -U postgres -d "$db" -c "REINDEX DATABASE \"$db\";" 2>&1 || true
+      fi
+    done
+    rm -f /pgdata/needs-reindex
+    echo "Background reindex complete"
+  ) &
+fi
+exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}
+"#.to_string()]),
 						env: Some(vec![
 							EnvVar {
 								name: "PGDATA".to_string(),
