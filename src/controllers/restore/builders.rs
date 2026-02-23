@@ -579,6 +579,12 @@ LOCALE_CHANGED=1
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
 
+echo "Clearing restored role passwords..."
+psql -U postgres -d postgres -At -c "SELECT rolname FROM pg_roles WHERE rolcanlogin AND rolname <> 'postgres' AND rolpassword IS NOT NULL" \
+| while IFS= read -r role; do
+  psql -U postgres -d postgres -c "ALTER ROLE \"$role\" WITH PASSWORD NULL;" 2>&1 || true
+done
+
 echo "Fixing database locales (post-startup fallback)..."
 if [ "$PG_MAJOR" -ge 13 ]; then
 LOCALE_CHANGED=$(psql -U postgres -d postgres -At << 'LOCALEEOF'
