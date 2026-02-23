@@ -18,8 +18,27 @@ env:
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
 
 jobs:
+  guard:
+    name: Check if workflow should run
+    runs-on: ubuntu-slim
+    outputs:
+      should_run: ${{ steps.check.outputs.should_run }}
+    steps:
+      - name: Check commit message
+        id: check
+        run: |
+          if [[ "${{ github.ref_type }}" == "tag" ]]; then
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          elif [[ "${{ github.event.head_commit.message }}" =~ ^repo:\ release\ .+ ]]; then
+            echo "should_run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_run=true" >> "$GITHUB_OUTPUT"
+          fi
+
   build-binaries:
     name: Build ${{ matrix.arch }} binaries
+    needs: [guard]
+    if: needs.guard.outputs.should_run == 'true'
     runs-on: ${{ matrix.runner }}
     strategy:
       matrix:
