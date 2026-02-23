@@ -543,15 +543,12 @@ host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
+echo "Fixing database locales incompatible with this OS (single-user mode)..."
+echo "UPDATE pg_database SET datcollate = 'C', datctype = 'C', datcollversion = NULL WHERE datcollate <> 'C' OR datctype <> 'C';" \
+  | postgres --single -D "$PGDATA" postgres
+
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
-
-echo "Fixing database locales incompatible with this OS..."
-psql -U postgres -d postgres << 'LOCALEEOF'
-UPDATE pg_database
-   SET datcollate = 'C', datctype = 'C', datcollversion = NULL
- WHERE datcollate <> 'C' OR datctype <> 'C';
-LOCALEEOF
 
 for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
   echo "Fixing collations in database: $db"

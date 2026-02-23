@@ -216,6 +216,10 @@ fn init_script_strips_source_host_config_overrides() {
 		"init script must disable logging_collector"
 	);
 	assert!(
+		script.contains("postgres --single"),
+		"init script must fix database locales via single-user mode before startup"
+	);
+	assert!(
 		script.contains("UPDATE pg_database"),
 		"init script must fix database locales via pg_database update"
 	);
