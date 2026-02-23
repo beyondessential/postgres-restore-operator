@@ -566,7 +566,7 @@ if [ -f "$PG_DB_FILE" ]; then
 fi
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
-echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8') OR datctype NOT IN ('C', 'C.UTF-8');" \
+echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
   | postgres --single -D "$PGDATA" postgres
 LOCALE_CHANGED=1
 
@@ -578,7 +578,7 @@ LOCALE_CHANGED=$(psql -U postgres -d postgres -At << 'LOCALEEOF'
 WITH updated AS (
   UPDATE pg_database
      SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL
-   WHERE datcollate NOT IN ('C', 'C.UTF-8') OR datctype NOT IN ('C', 'C.UTF-8')
+   WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST')
   RETURNING 1
 )
 SELECT count(*) FROM updated;
