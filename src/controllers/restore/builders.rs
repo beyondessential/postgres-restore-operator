@@ -428,9 +428,10 @@ pub fn build_deployment(
 	let locale_script = r#"set -ex
 PGDATA=/pgdata/pgdata
 
-echo "Checking for incompatible locales..."
+echo "Creating any missing locales found in cluster..."
 pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]*//' | sort -u | while IFS= read -r loc; do
   if locale -a 2>/dev/null | grep -qxF "$loc"; then
+    echo "Locale '$loc' already exists"
     continue
   fi
   codepage=$(echo "$loc" | grep -oE '[0-9]+$')
@@ -447,7 +448,7 @@ pg_controldata "$PGDATA" | grep -E '^LC_(COLLATE|CTYPE)' | sed 's/.*:[[:space:]]
     65001) charset="UTF-8" ;;
     *) charset="UTF-8" ;;
   esac
-  echo "Creating locale '$loc' (charset: $charset) so PostgreSQL can start..."
+  echo "Creating locale '$loc' (charset: $charset)..."
   localedef -i en_US -f "$charset" "$loc" || true
 done
 "#
