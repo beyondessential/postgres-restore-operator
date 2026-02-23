@@ -731,6 +731,7 @@ echo "Auth setup complete"
 				)])),
 				..Default::default()
 			},
+			progress_deadline_seconds: Some(3600),
 			strategy: Some(k8s_openapi::api::apps::v1::DeploymentStrategy {
 				type_: Some("Recreate".to_string()),
 				..Default::default()
