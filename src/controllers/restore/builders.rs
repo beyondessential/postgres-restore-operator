@@ -430,23 +430,6 @@ echo "Creating Windows-compatible locales..."
 for lang in \
   "English_United States" \
   "English_United Kingdom" \
-  "French_France" \
-  "German_Germany" \
-  "Spanish_Spain" \
-  "Italian_Italy" \
-  "Portuguese_Brazil" \
-  "Dutch_Netherlands" \
-  "Swedish_Sweden" \
-  "Norwegian_Norway" \
-  "Danish_Denmark" \
-  "Finnish_Finland" \
-  "Polish_Poland" \
-  "Czech_Czechia" \
-  "Turkish_Turkey" \
-  "Russian_Russia" \
-  "Japanese_Japan" \
-  "Korean_Korea" \
-  "Chinese_China" \
 ; do
   localedef -i en_US -f CP1250 "${lang}.1250" 2>/dev/null || true
   localedef -i en_US -f CP1251 "${lang}.1251" 2>/dev/null || true
@@ -459,8 +442,8 @@ for lang in \
   localedef -i en_US -f CP1258 "${lang}.1258" 2>/dev/null || true
   localedef -i en_US -f UTF-8  "${lang}.65001" 2>/dev/null || true
 done
-echo "Copying locale archive to shared volume..."
-cp /usr/lib/locale/locale-archive /locale-data/locale-archive
+echo "Copying locale data to shared volume..."
+cp -a /usr/lib/locale/* /locale-data/
 "#
 	.to_string();
 
@@ -779,15 +762,7 @@ echo "Auth setup complete"
 							image: Some(pg_image.clone()),
 							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 							args: Some(vec![init_script]),
-							env: Some({
-								let mut env = init_env;
-								env.push(EnvVar {
-									name: "LOCPATH".to_string(),
-									value: Some("/locale-data".to_string()),
-									..Default::default()
-								});
-								env
-							}),
+							env: Some(init_env),
 							volume_mounts: Some(vec![
 								VolumeMount {
 									name: "pgdata".to_string(),
@@ -796,7 +771,7 @@ echo "Auth setup complete"
 								},
 								VolumeMount {
 									name: "locale-data".to_string(),
-									mount_path: "/locale-data".to_string(),
+									mount_path: "/usr/lib/locale".to_string(),
 									..Default::default()
 								},
 							]),
@@ -848,11 +823,6 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 								value: Some("scram-sha-256".to_string()),
 								..Default::default()
 							},
-							EnvVar {
-								name: "LOCPATH".to_string(),
-								value: Some("/locale-data".to_string()),
-								..Default::default()
-							},
 						]),
 						ports: Some(vec![ContainerPort {
 							name: Some("postgres".to_string()),
@@ -868,7 +838,7 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							},
 							VolumeMount {
 								name: "locale-data".to_string(),
-								mount_path: "/locale-data".to_string(),
+								mount_path: "/usr/lib/locale".to_string(),
 								..Default::default()
 							},
 						]),
