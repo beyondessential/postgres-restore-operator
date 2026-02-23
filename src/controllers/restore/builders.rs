@@ -544,14 +544,22 @@ host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
-if ! getent passwd "$(id -u)" >/dev/null 2>&1; then
-  echo "postgres:x:$(id -u):$(id -g):PostgreSQL:/tmp:/bin/sh" >> /etc/passwd
+if echo "UPDATE pg_database SET datcollate = 'C', datctype = 'C', datcollversion = NULL WHERE datcollate <> 'C' OR datctype <> 'C';" \
+     | postgres --single -D "$PGDATA" postgres 2>&1; then
+  echo "Locale fix applied via single-user mode"
+else
+  echo "Single-user mode unavailable, will fix locales after startup"
 fi
-echo "UPDATE pg_database SET datcollate = 'C', datctype = 'C', datcollversion = NULL WHERE datcollate <> 'C' OR datctype <> 'C';" \
-  | postgres --single -D "$PGDATA" postgres
 
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
+
+echo "Fixing database locales incompatible with this OS..."
+psql -U postgres -d postgres << 'LOCALEEOF'
+UPDATE pg_database
+   SET datcollate = 'C', datctype = 'C', datcollversion = NULL
+ WHERE datcollate <> 'C' OR datctype <> 'C';
+LOCALEEOF
 
 for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
   echo "Fixing collations in database: $db"
