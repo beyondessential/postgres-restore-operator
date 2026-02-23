@@ -542,8 +542,31 @@ host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
+echo "Checking for Windows-style locales in pg_database catalog..."
+PG_DB_FILE="$PGDATA/global/1262"
+if [ -f "$PG_DB_FILE" ]; then
+  strings "$PG_DB_FILE" | grep -E '^[A-Z][a-z]+_.*\.[0-9]+$' | sort -u | while IFS= read -r loc; do
+    codepage=$(echo "$loc" | grep -oE '[0-9]+$')
+    case "$codepage" in
+      1250) charset="CP1250" ;;
+      1251) charset="CP1251" ;;
+      1252) charset="CP1252" ;;
+      1253) charset="CP1253" ;;
+      1254) charset="CP1254" ;;
+      1255) charset="CP1255" ;;
+      1256) charset="CP1256" ;;
+      1257) charset="CP1257" ;;
+      1258) charset="CP1258" ;;
+      65001) charset="UTF-8" ;;
+      *) charset="UTF-8" ;;
+    esac
+    echo "Creating locale '$loc' (charset: $charset) so PostgreSQL can start..."
+    localedef -i en_US -f "$charset" "$loc" 2>/dev/null || true
+  done
+fi
+
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
-echo "UPDATE pg_database SET datcollate = 'C', datctype = 'C', datcollversion = NULL WHERE datcollate <> 'C' OR datctype <> 'C';" \
+echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8') OR datctype NOT IN ('C', 'C.UTF-8');" \
   | postgres --single -D "$PGDATA" postgres
 
 echo "Starting temporary postgres to configure analytics user..."
@@ -552,15 +575,15 @@ pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w s
 echo "Fixing database locales (post-startup fallback)..."
 psql -U postgres -d postgres << 'LOCALEEOF'
 UPDATE pg_database
-   SET datcollate = 'C', datctype = 'C', datcollversion = NULL
- WHERE datcollate <> 'C' OR datctype <> 'C';
+   SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL
+ WHERE datcollate NOT IN ('C', 'C.UTF-8') OR datctype NOT IN ('C', 'C.UTF-8');
 LOCALEEOF
 
 for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
   echo "Fixing collations in database: $db"
   psql -U postgres -d "$db" << 'COLLEOF'
 UPDATE pg_collation
-   SET collcollate = 'C', collctype = 'C'
+   SET collcollate = 'C.UTF-8', collctype = 'C.UTF-8'
  WHERE collname = 'default';
 COLLEOF
 done
