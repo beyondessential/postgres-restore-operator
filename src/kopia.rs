@@ -1,7 +1,11 @@
 use k8s_openapi::api::core::v1::Secret;
 use serde::{Deserialize, Serialize};
 
-use crate::{error::Error, types::SnapshotFilter, util::glob_matches};
+use crate::{
+	error::Error,
+	types::SnapshotFilter,
+	util::{glob_matches, normalize_windows_path},
+};
 
 /// Credentials extracted from a kopia Kubernetes Secret.
 #[derive(Debug, Clone)]
@@ -168,6 +172,14 @@ pub fn filter_snapshots(snapshots: &[Snapshot], filter: Option<&SnapshotFilter>)
 				return false;
 			}
 
+			// Path pattern filtering (Windows paths are normalised to Unix style)
+			if let Some(pattern) = &filter.path_pattern {
+				let normalised = normalize_windows_path(&snap.source.path);
+				if !glob_matches(pattern, &normalised) {
+					return false;
+				}
+			}
+
 			true
 		})
 		.cloned()
@@ -292,10 +304,21 @@ mod tests {
 		start_time: &str,
 		tags: HashMap<String, String>,
 	) -> Snapshot {
+		make_snapshot_with_path(id, hostname, start_time, tags, "")
+	}
+
+	fn make_snapshot_with_path(
+		id: &str,
+		hostname: &str,
+		start_time: &str,
+		tags: HashMap<String, String>,
+		path: &str,
+	) -> Snapshot {
 		Snapshot {
 			id: id.into(),
 			source: SnapshotSource {
 				host: hostname.into(),
+				path: path.into(),
 				..Default::default()
 			},
 			start_time: start_time.into(),
@@ -335,6 +358,7 @@ mod tests {
 			tags: Some(HashMap::from([("env".into(), "prod".into())])),
 			host_pattern: None,
 			description_pattern: None,
+			path_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 1);
@@ -352,6 +376,7 @@ mod tests {
 			tags: None,
 			host_pattern: Some("fiji-prod-*".into()),
 			description_pattern: None,
+			path_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 2);
@@ -388,6 +413,7 @@ mod tests {
 			tags: Some(HashMap::from([("env".into(), "prod".into())])),
 			host_pattern: Some("fiji-prod-*".into()),
 			description_pattern: None,
+			path_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 1);
@@ -417,6 +443,7 @@ mod tests {
 			tags: None,
 			host_pattern: None,
 			description_pattern: Some("daily-*".into()),
+			path_pattern: None,
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 2);
@@ -514,6 +541,63 @@ mod tests {
 			tags: Some(HashMap::from([("area".into(), "postgres".into())])),
 			host_pattern: None,
 			description_pattern: None,
+			path_pattern: None,
+		};
+
+		let result = filter_snapshots(&snaps, Some(&filter));
+		assert_eq!(result.len(), 1);
+		assert_eq!(result[0].id, "a");
+	}
+
+	#[test]
+	fn filter_snapshots_by_path_pattern_windows() {
+		let snaps = vec![
+			make_snapshot_with_path("a", "win-host", "t1", HashMap::new(), r"D:\Full"),
+			make_snapshot_with_path("b", "win-host", "t2", HashMap::new(), r"E:\Incremental"),
+			make_snapshot_with_path("c", "linux-host", "t3", HashMap::new(), "/mnt/full"),
+		];
+		let filter = SnapshotFilter {
+			tags: None,
+			host_pattern: None,
+			description_pattern: None,
+			path_pattern: Some("/D/*".into()),
+		};
+		let result = filter_snapshots(&snaps, Some(&filter));
+		assert_eq!(result.len(), 1);
+		assert_eq!(result[0].id, "a");
+	}
+
+	#[test]
+	fn filter_snapshots_by_path_pattern_unix() {
+		let snaps = vec![
+			make_snapshot_with_path("a", "h", "t1", HashMap::new(), "/mnt/full"),
+			make_snapshot_with_path("b", "h", "t2", HashMap::new(), "/mnt/incremental"),
+			make_snapshot_with_path("c", "h", "t3", HashMap::new(), "/backup/full"),
+		];
+		let filter = SnapshotFilter {
+			tags: None,
+			host_pattern: None,
+			description_pattern: None,
+			path_pattern: Some("/mnt/*".into()),
+		};
+		let result = filter_snapshots(&snaps, Some(&filter));
+		assert_eq!(result.len(), 2);
+		assert_eq!(result[0].id, "a");
+		assert_eq!(result[1].id, "b");
+	}
+
+	#[test]
+	fn filter_snapshots_by_path_pattern_combined() {
+		let snaps = vec![
+			make_snapshot_with_path("a", "prod-01", "t1", HashMap::new(), r"D:\Full"),
+			make_snapshot_with_path("b", "prod-02", "t2", HashMap::new(), r"D:\Incremental"),
+			make_snapshot_with_path("c", "dev-01", "t3", HashMap::new(), r"D:\Full"),
+		];
+		let filter = SnapshotFilter {
+			tags: None,
+			host_pattern: Some("prod-*".into()),
+			description_pattern: None,
+			path_pattern: Some("/D/Full".into()),
 		};
 		let result = filter_snapshots(&snaps, Some(&filter));
 		assert_eq!(result.len(), 1);

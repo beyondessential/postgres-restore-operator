@@ -24,6 +24,22 @@ impl Display for TimeSpan {
 	}
 }
 
+/// Normalises a Windows-style path to a Unix-style path for consistent
+/// glob matching. Drive letters like `C:\` become `/C/`, and backslashes
+/// are replaced with forward slashes. Unix paths are returned unchanged.
+pub fn normalize_windows_path(path: &str) -> String {
+	let path = path.replace('\\', "/");
+	// Convert drive letter prefix: "C:/..." -> "/C/..."
+	if let Some(rest) = path
+		.strip_prefix(|c: char| c.is_ascii_alphabetic())
+		.and_then(|r| r.strip_prefix(':'))
+	{
+		let drive = path.chars().next().unwrap();
+		return format!("/{drive}{rest}");
+	}
+	path
+}
+
 /// Tests whether a string matches a glob pattern.
 pub fn glob_matches(pattern: &str, value: &str) -> bool {
 	let Ok(glob) = globset::GlobBuilder::new(pattern)
@@ -38,6 +54,34 @@ pub fn glob_matches(pattern: &str, value: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn normalize_windows_drive_path() {
+		assert_eq!(normalize_windows_path(r"D:\Full"), "/D/Full");
+		assert_eq!(
+			normalize_windows_path(r"C:\Users\backup\data"),
+			"/C/Users/backup/data"
+		);
+	}
+
+	#[test]
+	fn normalize_windows_drive_path_forward_slashes() {
+		assert_eq!(normalize_windows_path("D:/Full"), "/D/Full");
+	}
+
+	#[test]
+	fn normalize_unix_path_unchanged() {
+		assert_eq!(normalize_windows_path("/mnt/data"), "/mnt/data");
+		assert_eq!(
+			normalize_windows_path("/home/user/backup"),
+			"/home/user/backup"
+		);
+	}
+
+	#[test]
+	fn normalize_relative_path_unchanged() {
+		assert_eq!(normalize_windows_path("data/backup"), "data/backup");
+	}
 
 	#[test]
 	fn test_glob_matches_wildcard() {

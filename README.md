@@ -125,6 +125,7 @@ When using `H` in the cron expression, you might want to set the jitter to zero 
 | `tags` | `map[string]string` | No | Key-value tags that the snapshot must match. |
 | `hostPattern` | `string` | No | Glob pattern for filtering snapshot hosts. |
 | `descriptionPattern` | `string` | No | Glob pattern for filtering snapshot descriptions. |
+| `pathPattern` | `string` | No | Glob pattern for filtering snapshot source paths. Windows paths are normalised to Unix style (e.g. `D:\Full` becomes `/D/Full`). |
 
 #### NotificationConfig
 

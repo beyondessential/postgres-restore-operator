@@ -224,6 +224,11 @@ pub struct SnapshotFilter {
 	/// Glob pattern for filtering snapshot descriptions
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub description_pattern: Option<String>,
+
+	/// Glob pattern for filtering snapshot source paths.
+	/// Windows paths are normalised to Unix style (e.g. `D:\Full` → `/D/Full`).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub path_pattern: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

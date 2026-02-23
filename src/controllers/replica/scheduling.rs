@@ -330,6 +330,7 @@ mod tests {
 			tags: Some(HashMap::from([("env".into(), "prod".into())])),
 			host_pattern: None,
 			description_pattern: None,
+			path_pattern: None,
 		});
 		assert_eq!(replica.check_schedule(), ScheduleDecision::Trigger);
 	}
