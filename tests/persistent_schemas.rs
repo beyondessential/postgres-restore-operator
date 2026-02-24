@@ -127,6 +127,7 @@ async fn persistent_schemas_migration() {
 			},
 			snapshot: snapshot_id,
 			snapshot_size,
+			snapshot_time: None,
 			storage_size,
 		},
 	);
@@ -370,6 +371,7 @@ async fn persistent_schemas_conflict_fails_restore() {
 			},
 			snapshot: snapshot_id,
 			snapshot_size,
+			snapshot_time: None,
 			storage_size,
 		},
 	);

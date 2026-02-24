@@ -31,6 +31,7 @@ use crate::{
 pub struct SnapshotInfo {
 	pub id: String,
 	pub size: u64,
+	pub start_time: String,
 }
 
 impl SnapshotInfo {
@@ -210,6 +211,11 @@ impl PostgresPhysicalReplica {
 				},
 				snapshot: snapshot.id.clone(),
 				snapshot_size: snapshot.bytes().into(),
+				snapshot_time: if snapshot.start_time.is_empty() {
+					None
+				} else {
+					Some(snapshot.start_time.clone())
+				},
 				storage_size,
 			},
 		);

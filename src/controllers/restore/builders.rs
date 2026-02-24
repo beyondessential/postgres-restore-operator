@@ -673,6 +673,23 @@ END
 SQLEOF
 fi
 {reader_user_block}
+echo "Writing restore metadata..."
+psql -U postgres -d postgres << SQLEOF
+CREATE SCHEMA IF NOT EXISTS _pgro;
+CREATE TABLE IF NOT EXISTS _pgro.restore_info (
+  id integer PRIMARY KEY DEFAULT 1,
+  snapshot_id text NOT NULL,
+  snapshot_time timestamptz,
+  restored_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO _pgro.restore_info (id, snapshot_id, snapshot_time)
+VALUES (1, '${{PGRO_SNAPSHOT_ID}}', CASE WHEN '${{PGRO_SNAPSHOT_TIME}}' = '' THEN NULL ELSE '${{PGRO_SNAPSHOT_TIME}}'::timestamptz END)
+ON CONFLICT (id) DO UPDATE
+  SET snapshot_id = EXCLUDED.snapshot_id,
+      snapshot_time = EXCLUDED.snapshot_time,
+      restored_at = now();
+SQLEOF
+
 echo "Stopping temporary postgres..."
 pg_ctl -D "$PGDATA" -w stop
 
@@ -705,6 +722,16 @@ echo "Auth setup complete"
 		EnvVar {
 			name: "READ_ONLY".to_string(),
 			value: Some(read_only.to_string()),
+			..Default::default()
+		},
+		EnvVar {
+			name: "PGRO_SNAPSHOT_ID".to_string(),
+			value: Some(restore.spec.snapshot.clone()),
+			..Default::default()
+		},
+		EnvVar {
+			name: "PGRO_SNAPSHOT_TIME".to_string(),
+			value: Some(restore.spec.snapshot_time.clone().unwrap_or_default()),
 			..Default::default()
 		},
 	];

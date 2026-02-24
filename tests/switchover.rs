@@ -115,6 +115,7 @@ async fn second_restore_and_switchover() {
 			},
 			snapshot: snapshot_id.clone(),
 			snapshot_size,
+			snapshot_time: None,
 			storage_size,
 		},
 	);

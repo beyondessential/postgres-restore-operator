@@ -64,6 +64,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			},
 			snapshot: "snap123".to_string(),
 			snapshot_size: Quantity("10Gi".to_string()),
+			snapshot_time: None,
 			storage_size: Quantity("11Gi".to_string()),
 		},
 	);
@@ -130,6 +131,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			},
 			snapshot: "snap123".to_string(),
 			snapshot_size: Quantity("10Gi".to_string()),
+			snapshot_time: None,
 			storage_size: Quantity("11Gi".to_string()),
 		},
 	);

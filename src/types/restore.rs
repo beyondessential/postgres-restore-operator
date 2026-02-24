@@ -36,6 +36,10 @@ pub struct PostgresPhysicalRestoreSpec {
 	/// Size of the snapshot from kopia metadata
 	pub snapshot_size: Quantity,
 
+	/// Kopia snapshot start time (ISO 8601)
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub snapshot_time: Option<String>,
+
 	/// Calculated PVC size (snapshot_size * 1.1)
 	pub storage_size: Quantity,
 }

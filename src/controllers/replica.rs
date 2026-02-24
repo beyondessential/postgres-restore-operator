@@ -799,6 +799,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 								let info = SnapshotInfo {
 									id: snap.id.clone(),
 									size,
+									start_time: snap.start_time.clone(),
 								};
 								replica.create_restore_for_snapshot(client, &info).await?;
 								ctx.metrics.restores_started_total.inc();
