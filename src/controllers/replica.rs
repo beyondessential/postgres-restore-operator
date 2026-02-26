@@ -871,7 +871,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				if let Err(e) = jobs
 					.patch(
 						&snapshot_job_name,
-						&PatchParams::apply("postgres-restore-operator").force(),
+						&PatchParams::apply("postgres-restore-operator"),
 						&Patch::Merge(&ttl_patch),
 					)
 					.await
@@ -980,6 +980,14 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	const MAX_CONSECUTIVE_FAILURES: u32 = 3;
 	if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
+		// Update phase even while suspended so it doesn't stay stuck at
+		// "Restoring" after all in-progress restores have failed.
+		if active_restore.is_some() {
+			replica.update_phase(client, ReplicaPhase::Ready).await?;
+		} else {
+			replica.update_phase(client, ReplicaPhase::Pending).await?;
+		}
+
 		let already_suspended = replica
 			.status
 			.as_ref()
@@ -1004,13 +1012,42 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 					"ConsecutiveFailures",
 					&format!(
 						"Scheduling suspended after {consecutive_failures} consecutive restore failures. \
-						 Fix the underlying issue and reset by updating the spec or clearing \
-						 .status.consecutiveRestoreFailures."
+						 Fix the underlying issue and reset with: kubectl patch postgresphysicalreplica {name} \
+						 -n {namespace} --subresource=status --type=merge \
+						 -p '{{\"status\":{{\"consecutiveRestoreFailures\":0}}}}'"
 					),
 				)
 				.await?;
 		}
 		return Ok(Action::requeue(Duration::from_secs(300)));
+	}
+
+	// Clear RestoreSchedulingSuspended if it was previously set but the
+	// counter has since been reset below the threshold (e.g. manual patch).
+	if replica
+		.status
+		.as_ref()
+		.and_then(|s| {
+			s.conditions
+				.iter()
+				.find(|c| c.type_ == "RestoreSchedulingSuspended")
+		})
+		.is_some_and(|c| c.status == "True")
+	{
+		info!(
+			replica = name,
+			consecutive_failures,
+			"clearing RestoreSchedulingSuspended condition (counter below threshold)"
+		);
+		replica
+			.update_condition(
+				client,
+				"RestoreSchedulingSuspended",
+				"False",
+				"CounterReset",
+				"Consecutive failure counter reset below threshold",
+			)
+			.await?;
 	}
 
 	let should_restore = never_restored

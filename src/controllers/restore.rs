@@ -341,7 +341,7 @@ async fn reconcile_restoring(
 		if let Err(e) = jobs
 			.patch(
 				&job_name,
-				&PatchParams::apply("postgres-restore-operator").force(),
+				&PatchParams::apply("postgres-restore-operator"),
 				&Patch::Merge(&ttl_patch),
 			)
 			.await

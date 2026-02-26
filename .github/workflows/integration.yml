@@ -60,6 +60,14 @@ jobs:
             needs_non_pg_snapshot: false
             needs_cnpg: true
 
+          - name: consecutive_failures
+            namespaces: >-
+              test-consecutive-failures
+              test-phase-stuck
+              test-subresource-reset
+            needs_non_pg_snapshot: true
+            needs_cnpg: false
+
           - name: persistent_schemas
             namespaces: >-
               test-persistent-schemas
