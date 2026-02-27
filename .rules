@@ -19,4 +19,5 @@
 - Never write long summaries at the end of responses. Maximum 50 words if absolutely necessary.
 - To silence a warning, use `#[expect(..., reason = "...")]` instead of `#[allow(...)]`.
 - Don't use double spaces after punctuation.
+- Always work from a branch. If you're on `main`, create a new branch.
 <!-- end rules -->
