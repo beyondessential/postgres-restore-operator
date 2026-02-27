@@ -1,7 +1,7 @@
 name: Review Hero
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, reopened, edited]
 
 permissions:
   contents: read

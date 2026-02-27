@@ -1,7 +1,7 @@
 name: Review Hero Auto-Fix
 on:
   pull_request:
-    types: [opened, synchronize, reopened, edited]
+    types: [opened, reopened, edited]
 
 permissions:
   actions: read
