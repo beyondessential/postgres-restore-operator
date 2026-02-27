@@ -1,0 +1,5 @@
+project: postgres-restore-operator
+description: a Kubernetes operator for restoring PostgreSQL databases from backups
+
+ignore_patterns:
+  - "*.snap"
