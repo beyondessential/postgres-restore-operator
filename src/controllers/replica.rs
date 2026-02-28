@@ -1295,6 +1295,28 @@ async fn reconcile_schema_migration(
 	)
 	.await?;
 
+	// Filter out schemas that don't exist on the source. This happens when the
+	// user adds a schema to persistent_schemas before actually creating it.
+	let schemas = filter_existing_source_schemas(
+		client,
+		namespace,
+		&old_restore_name,
+		&source_dbname,
+		&reader_user,
+		&reader_password,
+		schemas,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	if schemas.is_empty() {
+		info!(
+			replica = %replica_name,
+			"no persistent schemas exist on source, skipping migration"
+		);
+		return Ok(true);
+	}
+
 	// Measure the actual on-disk database size of the source restore and
 	// compute how much the persistent schemas have grown beyond the original
 	// snapshot.  This delta is stored in the replica status so the next
@@ -1364,7 +1386,7 @@ async fn reconcile_schema_migration(
 		&target_dbname,
 		&reader_user,
 		&reader_password,
-		schemas,
+		&schemas,
 		ctx.use_port_forward(),
 	)
 	.await?;
@@ -1452,7 +1474,7 @@ async fn reconcile_schema_migration(
 		&new_restore_name,
 		&source_dbname,
 		&target_dbname,
-		schemas,
+		&schemas,
 		&reader_secret_name,
 		&target_superuser_secret_name,
 		&callback_url,
@@ -1478,6 +1500,58 @@ async fn reconcile_schema_migration(
 		.await?;
 
 	Ok(false) // Job created, not complete yet
+}
+
+/// Query the source restore and return only those schemas from the requested
+/// list that actually exist. Schemas that are not present are logged and
+/// silently skipped so that migration does not fail when the user has listed
+/// a schema they have not yet created.
+#[expect(
+	clippy::too_many_arguments,
+	reason = "internal helper with tightly-coupled params"
+)]
+async fn filter_existing_source_schemas(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	dbname: &str,
+	user: &str,
+	password: &str,
+	schemas: &[String],
+	use_port_forward: bool,
+) -> Result<Vec<String>> {
+	let conn = overlay::connect::connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		dbname,
+		user,
+		password,
+		use_port_forward,
+	)
+	.await?;
+
+	let rows = conn
+		.client
+		.query(
+			"SELECT schema_name FROM information_schema.schemata \
+			 WHERE schema_name = ANY($1)",
+			&[&schemas],
+		)
+		.await?;
+
+	let existing: Vec<String> = rows.iter().map(|r| r.get(0)).collect();
+
+	let skipped: Vec<&String> = schemas.iter().filter(|s| !existing.contains(s)).collect();
+	if !skipped.is_empty() {
+		warn!(
+			restore = %restore_name,
+			skipped = ?skipped,
+			"persistent schemas not found on source, skipping"
+		);
+	}
+
+	Ok(existing)
 }
 
 /// Check whether any of the persistent schemas already exist in the snapshot
