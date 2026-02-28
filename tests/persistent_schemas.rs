@@ -1,9 +1,6 @@
-use k8s_openapi::api::core::v1::{LocalObjectReference, Secret};
-use kube::{Api, ResourceExt, api::PostParams};
-use postgres_restore_operator::types::{
-	PostgresPhysicalReplica, PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase,
-	RestorePhase,
-};
+use k8s_openapi::api::core::v1::Secret;
+use kube::{Api, api::PostParams};
+use postgres_restore_operator::types::{PostgresPhysicalReplica, PostgresPhysicalRestore, ReplicaPhase, RestorePhase};
 use tokio::time::{sleep, timeout};
 
 use helpers::*;
@@ -100,69 +97,24 @@ async fn persistent_schemas_migration() {
 		"expected 42 rows in persistent_data schema on first restore"
 	);
 
-	// Capture snapshot details from the first restore to create a second one
 	let first_restore_obj = restores
 		.get(&first_restore_name)
 		.await
 		.expect("failed to get first restore");
-	let snapshot_id = first_restore_obj.spec.snapshot.clone();
-	let snapshot_size = first_restore_obj.spec.snapshot_size.clone();
-	let storage_size = first_restore_obj.spec.storage_size.clone();
-
 	let replica_obj = replicas
 		.get(replica_name)
 		.await
 		.expect("failed to get replica");
-	let replica_uid = replica_obj.uid().expect("replica has no UID");
 
 	// Manually create a second restore from the same snapshot to trigger switchover
 	let second_restore_name = format!("{replica_name}-second");
 	println!("--- creating second restore manually: {second_restore_name}");
 
-	let second_restore = PostgresPhysicalRestore::new(
-		&second_restore_name,
-		PostgresPhysicalRestoreSpec {
-			replica: LocalObjectReference {
-				name: replica_name.into(),
-			},
-			snapshot: snapshot_id,
-			snapshot_size,
-			snapshot_time: None,
-			storage_size,
-		},
-	);
-
-	let mut restore_value = serde_json::to_value(&second_restore).unwrap();
-	if let Some(meta) = restore_value
-		.as_object_mut()
-		.and_then(|o| o.get_mut("metadata"))
-		.and_then(|m| m.as_object_mut())
-	{
-		meta.insert(
-			"namespace".to_string(),
-			serde_json::Value::String(ns.to_string()),
-		);
-		meta.insert(
-			"labels".to_string(),
-			serde_json::json!({ "pgro.bes.au/replica": replica_name }),
-		);
-		meta.insert(
-			"ownerReferences".to_string(),
-			serde_json::json!([{
-				"apiVersion": "pgro.bes.au/v1alpha1",
-				"kind": "PostgresPhysicalReplica",
-				"name": replica_name,
-				"uid": replica_uid,
-				"controller": true,
-				"blockOwnerDeletion": true,
-			}]),
-		);
-	}
-
-	let second_restore_resource: PostgresPhysicalRestore =
-		serde_json::from_value(restore_value).unwrap();
 	restores
-		.create(&PostParams::default(), &second_restore_resource)
+		.create(
+			&PostParams::default(),
+			&build_second_restore(&second_restore_name, ns, &first_restore_obj, &replica_obj),
+		)
 		.await
 		.expect("failed to create second restore");
 
@@ -342,20 +294,14 @@ async fn persistent_schemas_conflict_fails_restore() {
 	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
 	println!("--- first restore active: {first_restore_name}");
 
-	// Capture snapshot details from the first restore to create a second one
 	let first_restore_obj = restores
 		.get(&first_restore_name)
 		.await
 		.expect("failed to get first restore");
-	let snapshot_id = first_restore_obj.spec.snapshot.clone();
-	let snapshot_size = first_restore_obj.spec.snapshot_size.clone();
-	let storage_size = first_restore_obj.spec.storage_size.clone();
-
 	let replica_obj = replicas
 		.get(replica_name)
 		.await
 		.expect("failed to get replica");
-	let replica_uid = replica_obj.uid().expect("replica has no UID");
 
 	// Manually create a second restore from the same snapshot to trigger switchover.
 	// The "public" schema will already exist in this snapshot, so migration should
@@ -363,50 +309,11 @@ async fn persistent_schemas_conflict_fails_restore() {
 	let second_restore_name = format!("{replica_name}-conflict");
 	println!("--- creating second restore: {second_restore_name}");
 
-	let second_restore = PostgresPhysicalRestore::new(
-		&second_restore_name,
-		PostgresPhysicalRestoreSpec {
-			replica: LocalObjectReference {
-				name: replica_name.into(),
-			},
-			snapshot: snapshot_id,
-			snapshot_size,
-			snapshot_time: None,
-			storage_size,
-		},
-	);
-
-	let mut restore_value = serde_json::to_value(&second_restore).unwrap();
-	if let Some(meta) = restore_value
-		.as_object_mut()
-		.and_then(|o| o.get_mut("metadata"))
-		.and_then(|m| m.as_object_mut())
-	{
-		meta.insert(
-			"namespace".to_string(),
-			serde_json::Value::String(ns.to_string()),
-		);
-		meta.insert(
-			"labels".to_string(),
-			serde_json::json!({ "pgro.bes.au/replica": replica_name }),
-		);
-		meta.insert(
-			"ownerReferences".to_string(),
-			serde_json::json!([{
-				"apiVersion": "pgro.bes.au/v1alpha1",
-				"kind": "PostgresPhysicalReplica",
-				"name": replica_name,
-				"uid": replica_uid,
-				"controller": true,
-				"blockOwnerDeletion": true,
-			}]),
-		);
-	}
-
-	let second_restore_resource: PostgresPhysicalRestore =
-		serde_json::from_value(restore_value).unwrap();
 	restores
-		.create(&PostParams::default(), &second_restore_resource)
+		.create(
+			&PostParams::default(),
+			&build_second_restore(&second_restore_name, ns, &first_restore_obj, &replica_obj),
+		)
 		.await
 		.expect("failed to create second restore");
 
