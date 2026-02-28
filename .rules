@@ -20,4 +20,5 @@
 - To silence a warning, use `#[expect(..., reason = "...")]` instead of `#[allow(...)]`.
 - Don't use double spaces after punctuation.
 - Always work from a branch. If you're on `main`, create a new branch.
+- If you can at all do something from the operator, instead of in a script that runs in a job, do so. For example, if you need to query something in a database, you should be able to do so from the operator, instead of writing SQL code in bash logic.
 <!-- end rules -->
