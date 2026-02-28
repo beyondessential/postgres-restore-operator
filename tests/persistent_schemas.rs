@@ -1,6 +1,6 @@
-use k8s_openapi::api::core::v1::Secret;
-use kube::{Api, api::PostParams};
-use postgres_restore_operator::types::{PostgresPhysicalReplica, PostgresPhysicalRestore, ReplicaPhase, RestorePhase};
+use k8s_openapi::api::core::v1::{LocalObjectReference, Secret};
+use kube::{Api, ResourceExt as _, api::PostParams};
+use postgres_restore_operator::types::{PostgresPhysicalReplica, PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase};
 use tokio::time::{sleep, timeout};
 
 use helpers::*;
