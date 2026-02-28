@@ -6,11 +6,12 @@
 use std::{collections::BTreeMap, time::Duration};
 
 use jiff::Span;
+
 use k8s_openapi::{
 	ByteString,
 	api::{
 		batch::v1::Job,
-		core::v1::{Secret, SecretReference},
+		core::v1::{LocalObjectReference, Secret, SecretReference},
 	},
 	apimachinery::pkg::api::resource::Quantity,
 };
@@ -21,7 +22,7 @@ use kube::{
 use postgres_restore_operator::{
 	types::{
 		OverlayDatabaseConfig, PostgresPhysicalReplica, PostgresPhysicalReplicaSpec,
-		PostgresPhysicalRestore, ReplicaPhase, RestorePhase,
+		PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
 	},
 	util::TimeSpan,
 };
@@ -324,4 +325,31 @@ pub async fn wait_for_pod_ready(ns: &str, pod: &str, timeout_dur: Duration) {
 	})
 	.await
 	.unwrap_or_else(|_| panic!("timed out waiting for pod {pod} to be ready in namespace {ns}"));
+}
+
+pub fn build_second_restore(
+	name: &str,
+	ns: &str,
+	first_restore: &PostgresPhysicalRestore,
+	replica: &PostgresPhysicalReplica,
+) -> PostgresPhysicalRestore {
+	let mut restore = PostgresPhysicalRestore::new(
+		name,
+		PostgresPhysicalRestoreSpec {
+			replica: LocalObjectReference {
+				name: replica.name_any(),
+			},
+			snapshot: first_restore.spec.snapshot.clone(),
+			snapshot_size: first_restore.spec.snapshot_size.clone(),
+			snapshot_time: None,
+			storage_size: first_restore.spec.storage_size.clone(),
+		},
+	);
+	restore.metadata.namespace = Some(ns.to_string());
+	restore.metadata.labels = Some(BTreeMap::from([(
+		"pgro.bes.au/replica".to_string(),
+		replica.name_any(),
+	)]));
+	restore.metadata.owner_references = Some(vec![replica.owner_reference()]);
+	restore
 }
