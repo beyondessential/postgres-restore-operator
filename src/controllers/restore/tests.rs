@@ -1,7 +1,9 @@
+use std::collections::BTreeMap;
+
 use jiff::Span;
 use k8s_openapi::api::core::v1::{
 	Affinity, LocalObjectReference, NodeAffinity, NodeSelector, NodeSelectorRequirement,
-	NodeSelectorTerm, SecretReference,
+	NodeSelectorTerm, ResourceRequirements, SecretReference,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
@@ -171,4 +173,171 @@ fn version_detect_job_has_ttl_seconds_after_finished() {
 		.ttl_seconds_after_finished
 		.expect("version-detect job must set ttlSecondsAfterFinished");
 	assert!(ttl > 0, "ttlSecondsAfterFinished must be positive");
+}
+
+#[test]
+fn deployment_has_dshm_volume_with_default_resources() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let dshm_vol = pod_spec
+		.volumes
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|v| v.name == "dshm")
+		.expect("dshm volume must exist");
+
+	let empty_dir = dshm_vol.empty_dir.as_ref().expect("dshm must be emptyDir");
+	assert_eq!(empty_dir.medium.as_deref(), Some("Memory"));
+	// Default 1Gi request: min(512Mi, ceil(36% of 1Gi)) = min(512Mi, 369Mi) = 369Mi
+	assert_eq!(empty_dir.size_limit.as_ref().unwrap().0, "369Mi");
+}
+
+#[test]
+fn deployment_has_dshm_volume_with_custom_resources() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	replica.spec.resources = Some(ResourceRequirements {
+		requests: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("4Gi".to_string()),
+		)])),
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("8Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let dshm_vol = pod_spec
+		.volumes
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|v| v.name == "dshm")
+		.expect("dshm volume must exist");
+
+	let empty_dir = dshm_vol.empty_dir.as_ref().expect("dshm must be emptyDir");
+	assert_eq!(empty_dir.medium.as_deref(), Some("Memory"));
+	// 4Gi request, 8Gi limit: min(4Gi/2, ceil(36% of 8Gi)) = min(2048Mi, 2950Mi) = 2048Mi
+	assert_eq!(empty_dir.size_limit.as_ref().unwrap().0, "2048Mi");
+}
+
+#[test]
+fn deployment_mounts_dshm_on_postgres_and_setup_auth() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let postgres = &pod_spec.containers[0];
+	assert_eq!(postgres.name, "postgres");
+	let pg_mounts = postgres.volume_mounts.as_ref().unwrap();
+	let pg_shm = pg_mounts
+		.iter()
+		.find(|m| m.mount_path == "/dev/shm")
+		.expect("postgres container must mount /dev/shm");
+	assert_eq!(pg_shm.name, "dshm");
+
+	let setup_auth = pod_spec
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let sa_mounts = setup_auth.volume_mounts.as_ref().unwrap();
+	let sa_shm = sa_mounts
+		.iter()
+		.find(|m| m.mount_path == "/dev/shm")
+		.expect("setup-auth must mount /dev/shm");
+	assert_eq!(sa_shm.name, "dshm");
+}
+
+#[test]
+fn deployment_init_script_sets_shared_buffers() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let setup_auth = pod_spec
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = &setup_auth.args.as_ref().unwrap()[0];
+
+	// Default 1Gi: SHM=369Mi, shared_buffers = floor(70% of 369) = 258MB
+	assert!(
+		script.contains("shared_buffers = 258MB"),
+		"init script must set shared_buffers to computed value, got script containing: {}",
+		script
+			.lines()
+			.find(|l| l.contains("shared_buffers"))
+			.unwrap_or("<not found>")
+	);
+
+	// The sed block must strip shared_buffers from source config
+	assert!(
+		script.contains("shared_buffers[[:space:]]*="),
+		"sed must strip shared_buffers from source config"
+	);
+}
+
+#[test]
+fn deployment_shared_buffers_with_custom_resources() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	replica.spec.resources = Some(ResourceRequirements {
+		requests: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("2Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let setup_auth = pod_spec
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = &setup_auth.args.as_ref().unwrap()[0];
+
+	// 2Gi request: SHM=738Mi, shared_buffers = floor(70% of 738) = 516MB
+	assert!(
+		script.contains("shared_buffers = 516MB"),
+		"init script must set shared_buffers for 2Gi request"
+	);
 }
