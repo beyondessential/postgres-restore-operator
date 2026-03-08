@@ -2,7 +2,7 @@ use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector, S
 use kube::{Api, Client};
 
 pub mod jobs;
-pub mod overlay;
+pub mod postgres;
 pub mod replica;
 pub mod restore;
 

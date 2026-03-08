@@ -16,7 +16,7 @@ use kube::{ResourceExt, api::ObjectMeta};
 
 use super::restore_owner_reference;
 use crate::{
-	controllers::{env_from_secret, env_from_secret_optional, kopia_writable_env, overlay},
+	controllers::{env_from_secret, env_from_secret_optional, kopia_writable_env},
 	error::{Error, Result},
 	quantity::compute_shm_and_shared_buffers,
 	types::*,
@@ -453,37 +453,6 @@ cp -a /usr/lib/locale/* /locale-data/
 	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
 	let read_only = effective_read_only.to_string();
 
-	let has_overlay = replica.spec.overlay_database.is_some();
-	let reader_secret = SecretReference {
-		name: Some(overlay::overlay_reader_secret_name(
-			&restore.spec.replica.name,
-		)),
-		namespace: Some(namespace.to_string()),
-	};
-
-	let reader_user_block = if has_overlay {
-		r#"
-if [ -n "$READER_USERNAME" ] && [ -n "$READER_PASSWORD" ]; then
-  echo "Creating overlay read-only user..."
-  psql -U postgres -d postgres << READEREOF
-DO \$\$
-BEGIN
-  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${READER_USERNAME}') THEN
-    CREATE ROLE ${READER_USERNAME} WITH LOGIN PASSWORD '${READER_PASSWORD}';
-  ELSE
-    ALTER ROLE ${READER_USERNAME} WITH PASSWORD '${READER_PASSWORD}';
-  END IF;
-END
-\$\$;
-GRANT pg_read_all_data TO ${READER_USERNAME};
-READEREOF
-fi
-"#
-		.to_string()
-	} else {
-		String::new()
-	};
-
 	let extra_config_block = if let Some(ref extra) = replica.spec.postgres_extra_config {
 		format!(
 			r#"echo "Appending extra postgresql.conf settings..."
@@ -676,7 +645,6 @@ END
 \$\$;
 SQLEOF
 fi
-{reader_user_block}
 echo "Writing restore metadata..."
 psql -U postgres -d postgres << SQLEOF
 CREATE SCHEMA IF NOT EXISTS _pgro;
@@ -716,7 +684,7 @@ echo "Auth setup complete"
 		("pgro.bes.au/restore".to_string(), name.to_string()),
 	]);
 
-	let mut init_env = vec![
+	let init_env = vec![
 		EnvVar {
 			name: "ANALYTICS_USERNAME".to_string(),
 			value: Some(replica.spec.analytics_username.clone()),
@@ -739,19 +707,6 @@ echo "Auth setup complete"
 			..Default::default()
 		},
 	];
-
-	if has_overlay {
-		init_env.push(env_from_secret(
-			"READER_USERNAME",
-			&reader_secret,
-			"username",
-		));
-		init_env.push(env_from_secret(
-			"READER_PASSWORD",
-			&reader_secret,
-			"password",
-		));
-	}
 
 	Ok(Deployment {
 		metadata: ObjectMeta {

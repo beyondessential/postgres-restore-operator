@@ -22,8 +22,6 @@ pub struct Context {
 	pub http_client: reqwest::Client,
 	/// In-memory store for snapshot-list results POSTed by jobs.
 	pub snapshot_results: Arc<CallbackStore>,
-	/// In-memory store for overlay copy results POSTed by jobs.
-	pub copy_results: Arc<CallbackStore>,
 	/// In-memory store for schema migration results POSTed by jobs.
 	pub schema_migration_results: Arc<CallbackStore>,
 	/// Base URL the operator is reachable at from within the cluster,
@@ -55,7 +53,6 @@ impl Context {
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
 			snapshot_results: Arc::new(CallbackStore::default()),
-			copy_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
 			callback_base_url,
 			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
@@ -78,14 +75,6 @@ impl Context {
 	pub fn snapshot_callback_url(&self, namespace: &str, replica: &str) -> String {
 		format!(
 			"{}/api/v1/snapshot-results/{namespace}/{replica}",
-			self.callback_base_url
-		)
-	}
-
-	/// Build the callback URL for a copy job to POST results to.
-	pub fn copy_callback_url(&self, namespace: &str, replica: &str) -> String {
-		format!(
-			"{}/api/v1/copy-results/{namespace}/{replica}",
 			self.callback_base_url
 		)
 	}
