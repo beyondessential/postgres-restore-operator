@@ -4,6 +4,7 @@ use k8s_openapi::{
 	api::core::v1::ResourceRequirements, apimachinery::pkg::api::resource::Quantity,
 };
 use kube_quantity::ParsedQuantity;
+use tracing::warn;
 
 /// Kubernetes resource quantity units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -73,14 +74,26 @@ impl ParsedQuantityExt for ParsedQuantity {
 
 const DEFAULT_MEMORY_REQUEST: &str = "1Gi";
 
+fn default_memory_request() -> ParsedQuantity {
+	DEFAULT_MEMORY_REQUEST
+		.try_into()
+		.expect("default memory request parses")
+}
+
 /// Resolve the memory request from resource requirements, defaulting to 1Gi.
 fn memory_request(resources: &Option<ResourceRequirements>) -> ParsedQuantity {
 	resources
 		.as_ref()
 		.and_then(|r| r.requests.as_ref())
 		.and_then(|r| r.get("memory"))
-		.map(|q| -> ParsedQuantity { q.0.as_str().try_into().expect("valid memory quantity") })
-		.unwrap_or_else(|| DEFAULT_MEMORY_REQUEST.try_into().expect("default parses"))
+		.and_then(|q| match q.0.as_str().try_into() {
+			Ok(pq) => Some(pq),
+			Err(e) => {
+				warn!(quantity = %q.0, error = %e, "failed to parse memory request, using default");
+				None
+			}
+		})
+		.unwrap_or_else(default_memory_request)
 }
 
 /// Resolve the memory limit from resource requirements.
@@ -89,46 +102,59 @@ fn memory_limit(resources: &Option<ResourceRequirements>) -> Option<ParsedQuanti
 		.as_ref()
 		.and_then(|r| r.limits.as_ref())
 		.and_then(|r| r.get("memory"))
-		.map(|q| -> ParsedQuantity { q.0.as_str().try_into().expect("valid memory quantity") })
+		.and_then(|q| match q.0.as_str().try_into() {
+			Ok(pq) => Some(pq),
+			Err(e) => {
+				warn!(quantity = %q.0, error = %e, "failed to parse memory limit, ignoring");
+				None
+			}
+		})
 }
 
-/// Compute the SHM size for the restore database container.
+/// Compute SHM size in MiB.
 ///
 /// `min(memory_request / 2, 36% of max(memory_request, memory_limit))`
 ///
-/// Result is ceiled to whole MiB.
-pub fn compute_shm_size(resources: &Option<ResourceRequirements>) -> Quantity {
+/// When a memory limit is present, also caps at `limit / 2` to avoid OOM
+/// (memory-backed emptyDir counts against the container's cgroup limit).
+///
+/// Result is ceiled to whole MiB, floored at 16 MiB.
+fn compute_shm_mib(resources: &Option<ResourceRequirements>) -> u64 {
 	let request = memory_request(resources);
 	let limit = memory_limit(resources);
 
 	let request_bytes = request.to_bytes_f64().unwrap_or(0.0);
-	let limit_bytes = limit.as_ref().and_then(|l| l.to_bytes_f64()).unwrap_or(0.0);
+	let limit_bytes = limit.as_ref().and_then(|l| l.to_bytes_f64());
 
 	let half_request = request_bytes / 2.0;
-	let effective_max = request_bytes.max(limit_bytes);
+	let effective_max = limit_bytes.map_or(request_bytes, |l| request_bytes.max(l));
 	let thirty_six_pct = effective_max * 0.36;
 
-	let shm_bytes = half_request.min(thirty_six_pct);
+	let mut shm_bytes = half_request.min(thirty_six_pct);
+
+	if let Some(lb) = limit_bytes {
+		shm_bytes = shm_bytes.min(lb / 2.0);
+	}
 
 	let mib = (shm_bytes / (1 << 20) as f64).ceil() as u64;
-	let mib = mib.max(16); // floor at 16Mi to avoid unusable values
+	mib.max(16)
+}
 
+/// Compute the SHM size for the restore database container as a Kubernetes
+/// [`Quantity`], suitable for an emptyDir `sizeLimit`.
+pub fn compute_shm_size(resources: &Option<ResourceRequirements>) -> Quantity {
+	let mib = compute_shm_mib(resources);
 	ParsedQuantity::from_unit(mib as i64, QuantityUnit::Mi).into()
 }
 
-/// Compute the `shared_buffers` PostgreSQL setting: 70% of SHM, as whole MB
-/// (PostgreSQL uses base-10 MB for this setting).
+/// Compute the `shared_buffers` PostgreSQL setting: 70% of SHM, as whole MB.
+///
+/// PostgreSQL interprets `MB` as binary mebibytes (1 MB = 1 048 576 bytes),
+/// so we floor to whole MiB. Minimum 16 MB.
 pub fn compute_shared_buffers_mb(resources: &Option<ResourceRequirements>) -> u64 {
-	let shm: Quantity = compute_shm_size(resources);
-	let shm_pq: ParsedQuantity = shm.0.as_str().try_into().expect("shm quantity parses");
-	let shm_bytes = shm_pq.to_bytes_f64().unwrap_or(0.0);
-
-	let sb_bytes = shm_bytes * 0.70;
-	// PostgreSQL shared_buffers uses base-10 MB (1 MB = 1_000_000 in docs,
-	// but the server actually uses 1 MB = 1048576). Use binary MiB to be safe
-	// and consistent with how PG interprets "MB".
-	let mb = (sb_bytes / 1_048_576.0).floor() as u64;
-	mb.max(16) // floor at 16MB
+	let shm_mib = compute_shm_mib(resources);
+	let sb_mib = ((shm_mib as f64) * 0.70).floor() as u64;
+	sb_mib.max(16)
 }
 
 #[cfg(test)]
@@ -202,7 +228,7 @@ mod tests {
 	#[test]
 	fn shm_defaults_to_1gi_request() {
 		// No resources: defaults to 1Gi request
-		// min(1Gi/2, 36% of 1Gi) = min(512Mi, ceil(368.64)Mi) = 369Mi
+		// min(512Mi, ceil(36% of 1024Mi)) = min(512Mi, ceil(368.64)Mi) = 369Mi
 		let shm = compute_shm_size(&None);
 		assert_eq!(shm.0, "369Mi");
 	}
@@ -210,7 +236,7 @@ mod tests {
 	#[test]
 	fn shm_request_only_2gi() {
 		// 2Gi request, no limit
-		// min(2Gi/2, 36% of 2Gi) = min(1Gi, ceil(737.28)Mi) = 738Mi
+		// min(1024Mi, ceil(36% of 2048Mi)) = min(1024Mi, ceil(737.28)Mi) = 738Mi
 		let res = resources_with(Some("2Gi"), None);
 		let shm = compute_shm_size(&res);
 		assert_eq!(shm.0, "738Mi");
@@ -219,7 +245,7 @@ mod tests {
 	#[test]
 	fn shm_request_and_limit() {
 		// 2Gi request, 4Gi limit
-		// min(2Gi/2, 36% of 4Gi) = min(1Gi, 1474Mi) = 1024Mi
+		// min(1024Mi, ceil(36% of 4096Mi), 2048Mi) = min(1024Mi, ceil(1474.56)Mi, 2048Mi) = 1024Mi
 		let res = resources_with(Some("2Gi"), Some("4Gi"));
 		let shm = compute_shm_size(&res);
 		assert_eq!(shm.0, "1024Mi");
@@ -228,11 +254,11 @@ mod tests {
 	#[test]
 	fn shm_limit_smaller_than_request() {
 		// 4Gi request, 2Gi limit (unusual but possible)
-		// max(4Gi, 2Gi) = 4Gi, 36% of 4Gi = ceil(1474.56)Mi = 1475Mi
-		// min(4Gi/2, 1475Mi) = min(2Gi, 1475Mi) = 1475Mi
+		// min(2048Mi, ceil(36% of 4096Mi), 1024Mi) = min(2048Mi, ceil(1474.56)Mi, 1024Mi) = 1024Mi
+		// Capped by limit/2 to avoid OOM
 		let res = resources_with(Some("4Gi"), Some("2Gi"));
 		let shm = compute_shm_size(&res);
-		assert_eq!(shm.0, "1475Mi");
+		assert_eq!(shm.0, "1024Mi");
 	}
 
 	#[test]
@@ -244,15 +270,15 @@ mod tests {
 
 	#[test]
 	fn shared_buffers_defaults() {
-		// SHM with no resources = 369Mi
-		// 70% of 369Mi = 258.3 -> floor = 258MB
+		// SHM MiB with no resources = 369
+		// floor(70% of 369) = 258MB
 		let sb = compute_shared_buffers_mb(&None);
 		assert_eq!(sb, 258);
 	}
 
 	#[test]
 	fn shared_buffers_2gi_request() {
-		// SHM = 738Mi, 70% of 738Mi = 516.6 -> floor = 516MB
+		// SHM MiB = 738, floor(70% of 738) = 516MB
 		let res = resources_with(Some("2Gi"), None);
 		let sb = compute_shared_buffers_mb(&res);
 		assert_eq!(sb, 516);
@@ -263,5 +289,37 @@ mod tests {
 		let res = resources_with(Some("32Mi"), None);
 		let sb = compute_shared_buffers_mb(&res);
 		assert_eq!(sb, 16);
+	}
+
+	#[test]
+	fn shm_unparseable_request_falls_back_to_default() {
+		let res = Some(ResourceRequirements {
+			requests: Some(BTreeMap::from([(
+				"memory".to_string(),
+				Quantity("bogus".to_string()),
+			)])),
+			..Default::default()
+		});
+		// Falls back to 1Gi default -> 369Mi
+		let shm = compute_shm_size(&res);
+		assert_eq!(shm.0, "369Mi");
+	}
+
+	#[test]
+	fn shm_unparseable_limit_is_ignored() {
+		let res = Some(ResourceRequirements {
+			requests: Some(BTreeMap::from([(
+				"memory".to_string(),
+				Quantity("2Gi".to_string()),
+			)])),
+			limits: Some(BTreeMap::from([(
+				"memory".to_string(),
+				Quantity("bogus".to_string()),
+			)])),
+			..Default::default()
+		});
+		// Limit ignored, treated as request-only: 738Mi
+		let shm = compute_shm_size(&res);
+		assert_eq!(shm.0, "738Mi");
 	}
 }
