@@ -832,11 +832,6 @@ echo "Auth setup complete"
 									mount_path: "/usr/lib/locale".to_string(),
 									..Default::default()
 								},
-								VolumeMount {
-									name: "dshm".to_string(),
-									mount_path: "/dev/shm".to_string(),
-									..Default::default()
-								},
 							]),
 							resources: Some(ResourceRequirements {
 								requests: Some(BTreeMap::from([
