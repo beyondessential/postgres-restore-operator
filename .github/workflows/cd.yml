@@ -80,7 +80,7 @@ jobs:
           mkdir -p artifacts/${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/operator artifacts/${{ matrix.arch }}/
 
-      - uses: actions/upload-artifact@v6
+      - uses: actions/upload-artifact@v7
         with:
           name: binaries-${{ matrix.arch }}
           path: artifacts/${{ matrix.arch }}/
@@ -103,13 +103,13 @@ jobs:
         run: echo "version=$(cargo pkgid | cut -d# -f2)" >> "$GITHUB_OUTPUT"
 
       - name: Download AMD64 binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binaries-amd64
           path: .github/build-context/amd64/
 
       - name: Download ARM64 binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
         with:
           name: binaries-arm64
           path: .github/build-context/arm64/
@@ -124,9 +124,9 @@ jobs:
           ls -lh .github/build-context/arm64/
 
       - name: Setup buildkit
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
-      - uses: docker/metadata-action@v5
+      - uses: docker/metadata-action@v6
         id: meta
         with:
           images: ghcr.io/beyondessential/postgres-restore-operator
@@ -143,7 +143,7 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later
 
       - name: Build and push
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .github/build-context
           file: Containerfile
