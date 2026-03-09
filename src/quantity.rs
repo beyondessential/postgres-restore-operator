@@ -123,8 +123,16 @@ fn compute_shm_mib(resources: &Option<ResourceRequirements>) -> u64 {
 	let request = memory_request(resources);
 	let limit = memory_limit(resources);
 
-	let request_bytes = request.to_bytes_f64().unwrap_or(0.0);
-	let limit_bytes = limit.as_ref().and_then(|l| l.to_bytes_f64());
+	let request_bytes = request.to_bytes_f64().unwrap_or_else(|| {
+		warn!("failed to convert memory request to bytes, defaulting SHM to floor");
+		0.0
+	});
+	let limit_bytes = limit.as_ref().and_then(|l| {
+		l.to_bytes_f64().or_else(|| {
+			warn!("failed to convert memory limit to bytes, ignoring limit");
+			None
+		})
+	});
 
 	let half_request = request_bytes / 2.0;
 	let effective_max = limit_bytes.map_or(request_bytes, |l| request_bytes.max(l));
@@ -140,21 +148,14 @@ fn compute_shm_mib(resources: &Option<ResourceRequirements>) -> u64 {
 	mib.max(16)
 }
 
-/// Compute the SHM size for the restore database container as a Kubernetes
-/// [`Quantity`], suitable for an emptyDir `sizeLimit`.
-pub fn compute_shm_size(resources: &Option<ResourceRequirements>) -> Quantity {
-	let mib = compute_shm_mib(resources);
-	ParsedQuantity::from_unit(mib as i64, QuantityUnit::Mi).into()
-}
-
-/// Compute the `shared_buffers` PostgreSQL setting: 70% of SHM, as whole MB.
-///
-/// PostgreSQL interprets `MB` as binary mebibytes (1 MB = 1 048 576 bytes),
-/// so we floor to whole MiB. Minimum 16 MB.
-pub fn compute_shared_buffers_mb(resources: &Option<ResourceRequirements>) -> u64 {
+/// Compute both the SHM size ([`Quantity`] for emptyDir `sizeLimit`) and the
+/// `shared_buffers` PostgreSQL setting (whole MB) from a single parse of
+/// the resource requirements.
+pub fn compute_shm_and_shared_buffers(resources: &Option<ResourceRequirements>) -> (Quantity, u64) {
 	let shm_mib = compute_shm_mib(resources);
+	let shm_quantity = ParsedQuantity::from_unit(shm_mib as i64, QuantityUnit::Mi).into();
 	let sb_mib = ((shm_mib as f64) * 0.70).floor() as u64;
-	sb_mib.max(16)
+	(shm_quantity, sb_mib.max(16))
 }
 
 #[cfg(test)]
@@ -228,67 +229,76 @@ mod tests {
 	#[test]
 	fn shm_defaults_to_1gi_request() {
 		// No resources: defaults to 1Gi request
-		// min(512Mi, ceil(36% of 1024Mi)) = min(512Mi, ceil(368.64)Mi) = 369Mi
-		let shm = compute_shm_size(&None);
+		// min(1Gi/2, 36% of 1Gi) = min(512Mi, ceil(368.64)Mi) = 369Mi
+		let (shm, _) = compute_shm_and_shared_buffers(&None);
 		assert_eq!(shm.0, "369Mi");
 	}
 
 	#[test]
 	fn shm_request_only_2gi() {
 		// 2Gi request, no limit
-		// min(1024Mi, ceil(36% of 2048Mi)) = min(1024Mi, ceil(737.28)Mi) = 738Mi
+		// min(2Gi/2, 36% of 2Gi) = min(1Gi, ceil(737.28)Mi) = 738Mi
 		let res = resources_with(Some("2Gi"), None);
-		let shm = compute_shm_size(&res);
+		let (shm, _) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(shm.0, "738Mi");
 	}
 
 	#[test]
 	fn shm_request_and_limit() {
 		// 2Gi request, 4Gi limit
-		// min(1024Mi, ceil(36% of 4096Mi), 2048Mi) = min(1024Mi, ceil(1474.56)Mi, 2048Mi) = 1024Mi
+		// min(2Gi/2, 36% of 4Gi) = min(1Gi, 1475Mi) = 1024Mi
 		let res = resources_with(Some("2Gi"), Some("4Gi"));
-		let shm = compute_shm_size(&res);
+		let (shm, _) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(shm.0, "1024Mi");
 	}
 
 	#[test]
 	fn shm_limit_smaller_than_request() {
 		// 4Gi request, 2Gi limit (unusual but possible)
-		// min(2048Mi, ceil(36% of 4096Mi), 1024Mi) = min(2048Mi, ceil(1474.56)Mi, 1024Mi) = 1024Mi
-		// Capped by limit/2 to avoid OOM
+		// max(4Gi, 2Gi) = 4Gi, 36% of 4Gi = ceil(1474.56)Mi = 1475Mi
+		// but capped at limit/2 = 1024Mi
 		let res = resources_with(Some("4Gi"), Some("2Gi"));
-		let shm = compute_shm_size(&res);
+		let (shm, _) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(shm.0, "1024Mi");
 	}
 
 	#[test]
 	fn shm_small_request_floors_at_16mi() {
 		let res = resources_with(Some("32Mi"), None);
-		let shm = compute_shm_size(&res);
+		let (shm, _) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(shm.0, "16Mi");
 	}
 
 	#[test]
 	fn shared_buffers_defaults() {
-		// SHM MiB with no resources = 369
-		// floor(70% of 369) = 258MB
-		let sb = compute_shared_buffers_mb(&None);
+		// SHM with no resources = 369Mi
+		// 70% of 369Mi = 258.3 -> floor = 258MB
+		let (_, sb) = compute_shm_and_shared_buffers(&None);
 		assert_eq!(sb, 258);
 	}
 
 	#[test]
 	fn shared_buffers_2gi_request() {
-		// SHM MiB = 738, floor(70% of 738) = 516MB
+		// SHM = 738Mi, 70% of 738Mi = 516.6 -> floor = 516MB
 		let res = resources_with(Some("2Gi"), None);
-		let sb = compute_shared_buffers_mb(&res);
+		let (_, sb) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(sb, 516);
 	}
 
 	#[test]
 	fn shared_buffers_small_floors_at_16() {
 		let res = resources_with(Some("32Mi"), None);
-		let sb = compute_shared_buffers_mb(&res);
+		let (_, sb) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(sb, 16);
+	}
+
+	#[test]
+	fn returns_both_values_from_single_call() {
+		let res = resources_with(Some("2Gi"), Some("4Gi"));
+		let (shm, sb) = compute_shm_and_shared_buffers(&res);
+		assert_eq!(shm.0, "1024Mi");
+		// 70% of 1024 = 716
+		assert_eq!(sb, 716);
 	}
 
 	#[test]
@@ -301,7 +311,7 @@ mod tests {
 			..Default::default()
 		});
 		// Falls back to 1Gi default -> 369Mi
-		let shm = compute_shm_size(&res);
+		let (shm, _) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(shm.0, "369Mi");
 	}
 
@@ -319,7 +329,7 @@ mod tests {
 			..Default::default()
 		});
 		// Limit ignored, treated as request-only: 738Mi
-		let shm = compute_shm_size(&res);
+		let (shm, _) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(shm.0, "738Mi");
 	}
 }

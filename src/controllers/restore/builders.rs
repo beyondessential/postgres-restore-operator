@@ -18,7 +18,7 @@ use super::restore_owner_reference;
 use crate::{
 	controllers::{env_from_secret, env_from_secret_optional, kopia_writable_env, overlay},
 	error::{Error, Result},
-	quantity::{compute_shared_buffers_mb, compute_shm_size},
+	quantity::compute_shm_and_shared_buffers,
 	types::*,
 };
 
@@ -412,8 +412,7 @@ pub fn build_deployment(
 	replica: &PostgresPhysicalReplica,
 ) -> Result<Deployment> {
 	let pvc_name = format!("{name}-data");
-	let shm_size = compute_shm_size(&replica.spec.resources);
-	let shared_buffers_mb = compute_shared_buffers_mb(&replica.spec.resources);
+	let (shm_size, shared_buffers_mb) = compute_shm_and_shared_buffers(&replica.spec.resources);
 	let creds_secret = SecretReference {
 		name: Some(format!("{}-creds", restore.spec.replica.name)),
 		namespace: Some(namespace.to_string()),
