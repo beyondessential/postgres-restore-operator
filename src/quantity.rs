@@ -292,7 +292,7 @@ mod tests {
 	}
 
 	#[test]
-	fn shm_unparseable_request_falls_back_to_default() {
+	fn shm_unparsable_request_falls_back_to_default() {
 		let res = Some(ResourceRequirements {
 			requests: Some(BTreeMap::from([(
 				"memory".to_string(),
@@ -306,7 +306,7 @@ mod tests {
 	}
 
 	#[test]
-	fn shm_unparseable_limit_is_ignored() {
+	fn shm_unparsable_limit_is_ignored() {
 		let res = Some(ResourceRequirements {
 			requests: Some(BTreeMap::from([(
 				"memory".to_string(),
