@@ -93,12 +93,7 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub notifications: Vec<NotificationConfig>,
 
-	/// Optional overlay database configuration (persistent database via CNPG)
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub overlay_database: Option<OverlayDatabaseConfig>,
-
 	/// List of schema names to migrate from the previous restore to the new restore on each switchover.
-	/// Mutually exclusive with overlay_database.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub persistent_schemas: Option<Vec<String>>,
 
@@ -123,92 +118,6 @@ fn default_schedule_jitter() -> TimeSpan {
 }
 fn default_analytics_username() -> String {
 	"analytics".to_string()
-}
-
-/// Strategy for populating the overlay database from the restore.
-#[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq, Hash)]
-#[serde(rename_all = "lowercase")]
-pub enum OverlayStrategy {
-	/// Use Foreign Data Wrappers to create foreign tables pointing at the
-	/// restore. The restore must remain running for queries to work.
-	#[default]
-	Fdw,
-	/// Use pg_dump | psql to copy schema + data from the restore into the
-	/// overlay. Tolerates PostgreSQL version differences and does not
-	/// require the restore to stay alive after the copy completes.
-	Copy,
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct OverlayDatabaseConfig {
-	/// Strategy for populating the overlay from the restore.
-	#[serde(default)]
-	pub strategy: OverlayStrategy,
-
-	/// PostgreSQL major version for the CNPG cluster.
-	/// If absent, resolved from the CNPG image catalog (see image_catalog).
-	/// Falls back to a hardcoded default (17) if no catalog is available.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub postgres_version: Option<u32>,
-
-	/// CNPG image catalog to use for PG version discovery and image resolution.
-	/// If absent, defaults to ClusterImageCatalog kind.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub image_catalog: Option<ImageCatalogRef>,
-
-	/// Override for the overlay database PVC size.
-	/// If absent, auto-sized: 5Gi + ceil(snapshot_size / 10) rounded up to whole Gi.
-	/// Auto-sizing only ever increases (ratchets up), never shrinks.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub storage_size_override: Option<Quantity>,
-
-	/// Storage class for the overlay database PVC
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub storage_class: Option<String>,
-
-	/// Resource requirements for the overlay database pods
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub resources: Option<ResourceRequirements>,
-
-	/// Pod affinity/anti-affinity rules for the overlay database
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub affinity: Option<Affinity>,
-
-	/// Tolerations for the overlay database pods
-	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub tolerations: Vec<Toleration>,
-
-	/// Annotations to apply to the overlay database's -rw Service
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub service_annotations: Option<BTreeMap<String, String>>,
-
-	/// Include GENERATED expressions when importing foreign schemas (FDW only).
-	/// Requires that all functions used in generated columns exist on the
-	/// overlay database. Defaults to false. Ignored for copy strategy.
-	#[serde(default)]
-	pub import_generated: bool,
-
-	/// When false and strategy is `copy`, delete the restore Deployment and
-	/// PVC after a successful copy. The restore CR is kept for bookkeeping.
-	/// Ignored for `fdw` strategy (the restore must stay alive).
-	#[serde(default = "default_retain_restore")]
-	pub retain_restore: bool,
-}
-
-fn default_retain_restore() -> bool {
-	true
-}
-
-#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
-#[serde(rename_all = "camelCase")]
-pub struct ImageCatalogRef {
-	/// Name of the image catalog resource
-	pub name: String,
-
-	/// Kind: "ClusterImageCatalog" (default) or "ImageCatalog"
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -363,30 +272,10 @@ pub struct PostgresPhysicalReplicaStatus {
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub conditions: Vec<Condition>,
 
-	/// Name of the CNPG Cluster CR for the overlay database
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub overlay_cluster_name: Option<String>,
-
-	/// Name of the restore whose schemas are currently imported into the overlay
-	#[serde(
-		default,
-		skip_serializing_if = "Option::is_none",
-		alias = "overlayFdwRestore"
-	)]
-	pub overlay_restore: Option<String>,
-
 	/// Hash of the schedule inputs used to compute `nextScheduledRestore`,
 	/// so we only recompute when the inputs actually change.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub schedule_input_hash: Option<String>,
-
-	/// Current (possibly ratcheted) storage size of the overlay PVC
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub overlay_storage_size: Option<Quantity>,
-
-	/// Resolved PG major version used for the overlay cluster
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub overlay_postgres_version: Option<u32>,
 
 	/// Name of the Job performing schema migration (persistent_schemas only)
 	#[serde(default, skip_serializing_if = "Option::is_none")]

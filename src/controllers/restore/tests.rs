@@ -35,7 +35,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			read_only: true,
 			postgres_extra_config: None,
 			notifications: vec![],
-			overlay_database: None,
+
 			persistent_schemas: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
@@ -119,7 +119,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			read_only: true,
 			postgres_extra_config: None,
 			notifications: vec![],
-			overlay_database: None,
+
 			persistent_schemas: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},

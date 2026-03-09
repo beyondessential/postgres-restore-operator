@@ -23,8 +23,8 @@ use tracing::{debug, error, info, warn};
 
 use super::{
 	jobs::{JobStatus, classify_job},
-	overlay,
-	overlay::common::DEFAULT_PG_VERSION,
+	postgres,
+	postgres::DEFAULT_PG_VERSION,
 };
 use crate::{
 	context::Context,
@@ -129,46 +129,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	};
 
-	// Validate mutual exclusivity: overlay_database and persistent_schemas cannot both be set
-	if replica.spec.overlay_database.is_some() && replica.spec.persistent_schemas.is_some() {
-		warn!(
-			replica = name,
-			"invalid configuration: both overlay_database and persistent_schemas are set"
-		);
-
-		replica
-			.update_condition(
-				client,
-				"ConfigValid",
-				"False",
-				"ConfigConflict",
-				"Cannot configure both overlay_database and persistent_schemas - they are mutually exclusive. \
-				 Choose one: overlay_database for FDW/Copy strategies, or persistent_schemas for schema migration.",
-			)
-			.await?;
-
-		// Skip reconciliation - return with requeue to allow user to fix
-		return Ok(Action::requeue(Duration::from_secs(300)));
-	}
-
-	// Clear any previous ConfigValid=False condition if config is now valid
-	if replica
-		.status
-		.as_ref()
-		.and_then(|s| s.conditions.iter().find(|c| c.type_ == "ConfigValid"))
-		.is_some_and(|c| c.status == "False")
-	{
-		replica
-			.update_condition(
-				client,
-				"ConfigValid",
-				"True",
-				"ConfigValid",
-				"Configuration is valid",
-			)
-			.await?;
-	}
-
 	replica.ensure_credentials_secret(client).await?;
 
 	replica.ensure_service(client).await?;
@@ -178,80 +138,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.await?;
 
 	replica.update_connection_info(client).await?;
-
-	// Reconcile overlay database if configured, but only after the first
-	// restore exists so we know the real snapshot size.
-	let mut overlay_cluster_ready = false;
-	if replica.spec.overlay_database.is_some() {
-		let restores_api: Api<PostgresPhysicalRestore> =
-			Api::namespaced(client.clone(), &namespace);
-		let snapshot_size = match replica
-			.status
-			.as_ref()
-			.and_then(|s| s.current_restore.as_ref())
-		{
-			Some(current_restore_name) => match restores_api.get(current_restore_name).await {
-				Ok(current_restore) => Some(current_restore.spec.snapshot_size.clone()),
-				Err(_) => None,
-			},
-			None => None,
-		};
-
-		if let Some(snapshot_size) = snapshot_size {
-			match overlay::reconcile_overlay(client, &namespace, &replica, &snapshot_size).await {
-				Ok((cluster_ready, storage_size, pg_version)) => {
-					let replicas_api: Api<PostgresPhysicalReplica> =
-						Api::namespaced(client.clone(), &namespace);
-					let cluster_name = overlay::overlay_cluster_name(&name);
-					let patch = serde_json::json!({
-						"status": {
-							"overlayClusterName": cluster_name,
-							"overlayStorageSize": storage_size,
-							"overlayPostgresVersion": pg_version,
-						}
-					});
-					replicas_api
-						.patch_status(
-							&name,
-							&PatchParams::apply("postgres-restore-operator"),
-							&Patch::Merge(&patch),
-						)
-						.await?;
-
-					overlay_cluster_ready = cluster_ready;
-					if !cluster_ready {
-						info!(replica = name, "overlay cluster not yet ready, will retry");
-						replica
-							.update_condition(
-								client,
-								"OverlayReady",
-								"False",
-								"ClusterNotReady",
-								"Overlay CNPG cluster is not yet ready",
-							)
-							.await?;
-					}
-				}
-				Err(e) => {
-					warn!(replica = name, error = %e, "failed to reconcile overlay database");
-					replica
-						.update_condition(
-							client,
-							"OverlayReady",
-							"False",
-							"ProvisioningFailed",
-							&format!("Failed to reconcile overlay cluster: {e}"),
-						)
-						.await?;
-				}
-			}
-		} else {
-			debug!(
-				replica = name,
-				"no active restore yet, deferring overlay creation until first snapshot"
-			);
-		}
-	}
 
 	// Check child PostgresPhysicalRestore resources
 	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), &namespace);
@@ -383,192 +269,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
-	// Reconcile overlay database state (FDW or copy strategy).
-	// Always verify and fix the actual state inside the overlay database
-	// rather than relying solely on the status field, which can become stale
-	// if the overlay cluster is reset.
-	if let Some(overlay_config) = replica
-		.spec
-		.overlay_database
-		.as_ref()
-		.filter(|_| overlay_cluster_ready)
-	{
-		use crate::types::OverlayStrategy;
-
-		let current_restore = replica
-			.status
-			.as_ref()
-			.and_then(|s| s.current_restore.as_ref());
-		let overlay_restore = replica
-			.status
-			.as_ref()
-			.and_then(|s| s.overlay_restore.as_ref());
-
-		if let Some(current) = current_restore.filter(|_| active_restore.is_some()) {
-			debug!(
-				replica = name,
-				current_restore = %current,
-				overlay_restore = ?overlay_restore,
-				strategy = ?overlay_config.strategy,
-				"reconciling overlay state"
-			);
-
-			let result = match overlay_config.strategy {
-				OverlayStrategy::Fdw => {
-					overlay::fdw::reconcile_fdw(
-						client,
-						&namespace,
-						&replica,
-						current,
-						ctx.use_port_forward(),
-					)
-					.await
-				}
-				OverlayStrategy::Copy => {
-					overlay::copy::reconcile_copy(
-						client,
-						&ctx,
-						&namespace,
-						&replica,
-						current,
-						ctx.use_port_forward(),
-					)
-					.await
-				}
-			};
-
-			match result {
-				Ok(true) => {
-					replica
-						.update_condition(
-							client,
-							"OverlayReady",
-							"True",
-							"Reconciled",
-							"Overlay database is reconciled and ready",
-						)
-						.await?;
-					if overlay_restore.as_ref() != Some(&current) {
-						info!(
-							replica = name,
-							restore = current,
-							strategy = ?overlay_config.strategy,
-							"overlay reconciled, updating overlayRestore status"
-						);
-						let replicas: Api<PostgresPhysicalReplica> =
-							Api::namespaced(client.clone(), &namespace);
-						let patch = serde_json::json!({
-							"status": {
-								"overlayRestore": current,
-							}
-						});
-						replicas
-							.patch_status(
-								&name,
-								&PatchParams::apply("postgres-restore-operator"),
-								&Patch::Merge(&patch),
-							)
-							.await?;
-						debug!(replica = name, "overlayRestore status patched");
-					}
-
-					// Copy strategy: clean up restore resources if retainRestore is false
-					if overlay_config.strategy == OverlayStrategy::Copy
-						&& !overlay_config.retain_restore
-					{
-						debug!(
-							replica = name,
-							restore = current,
-							"retainRestore=false, cleaning up restore deployment and PVC"
-						);
-						let deployments: Api<k8s_openapi::api::apps::v1::Deployment> =
-							Api::namespaced(client.clone(), &namespace);
-						let pvcs: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
-							Api::namespaced(client.clone(), &namespace);
-						let pvc_name = format!("{current}-data");
-
-						if let Err(e) = deployments.delete(current, &Default::default()).await {
-							warn!(
-								replica = name,
-								restore = current,
-								error = %e,
-								"failed to delete restore deployment after copy"
-							);
-						}
-						if let Err(e) = pvcs.delete(&pvc_name, &Default::default()).await {
-							warn!(
-								replica = name,
-								pvc = pvc_name,
-								error = %e,
-								"failed to delete restore PVC after copy"
-							);
-						}
-					}
-				}
-				Ok(false) => {
-					debug!(
-						replica = name,
-						restore = current,
-						strategy = ?overlay_config.strategy,
-						"overlay reconciliation in progress"
-					);
-					replica
-						.update_condition(
-							client,
-							"OverlayReady",
-							"False",
-							"ReconciliationInProgress",
-							"Overlay database reconciliation is in progress",
-						)
-						.await?;
-					return Ok(Action::requeue(Duration::from_secs(30)));
-				}
-				Err(Error::InvalidOverlayConfig(msg)) => {
-					warn!(
-						replica = name,
-						restore = current,
-						strategy = ?overlay_config.strategy,
-						error = msg,
-						"overlay reconciliation permanently failed, continuing with scheduling"
-					);
-					replica
-						.update_condition(
-							client,
-							"OverlayReady",
-							"False",
-							"ConfigInvalid",
-							&format!("Overlay configuration is invalid: {msg}"),
-						)
-						.await?;
-				}
-				Err(e) => {
-					warn!(
-						replica = name,
-						restore = current,
-						strategy = ?overlay_config.strategy,
-						error = ?e,
-						"overlay reconciliation failed, will retry"
-					);
-					replica
-						.update_condition(
-							client,
-							"OverlayReady",
-							"False",
-							"ReconciliationFailed",
-							&format!("Overlay reconciliation failed: {e}"),
-						)
-						.await?;
-					return Ok(Action::requeue(Duration::from_secs(30)));
-				}
-			}
-		} else {
-			debug!(
-				replica = name,
-				"no current restore set, skipping overlay reconciliation"
-			);
-		}
-	}
-
 	// Clean up old restores after grace period
 	if let Some(prev_name) = replica
 		.status
@@ -583,7 +283,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				.and_then(|s| s.schema_migration_phase.as_ref())
 				.is_some_and(|p| p == "complete")
 		} else {
-			true // For overlay strategies or no persistence config, always allow grace period
+			true // No persistence config, always allow grace period
 		};
 
 		if migration_complete {
@@ -1155,10 +855,11 @@ async fn reconcile_schema_migration(
 	let replica_name = replica.name_any();
 	let new_restore_name = new_restore.name_any();
 
-	let schemas =
-		replica.spec.persistent_schemas.as_ref().ok_or_else(|| {
-			Error::InvalidOverlayConfig("missing persistent_schemas config".into())
-		})?;
+	let schemas = replica
+		.spec
+		.persistent_schemas
+		.as_ref()
+		.ok_or_else(|| Error::SchemaMigration("missing persistent_schemas config".into()))?;
 
 	// Edge case: First restore, no previous restore to migrate from
 	let old_restore = match old_restore_opt {
@@ -1262,7 +963,7 @@ async fn reconcile_schema_migration(
 					.await?;
 
 				// Strategy: Keep old restore active, fail the new restore
-				return Err(Error::InvalidOverlayConfig(format!(
+				return Err(Error::SchemaMigration(format!(
 					"schema migration failed: {}",
 					last_error
 				)));
@@ -1283,10 +984,10 @@ async fn reconcile_schema_migration(
 	let reader_secret_name = replica.creds_secret_name();
 	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
 	let reader_secret = secrets.get(&reader_secret_name).await?;
-	let reader_user = overlay::connect::read_secret_field(&reader_secret, "username")?;
-	let reader_password = overlay::connect::read_secret_field(&reader_secret, "password")?;
+	let reader_user = postgres::read_secret_field(&reader_secret, "username")?;
+	let reader_password = postgres::read_secret_field(&reader_secret, "password")?;
 
-	let source_dbname = overlay::common::discover_restore_database(
+	let source_dbname = postgres::discover_restore_database(
 		client,
 		namespace,
 		&old_restore_name,
@@ -1335,7 +1036,7 @@ async fn reconcile_schema_migration(
 	// compute how much the persistent schemas have grown beyond the original
 	// snapshot.  This delta is stored in the replica status so the next
 	// restore PVC can be sized accordingly.
-	let db_size_bytes = overlay::common::measure_database_size(
+	let db_size_bytes = postgres::measure_database_size(
 		client,
 		namespace,
 		&old_restore_name,
@@ -1380,7 +1081,7 @@ async fn reconcile_schema_migration(
 		)
 		.await?;
 
-	let target_dbname = overlay::common::discover_restore_database(
+	let target_dbname = postgres::discover_restore_database(
 		client,
 		namespace,
 		&new_restore_name,
@@ -1463,7 +1164,7 @@ async fn reconcile_schema_migration(
 			warn!(replica = %replica_name, error = %e, "failed to publish RestoreFailed event");
 		}
 
-		return Err(Error::InvalidOverlayConfig(msg));
+		return Err(Error::SchemaMigration(msg));
 	}
 
 	// The analytics user already has pg_write_all_data + CREATE ON DATABASE
@@ -1534,7 +1235,7 @@ async fn query_existing_schemas(
 	schemas: &[String],
 	use_port_forward: bool,
 ) -> Result<Vec<String>> {
-	let conn = overlay::connect::connect_to_restore(
+	let conn = postgres::connect_to_restore(
 		client,
 		namespace,
 		restore_name,

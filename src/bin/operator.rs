@@ -381,10 +381,6 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			axum::routing::post(post_snapshot_results),
 		)
 		.route(
-			"/api/v1/copy-results/{namespace}/{replica}",
-			axum::routing::post(post_copy_results),
-		)
-		.route(
 			"/api/v1/schema-migration-results/{namespace}/{replica}",
 			axum::routing::post(post_schema_migration_results),
 		)
@@ -405,24 +401,6 @@ async fn post_snapshot_results(
 		"received snapshot results callback"
 	);
 	state.ctx.snapshot_results.store(&namespace, &replica, body);
-	StatusCode::NO_CONTENT
-}
-
-/// Accept copy-job result POSTed by a job.
-///
-/// Body is plain text: `"success"` on success, or the error output on failure.
-async fn post_copy_results(
-	State(state): State<ServerState>,
-	Path((namespace, replica)): Path<(String, String)>,
-	body: String,
-) -> StatusCode {
-	info!(
-		namespace = namespace,
-		replica = replica,
-		bytes = body.len(),
-		"received copy results callback"
-	);
-	state.ctx.copy_results.store(&namespace, &replica, body);
 	StatusCode::NO_CONTENT
 }
 

@@ -102,11 +102,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `readOnly` | `bool` | No | `true` | Set the restored database to read-only mode. |
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
-| `overlayDatabase` | `OverlayDatabaseConfig` | No | — | Optional overlay database configuration (persistent database via CNPG). Mutually exclusive with `persistentSchemas`. |
-| `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the old restore to the new restore on each switchover. Mutually exclusive with `overlayDatabase`. |
-
-Using the `overlayDatabase` requires the CloudNative-PG operator to be installed and configured.
-Installing the CNPG cluster-level catalogs is optional but recommended.
+| `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -151,34 +147,6 @@ Additional fields for `target: graphQL`:
 | `mutation` | `string` | Yes | GraphQL mutation string. |
 | `variablesTemplate` | `string` | Yes | Template for the GraphQL variables payload. |
 
-#### OverlayDatabaseConfig
-
-Configures an overlay database backed by a CNPG Cluster that imports schemas from the restored replica.
-Two strategies are available: `fdw` (Foreign Data Wrappers, the default) and `copy` (`pg_dump | psql`).
-The `copy` strategy tolerates PostgreSQL version differences and does not require the restore to stay alive after the copy completes.
-This can be used to persistently write data in other schemas in the overlay without interfacing between two databases.
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `strategy` | `"fdw"` \| `"copy"` | No | `"fdw"` | Strategy for populating the overlay from the restore. `fdw` creates foreign tables (restore must stay alive). `copy` uses `pg_dump \| psql` to copy data (tolerates version differences, restore can be discarded). |
-| `postgresVersion` | `uint32` | No | Resolved from image catalog, or `18` | PostgreSQL major version for the CNPG cluster. |
-| `imageCatalog` | `ImageCatalogRef` | No | ClusterImageCatalog | CNPG image catalog for PG version discovery and image resolution. |
-| `storageSizeOverride` | `Quantity` | No | Auto-sized | Override for the overlay PVC size. Auto-sizing: `5Gi + ceil(snapshotSize / 10)`, ratchets up only. |
-| `storageClass` | `string` | No | — | Storage class for the overlay database PVC. |
-| `resources` | `ResourceRequirements` | No | — | Resource requirements for the overlay database pods. |
-| `affinity` | `Affinity` | No | — | Pod affinity rules for the overlay database. |
-| `tolerations` | `[]Toleration` | No | `[]` | Tolerations for the overlay database pods. |
-| `serviceAnnotations` | `map[string]string` | No | — | Annotations for the overlay database's `-rw` Service. |
-| `importGenerated` | `bool` | No | `false` | Include `GENERATED` column expressions when importing foreign schemas (FDW only). Ignored for `copy` strategy. |
-| `retainRestore` | `bool` | No | `true` | When `false` and strategy is `copy`, delete the restore Deployment and PVC after a successful copy. The restore CR is kept for bookkeeping. Ignored for `fdw` strategy. |
-
-#### ImageCatalogRef
-
-| Field | Type | Required | Default | Description |
-|-------|------|----------|---------|-------------|
-| `name` | `string` | Yes | — | Name of the image catalog resource. |
-| `kind` | `string` | No | `"ClusterImageCatalog"` | Kind of the image catalog (`ClusterImageCatalog` or `ImageCatalog`). |
-
 #### Status
 
 | Field | Type | Description |
@@ -194,10 +162,6 @@ This can be used to persistently write data in other schemas in the overlay with
 | `queuePosition` | `uint32` | Position in the global restore queue. |
 | `notifications` | `[]NotificationStatus` | Status of each configured notification target. |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions. |
-| `overlayClusterName` | `string` | Name of the CNPG Cluster CR for the overlay database. |
-| `overlayRestore` | `string` | Name of the restore whose schemas are currently imported into the overlay. |
-| `overlayStorageSize` | `Quantity` | Current (possibly ratcheted) storage size of the overlay PVC. |
-| `overlayPostgresVersion` | `uint32` | Resolved PG major version used for the overlay cluster. |
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
 | `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, or `failed: <reason>`). |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |

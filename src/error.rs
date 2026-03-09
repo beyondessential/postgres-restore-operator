@@ -32,8 +32,8 @@ pub enum Error {
 	#[error("Missing field: {0}")]
 	MissingField(String),
 
-	#[error("Invalid overlay database config: {0}")]
-	InvalidOverlayConfig(String),
+	#[error("Schema migration error: {0}")]
+	SchemaMigration(String),
 
 	#[error("Computed PVC size ({}) exceeds storageSizeMaximum ({})", .computed.0, .maximum.0)]
 	StorageLimitExceeded {
@@ -41,8 +41,8 @@ pub enum Error {
 		maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity,
 	},
 
-	#[error("FDW setup error: {0}")]
-	FdwSetup(#[from] tokio_postgres::Error),
+	#[error("Database connection error: {0}")]
+	Postgres(#[from] tokio_postgres::Error),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

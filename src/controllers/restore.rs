@@ -19,7 +19,7 @@ use kube::{
 };
 use tracing::{debug, info, warn};
 
-use super::{overlay, read_job_termination_message};
+use super::read_job_termination_message;
 use crate::{
 	context::Context,
 	error::{Error, Result},
@@ -455,13 +455,6 @@ async fn reconcile_active(
 		None => return Ok(Action::requeue(Duration::from_secs(300))),
 	};
 
-	// Ensure the reader credentials secret exists (name may have changed
-	// across operator upgrades).
-	if replica.spec.overlay_database.is_some() {
-		overlay::common::ensure_reader_credentials(client, namespace, replica_name, &replica)
-			.await?;
-	}
-
 	// SSA-patch the deployment to converge on any spec changes.
 	if restore
 		.status
@@ -599,16 +592,6 @@ async fn reconcile_ready(
 
 	// Ensure per-restore Service exists (stable endpoint for FDW and direct access)
 	ensure_restore_service(client, restore, name, namespace).await?;
-
-	// Ensure FDW credentials secret exists before creating the deployment,
-	// which references it via env vars. The secret is also ensured by the
-	// replica controller's overlay reconciliation, but that path only runs
-	// once currentRestore is set (i.e. after switchover), creating a deadlock
-	// for the first restore.
-	if replica.spec.overlay_database.is_some() {
-		overlay::common::ensure_reader_credentials(client, namespace, replica_name, &replica)
-			.await?;
-	}
 
 	// Apply desired deployment (creates or updates to converge on operator upgrades)
 	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);

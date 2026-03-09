@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 
 pub use self::{replica::*, restore::*};
 
-pub mod cnpg;
 mod replica;
 mod restore;
 

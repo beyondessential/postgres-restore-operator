@@ -186,7 +186,7 @@ mod tests {
 				storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
 					"2Ti".to_string(),
 				),
-				overlay_database: None,
+
 				persistent_schemas: None,
 			},
 			status: Some(PostgresPhysicalReplicaStatus {

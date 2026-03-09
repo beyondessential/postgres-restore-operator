@@ -5,9 +5,11 @@ use kube::{
 };
 use tokio::net::TcpStream;
 use tokio_postgres::NoTls;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
+
+pub const DEFAULT_PG_VERSION: i32 = 18;
 
 /// Holds a Postgres client and any resources that must stay alive for the
 /// duration of the connection (e.g. a port-forwarder).
@@ -17,7 +19,7 @@ pub struct PgConnection {
 }
 
 /// Connect to a Postgres instance inside a Kubernetes pod via the kube
-/// API port-forward mechanism.  This works both in-cluster and
+/// API port-forward mechanism. This works both in-cluster and
 /// out-of-cluster (e.g. CI with a kind cluster).
 async fn connect_via_port_forward(
 	client: &Client,
@@ -129,40 +131,6 @@ pub async fn find_pod_ip_by_label(
 	Ok(ip.clone())
 }
 
-/// Connect to the overlay CNPG database.
-///
-/// When `use_port_forward` is true, connects via the kube API port-forward
-/// mechanism (useful for out-of-cluster test runners). Otherwise connects
-/// directly via TCP to the CNPG `-rw` service.
-pub async fn connect_overlay(
-	client: &Client,
-	cluster_name: &str,
-	namespace: &str,
-	su_secret: &Secret,
-	use_port_forward: bool,
-) -> Result<PgConnection> {
-	let overlay_user = read_secret_field(su_secret, "username")?;
-	let overlay_password = read_secret_field(su_secret, "password")?;
-
-	if use_port_forward {
-		let pod_name = format!("{cluster_name}-1");
-		info!(pod = %pod_name, "connecting to overlay database via port-forward");
-		connect_via_port_forward(
-			client,
-			namespace,
-			&pod_name,
-			"app",
-			&overlay_user,
-			&overlay_password,
-		)
-		.await
-	} else {
-		let host = format!("{cluster_name}-rw.{namespace}.svc");
-		info!(host = %host, "connecting to overlay database via TCP");
-		connect_via_tcp(&host, 5432, "app", &overlay_user, &overlay_password).await
-	}
-}
-
 /// Connect to a restore's Postgres instance.
 ///
 /// When `use_port_forward` is true, finds the restore pod by label and
@@ -200,4 +168,103 @@ pub fn read_secret_field(secret: &Secret, key: &str) -> Result<String> {
 		.ok_or_else(|| Error::MissingField(format!("secret missing key: {key}")))?;
 	String::from_utf8(bytes.0.clone())
 		.map_err(|_| Error::MissingField(format!("secret key {key} is not valid UTF-8")))
+}
+
+/// Connect to the restore's `postgres` database and find the largest
+/// non-system database by size. This is the database whose schemas we
+/// use for schema migration.
+pub async fn discover_restore_database(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	reader_user: &str,
+	reader_password: &str,
+	use_port_forward: bool,
+) -> Result<String> {
+	let conn = connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		"postgres",
+		reader_user,
+		reader_password,
+		use_port_forward,
+	)
+	.await?;
+	let pg = &conn.client;
+
+	let row = pg
+		.query_opt(
+			"SELECT datname FROM pg_database \
+			 WHERE datname NOT IN ('postgres', 'template0', 'template1') \
+			 ORDER BY pg_database_size(datname) DESC \
+			 LIMIT 1",
+			&[],
+		)
+		.await?;
+
+	match row {
+		Some(r) => {
+			let name: String = r.get(0);
+			debug!(
+				restore = restore_name,
+				database = %name,
+				"discovered main database in restore by size"
+			);
+			Ok(name)
+		}
+		None => Err(Error::MissingField(
+			"no non-system databases found in restore".into(),
+		)),
+	}
+}
+
+/// Query the on-disk size of the given database (bytes) via `pg_database_size()`.
+pub async fn measure_database_size(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	dbname: &str,
+	user: &str,
+	password: &str,
+	use_port_forward: bool,
+) -> Result<u64> {
+	let conn = connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		dbname,
+		user,
+		password,
+		use_port_forward,
+	)
+	.await?;
+
+	let row = conn
+		.client
+		.query_one("SELECT pg_database_size(current_database())", &[])
+		.await?;
+
+	let size: i64 = row.get(0);
+	Ok(size as u64)
+}
+
+/// Escape a SQL identifier by double-quoting it.
+pub fn quote_ident(s: &str) -> String {
+	format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn quote_ident_plain() {
+		assert_eq!(quote_ident("public"), "\"public\"");
+	}
+
+	#[test]
+	fn quote_ident_with_quotes() {
+		assert_eq!(quote_ident("my\"schema"), "\"my\"\"schema\"");
+	}
 }

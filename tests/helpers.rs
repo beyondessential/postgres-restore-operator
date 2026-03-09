@@ -21,8 +21,8 @@ use kube::{
 };
 use postgres_restore_operator::{
 	types::{
-		OverlayDatabaseConfig, PostgresPhysicalReplica, PostgresPhysicalReplicaSpec,
-		PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
+		PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore,
+		PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
 	},
 	util::TimeSpan,
 };
@@ -120,7 +120,6 @@ pub struct ReplicaOpts {
 	pub schedule: String,
 	pub minimum_ttl: Option<TimeSpan>,
 	pub schedule_jitter: Option<TimeSpan>,
-	pub overlay_database: Option<OverlayDatabaseConfig>,
 	pub read_only: bool,
 }
 
@@ -130,7 +129,6 @@ impl Default for ReplicaOpts {
 			schedule: "0 */6 * * *".into(),
 			minimum_ttl: None,
 			schedule_jitter: None,
-			overlay_database: None,
 			read_only: true,
 		}
 	}
@@ -160,7 +158,6 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 			read_only: opts.read_only,
 			postgres_extra_config: None,
 			notifications: vec![],
-			overlay_database: opts.overlay_database,
 			persistent_schemas: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
