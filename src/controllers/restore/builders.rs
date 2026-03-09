@@ -18,6 +18,7 @@ use super::restore_owner_reference;
 use crate::{
 	controllers::{env_from_secret, env_from_secret_optional, kopia_writable_env, overlay},
 	error::{Error, Result},
+	quantity::compute_shm_and_shared_buffers,
 	types::*,
 };
 
@@ -411,6 +412,7 @@ pub fn build_deployment(
 	replica: &PostgresPhysicalReplica,
 ) -> Result<Deployment> {
 	let pvc_name = format!("{name}-data");
+	let (shm_size, shared_buffers_mb) = compute_shm_and_shared_buffers(&replica.spec.resources);
 	let creds_secret = SecretReference {
 		name: Some(format!("{}-creds", restore.spec.replica.name)),
 		namespace: Some(namespace.to_string()),
@@ -506,7 +508,7 @@ listen_addresses = '*'
 port = 5432
 max_connections = 100
 max_prepared_transactions = 16
-shared_buffers = 128MB
+shared_buffers = {shared_buffers_mb}MB
 dynamic_shared_memory_type = posix
 log_timezone = 'UTC'
 datestyle = 'iso, mdy'
@@ -526,6 +528,7 @@ sed -i \
   -e '/^[[:space:]]*ident_file[[:space:]]*=/d' \
   -e '/^[[:space:]]*data_directory[[:space:]]*=/d' \
   -e '/^[[:space:]]*dynamic_shared_memory_type[[:space:]]*=/d' \
+  -e '/^[[:space:]]*shared_buffers[[:space:]]*=/d' \
   -e '/^[[:space:]]*log_destination[[:space:]]*=/d' \
   -e '/^[[:space:]]*logging_collector[[:space:]]*=/d' \
   -e '/^[[:space:]]*log_directory[[:space:]]*=/d' \
@@ -546,6 +549,7 @@ echo "Configuring stderr logging..."
 echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
 echo "password_encryption = 'scram-sha-256'" >> "$PGDATA/postgresql.conf"
 echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
+echo "shared_buffers = {shared_buffers_mb}MB" >> "$PGDATA/postgresql.conf"
 
 PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
 
@@ -908,6 +912,11 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 								mount_path: "/usr/lib/locale".to_string(),
 								..Default::default()
 							},
+							VolumeMount {
+								name: "dshm".to_string(),
+								mount_path: "/dev/shm".to_string(),
+								..Default::default()
+							},
 						]),
 						readiness_probe: Some(Probe {
 							exec: Some(ExecAction {
@@ -957,6 +966,16 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							name: "locale-data".to_string(),
 							empty_dir: Some(
 								k8s_openapi::api::core::v1::EmptyDirVolumeSource::default(),
+							),
+							..Default::default()
+						},
+						Volume {
+							name: "dshm".to_string(),
+							empty_dir: Some(
+								k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+										medium: Some("Memory".to_string()),
+										size_limit: Some(shm_size),
+									},
 							),
 							..Default::default()
 						},
