@@ -290,9 +290,9 @@ fn deployment_init_script_sets_shared_buffers() {
 		.expect("setup-auth init container must exist");
 	let script = &setup_auth.args.as_ref().unwrap()[0];
 
-	// Default 1Gi: SHM=369Mi, shared_buffers = floor(70% of 369 MiB / 1e6) = 270MB
+	// Default 1Gi: SHM=369Mi, shared_buffers = floor(70% of 369) = 258MB
 	assert!(
-		script.contains("shared_buffers = 270MB"),
+		script.contains("shared_buffers = 258MB"),
 		"init script must set shared_buffers to computed value, got script containing: {}",
 		script
 			.lines()
@@ -334,9 +334,9 @@ fn deployment_shared_buffers_with_custom_resources() {
 		.expect("setup-auth init container must exist");
 	let script = &setup_auth.args.as_ref().unwrap()[0];
 
-	// 2Gi request: SHM=738Mi, shared_buffers = floor(70% of 738 MiB / 1e6) = 541MB
+	// 2Gi request: SHM=738Mi, shared_buffers = floor(70% of 738) = 516MB
 	assert!(
-		script.contains("shared_buffers = 541MB"),
+		script.contains("shared_buffers = 516MB"),
 		"init script must set shared_buffers for 2Gi request"
 	);
 }
