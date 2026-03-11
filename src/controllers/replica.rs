@@ -1167,7 +1167,8 @@ async fn reconcile_schema_migration(
 		return Err(Error::SchemaMigration(msg));
 	}
 
-	// The analytics user already has pg_write_all_data + CREATE ON DATABASE
+	// The analytics user already has write privileges (superuser on PG < 17,
+	// pg_write_all_data + pg_maintain + CREATE ON DATABASE on PG >= 17)
 	// when persistent_schemas is configured (read_only is effectively false),
 	// so we reuse the replica creds secret for write access to the target.
 	let target_superuser_secret_name = reader_secret_name.clone();
