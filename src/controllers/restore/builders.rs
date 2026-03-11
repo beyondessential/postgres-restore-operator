@@ -599,7 +599,8 @@ fi
 
 echo "Detected PG major version: $PG_MAJOR"
 
-if [ "$PG_MAJOR" -ge 14 ]; then
+if [ "$PG_MAJOR" -ge 14 ] && [ "{read_only}" = "true" ]; then
+  # PG >= 14 read-only: granular read role
   psql -U postgres -d postgres << SQLEOF
 DO \$\$
 BEGIN
@@ -612,13 +613,23 @@ END
 \$\$;
 GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};
 SQLEOF
+  echo "Read-only mode with PG >= 14, granted pg_read_all_data"
 
-  if [ "{read_only}" = "true" ]; then
-    echo "Read-only mode with PG >= 14, granted pg_read_all_data"
-  else
-    echo "Read-write mode with PG >= 14, granting pg_write_all_data + CREATE ON DATABASE..."
-    psql -U postgres -d postgres << SQLEOF
+elif [ "$PG_MAJOR" -ge 17 ]; then
+  # PG >= 17 read-write: granular roles including pg_maintain
+  psql -U postgres -d postgres << SQLEOF
+DO \$\$
+BEGIN
+  IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${{ANALYTICS_USERNAME}}') THEN
+    CREATE ROLE ${{ANALYTICS_USERNAME}} WITH LOGIN PASSWORD '${{ANALYTICS_PASSWORD}}';
+  ELSE
+    ALTER ROLE ${{ANALYTICS_USERNAME}} WITH PASSWORD '${{ANALYTICS_PASSWORD}}';
+  END IF;
+END
+\$\$;
+GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};
 GRANT pg_write_all_data TO ${{ANALYTICS_USERNAME}};
+GRANT pg_maintain TO ${{ANALYTICS_USERNAME}};
 DO \$\$
 DECLARE
   dbname text;
@@ -630,9 +641,11 @@ BEGIN
 END
 \$\$;
 SQLEOF
-  fi
+  echo "Read-write mode with PG >= 17, granted pg_read_all_data + pg_write_all_data + pg_maintain + CREATE ON DATABASE"
+
 else
-  echo "PG < 14, granting superuser to analytics user..."
+  # PG < 14, or PG 14-16 read-write: superuser
+  echo "Granting superuser to analytics user (PG < 17 read-write or PG < 14)..."
   psql -U postgres -d postgres << SQLEOF
 DO \$\$
 BEGIN

@@ -399,6 +399,22 @@ async fn analytics_create_schema_read_write() {
 	)
 	.await;
 
+	println!("--- verifying analytics user can REINDEX");
+	kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-c",
+			"REINDEX TABLE test_pgro_app.rw_test",
+		],
+	)
+	.await;
+
 	println!("--- all read-write assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &["rw-replica"]).await;
 }
