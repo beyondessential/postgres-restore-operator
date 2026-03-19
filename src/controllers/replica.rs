@@ -978,7 +978,7 @@ async fn ensure_credential_reset(
 	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
 	let label = format!("pgro.bes.au/restore={restore_name}");
 	let running_pods = pods
-		.list(&kube::api::ListParams::default().labels(&label))
+		.list(&kube::api::ListParams::default().labels(&label).limit(2))
 		.await?;
 	let any_running = running_pods.items.iter().any(|p| {
 		p.status
@@ -1167,7 +1167,13 @@ async fn reconcile_schema_migration(
 				error = %e,
 				"auth failure connecting to active restore; triggering credential reset"
 			);
-			ensure_credential_reset(client, namespace, old_restore, replica).await?;
+			if ensure_credential_reset(client, namespace, old_restore, replica).await? {
+				info!(
+					replica = %replica_name,
+					restore = %old_restore_name,
+					"credential reset complete, retrying on next reconcile"
+				);
+			}
 			return Ok(false);
 		}
 		Err(e) => return Err(e),
@@ -1275,7 +1281,13 @@ async fn reconcile_schema_migration(
 				error = %e,
 				"auth failure connecting to switching restore; triggering credential reset"
 			);
-			ensure_credential_reset(client, namespace, new_restore, replica).await?;
+			if ensure_credential_reset(client, namespace, new_restore, replica).await? {
+				info!(
+					replica = %replica_name,
+					restore = %new_restore_name,
+					"credential reset complete, retrying on next reconcile"
+				);
+			}
 			return Ok(false);
 		}
 		Err(e) => return Err(e),

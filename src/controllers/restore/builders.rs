@@ -58,7 +58,7 @@ pub fn build_credential_reset_job(
 
 	// ANALYTICS_PASSWORD is operator-generated (not user input), so direct
 	// shell interpolation into the SQL string is safe.
-	let script = r#"set -ex
+	let script = r#"set -e
 PGDATA=/pgdata/pgdata
 
 echo "Resetting analytics user password via single-user mode..."
