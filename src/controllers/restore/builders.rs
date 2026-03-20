@@ -22,6 +22,139 @@ use crate::{
 	types::*,
 };
 
+/// Name of the credential-reset Job for a given restore.
+pub fn credential_reset_job_name(restore_name: &str) -> String {
+	format!("{restore_name}-cred-reset")
+}
+
+/// Build a Job that resets the analytics user's password on a restore whose
+/// Postgres deployment has been scaled to zero.
+///
+/// The job mounts the restore's data PVC directly, starts a temporary
+/// `postgres --single` process (no TCP listener, no auth), runs the
+/// ALTER ROLE statement, then exits. The deployment must already be scaled
+/// to 0 before this job is created so that the PVC is not in use.
+pub fn build_credential_reset_job(
+	restore: &PostgresPhysicalRestore,
+	replica: &PostgresPhysicalReplica,
+	job_name: &str,
+	namespace: &str,
+) -> Result<Job> {
+	let pvc_name = format!("{}-data", restore.name_any());
+
+	let pg_version = restore
+		.status
+		.as_ref()
+		.and_then(|s| s.postgres_version.as_ref())
+		.cloned()
+		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
+
+	let pg_image = format!("postgres:{pg_version}");
+
+	let creds_secret = SecretReference {
+		name: Some(format!("{}-creds", restore.spec.replica.name)),
+		namespace: Some(namespace.to_string()),
+	};
+
+	// ANALYTICS_PASSWORD is operator-generated (not user input), so direct
+	// shell interpolation into the SQL string is safe.
+	let script = r#"set -e
+PGDATA=/pgdata/pgdata
+
+echo "Resetting analytics user password via single-user mode..."
+echo "ALTER ROLE ${ANALYTICS_USERNAME} WITH PASSWORD '${ANALYTICS_PASSWORD}';" \
+  | postgres --single -D "$PGDATA" postgres
+
+echo "Credential reset complete."
+"#
+	.to_string();
+
+	let labels = BTreeMap::from([
+		(
+			"pgro.bes.au/replica".to_string(),
+			restore.spec.replica.name.clone(),
+		),
+		("pgro.bes.au/restore".to_string(), restore.name_any()),
+		("pgro.bes.au/job-type".to_string(), "cred-reset".to_string()),
+	]);
+
+	Ok(Job {
+		metadata: ObjectMeta {
+			name: Some(job_name.to_string()),
+			namespace: Some(namespace.to_string()),
+			labels: Some(labels.clone()),
+			owner_references: Some(vec![restore_owner_reference(restore)]),
+			..Default::default()
+		},
+		spec: Some(JobSpec {
+			backoff_limit: Some(2),
+			active_deadline_seconds: Some(120),
+			ttl_seconds_after_finished: Some(600),
+			template: PodTemplateSpec {
+				metadata: Some(ObjectMeta {
+					labels: Some(labels),
+					..Default::default()
+				}),
+				spec: Some(PodSpec {
+					restart_policy: Some("Never".to_string()),
+					security_context: Some(k8s_openapi::api::core::v1::PodSecurityContext {
+						run_as_user: Some(999),
+						run_as_group: Some(999),
+						fs_group: Some(999),
+						..Default::default()
+					}),
+					containers: vec![Container {
+						name: "cred-reset".to_string(),
+						image: Some(pg_image),
+						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+						args: Some(vec![script]),
+						env: Some(vec![
+							EnvVar {
+								name: "ANALYTICS_USERNAME".to_string(),
+								value: Some(replica.spec.analytics_username.clone()),
+								..Default::default()
+							},
+							env_from_secret("ANALYTICS_PASSWORD", &creds_secret, "password"),
+						]),
+						volume_mounts: Some(vec![VolumeMount {
+							name: "pgdata".to_string(),
+							mount_path: "/pgdata".to_string(),
+							..Default::default()
+						}]),
+						resources: Some(ResourceRequirements {
+							requests: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("100m".to_string())),
+								("memory".to_string(), Quantity("128Mi".to_string())),
+							])),
+							limits: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("500m".to_string())),
+								("memory".to_string(), Quantity("256Mi".to_string())),
+							])),
+							..Default::default()
+						}),
+						..Default::default()
+					}],
+					volumes: Some(vec![Volume {
+						name: "pgdata".to_string(),
+						persistent_volume_claim: Some(
+							k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+								claim_name: pvc_name,
+								read_only: Some(false),
+							},
+						),
+						..Default::default()
+					}]),
+					affinity: replica.spec.affinity.clone(),
+					tolerations: Some(replica.spec.tolerations.clone()),
+					..Default::default()
+				}),
+			},
+			..Default::default()
+		}),
+		..Default::default()
+	})
+}
+
 pub fn build_version_detect_job(
 	restore: &PostgresPhysicalRestore,
 	job_name: &str,
