@@ -672,6 +672,11 @@ host    all             all             0.0.0.0/0               scram-sha-256
 host    all             all             ::/0                    scram-sha-256
 HBAEOF
 
+if [ ! -d "$PGDATA/pg_wal" ]; then
+  echo "pg_wal directory missing (snapshot may be from a Windows host with WAL on a separate path), creating empty pg_wal..."
+  mkdir -p "$PGDATA/pg_wal"
+fi
+
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
 if [ "$PG_MAJOR" -ge 13 ]; then
   echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
