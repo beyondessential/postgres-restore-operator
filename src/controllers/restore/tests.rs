@@ -308,6 +308,90 @@ fn deployment_init_script_sets_shared_buffers() {
 }
 
 #[test]
+fn init_script_sets_initial_stage_based_on_reindex_flag() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let setup_auth = pod_spec
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = &setup_auth.args.as_ref().unwrap()[0];
+
+	assert!(
+		script.contains("stage text NOT NULL DEFAULT 'restored'"),
+		"table must include stage column"
+	);
+	assert!(
+		script.contains("last_transition_time timestamptz NOT NULL DEFAULT now()"),
+		"table must include last_transition_time column"
+	);
+	assert!(
+		script.contains("ADD COLUMN IF NOT EXISTS stage"),
+		"must add stage column for existing tables carried in snapshot"
+	);
+	assert!(
+		script.contains("ADD COLUMN IF NOT EXISTS last_transition_time"),
+		"must add last_transition_time column for existing tables carried in snapshot"
+	);
+	assert!(
+		script.contains("PGRO_STAGE=restored") && script.contains("PGRO_STAGE=ready"),
+		"init must pick stage based on needs-reindex flag"
+	);
+	assert!(
+		script.contains("'${PGRO_STAGE}'"),
+		"insert must use the chosen stage"
+	);
+}
+
+#[test]
+fn postgres_container_updates_stage_around_reindex() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let postgres = pod_spec
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	let script = &postgres.args.as_ref().unwrap()[0];
+
+	let reindexing_pos = script
+		.find("stage = 'reindexing'")
+		.expect("must update stage to reindexing before the REINDEX loop");
+	let ready_pos = script
+		.find("stage = 'ready'")
+		.expect("must update stage to ready after the REINDEX loop");
+	assert!(
+		reindexing_pos < ready_pos,
+		"reindexing update must come before ready update"
+	);
+	assert!(
+		reindexing_pos < script.find("REINDEX INDEX").unwrap(),
+		"reindexing update must come before any REINDEX call"
+	);
+	assert!(
+		script[..ready_pos].contains("rm -f /pgdata/needs-reindex"),
+		"ready update must happen after the needs-reindex flag is cleared"
+	);
+}
+
+#[test]
 fn deployment_shared_buffers_with_custom_resources() {
 	let (mut restore, mut replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {

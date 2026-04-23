@@ -785,21 +785,33 @@ else
 ALTER ROLE ${{ANALYTICS_USERNAME}} WITH SUPERUSER;
 SQLEOF
 fi
-echo "Writing restore metadata..."
+if [ -f /pgdata/needs-reindex ]; then
+  PGRO_STAGE=restored
+else
+  PGRO_STAGE=ready
+fi
+
+echo "Writing restore metadata (stage=${{PGRO_STAGE}})..."
 psql -U postgres -d postgres << SQLEOF
 CREATE SCHEMA IF NOT EXISTS _pgro;
 CREATE TABLE IF NOT EXISTS _pgro.restore_info (
   id integer PRIMARY KEY DEFAULT 1,
   snapshot_id text NOT NULL,
   snapshot_time timestamptz,
-  restored_at timestamptz NOT NULL DEFAULT now()
+  restored_at timestamptz NOT NULL DEFAULT now(),
+  stage text NOT NULL DEFAULT 'restored',
+  last_transition_time timestamptz NOT NULL DEFAULT now()
 );
-INSERT INTO _pgro.restore_info (id, snapshot_id, snapshot_time)
-VALUES (1, '${{PGRO_SNAPSHOT_ID}}', CASE WHEN '${{PGRO_SNAPSHOT_TIME}}' = '' THEN NULL ELSE '${{PGRO_SNAPSHOT_TIME}}'::timestamptz END)
+ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS stage text NOT NULL DEFAULT 'restored';
+ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS last_transition_time timestamptz NOT NULL DEFAULT now();
+INSERT INTO _pgro.restore_info (id, snapshot_id, snapshot_time, stage, last_transition_time)
+VALUES (1, '${{PGRO_SNAPSHOT_ID}}', CASE WHEN '${{PGRO_SNAPSHOT_TIME}}' = '' THEN NULL ELSE '${{PGRO_SNAPSHOT_TIME}}'::timestamptz END, '${{PGRO_STAGE}}', now())
 ON CONFLICT (id) DO UPDATE
   SET snapshot_id = EXCLUDED.snapshot_id,
       snapshot_time = EXCLUDED.snapshot_time,
-      restored_at = now();
+      restored_at = now(),
+      stage = EXCLUDED.stage,
+      last_transition_time = now();
 SQLEOF
 
 echo "Stopping temporary postgres..."
@@ -951,6 +963,7 @@ if [ -f /pgdata/needs-reindex ]; then
   PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
   (
     while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
+    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
     for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
       INDEXES=$(psql -U postgres -d "$db" -At -c "
         SELECT DISTINCT indexrelid::regclass::text
@@ -973,6 +986,7 @@ if [ -f /pgdata/needs-reindex ]; then
       done
     done
     rm -f /pgdata/needs-reindex
+    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
     echo "Background reindex complete"
   ) &
 fi
