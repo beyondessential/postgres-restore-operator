@@ -271,13 +271,19 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
-	// Clean up old restores after grace period
-	if let Some(prev_name) = replica
+	// Sweep stale Active restores after grace period.
+	//
+	// Any Active restore for this replica that isn't the current one is a
+	// leftover from a prior cycle and should be deleted once the grace
+	// period elapses. Sweep-based rather than tracking a single
+	// `previousRestore` pointer means cleanup converges even if multiple
+	// stale restores accumulate (e.g. from a bug or operator restart
+	// during a switchover).
+	let current_restore_name = replica
 		.status
 		.as_ref()
-		.and_then(|s| s.previous_restore.clone())
-	{
-		// For persistent_schemas: Don't start grace period countdown until migration completes
+		.and_then(|s| s.current_restore.as_deref());
+	if let Some(current) = current_restore_name {
 		let migration_complete = if replica.spec.persistent_schemas.is_some() {
 			replica
 				.status
@@ -285,29 +291,64 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				.and_then(|s| s.schema_migration_phase.as_ref())
 				.is_some_and(|p| p == "complete")
 		} else {
-			true // No persistence config, always allow grace period
+			true
 		};
 
-		if migration_complete {
-			let grace_period = SignedDuration::try_from(replica.spec.switchover_grace_period.0)
-				.unwrap_or_default();
-			let last_completed = replica
-				.status
-				.as_ref()
-				.and_then(|s| s.last_restore_completed_at.as_ref());
+		let grace_period =
+			SignedDuration::try_from(replica.spec.switchover_grace_period.0).unwrap_or_default();
+		let last_completed = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.last_restore_completed_at.as_ref());
 
-			if let Some(completed_at) = last_completed {
-				let elapsed = now.duration_since(completed_at.0);
-				if elapsed > grace_period {
-					info!(
-						replica = name,
-						restore = prev_name,
-						"cleaning up previous restore after grace period"
-					);
-					if let Err(e) = restores.delete(&prev_name, &Default::default()).await {
-						warn!(restore = prev_name, error = %e, "failed to delete previous restore");
+		// Refuse to sweep if status.currentRestore doesn't match any live
+		// Active restore — likely an inconsistent state where another path
+		// (manual intervention, controller startup) should resolve it.
+		// Filter on Active phase too so the sweep can't fire while the
+		// "current" is mid-switchover, even if a future flow change lets
+		// this block run with a non-Active current.
+		let has_matching_current = restore_list.items.iter().any(|r| {
+			r.name_any() == current
+				&& r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Active)
+		});
+
+		if migration_complete
+			&& has_matching_current
+			&& let Some(completed_at) = last_completed
+			&& now.duration_since(completed_at.0) > grace_period
+		{
+			let stale: Vec<String> = restore_list
+				.items
+				.iter()
+				.filter(|r| {
+					r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Active)
+						&& r.name_any() != current
+				})
+				.map(|r| r.name_any())
+				.collect();
+
+			if !stale.is_empty() {
+				info!(
+					replica = name,
+					count = stale.len(),
+					current = current,
+					"sweeping stale Active restores after grace period"
+				);
+				let mut all_deleted = true;
+				for stale_name in &stale {
+					if let Err(e) = restores.delete(stale_name, &Default::default()).await {
+						warn!(restore = stale_name, error = %e, "failed to delete stale restore");
+						all_deleted = false;
 					}
-					// Clear previousRestore from status
+				}
+
+				// Only clear schemaMigrationPhase if every delete succeeded.
+				// Clearing it while a stale restore survives would set
+				// migration_complete=false on the next reconcile (when
+				// persistent_schemas is configured), blocking the sweep
+				// from retrying until the next switchover re-marks
+				// complete. Leave the next reconcile to retry instead.
+				if all_deleted {
 					let replicas: Api<PostgresPhysicalReplica> =
 						Api::namespaced(client.clone(), &namespace);
 					let patch = serde_json::json!({
@@ -324,6 +365,11 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							&Patch::Merge(&patch),
 						)
 						.await?;
+				} else {
+					warn!(
+						replica = name,
+						"some stale restores failed to delete; leaving schemaMigrationPhase set so next reconcile retries"
+					);
 				}
 			}
 		}
@@ -503,17 +549,39 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 									size,
 									start_time: snap.start_time.clone(),
 								};
-								replica.create_restore_for_snapshot(client, &info).await?;
-								ctx.metrics.restores_started_total.inc();
+								let created =
+									replica.create_restore_for_snapshot(client, &info).await?;
+								if created {
+									ctx.metrics.restores_started_total.inc();
 
-								if let Err(e) = ctx
+									if let Err(e) = ctx
+										.recorder
+										.publish(
+											&Event {
+												type_: EventType::Normal,
+												reason: "RestoreStarted".into(),
+												note: Some(format!(
+													"Started restore from snapshot {}",
+													snap.id
+												)),
+												action: "Restore".into(),
+												secondary: None,
+											},
+											&replica.object_ref(&()),
+										)
+										.await
+									{
+										warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+									}
+								} else if let Err(e) = ctx
 									.recorder
 									.publish(
 										&Event {
-											type_: EventType::Normal,
-											reason: "RestoreStarted".into(),
+											type_: EventType::Warning,
+											reason: "RestoreCreationBlocked".into(),
 											note: Some(format!(
-												"Started restore from snapshot {}",
+												"Refused to create restore for snapshot {} — \
+												 too many restores already exist",
 												snap.id
 											)),
 											action: "Restore".into(),
@@ -523,7 +591,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 									)
 									.await
 								{
-									warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+									warn!(replica = name, error = %e, "failed to publish RestoreCreationBlocked event");
 								}
 							}
 						} else {
@@ -1006,6 +1074,34 @@ async fn ensure_credential_reset(
 	Ok(false)
 }
 
+/// Mark schema migration as complete in the replica status without running a
+/// Job. Used by the early-return branches of `reconcile_schema_migration`
+/// (first restore, empty config, all schemas missing on source) so that the
+/// cleanup gate in `reconcile_replica` can fire — it requires
+/// `schemaMigrationPhase == "complete"` whenever `persistent_schemas` is set
+/// in spec.
+async fn mark_schema_migration_complete(
+	client: &Client,
+	replica_name: &str,
+	namespace: &str,
+) -> Result<()> {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let patch = serde_json::json!({
+		"status": {
+			"schemaMigrationJob": null,
+			"schemaMigrationPhase": "complete",
+		}
+	});
+	replicas
+		.patch_status(
+			replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+	Ok(())
+}
+
 async fn reconcile_schema_migration(
 	client: &Client,
 	ctx: &Arc<Context>,
@@ -1023,7 +1119,11 @@ async fn reconcile_schema_migration(
 		.as_ref()
 		.ok_or_else(|| Error::SchemaMigration("missing persistent_schemas config".into()))?;
 
-	// Edge case: First restore, no previous restore to migrate from
+	// Edge case: First restore, no previous restore to migrate from. Don't
+	// mark schemaMigrationPhase=complete here: nothing is stale yet (no
+	// previous restore exists), so the cleanup gate is moot, and setting
+	// the phase would short-circuit the *next* migration via the guard at
+	// L1123 even when real schemas need to be carried over.
 	let old_restore = match old_restore_opt {
 		Some(r) => r,
 		None => {
@@ -1037,6 +1137,7 @@ async fn reconcile_schema_migration(
 	// Edge case: No persistent schemas configured
 	if schemas.is_empty() {
 		info!(replica = %replica_name, "no persistent schemas configured, skipping migration");
+		mark_schema_migration_complete(client, &replica_name, namespace).await?;
 		return Ok(true);
 	}
 
@@ -1211,6 +1312,7 @@ async fn reconcile_schema_migration(
 			replica = %replica_name,
 			"no persistent schemas exist on source, skipping migration"
 		);
+		mark_schema_migration_complete(client, &replica_name, namespace).await?;
 		return Ok(true);
 	}
 
