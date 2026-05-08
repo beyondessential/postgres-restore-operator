@@ -14,14 +14,11 @@ use k8s_openapi::{
 };
 use kube::{
 	Api, Client, ResourceExt,
-	api::{ObjectMeta, Patch, PatchParams, PostParams},
+	api::{ListParams, ObjectMeta, Patch, PatchParams, PostParams},
 };
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
-use tracing::info;
-
-use kube::api::ListParams;
-use tracing::warn;
+use tracing::{info, warn};
 
 use super::generate_password;
 use crate::{
