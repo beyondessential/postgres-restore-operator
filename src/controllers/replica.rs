@@ -271,13 +271,19 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
-	// Clean up old restores after grace period
-	if let Some(prev_name) = replica
+	// Sweep stale Active restores after grace period.
+	//
+	// Any Active restore for this replica that isn't the current one is a
+	// leftover from a prior cycle and should be deleted once the grace
+	// period elapses. Sweep-based rather than tracking a single
+	// `previousRestore` pointer means cleanup converges even if multiple
+	// stale restores accumulate (e.g. from a bug or operator restart
+	// during a switchover).
+	let current_restore_name = replica
 		.status
 		.as_ref()
-		.and_then(|s| s.previous_restore.clone())
-	{
-		// For persistent_schemas: Don't start grace period countdown until migration completes
+		.and_then(|s| s.current_restore.as_deref());
+	if let Some(current) = current_restore_name {
 		let migration_complete = if replica.spec.persistent_schemas.is_some() {
 			replica
 				.status
@@ -285,46 +291,72 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				.and_then(|s| s.schema_migration_phase.as_ref())
 				.is_some_and(|p| p == "complete")
 		} else {
-			true // No persistence config, always allow grace period
+			true
 		};
 
-		if migration_complete {
-			let grace_period = SignedDuration::try_from(replica.spec.switchover_grace_period.0)
-				.unwrap_or_default();
-			let last_completed = replica
-				.status
-				.as_ref()
-				.and_then(|s| s.last_restore_completed_at.as_ref());
+		let grace_period = SignedDuration::try_from(replica.spec.switchover_grace_period.0)
+			.unwrap_or_default();
+		let last_completed = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.last_restore_completed_at.as_ref());
 
-			if let Some(completed_at) = last_completed {
-				let elapsed = now.duration_since(completed_at.0);
-				if elapsed > grace_period {
-					info!(
-						replica = name,
-						restore = prev_name,
-						"cleaning up previous restore after grace period"
-					);
-					if let Err(e) = restores.delete(&prev_name, &Default::default()).await {
-						warn!(restore = prev_name, error = %e, "failed to delete previous restore");
+		// Refuse to sweep if status.currentRestore doesn't match any live
+		// Active restore — likely an inconsistent state where another path
+		// (manual intervention, controller startup) should resolve it.
+		let has_matching_current = restore_list
+			.items
+			.iter()
+			.any(|r| r.name_any() == current);
+
+		if migration_complete
+			&& has_matching_current
+			&& let Some(completed_at) = last_completed
+			&& now.duration_since(completed_at.0) > grace_period
+		{
+			let stale: Vec<String> = restore_list
+				.items
+				.iter()
+				.filter(|r| {
+					r.status.as_ref().and_then(|s| s.phase.as_ref())
+						== Some(&RestorePhase::Active)
+						&& r.name_any() != current
+				})
+				.map(|r| r.name_any())
+				.collect();
+
+			if !stale.is_empty() {
+				info!(
+					replica = name,
+					count = stale.len(),
+					current = current,
+					"sweeping stale Active restores after grace period"
+				);
+				for stale_name in &stale {
+					if let Err(e) = restores.delete(stale_name, &Default::default()).await {
+						warn!(restore = stale_name, error = %e, "failed to delete stale restore");
 					}
-					// Clear previousRestore from status
-					let replicas: Api<PostgresPhysicalReplica> =
-						Api::namespaced(client.clone(), &namespace);
-					let patch = serde_json::json!({
-						"status": {
-							"previousRestore": null,
-							"schemaMigrationJob": null,
-							"schemaMigrationPhase": null,
-						}
-					});
-					replicas
-						.patch_status(
-							&name,
-							&PatchParams::apply("postgres-restore-operator"),
-							&Patch::Merge(&patch),
-						)
-						.await?;
 				}
+
+				// Clear previousRestore (and migration phase) from status
+				// since the swept set covers anything it would have
+				// referred to.
+				let replicas: Api<PostgresPhysicalReplica> =
+					Api::namespaced(client.clone(), &namespace);
+				let patch = serde_json::json!({
+					"status": {
+						"previousRestore": null,
+						"schemaMigrationJob": null,
+						"schemaMigrationPhase": null,
+					}
+				});
+				replicas
+					.patch_status(
+						&name,
+						&PatchParams::apply("postgres-restore-operator"),
+						&Patch::Merge(&patch),
+					)
+					.await?;
 			}
 		}
 	}
