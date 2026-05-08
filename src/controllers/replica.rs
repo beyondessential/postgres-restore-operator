@@ -304,7 +304,13 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		// Refuse to sweep if status.currentRestore doesn't match any live
 		// Active restore — likely an inconsistent state where another path
 		// (manual intervention, controller startup) should resolve it.
-		let has_matching_current = restore_list.items.iter().any(|r| r.name_any() == current);
+		// Filter on Active phase too so the sweep can't fire while the
+		// "current" is mid-switchover, even if a future flow change lets
+		// this block run with a non-Active current.
+		let has_matching_current = restore_list.items.iter().any(|r| {
+			r.name_any() == current
+				&& r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Active)
+		});
 
 		if migration_complete
 			&& has_matching_current
