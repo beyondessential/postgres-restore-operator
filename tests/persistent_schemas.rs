@@ -634,3 +634,133 @@ async fn persistent_schemas_skip_missing_on_source() {
 	println!("--- skip-missing-schema assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &[replica_name]).await;
 }
+
+/// Regression: when *all* configured `persistent_schemas` are missing on the
+/// source restore (the production state that triggered the original bug
+/// where `dbt` was speculatively listed in `persistentSchemas` ahead of
+/// being created upstream), the operator must still:
+///
+///   1. Mark `schemaMigrationPhase = complete` so the cleanup gate fires.
+///   2. Sweep the previous Active restore once the grace period elapses.
+///
+/// Before the fix, neither happened: the migration was silently skipped
+/// without updating status, the cleanup gate stayed False, and stale
+/// restores accumulated indefinitely (one cluster grew to 41).
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn persistent_schemas_all_missing_prunes_previous_restore() {
+	let client = make_client().await;
+	let ns = "test-ps-all-missing";
+	let replica_name = "ps-all-missing-replica";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "ps-all-missing-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	// Configure persistent_schemas with a single schema that will never be
+	// created on the source. This drives reconcile_schema_migration into the
+	// "all schemas filtered" branch.
+	println!("--- creating replica with persistent_schemas: [\"never_created\"]");
+	let mut replica = build_replica(
+		replica_name,
+		"ps-all-missing-creds",
+		ReplicaOpts {
+			read_only: false,
+			..Default::default()
+		},
+	);
+	replica.spec.persistent_schemas = Some(vec!["never_created".to_string()]);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for first restore to become Active");
+	let first_restore_name =
+		wait_for_restore_phase(&restores, replica_name, RestorePhase::Active, PHASE_TIMEOUT).await;
+	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
+	println!("--- first restore active: {first_restore_name}");
+
+	let first_restore_obj = restores
+		.get(&first_restore_name)
+		.await
+		.expect("failed to get first restore");
+	let replica_obj = replicas
+		.get(replica_name)
+		.await
+		.expect("failed to get replica");
+
+	let second_restore_name = format!("{replica_name}-second");
+	println!("--- creating second restore manually: {second_restore_name}");
+	restores
+		.create(
+			&PostParams::default(),
+			&build_second_restore(&second_restore_name, ns, &first_restore_obj, &replica_obj),
+		)
+		.await
+		.expect("failed to create second restore");
+
+	println!("--- waiting for switchover (currentRestore == second)");
+	timeout(LONG_PHASE_TIMEOUT, async {
+		loop {
+			if let Ok(r) = replicas.get(replica_name).await
+				&& r.status.as_ref().and_then(|s| s.current_restore.as_deref())
+					== Some(second_restore_name.as_str())
+			{
+				return;
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for switchover to second restore");
+
+	println!("--- asserting schemaMigrationPhase == complete");
+	let post_switchover = replicas
+		.get(replica_name)
+		.await
+		.expect("failed to get replica after switchover");
+	assert_eq!(
+		post_switchover
+			.status
+			.as_ref()
+			.and_then(|s| s.schema_migration_phase.as_deref()),
+		Some("complete"),
+		"schemaMigrationPhase must be set to complete even when all schemas are skipped"
+	);
+
+	println!("--- waiting for first restore to be swept after grace period");
+	timeout(LONG_PHASE_TIMEOUT, async {
+		loop {
+			if restores.get(&first_restore_name).await.is_err() {
+				println!("--- first restore deleted: {first_restore_name}");
+				return;
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for previous restore to be cleaned up");
+
+	let final_count = count_restores_for_replica(&client, ns, replica_name).await;
+	assert_eq!(
+		final_count, 1,
+		"after sweep, exactly one restore should remain for this replica"
+	);
+
+	println!("--- all-missing-schema sweep assertions passed, cleaning up");
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+}

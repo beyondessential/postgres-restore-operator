@@ -60,6 +60,7 @@ jobs:
               test-persistent-schemas
               test-ps-conflict
               test-ps-skip-missing
+              test-ps-all-missing
             needs_non_pg_snapshot: false
 
     steps:
