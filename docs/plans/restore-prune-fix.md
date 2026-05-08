@@ -99,3 +99,13 @@ Add a `RestoreCreationBlocked` condition to the replica status when the guardrai
 ## Branching
 
 Repo uses jj. Work on a new branch off main.
+
+## Implementation status
+
+- Phase 1: ✅ shipped. `mark_schema_migration_complete` helper called from all three early-return branches in `reconcile_schema_migration` (first restore, empty config, all schemas missing on source).
+- Phase 2: ✅ shipped. Cleanup block replaced with sweep over all Active restores != currentRestore. Refuses to sweep if no live Active matches `status.currentRestore`.
+- Phase 3: ✅ shipped. `MAX_RESTORES_PER_REPLICA = 3` constant. `create_restore_for_snapshot` returns `Result<bool>` — `false` on guardrail. `RestoreCreationBlocked` condition + Warning Event. Caller skips post-create side effects on `false`.
+- Phase 4 tests:
+  - Phase 1+2: ✅ integration test `persistent_schemas_all_missing_prunes_previous_restore` in `tests/persistent_schemas.rs`. Matrix entry extended.
+  - Phase 3: ⏳ deferred. End-to-end exercise requires rotating the kopia snapshot mid-test (a `setup-second-snapshot.yaml` fixture). The guardrail logic itself is 5 lines and inspected; field exposure via the new condition makes it self-evident in production. Worth adding when next we touch the test fixtures.
+- Phase 5: ✅ shipped (`RestoreCreationBlocked` condition).
