@@ -1006,6 +1006,34 @@ async fn ensure_credential_reset(
 	Ok(false)
 }
 
+/// Mark schema migration as complete in the replica status without running a
+/// Job. Used by the early-return branches of `reconcile_schema_migration`
+/// (first restore, empty config, all schemas missing on source) so that the
+/// cleanup gate in `reconcile_replica` can fire — it requires
+/// `schemaMigrationPhase == "complete"` whenever `persistent_schemas` is set
+/// in spec.
+async fn mark_schema_migration_complete(
+	client: &Client,
+	replica_name: &str,
+	namespace: &str,
+) -> Result<()> {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let patch = serde_json::json!({
+		"status": {
+			"schemaMigrationJob": null,
+			"schemaMigrationPhase": "complete",
+		}
+	});
+	replicas
+		.patch_status(
+			replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+	Ok(())
+}
+
 async fn reconcile_schema_migration(
 	client: &Client,
 	ctx: &Arc<Context>,
@@ -1028,6 +1056,7 @@ async fn reconcile_schema_migration(
 		Some(r) => r,
 		None => {
 			info!(replica = %replica_name, "first restore, skipping schema migration");
+			mark_schema_migration_complete(client, &replica_name, namespace).await?;
 			return Ok(true); // Allow switchover to proceed
 		}
 	};
@@ -1037,6 +1066,7 @@ async fn reconcile_schema_migration(
 	// Edge case: No persistent schemas configured
 	if schemas.is_empty() {
 		info!(replica = %replica_name, "no persistent schemas configured, skipping migration");
+		mark_schema_migration_complete(client, &replica_name, namespace).await?;
 		return Ok(true);
 	}
 
@@ -1211,6 +1241,7 @@ async fn reconcile_schema_migration(
 			replica = %replica_name,
 			"no persistent schemas exist on source, skipping migration"
 		);
+		mark_schema_migration_complete(client, &replica_name, namespace).await?;
 		return Ok(true);
 	}
 
