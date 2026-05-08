@@ -334,31 +334,43 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 					current = current,
 					"sweeping stale Active restores after grace period"
 				);
+				let mut all_deleted = true;
 				for stale_name in &stale {
 					if let Err(e) = restores.delete(stale_name, &Default::default()).await {
 						warn!(restore = stale_name, error = %e, "failed to delete stale restore");
+						all_deleted = false;
 					}
 				}
 
-				// Clear previousRestore (and migration phase) from status
-				// since the swept set covers anything it would have
-				// referred to.
-				let replicas: Api<PostgresPhysicalReplica> =
-					Api::namespaced(client.clone(), &namespace);
-				let patch = serde_json::json!({
-					"status": {
-						"previousRestore": null,
-						"schemaMigrationJob": null,
-						"schemaMigrationPhase": null,
-					}
-				});
-				replicas
-					.patch_status(
-						&name,
-						&PatchParams::apply("postgres-restore-operator"),
-						&Patch::Merge(&patch),
-					)
-					.await?;
+				// Only clear schemaMigrationPhase if every delete succeeded.
+				// Clearing it while a stale restore survives would set
+				// migration_complete=false on the next reconcile (when
+				// persistent_schemas is configured), blocking the sweep
+				// from retrying until the next switchover re-marks
+				// complete. Leave the next reconcile to retry instead.
+				if all_deleted {
+					let replicas: Api<PostgresPhysicalReplica> =
+						Api::namespaced(client.clone(), &namespace);
+					let patch = serde_json::json!({
+						"status": {
+							"previousRestore": null,
+							"schemaMigrationJob": null,
+							"schemaMigrationPhase": null,
+						}
+					});
+					replicas
+						.patch_status(
+							&name,
+							&PatchParams::apply("postgres-restore-operator"),
+							&Patch::Merge(&patch),
+						)
+						.await?;
+				} else {
+					warn!(
+						replica = name,
+						"some stale restores failed to delete; leaving schemaMigrationPhase set so next reconcile retries"
+					);
+				}
 			}
 		}
 	}
