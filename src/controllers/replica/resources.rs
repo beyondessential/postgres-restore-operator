@@ -20,12 +20,23 @@ use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
 use tracing::info;
 
+use kube::api::ListParams;
+use tracing::warn;
+
 use super::generate_password;
 use crate::{
 	controllers::{env_from_secret, env_from_secret_optional},
 	error::Result,
 	types::*,
 };
+
+/// Hard cap on how many `PostgresPhysicalRestore` objects may exist for a
+/// single replica before the operator refuses to create more. In steady
+/// state a replica has 1 (current) or transiently 2 (current + a switching
+/// or in-grace-period predecessor); 3 is already a degenerate case, and the
+/// guardrail exists so a pruning bug can't silently fill a cluster with
+/// orphan PVCs again.
+pub const MAX_RESTORES_PER_REPLICA: usize = 3;
 
 #[derive(Debug, serde::Deserialize)]
 pub struct SnapshotInfo {
@@ -156,12 +167,53 @@ fi
 }
 
 impl PostgresPhysicalReplica {
+	/// Create a new `PostgresPhysicalRestore` for this replica from the given
+	/// snapshot. Returns `Ok(true)` when a restore was created, `Ok(false)`
+	/// when creation was refused because the replica already has
+	/// [`MAX_RESTORES_PER_REPLICA`] or more restore objects (the
+	/// too-many-restores guardrail). The caller should skip post-create side
+	/// effects (metrics, events) when `false` is returned.
 	pub async fn create_restore_for_snapshot(
 		&self,
 		client: &Client,
 		snapshot: &SnapshotInfo,
-	) -> Result<()> {
+	) -> Result<bool> {
 		let replica_name = self.name_any();
+
+		// Guardrail: refuse to create another restore if we already have too
+		// many. Pruning normally keeps this at 1; if it doesn't, capping
+		// here prevents runaway PVC creation while the underlying issue is
+		// fixed.
+		let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), &self.ns());
+		let existing = restores
+			.list(&ListParams::default().labels(&format!("pgro.bes.au/replica={replica_name}")))
+			.await?;
+		if existing.items.len() >= MAX_RESTORES_PER_REPLICA {
+			let names: Vec<String> = existing.items.iter().map(|r| r.name_any()).collect();
+			warn!(
+				replica = replica_name,
+				existing = ?names,
+				limit = MAX_RESTORES_PER_REPLICA,
+				"refusing to create new restore: too many already exist for this replica"
+			);
+			self.update_condition(
+				client,
+				"RestoreCreationBlocked",
+				"True",
+				"TooManyRestores",
+				&format!(
+					"Refusing to create new restore: {} restores already exist for this \
+					 replica (limit {}). Existing: [{}]. Reduce the count by deleting stale \
+					 restores or fix the pruning issue.",
+					existing.items.len(),
+					MAX_RESTORES_PER_REPLICA,
+					names.join(", "),
+				),
+			)
+			.await?;
+			return Ok(false);
+		}
+
 		let timestamp = Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
 		let restore_name = format!("{replica_name}-{timestamp}");
 
@@ -237,7 +289,18 @@ impl PostgresPhysicalReplica {
 			"created restore resource"
 		);
 
-		Ok(())
+		// Clear the guardrail condition once we successfully created a restore
+		// — the count is now below the limit again.
+		self.update_condition(
+			client,
+			"RestoreCreationBlocked",
+			"False",
+			"Healthy",
+			"Restore count is below the per-replica limit",
+		)
+		.await?;
+
+		Ok(true)
 	}
 
 	pub async fn ensure_credentials_secret(&self, client: &Client) -> Result<()> {

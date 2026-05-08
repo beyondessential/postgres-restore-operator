@@ -294,8 +294,8 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			true
 		};
 
-		let grace_period = SignedDuration::try_from(replica.spec.switchover_grace_period.0)
-			.unwrap_or_default();
+		let grace_period =
+			SignedDuration::try_from(replica.spec.switchover_grace_period.0).unwrap_or_default();
 		let last_completed = replica
 			.status
 			.as_ref()
@@ -304,10 +304,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		// Refuse to sweep if status.currentRestore doesn't match any live
 		// Active restore — likely an inconsistent state where another path
 		// (manual intervention, controller startup) should resolve it.
-		let has_matching_current = restore_list
-			.items
-			.iter()
-			.any(|r| r.name_any() == current);
+		let has_matching_current = restore_list.items.iter().any(|r| r.name_any() == current);
 
 		if migration_complete
 			&& has_matching_current
@@ -318,8 +315,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				.items
 				.iter()
 				.filter(|r| {
-					r.status.as_ref().and_then(|s| s.phase.as_ref())
-						== Some(&RestorePhase::Active)
+					r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Active)
 						&& r.name_any() != current
 				})
 				.map(|r| r.name_any())
@@ -535,17 +531,39 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 									size,
 									start_time: snap.start_time.clone(),
 								};
-								replica.create_restore_for_snapshot(client, &info).await?;
-								ctx.metrics.restores_started_total.inc();
+								let created =
+									replica.create_restore_for_snapshot(client, &info).await?;
+								if created {
+									ctx.metrics.restores_started_total.inc();
 
-								if let Err(e) = ctx
+									if let Err(e) = ctx
+										.recorder
+										.publish(
+											&Event {
+												type_: EventType::Normal,
+												reason: "RestoreStarted".into(),
+												note: Some(format!(
+													"Started restore from snapshot {}",
+													snap.id
+												)),
+												action: "Restore".into(),
+												secondary: None,
+											},
+											&replica.object_ref(&()),
+										)
+										.await
+									{
+										warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+									}
+								} else if let Err(e) = ctx
 									.recorder
 									.publish(
 										&Event {
-											type_: EventType::Normal,
-											reason: "RestoreStarted".into(),
+											type_: EventType::Warning,
+											reason: "RestoreCreationBlocked".into(),
 											note: Some(format!(
-												"Started restore from snapshot {}",
+												"Refused to create restore for snapshot {} — \
+												 too many restores already exist",
 												snap.id
 											)),
 											action: "Restore".into(),
@@ -555,7 +573,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 									)
 									.await
 								{
-									warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+									warn!(replica = name, error = %e, "failed to publish RestoreCreationBlocked event");
 								}
 							}
 						} else {
