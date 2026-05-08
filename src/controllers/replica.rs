@@ -1101,12 +1101,15 @@ async fn reconcile_schema_migration(
 		.as_ref()
 		.ok_or_else(|| Error::SchemaMigration("missing persistent_schemas config".into()))?;
 
-	// Edge case: First restore, no previous restore to migrate from
+	// Edge case: First restore, no previous restore to migrate from. Don't
+	// mark schemaMigrationPhase=complete here: nothing is stale yet (no
+	// previous restore exists), so the cleanup gate is moot, and setting
+	// the phase would short-circuit the *next* migration via the guard at
+	// L1123 even when real schemas need to be carried over.
 	let old_restore = match old_restore_opt {
 		Some(r) => r,
 		None => {
 			info!(replica = %replica_name, "first restore, skipping schema migration");
-			mark_schema_migration_complete(client, &replica_name, namespace).await?;
 			return Ok(true); // Allow switchover to proceed
 		}
 	};
