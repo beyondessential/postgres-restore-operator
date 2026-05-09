@@ -88,12 +88,15 @@ jobs:
             -schema-location 'https://raw.githubusercontent.com/yannh/kubernetes-json-schema/master/{{ .NormalizedKubernetesVersion }}/{{ .ResourceKind }}{{ .KindSuffix }}.json' \
             operator.yaml crds.yaml
 
-  tests-pass:
+  all-green:
+    name: All CI green
     if: always()
-    name: Tests pass
     needs: [test, clippy, gen-crds, kubeconform]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-slim
     steps:
-      - uses: re-actors/alls-green@release/v1
-        with:
-          jobs: ${{ toJSON(needs) }}
+      - name: Check job results
+        run: |
+          result='${{ toJSON(needs) }}'
+          echo "$result" | jq .
+          echo "$result" | jq -e 'all(.result == "success")'
+

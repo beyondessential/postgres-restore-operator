@@ -645,6 +645,7 @@ sed -i \
   -e '/^[[:space:]]*lc_[a-z]*[[:space:]]*=/d' \
   -e '/^[[:space:]]*default_transaction_read_only[[:space:]]*=/d' \
   -e '/^[[:space:]]*password_encryption[[:space:]]*=/d' \
+  -e '/^[[:space:]]*listen_addresses[[:space:]]*=/d' \
   "$PGDATA/postgresql.conf"
 
 echo "Configuring stderr logging..."
@@ -652,6 +653,7 @@ echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
 echo "password_encryption = 'scram-sha-256'" >> "$PGDATA/postgresql.conf"
 echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
 echo "shared_buffers = {shared_buffers_mb}MB" >> "$PGDATA/postgresql.conf"
+echo "listen_addresses = '*'" >> "$PGDATA/postgresql.conf"
 
 PG_MAJOR=$(cat "$PGDATA/PG_VERSION")
 
