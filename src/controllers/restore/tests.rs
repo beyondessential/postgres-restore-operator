@@ -308,6 +308,41 @@ fn deployment_init_script_sets_shared_buffers() {
 }
 
 #[test]
+fn deployment_init_script_overrides_listen_addresses() {
+	// Some source backups carry `listen_addresses = 'localhost'` in
+	// postgresql.conf, which restricts the restored postgres to localhost
+	// only and breaks operator → restore connections (e.g. schema
+	// migration discovery). Strip the source value and append our own '*'
+	// so the restored pod is reachable on the pod IP.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+
+	let setup_auth = pod_spec
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = &setup_auth.args.as_ref().unwrap()[0];
+
+	assert!(
+		script.contains("listen_addresses[[:space:]]*="),
+		"sed must strip listen_addresses from source config"
+	);
+	assert!(
+		script.contains(r#"listen_addresses = '*'"#),
+		"init script must append listen_addresses = '*' override"
+	);
+}
+
+#[test]
 fn init_script_sets_initial_stage_based_on_reindex_flag() {
 	let (mut restore, replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {

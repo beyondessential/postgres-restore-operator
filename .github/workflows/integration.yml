@@ -311,3 +311,16 @@ jobs:
           if [ -f /tmp/operator.pid ]; then
             kill "$(cat /tmp/operator.pid)" 2>/dev/null || true
           fi
+
+  all-green:
+    name: All integrations green
+    if: always()
+    needs: [integration]
+    runs-on: ubuntu-slim
+    steps:
+      - name: Check job results
+        run: |
+          result='${{ toJSON(needs) }}'
+          echo "$result" | jq .
+          echo "$result" | jq -e 'all(.result == "success")'
+

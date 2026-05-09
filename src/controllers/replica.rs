@@ -284,12 +284,21 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.as_ref()
 		.and_then(|s| s.current_restore.as_deref());
 	if let Some(current) = current_restore_name {
+		// Allow the sweep when no migration is in flight: phase=None means
+		// either no migration has run since this replica was first
+		// reconciled, or a previous sweep cleared it. In both cases the
+		// gate's purpose (don't delete the source while a migration depends
+		// on it) is satisfied. Without this branch, a replica with
+		// persistent_schemas configured that hits the too-many-restores
+		// guardrail can't recover automatically: the guardrail blocks new
+		// restores, no switchover runs, no path sets phase=complete, and
+		// the sweep stays gated forever.
 		let migration_complete = if replica.spec.persistent_schemas.is_some() {
-			replica
+			let phase = replica
 				.status
 				.as_ref()
-				.and_then(|s| s.schema_migration_phase.as_ref())
-				.is_some_and(|p| p == "complete")
+				.and_then(|s| s.schema_migration_phase.as_deref());
+			matches!(phase, None | Some("complete"))
 		} else {
 			true
 		};
