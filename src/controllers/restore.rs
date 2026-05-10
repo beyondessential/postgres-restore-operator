@@ -35,6 +35,38 @@ mod tests;
 
 use builders::{build_deployment, build_pvc, build_restore_job, build_version_detect_job};
 
+/// SSA-apply the desired Deployment for a restore so it converges on any
+/// spec changes (e.g. an init-script update introduced by an operator
+/// upgrade). Returns the resulting `Deployment` so callers can inspect
+/// `status.ready_replicas` for phase-transition decisions.
+///
+/// Used by every phase that owns a running restore pod — `Restoring`,
+/// `Ready`, `Switching`, `Active` — so that a deployment whose phase
+/// happened to be in any of those states during an operator upgrade
+/// doesn't keep stale init scripts forever.
+async fn apply_restore_deployment(
+	client: &Client,
+	restore: &PostgresPhysicalRestore,
+	replica: &PostgresPhysicalReplica,
+	name: &str,
+	namespace: &str,
+) -> Result<Deployment> {
+	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
+	let desired = build_deployment(restore, name, namespace, replica)?;
+	let mut patch_value = serde_json::to_value(&desired)?;
+	patch_value["apiVersion"] = serde_json::json!("apps/v1");
+	patch_value["kind"] = serde_json::json!("Deployment");
+
+	let deploy = deployments
+		.patch(
+			name,
+			&PatchParams::apply("postgres-restore-operator").force(),
+			&Patch::Apply(&patch_value),
+		)
+		.await?;
+	Ok(deploy)
+}
+
 async fn fail_restore(
 	ctx: &Context,
 	namespace: &str,
@@ -136,9 +168,7 @@ pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>)
 		}
 		Some(RestorePhase::Ready) => reconcile_ready(&restore, &ctx, &name, &namespace).await,
 		Some(RestorePhase::Switching) => {
-			// Parent (replica) controller handles service update.
-			// Just wait.
-			Ok(Action::requeue(Duration::from_secs(10)))
+			reconcile_switching(&restore, &ctx, &name, &namespace).await
 		}
 		Some(RestorePhase::Active) => reconcile_active(&restore, &ctx, &name, &namespace).await,
 		Some(RestorePhase::Failed) => {
@@ -442,6 +472,41 @@ async fn ensure_restore_service(
 /// This is intentionally lightweight: it SSA-patches the deployment so that
 /// credential renames, image changes, or config tweaks introduced by an
 /// operator upgrade are applied without requiring a manual restart.
+/// Switching phase: the replica controller is in the middle of swapping the
+/// service selector to this restore. We don't need to drive the switchover
+/// here, but we *do* need to keep the deployment converged with the latest
+/// spec — otherwise an init-script update introduced by an operator upgrade
+/// while a restore was already Switching would never roll the pod, leaving
+/// the running postgres on a stale config indefinitely. (Observed in
+/// production: a restore stuck in Switching for 33h+ across two operator
+/// upgrades because nothing here was re-applying the deployment.)
+async fn reconcile_switching(
+	restore: &PostgresPhysicalRestore,
+	ctx: &Context,
+	name: &str,
+	namespace: &str,
+) -> Result<Action> {
+	let client = &ctx.client;
+	let replica_name = &restore.spec.replica.name;
+
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let replica = match replicas.get_opt(replica_name).await? {
+		Some(r) => r,
+		None => return Ok(Action::requeue(Duration::from_secs(30))),
+	};
+
+	if restore
+		.status
+		.as_ref()
+		.and_then(|s| s.postgres_version.as_ref())
+		.is_some()
+	{
+		apply_restore_deployment(client, restore, &replica, name, namespace).await?;
+	}
+
+	Ok(Action::requeue(Duration::from_secs(10)))
+}
+
 async fn reconcile_active(
 	restore: &PostgresPhysicalRestore,
 	ctx: &Context,
@@ -464,19 +529,7 @@ async fn reconcile_active(
 		.and_then(|s| s.postgres_version.as_ref())
 		.is_some()
 	{
-		let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-		let desired = build_deployment(restore, name, namespace, &replica)?;
-		let mut patch_value = serde_json::to_value(&desired)?;
-		patch_value["apiVersion"] = serde_json::json!("apps/v1");
-		patch_value["kind"] = serde_json::json!("Deployment");
-
-		deployments
-			.patch(
-				name,
-				&PatchParams::apply("postgres-restore-operator").force(),
-				&Patch::Apply(&patch_value),
-			)
-			.await?;
+		apply_restore_deployment(client, restore, &replica, name, namespace).await?;
 	}
 
 	Ok(Action::requeue(Duration::from_secs(300)))
@@ -596,19 +649,7 @@ async fn reconcile_ready(
 	ensure_restore_service(client, restore, name, namespace).await?;
 
 	// Apply desired deployment (creates or updates to converge on operator upgrades)
-	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-	let desired = build_deployment(restore, name, namespace, &replica)?;
-	let mut patch_value = serde_json::to_value(&desired)?;
-	patch_value["apiVersion"] = serde_json::json!("apps/v1");
-	patch_value["kind"] = serde_json::json!("Deployment");
-
-	let deploy = deployments
-		.patch(
-			name,
-			&PatchParams::apply("postgres-restore-operator").force(),
-			&Patch::Apply(&patch_value),
-		)
-		.await?;
+	let deploy = apply_restore_deployment(client, restore, &replica, name, namespace).await?;
 
 	// Check if ready
 	let ready_replicas = deploy
