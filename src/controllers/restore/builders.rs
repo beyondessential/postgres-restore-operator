@@ -357,7 +357,7 @@ pub fn kopia_cache_pvc_name(replica_name: &str) -> String {
 /// Returns true if `desired` is strictly larger than `current`. Used by
 /// the restore controller to apply ratchet semantics to the cache PVC:
 /// grow on snapshot growth, never shrink. Returns false on parse error
-/// so a corrupt or unparseable quantity doesn't cause spurious resize
+/// so a corrupt or unparsable quantity doesn't cause spurious resize
 /// attempts.
 pub fn cache_size_needs_grow(current: &Quantity, desired: &Quantity) -> bool {
 	match (
