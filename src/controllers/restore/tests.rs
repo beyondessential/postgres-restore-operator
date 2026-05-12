@@ -308,15 +308,14 @@ fn deployment_init_script_sets_shared_buffers() {
 }
 
 #[test]
-fn deployment_init_script_reassigns_persistent_schema_ownership() {
-	// When persistent_schemas is configured, the init script must reassign
-	// ownership of those schemas (where they exist in the restored data)
-	// to the analytics user, so the operator can drop and recreate them
-	// during migration without needing superuser at runtime. When no
-	// persistent_schemas are configured, the block is a no-op (empty CSV
-	// → guarded by the `if [ -n "$PERSISTENT_SCHEMAS_CSV" ]` check).
+fn deployment_init_script_grants_superuser_for_read_write() {
+	// Read-write restores grant SUPERUSER to the analytics user. The
+	// granular pg_*_all_data + pg_maintain + CREATE ON DATABASE set was
+	// tried and didn't cover DDL on existing schemas the user does not own
+	// (CREATE TABLE in public on PG >= 15, dropping persistent_schemas
+	// owned by other users on migration). Falling back to superuser keeps
+	// the use cases working on every PG version.
 	let (mut restore, mut replica) = test_restore_and_replica();
-	replica.spec.persistent_schemas = Some(vec!["dbt".to_string(), "marts".to_string()]);
 	replica.spec.read_only = false;
 	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("18".to_string()),
@@ -335,44 +334,41 @@ fn deployment_init_script_reassigns_persistent_schema_ownership() {
 	let script = &setup_auth.args.as_ref().unwrap()[0];
 
 	assert!(
-		script.contains(r#"PERSISTENT_SCHEMAS_CSV="dbt,marts""#),
-		"init script must interpolate persistent_schemas as comma-separated list"
+		script.contains("ALTER ROLE ${ANALYTICS_USERNAME} WITH SUPERUSER"),
+		"read-write init script must grant superuser to analytics"
 	);
 	assert!(
-		script.contains("ALTER SCHEMA %I OWNER TO %I"),
-		"init script must reassign schema ownership via ALTER SCHEMA"
+		!script.contains("GRANT pg_write_all_data"),
+		"read-write init script must not use the predefined pg_write_all_data role"
 	);
-	assert!(
-		script.contains(r#"SELECT unnest(string_to_array('$PERSISTENT_SCHEMAS_CSV', ','))"#),
-		"init script must drive the ownership loop from the interpolated CSV"
-	);
+}
 
-	// Sanity: with no persistent_schemas, the CSV is empty and the guarded
-	// block is a no-op.
-	let (mut restore2, replica2) = test_restore_and_replica();
-	restore2.status = Some(PostgresPhysicalRestoreStatus {
+#[test]
+fn deployment_init_script_grants_read_only_on_pg14_plus() {
+	// PG >= 14 read-only uses pg_read_all_data instead of superuser to keep
+	// the surface area minimal. Below PG 14 the read-only path falls through
+	// to the superuser branch (no predefined read role).
+	let (mut restore, mut replica) = test_restore_and_replica();
+	replica.spec.read_only = true;
+	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("18".to_string()),
 		..Default::default()
 	});
-	let deploy2 = build_deployment(&restore2, "test-restore", "default", &replica2).unwrap();
-	let script2 = &deploy2
-		.spec
-		.unwrap()
-		.template
-		.spec
-		.unwrap()
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+	let setup_auth = pod_spec
 		.init_containers
+		.as_ref()
 		.unwrap()
 		.iter()
 		.find(|c| c.name == "setup-auth")
-		.unwrap()
-		.args
-		.as_ref()
-		.unwrap()[0]
-		.clone();
+		.expect("setup-auth init container must exist");
+	let script = &setup_auth.args.as_ref().unwrap()[0];
+
 	assert!(
-		script2.contains(r#"PERSISTENT_SCHEMAS_CSV="""#),
-		"with no persistent_schemas, init script must emit empty CSV"
+		script.contains("GRANT pg_read_all_data TO ${ANALYTICS_USERNAME}"),
+		"read-only init script must grant pg_read_all_data"
 	);
 }
 
