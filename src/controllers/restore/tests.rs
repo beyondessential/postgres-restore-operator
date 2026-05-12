@@ -213,8 +213,9 @@ fn restore_job_mounts_persistent_kopia_cache() {
 
 #[test]
 fn kopia_cache_pvc_owned_by_replica() {
-	let (_restore, replica) = test_restore_and_replica();
-	let pvc = super::builders::build_kopia_cache_pvc(&replica, "default");
+	let (restore, replica) = test_restore_and_replica();
+	let pvc =
+		super::builders::build_kopia_cache_pvc(&replica, &restore.spec.snapshot_size, "default");
 
 	let owner_refs = pvc
 		.metadata
@@ -233,6 +234,52 @@ fn kopia_cache_pvc_owned_by_replica() {
 		.as_ref()
 		.expect("cache PVC must declare access modes");
 	assert_eq!(access_modes, &vec!["ReadWriteOnce".to_string()]);
+}
+
+#[test]
+fn cache_size_needs_grow_ratchet() {
+	let small = Quantity("10Gi".to_string());
+	let bigger = Quantity("20Gi".to_string());
+	assert!(
+		super::builders::cache_size_needs_grow(&small, &bigger),
+		"must grow when desired > current"
+	);
+	assert!(
+		!super::builders::cache_size_needs_grow(&bigger, &small),
+		"must NOT shrink when desired < current"
+	);
+	assert!(
+		!super::builders::cache_size_needs_grow(&small, &small),
+		"equal sizes must not trigger a grow"
+	);
+}
+
+#[test]
+fn kopia_cache_pvc_size_floors_at_10gi() {
+	// For a small snapshot, 20% would be sub-Gi; the floor catches that.
+	let small = Quantity("1Gi".to_string());
+	let size = super::builders::kopia_cache_pvc_size(&small);
+	let parsed = kube_quantity::ParsedQuantity::try_from(size).unwrap();
+	let floor = kube_quantity::ParsedQuantity::try_from("10Gi").unwrap();
+	assert!(
+		parsed >= floor,
+		"sub-floor snapshot must clamp to at least 10Gi"
+	);
+}
+
+#[test]
+fn kopia_cache_pvc_size_scales_with_snapshot() {
+	// For a 100Gi snapshot, 20% = 20Gi which is above the 10Gi floor.
+	let big = Quantity("100Gi".to_string());
+	let size = super::builders::kopia_cache_pvc_size(&big);
+	let parsed = kube_quantity::ParsedQuantity::try_from(size).unwrap();
+	let expected = kube_quantity::ParsedQuantity::try_from("20Gi").unwrap();
+	let floor = kube_quantity::ParsedQuantity::try_from("10Gi").unwrap();
+	assert!(parsed > floor, "100Gi snapshot must not hit the floor");
+	assert_eq!(
+		parsed, expected,
+		"100Gi snapshot must produce exactly 20Gi cache"
+	);
 }
 
 #[test]

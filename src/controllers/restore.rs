@@ -7,7 +7,10 @@ use k8s_openapi::{
 		batch::v1::Job,
 		core::v1::{ObjectReference, PersistentVolumeClaim, Service},
 	},
-	apimachinery::pkg::apis::meta::v1::{OwnerReference, Time},
+	apimachinery::pkg::{
+		api::resource::Quantity,
+		apis::meta::v1::{OwnerReference, Time},
+	},
 };
 use kube::{
 	Api, Client, ResourceExt,
@@ -65,6 +68,76 @@ async fn apply_restore_deployment(
 		)
 		.await?;
 	Ok(deploy)
+}
+
+/// Ensure the per-replica kopia cache PVC exists and is at least sized for
+/// the current snapshot. Creates the PVC on first call, patches the
+/// requested storage upward on subsequent calls when the desired size
+/// (computed from this snapshot) is larger than the current request.
+/// Never shrinks. Resize requires the storage class to allow volume
+/// expansion; failure is logged and the restore proceeds with whatever
+/// size the PVC currently has.
+async fn ensure_kopia_cache_pvc(
+	client: &Client,
+	namespace: &str,
+	replica_name: &str,
+	snapshot_size: &Quantity,
+) -> Result<()> {
+	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+	let cache_pvc_name = builders::kopia_cache_pvc_name(replica_name);
+	let desired_size = builders::kopia_cache_pvc_size(snapshot_size);
+
+	match pvcs.get_opt(&cache_pvc_name).await? {
+		None => {
+			info!(pvc = cache_pvc_name, "creating shared kopia cache PVC");
+			let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+			let replica = replicas.get(replica_name).await?;
+			let pvc = builders::build_kopia_cache_pvc(&replica, snapshot_size, namespace);
+			pvcs.create(&PostParams::default(), &pvc).await?;
+		}
+		Some(existing) => {
+			let current = existing
+				.spec
+				.as_ref()
+				.and_then(|s| s.resources.as_ref())
+				.and_then(|r| r.requests.as_ref())
+				.and_then(|reqs| reqs.get("storage"));
+			if let Some(current) = current
+				&& builders::cache_size_needs_grow(current, &desired_size)
+			{
+				info!(
+					pvc = cache_pvc_name,
+					current = current.0,
+					desired = desired_size.0,
+					"growing shared kopia cache PVC"
+				);
+				let patch = serde_json::json!({
+					"spec": {
+						"resources": {
+							"requests": {
+								"storage": desired_size,
+							}
+						}
+					}
+				});
+				if let Err(e) = pvcs
+					.patch(
+						&cache_pvc_name,
+						&PatchParams::apply("postgres-restore-operator"),
+						&Patch::Merge(&patch),
+					)
+					.await
+				{
+					warn!(
+						pvc = cache_pvc_name,
+						error = %e,
+						"failed to grow cache PVC (storage class may not support volume expansion); continuing with current size"
+					);
+				}
+			}
+		}
+	}
+	Ok(())
 }
 
 async fn fail_restore(
@@ -223,30 +296,21 @@ async fn reconcile_pending(
 	// Delete previous restore's Job for the same replica (log cleanup)
 	cleanup_previous_jobs(client, namespace, replica_name, name).await?;
 
-	// Create PVC if it doesn't exist
+	// Ensure data PVC exists (one per restore, no resize needed)
 	let pvc_name = format!("{name}-data");
 	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
-	let needs_data_pvc = pvcs.get_opt(&pvc_name).await?.is_none();
-	let cache_pvc_name = builders::kopia_cache_pvc_name(replica_name);
-	let needs_cache_pvc = pvcs.get_opt(&cache_pvc_name).await?.is_none();
-	if needs_data_pvc || needs_cache_pvc {
+	if pvcs.get_opt(&pvc_name).await?.is_none() {
+		info!(restore = name, pvc = pvc_name, "creating PVC");
 		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 		let replica = replicas.get(replica_name).await?;
-		if needs_data_pvc {
-			info!(restore = name, pvc = pvc_name, "creating PVC");
-			let pvc = build_pvc(restore, &pvc_name, namespace, &replica)?;
-			pvcs.create(&PostParams::default(), &pvc).await?;
-		}
-		if needs_cache_pvc {
-			info!(
-				restore = name,
-				pvc = cache_pvc_name,
-				"creating shared kopia cache PVC"
-			);
-			let pvc = builders::build_kopia_cache_pvc(&replica, namespace);
-			pvcs.create(&PostParams::default(), &pvc).await?;
-		}
+		let pvc = build_pvc(restore, &pvc_name, namespace, &replica)?;
+		pvcs.create(&PostParams::default(), &pvc).await?;
 	}
+
+	// Ensure cache PVC exists and is sized for the current snapshot. The
+	// cache PVC is shared across all restores for the replica and ratchets
+	// up as snapshots grow — it never shrinks.
+	ensure_kopia_cache_pvc(client, namespace, replica_name, &restore.spec.snapshot_size).await?;
 
 	// Transition to Restoring immediately — don't wait for PVC to bind.
 	// With WaitForFirstConsumer storage classes the PVC stays Pending until
