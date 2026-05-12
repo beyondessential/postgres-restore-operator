@@ -343,6 +343,58 @@ pub fn build_pvc(
 	})
 }
 
+/// Name of the per-replica kopia cache PVC. One per replica, reused across
+/// every restore Job for that replica — kopia's content cache then survives
+/// restore-to-restore and the next snapshot only has to download new
+/// blobs. Owned by the replica (cascade-deleted with it), unlike the
+/// per-restore data PVC.
+pub fn kopia_cache_pvc_name(replica_name: &str) -> String {
+	format!("{replica_name}-kopia-cache")
+}
+
+/// Default size of the per-replica kopia cache PVC. Kopia caches snapshot
+/// metadata, indices, and content blobs; the right size depends on
+/// snapshot size and churn, but 20Gi is a generous default for typical
+/// tamanu-sized clusters (~100 GiB) and avoids the ephemeral-storage
+/// eviction observed in production with `/tmp/kopia` on the writable
+/// layer.
+pub const KOPIA_CACHE_PVC_SIZE: &str = "20Gi";
+
+pub fn build_kopia_cache_pvc(
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+) -> PersistentVolumeClaim {
+	let replica_name = replica.name_any();
+	PersistentVolumeClaim {
+		metadata: ObjectMeta {
+			name: Some(kopia_cache_pvc_name(&replica_name)),
+			namespace: Some(namespace.to_string()),
+			labels: Some(BTreeMap::from([
+				("pgro.bes.au/replica".to_string(), replica_name),
+				(
+					"pgro.bes.au/component".to_string(),
+					"kopia-cache".to_string(),
+				),
+			])),
+			owner_references: Some(vec![replica.owner_reference()]),
+			..Default::default()
+		},
+		spec: Some(PersistentVolumeClaimSpec {
+			access_modes: Some(vec!["ReadWriteOnce".to_string()]),
+			storage_class_name: replica.spec.storage_class.clone(),
+			resources: Some(VolumeResourceRequirements {
+				requests: Some(BTreeMap::from([(
+					"storage".to_string(),
+					Quantity(KOPIA_CACHE_PVC_SIZE.to_string()),
+				)])),
+				..Default::default()
+			}),
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
 pub fn build_restore_job(
 	restore: &PostgresPhysicalRestore,
 	job_name: &str,
@@ -352,6 +404,7 @@ pub fn build_restore_job(
 ) -> Result<Job> {
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let pvc_name = format!("{}-data", restore.name_any());
+	let cache_pvc_name = kopia_cache_pvc_name(&restore.spec.replica.name);
 
 	let restore_script = r#"set -e
 
@@ -501,11 +554,18 @@ echo -n "$VERSION" > /dev/termination-log
 							]
 							.concat(),
 						),
-						volume_mounts: Some(vec![VolumeMount {
-							name: "pgdata".to_string(),
-							mount_path: "/pgdata".to_string(),
-							..Default::default()
-						}]),
+						volume_mounts: Some(vec![
+							VolumeMount {
+								name: "pgdata".to_string(),
+								mount_path: "/pgdata".to_string(),
+								..Default::default()
+							},
+							k8s_openapi::api::core::v1::VolumeMount {
+								name: "kopia-cache".to_string(),
+								mount_path: "/tmp/kopia".to_string(),
+								..Default::default()
+							},
+						]),
 						resources: Some(ResourceRequirements {
 							requests: Some(BTreeMap::from([
 								("cpu".to_string(), Quantity("500m".to_string())),
@@ -519,16 +579,28 @@ echo -n "$VERSION" > /dev/termination-log
 						}),
 						..Default::default()
 					}],
-					volumes: Some(vec![Volume {
-						name: "pgdata".to_string(),
-						persistent_volume_claim: Some(
-							k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-								claim_name: pvc_name,
-								read_only: Some(false),
-							},
-						),
-						..Default::default()
-					}]),
+					volumes: Some(vec![
+						Volume {
+							name: "pgdata".to_string(),
+							persistent_volume_claim: Some(
+								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+									claim_name: pvc_name,
+									read_only: Some(false),
+								},
+							),
+							..Default::default()
+						},
+						Volume {
+							name: "kopia-cache".to_string(),
+							persistent_volume_claim: Some(
+								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+									claim_name: cache_pvc_name,
+									read_only: Some(false),
+								},
+							),
+							..Default::default()
+						},
+					]),
 					..Default::default()
 				}),
 			},

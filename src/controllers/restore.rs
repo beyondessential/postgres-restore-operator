@@ -226,12 +226,26 @@ async fn reconcile_pending(
 	// Create PVC if it doesn't exist
 	let pvc_name = format!("{name}-data");
 	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
-	if pvcs.get_opt(&pvc_name).await?.is_none() {
-		info!(restore = name, pvc = pvc_name, "creating PVC");
+	let needs_data_pvc = pvcs.get_opt(&pvc_name).await?.is_none();
+	let cache_pvc_name = builders::kopia_cache_pvc_name(replica_name);
+	let needs_cache_pvc = pvcs.get_opt(&cache_pvc_name).await?.is_none();
+	if needs_data_pvc || needs_cache_pvc {
 		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 		let replica = replicas.get(replica_name).await?;
-		let pvc = build_pvc(restore, &pvc_name, namespace, &replica)?;
-		pvcs.create(&PostParams::default(), &pvc).await?;
+		if needs_data_pvc {
+			info!(restore = name, pvc = pvc_name, "creating PVC");
+			let pvc = build_pvc(restore, &pvc_name, namespace, &replica)?;
+			pvcs.create(&PostParams::default(), &pvc).await?;
+		}
+		if needs_cache_pvc {
+			info!(
+				restore = name,
+				pvc = cache_pvc_name,
+				"creating shared kopia cache PVC"
+			);
+			let pvc = builders::build_kopia_cache_pvc(&replica, namespace);
+			pvcs.create(&PostParams::default(), &pvc).await?;
+		}
 	}
 
 	// Transition to Restoring immediately — don't wait for PVC to bind.

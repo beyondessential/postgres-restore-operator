@@ -7,6 +7,8 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
+use kube::ResourceExt;
+
 use super::builders::{build_deployment, build_restore_job, build_version_detect_job};
 use crate::{types::*, util::TimeSpan};
 
@@ -160,6 +162,77 @@ fn restore_job_has_ttl_seconds_after_finished() {
 		.ttl_seconds_after_finished
 		.expect("restore job must set ttlSecondsAfterFinished");
 	assert!(ttl > 0, "ttlSecondsAfterFinished must be positive");
+}
+
+#[test]
+fn restore_job_mounts_persistent_kopia_cache() {
+	// Kopia's cache and logs used to land on the pod's writable layer at
+	// /tmp/kopia, causing the restore pod to be evicted under
+	// ephemeral-storage pressure (observed in production at ~10 GiB
+	// usage). Mount a per-replica PVC at /tmp/kopia so the cache persists
+	// across restores and doesn't count toward ephemeral-storage.
+	let (restore, replica) = test_restore_and_replica();
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+	)
+	.unwrap();
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+
+	let volumes = pod_spec.volumes.as_ref().expect("pod must declare volumes");
+	let cache_volume = volumes
+		.iter()
+		.find(|v| v.name == "kopia-cache")
+		.expect("restore Job pod must include a kopia-cache volume");
+	let claim_name = cache_volume
+		.persistent_volume_claim
+		.as_ref()
+		.expect("kopia-cache volume must reference a PVC")
+		.claim_name
+		.as_str();
+	assert_eq!(
+		claim_name,
+		super::builders::kopia_cache_pvc_name(&restore.spec.replica.name),
+		"kopia-cache volume must reference the per-replica cache PVC"
+	);
+
+	let mounts = pod_spec.containers[0]
+		.volume_mounts
+		.as_ref()
+		.expect("restore container must declare volume mounts");
+	assert!(
+		mounts
+			.iter()
+			.any(|m| m.name == "kopia-cache" && m.mount_path == "/tmp/kopia"),
+		"restore container must mount kopia-cache at /tmp/kopia"
+	);
+}
+
+#[test]
+fn kopia_cache_pvc_owned_by_replica() {
+	let (_restore, replica) = test_restore_and_replica();
+	let pvc = super::builders::build_kopia_cache_pvc(&replica, "default");
+
+	let owner_refs = pvc
+		.metadata
+		.owner_references
+		.as_ref()
+		.expect("cache PVC must have owner references");
+	assert_eq!(owner_refs.len(), 1);
+	assert_eq!(owner_refs[0].kind, "PostgresPhysicalReplica");
+	assert_eq!(owner_refs[0].name, replica.name_any());
+
+	let access_modes = pvc
+		.spec
+		.as_ref()
+		.unwrap()
+		.access_modes
+		.as_ref()
+		.expect("cache PVC must declare access modes");
+	assert_eq!(access_modes, &vec!["ReadWriteOnce".to_string()]);
 }
 
 #[test]
