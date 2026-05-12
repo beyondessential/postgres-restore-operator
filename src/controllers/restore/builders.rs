@@ -586,6 +586,19 @@ cp -a /usr/lib/locale/* /locale-data/
 	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
 	let read_only = effective_read_only.to_string();
 
+	// Comma-separated list of persistent_schemas for the init script. Used to
+	// reassign ownership of those schemas (where they exist in the restored
+	// data) to the analytics user, so the operator can drop and recreate
+	// them during migration without needing superuser. Empty when no
+	// persistent_schemas are configured — the corresponding init-script
+	// block is then a no-op.
+	let persistent_schemas_csv = replica
+		.spec
+		.persistent_schemas
+		.as_ref()
+		.map(|s| s.join(","))
+		.unwrap_or_default();
+
 	let extra_config_block = if let Some(ref extra) = replica.spec.postgres_extra_config {
 		format!(
 			r#"echo "Appending extra postgresql.conf settings..."
@@ -787,6 +800,37 @@ else
 ALTER ROLE ${{ANALYTICS_USERNAME}} WITH SUPERUSER;
 SQLEOF
 fi
+
+# When persistent_schemas is configured, reassign ownership of those schemas
+# (where they exist in the restored data) to the analytics user. The migration
+# step in the operator then drops and re-creates these schemas as part of
+# copying the persistent copy from the previous restore — but on PG >= 17
+# the analytics user only has pg_write_all_data + pg_maintain + CREATE ON
+# DATABASE, which is not enough to DROP SCHEMA owned by another user. Doing
+# the ownership reassignment here, while we still have the postgres
+# superuser via local trust auth, keeps the runtime grants minimal.
+PERSISTENT_SCHEMAS_CSV="{persistent_schemas_csv}"
+if [ -n "$PERSISTENT_SCHEMAS_CSV" ]; then
+  echo "Reassigning ownership of persistent schemas (if present) to ${{ANALYTICS_USERNAME}}..."
+  for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname NOT IN ('template0', 'template1')"); do
+    psql -U postgres -d "$db" << SQLEOF
+DO \$DO\$
+DECLARE
+  schema_name text;
+BEGIN
+  FOR schema_name IN
+    SELECT unnest(string_to_array('$PERSISTENT_SCHEMAS_CSV', ','))
+    INTERSECT
+    SELECT nspname FROM pg_namespace
+  LOOP
+    EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, '${{ANALYTICS_USERNAME}}');
+  END LOOP;
+END
+\$DO\$;
+SQLEOF
+  done
+fi
+
 if [ -f /pgdata/needs-reindex ]; then
   PGRO_STAGE=restored
 else

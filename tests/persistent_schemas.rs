@@ -249,9 +249,17 @@ async fn persistent_schemas_migration() {
 	cleanup_namespace(&client, ns, &[replica_name]).await;
 }
 
+/// When a persistent schema is already present in the target's snapshot
+/// (e.g. because the schema has leaked back into the source DB), the
+/// operator drops it and recreates it from the previous restore's
+/// canonical copy — the persistent_schemas spec semantics treat the
+/// schema as operator-owned. Tests the public schema (which always
+/// exists in every database) as the conflicting target, asserts that
+/// the marker we wrote to the previous restore's public schema makes
+/// it into the new restore via migration.
 #[tokio::test]
 #[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
-async fn persistent_schemas_conflict_fails_restore() {
+async fn persistent_schemas_drops_and_replaces_target_copy() {
 	let client = make_client().await;
 	let ns = "test-ps-conflict";
 	let replica_name = "ps-conflict-replica";
@@ -272,9 +280,10 @@ async fn persistent_schemas_conflict_fails_restore() {
 		.await
 		.expect("failed to create kopia secret");
 
-	// Configure persistent_schemas with "public", which already exists in the
-	// snapshot's database. This should cause the second restore to fail when
-	// the operator detects the conflict before migration.
+	// Configure persistent_schemas with "public", which already exists in
+	// the snapshot's database. The operator should drop the target's
+	// public schema during migration and refill it from the previous
+	// restore.
 	println!("--- creating replica with persistent_schemas: [\"public\"]");
 	let mut replica = build_replica(
 		replica_name,
@@ -297,6 +306,29 @@ async fn persistent_schemas_conflict_fails_restore() {
 	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
 	println!("--- first restore active: {first_restore_name}");
 
+	// Drop a marker table into the first restore's public schema. After the
+	// switchover, the second restore should have the marker — proving the
+	// operator dropped the target's public (which would have come from the
+	// snapshot, *without* the marker) and replaced it with the migrated
+	// copy from the first restore.
+	println!("--- writing marker table to first restore's public schema");
+	let first_deploy = format!("deployment/{first_restore_name}");
+	kubectl_exec(
+		ns,
+		&first_deploy,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-c",
+			"CREATE TABLE public.migration_marker (id serial PRIMARY KEY, label text NOT NULL); \
+			 INSERT INTO public.migration_marker (label) VALUES ('from-first-restore')",
+		],
+	)
+	.await;
+
 	let first_restore_obj = restores
 		.get(&first_restore_name)
 		.await
@@ -306,12 +338,8 @@ async fn persistent_schemas_conflict_fails_restore() {
 		.await
 		.expect("failed to get replica");
 
-	// Manually create a second restore from the same snapshot to trigger switchover.
-	// The "public" schema will already exist in this snapshot, so migration should
-	// be blocked and the restore should fail.
-	let second_restore_name = format!("{replica_name}-conflict");
+	let second_restore_name = format!("{replica_name}-second");
 	println!("--- creating second restore: {second_restore_name}");
-
 	restores
 		.create(
 			&PostParams::default(),
@@ -320,58 +348,60 @@ async fn persistent_schemas_conflict_fails_restore() {
 		.await
 		.expect("failed to create second restore");
 
-	println!("--- waiting for second restore to reach Failed phase (schema conflict)");
+	println!("--- waiting for switchover (currentRestore == second)");
 	timeout(LONG_PHASE_TIMEOUT, async {
 		loop {
-			if let Ok(restore) = restores.get(&second_restore_name).await {
-				let phase = restore.status.as_ref().and_then(|s| s.phase.as_ref());
-				println!("[{second_restore_name}] phase: {phase:?}");
-				if phase == Some(&RestorePhase::Failed) {
-					return;
-				}
+			if let Ok(r) = replicas.get(replica_name).await
+				&& r.status.as_ref().and_then(|s| s.current_restore.as_deref())
+					== Some(second_restore_name.as_str())
+			{
+				return;
 			}
 			sleep(POLL_INTERVAL).await;
 		}
 	})
 	.await
-	.expect("timed out waiting for second restore to fail due to schema conflict");
+	.expect("timed out waiting for switchover to second restore");
 
-	println!("--- verifying first restore is still Active");
-	let first_restore_after = restores
-		.get(&first_restore_name)
+	println!("--- verifying second restore is Active, not Failed");
+	let second_restore_after = restores
+		.get(&second_restore_name)
 		.await
-		.expect("failed to get first restore after conflict");
+		.expect("failed to get second restore after switchover");
 	assert_eq!(
-		first_restore_after
+		second_restore_after
 			.status
 			.as_ref()
 			.and_then(|s| s.phase.as_ref()),
 		Some(&RestorePhase::Active),
-		"first restore should remain Active after schema conflict"
+		"second restore must reach Active after drop-and-replace, not Failed"
 	);
 
-	println!("--- verifying replica still points to first restore");
-	let replica_after = replicas
-		.get(replica_name)
-		.await
-		.expect("failed to get replica after conflict");
-	let status = replica_after
-		.status
-		.as_ref()
-		.expect("replica has no status");
+	println!("--- verifying marker table from first restore exists on second restore");
+	let second_deploy = format!("deployment/{second_restore_name}");
+	let marker_out = kubectl_exec(
+		ns,
+		&second_deploy,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-t",
+			"-A",
+			"-c",
+			"SELECT label FROM public.migration_marker WHERE id = 1",
+		],
+	)
+	.await;
 	assert_eq!(
-		status.current_restore.as_deref(),
-		Some(first_restore_name.as_str()),
-		"currentRestore should still be the first restore"
+		marker_out.trim(),
+		"from-first-restore",
+		"second restore's public schema must contain the marker copied via migration"
 	);
 
-	println!("--- verifying consecutiveRestoreFailures was incremented");
-	assert!(
-		status.consecutive_restore_failures.unwrap_or(0) >= 1,
-		"consecutiveRestoreFailures should be at least 1 after schema conflict"
-	);
-
-	println!("--- persistent schema conflict correctly prevented switchover, cleaning up");
+	println!("--- drop-and-replace assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &[replica_name]).await;
 }
 

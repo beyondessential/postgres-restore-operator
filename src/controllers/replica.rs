@@ -20,7 +20,7 @@ use kube::{
 use kube_quantity::ParsedQuantity;
 use rand::RngExt;
 use rust_decimal::Decimal;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 use super::{
 	jobs::{JobStatus, classify_job},
@@ -1404,10 +1404,14 @@ async fn reconcile_schema_migration(
 		Err(e) => return Err(e),
 	};
 
-	// Check that none of the persistent schemas already exist in the snapshot.
-	// If they do, the pg_dump|psql migration would conflict, so we must fail
-	// the restore instead of attempting migration.
-	let conflicting = query_existing_schemas(
+	// Drop any persistent_schemas that are already present in the new
+	// restore. They are operator-owned: whatever was in the restored data
+	// is junk (typically because the schema has leaked back into the source
+	// DB), and the migration Job is about to write the canonical copy
+	// from the previous restore via pg_dump | psql, which would otherwise
+	// conflict on existing objects. Idempotent and no-op when the schemas
+	// are absent — safe to run unconditionally before every migration.
+	let preexisting = query_existing_schemas(
 		client,
 		namespace,
 		&new_restore_name,
@@ -1418,66 +1422,24 @@ async fn reconcile_schema_migration(
 		ctx.use_port_forward(),
 	)
 	.await?;
-
-	if !conflicting.is_empty() {
-		let msg = format!(
-			"persistent schemas already present in snapshot: {}",
-			conflicting.join(", ")
-		);
-		error!(
+	if !preexisting.is_empty() {
+		info!(
 			replica = %replica_name,
 			restore = %new_restore_name,
-			conflicting_schemas = ?conflicting,
-			"failing restore: persistent schemas found in snapshot"
+			schemas = ?preexisting,
+			"dropping pre-existing persistent schemas in target before migration"
 		);
-
-		// Mark the new restore as Failed
-		new_restore
-			.update_phase(client, RestorePhase::Failed)
-			.await?;
-
-		// Increment consecutiveRestoreFailures on the replica
-		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
-		let current_failures = replica
-			.status
-			.as_ref()
-			.and_then(|s| s.consecutive_restore_failures)
-			.unwrap_or(0);
-		let patch = serde_json::json!({
-			"status": {
-				"consecutiveRestoreFailures": current_failures + 1,
-				"schemaMigrationPhase": null,
-				"schemaMigrationJob": null,
-			}
-		});
-		replicas
-			.patch_status(
-				&replica_name,
-				&PatchParams::apply("postgres-restore-operator"),
-				&Patch::Merge(&patch),
-			)
-			.await?;
-
-		ctx.metrics.restores_failed_total.inc();
-
-		if let Err(e) = ctx
-			.recorder
-			.publish(
-				&Event {
-					type_: EventType::Warning,
-					reason: "RestoreFailed".into(),
-					note: Some(format!("Restore {new_restore_name} failed: {msg}")),
-					action: "Restore".into(),
-					secondary: Some(new_restore.object_ref(&())),
-				},
-				&replica.object_ref(&()),
-			)
-			.await
-		{
-			warn!(replica = %replica_name, error = %e, "failed to publish RestoreFailed event");
-		}
-
-		return Err(Error::SchemaMigration(msg));
+		postgres::drop_schemas_in_restore(
+			client,
+			namespace,
+			&new_restore_name,
+			&target_dbname,
+			&reader_user,
+			&reader_password,
+			&preexisting,
+			ctx.use_port_forward(),
+		)
+		.await?;
 	}
 
 	// The analytics user already has write privileges (superuser on PG < 17,

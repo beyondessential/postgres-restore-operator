@@ -254,6 +254,50 @@ pub fn quote_ident(s: &str) -> String {
 	format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Drop the given schemas (and all their contents) from the named database
+/// in the restore. Idempotent: schemas that do not exist are silently
+/// skipped via `DROP SCHEMA IF EXISTS`. Used to wipe persistent_schemas in
+/// a new restore before the migration writes the persistent copies from
+/// the previous restore.
+///
+/// Assumes the connecting user owns each schema (the restore's init script
+/// reassigns ownership to the analytics user at startup, see
+/// `controllers::restore::builders`).
+#[expect(
+	clippy::too_many_arguments,
+	reason = "mirrors the surrounding connect_to_restore signature; refactoring all of them is out of scope"
+)]
+pub async fn drop_schemas_in_restore(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	dbname: &str,
+	user: &str,
+	password: &str,
+	schemas: &[String],
+	use_port_forward: bool,
+) -> Result<()> {
+	if schemas.is_empty() {
+		return Ok(());
+	}
+	let conn = connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		dbname,
+		user,
+		password,
+		use_port_forward,
+	)
+	.await?;
+	for schema in schemas {
+		let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
+		debug!(restore = restore_name, schema = schema, "dropping schema");
+		conn.client.execute(stmt.as_str(), &[]).await?;
+	}
+	Ok(())
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
