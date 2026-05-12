@@ -243,7 +243,8 @@ async fn reconcile_pending(
 				pvc = cache_pvc_name,
 				"creating shared kopia cache PVC"
 			);
-			let pvc = builders::build_kopia_cache_pvc(&replica, namespace);
+			let pvc =
+				builders::build_kopia_cache_pvc(&replica, &restore.spec.snapshot_size, namespace);
 			pvcs.create(&PostParams::default(), &pvc).await?;
 		}
 	}

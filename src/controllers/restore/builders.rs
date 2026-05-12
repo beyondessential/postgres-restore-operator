@@ -13,6 +13,8 @@ use k8s_openapi::{
 	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::LabelSelector},
 };
 use kube::{ResourceExt, api::ObjectMeta};
+use kube_quantity::ParsedQuantity;
+use rust_decimal::Decimal;
 
 use super::restore_owner_reference;
 use crate::{
@@ -352,16 +354,27 @@ pub fn kopia_cache_pvc_name(replica_name: &str) -> String {
 	format!("{replica_name}-kopia-cache")
 }
 
-/// Default size of the per-replica kopia cache PVC. Kopia caches snapshot
-/// metadata, indices, and content blobs; the right size depends on
-/// snapshot size and churn, but 20Gi is a generous default for typical
-/// tamanu-sized clusters (~100 GiB) and avoids the ephemeral-storage
-/// eviction observed in production with `/tmp/kopia` on the writable
-/// layer.
-pub const KOPIA_CACHE_PVC_SIZE: &str = "20Gi";
+/// Compute the per-replica kopia cache PVC size as `max(10Gi, 20% of
+/// snapshot size)`. Kopia caches snapshot metadata, indices, and content
+/// blobs; sizing relative to the snapshot scales naturally with the data
+/// volume, and the 10Gi floor catches tiny snapshots where 20% would
+/// leave no room for incremental churn.
+pub fn kopia_cache_pvc_size(snapshot_size: &Quantity) -> Quantity {
+	let twenty_percent = ParsedQuantity::try_from(snapshot_size.clone())
+		.map(|q| q * Decimal::new(2, 1))
+		.unwrap_or_else(|_| ParsedQuantity::from(Decimal::ZERO));
+	let floor = ParsedQuantity::try_from("10Gi").expect("10Gi parses");
+	let chosen = if twenty_percent > floor {
+		twenty_percent
+	} else {
+		floor
+	};
+	chosen.into()
+}
 
 pub fn build_kopia_cache_pvc(
 	replica: &PostgresPhysicalReplica,
+	snapshot_size: &Quantity,
 	namespace: &str,
 ) -> PersistentVolumeClaim {
 	let replica_name = replica.name_any();
@@ -385,7 +398,7 @@ pub fn build_kopia_cache_pvc(
 			resources: Some(VolumeResourceRequirements {
 				requests: Some(BTreeMap::from([(
 					"storage".to_string(),
-					Quantity(KOPIA_CACHE_PVC_SIZE.to_string()),
+					kopia_cache_pvc_size(snapshot_size),
 				)])),
 				..Default::default()
 			}),
