@@ -237,6 +237,24 @@ fn kopia_cache_pvc_owned_by_replica() {
 }
 
 #[test]
+fn cache_size_needs_grow_ratchet() {
+	let small = Quantity("10Gi".to_string());
+	let bigger = Quantity("20Gi".to_string());
+	assert!(
+		super::builders::cache_size_needs_grow(&small, &bigger),
+		"must grow when desired > current"
+	);
+	assert!(
+		!super::builders::cache_size_needs_grow(&bigger, &small),
+		"must NOT shrink when desired < current"
+	);
+	assert!(
+		!super::builders::cache_size_needs_grow(&small, &small),
+		"equal sizes must not trigger a grow"
+	);
+}
+
+#[test]
 fn kopia_cache_pvc_size_floors_at_10gi() {
 	// For a small snapshot, 20% would be sub-Gi; the floor catches that.
 	let small = Quantity("1Gi".to_string());
