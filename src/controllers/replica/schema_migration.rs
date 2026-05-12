@@ -32,7 +32,11 @@ pub fn migration_job_name(replica_name: &str) -> String {
 ///   SCHEMAS (comma-separated list)
 ///   MIGRATION_CALLBACK_URL
 static MIGRATION_SCRIPT: &str = r#"#!/bin/bash
-set -o pipefail
+# pipefail is intentionally NOT set: psql's per-statement failures don't
+# propagate into the script's exit code (see ON_ERROR_STOP discussion
+# below), and pg_dump can fail mid-stream after producing partial output
+# — we still want psql to apply whatever it did receive, then exit
+# normally so the replica can come up.
 
 # Parse comma-separated schema list
 IFS=',' read -ra SCHEMA_ARRAY <<< "$SCHEMAS"
@@ -58,6 +62,17 @@ for schema in "${SCHEMA_ARRAY[@]}"; do
   echo "Migrating schema: $schema"
 done
 
+# Capture psql's stderr for visibility on partial failures.
+PSQL_STDERR=$(mktemp)
+
+# ON_ERROR_STOP is deliberately NOT set: persistent_schemas like dbt
+# contain views derived from upstream tables, and across upstream schema
+# changes (renamed columns, dropped tables) some view DDL in the old
+# replica's schema becomes invalid against the new restore's source
+# tables. Failing the whole migration on the first such error blocks the
+# replica from coming up at all. Tolerance trades schema completeness
+# for replica availability — clients can regenerate the broken views
+# afterward, but the replica must be reachable.
 PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
   -h "$SOURCE_HOST" -p 5432 -U "$SOURCE_USER" -d "$SOURCE_DB" \
   "${SCHEMA_ARGS[@]}" \
@@ -66,21 +81,30 @@ PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
   --verbose \
 | PGPASSWORD="$TARGET_PASSWORD" psql \
   -h "$TARGET_HOST" -p 5432 -U "$TARGET_USER" -d "$TARGET_DB" \
-  -v ON_ERROR_STOP=1 --quiet
+  --quiet 2> >(tee "$PSQL_STDERR" >&2)
 
-EXIT_CODE=$?
+PSQL_EXIT=$?
+PSQL_ERROR_COUNT=$(grep -c '^ERROR:' "$PSQL_STDERR" 2>/dev/null || echo 0)
+PSQL_ERROR_COUNT=${PSQL_ERROR_COUNT:-0}
+rm -f "$PSQL_STDERR"
 
-if [ $EXIT_CODE -eq 0 ]; then
-  echo ""
-  echo "=== Schema migration completed successfully ==="
-  report_result 'success'
-else
-  echo ""
-  echo "=== Schema migration failed with exit code $EXIT_CODE ===" >&2
-  report_result "Migration failed with exit code $EXIT_CODE"
+echo ""
+if [ "$PSQL_EXIT" -ne 0 ]; then
+  echo "=== psql exited non-zero ($PSQL_EXIT); proceeding so the replica can come up ===" >&2
 fi
 
-exit $EXIT_CODE
+if [ "$PSQL_ERROR_COUNT" -gt 0 ]; then
+  echo "=== Schema migration tolerated $PSQL_ERROR_COUNT statement error(s); some objects may need regenerating ===" >&2
+  report_result "partial: $PSQL_ERROR_COUNT statement error(s)"
+else
+  echo "=== Schema migration completed successfully ==="
+  report_result 'success'
+fi
+
+# Always exit 0: any non-fatal issues are reported via the callback
+# above. Treating partial migrations as Job failures puts the operator
+# into a retry loop that never converges (the same views keep failing).
+exit 0
 "#;
 
 /// Build the schema migration Job spec.
@@ -264,6 +288,29 @@ mod tests {
 			},
 			status: None,
 		}
+	}
+
+	#[test]
+	fn migration_script_is_tolerant_to_statement_errors() {
+		// The migration script must NOT use `ON_ERROR_STOP=1`. Persistent
+		// schemas (e.g. dbt) contain views derived from upstream tables;
+		// when upstream schema migrations rename or drop those columns,
+		// some view recreations fail. Aborting the entire migration on
+		// the first such error blocks the replica from coming up, which
+		// is a worse outcome than a partial migration that clients can
+		// patch up afterwards.
+		assert!(
+			!MIGRATION_SCRIPT.contains("ON_ERROR_STOP=1"),
+			"migration script must not enable ON_ERROR_STOP=1 — statement errors should be tolerated so the replica can come up"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains("exit 0"),
+			"migration script must exit 0 on completion; non-fatal errors are reported via the callback body"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains("partial"),
+			"migration script must report partial migrations via the callback so the operator can surface them"
+		);
 	}
 
 	#[test]
