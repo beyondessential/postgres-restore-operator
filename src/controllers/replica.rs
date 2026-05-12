@@ -298,7 +298,10 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				.status
 				.as_ref()
 				.and_then(|s| s.schema_migration_phase.as_deref());
-			matches!(phase, None | Some("complete"))
+			// "partial" counts as complete for sweep purposes: the
+			// migration Job ran and we accepted the result; we no longer
+			// depend on the previous restore being around.
+			matches!(phase, None | Some("complete") | Some("partial"))
 		} else {
 			true
 		};
@@ -1172,15 +1175,50 @@ async fn reconcile_schema_migration(
 				return Ok(false);
 			}
 			JobStatus::Succeeded => {
-				info!(replica = %replica_name, "migration Job succeeded");
+				// The migration script reports a partial-success callback body
+				// when psql exited cleanly but some individual statements
+				// failed (typical when dbt views reference renamed/dropped
+				// upstream columns). We treat it as completion either way —
+				// the replica must come up — but surface partials as a
+				// Warning event so operators can find them.
+				let callback = ctx.schema_migration_results.take(namespace, &replica_name);
+				let is_partial = callback
+					.as_deref()
+					.is_some_and(|b| b.starts_with("partial"));
 
-				// Update status
+				if is_partial {
+					warn!(
+						replica = %replica_name,
+						result = ?callback,
+						"migration Job succeeded with statement errors; some persistent_schemas objects may need regenerating"
+					);
+					if let Err(e) = ctx
+						.recorder
+						.publish(
+							&Event {
+								type_: EventType::Warning,
+								reason: "SchemaMigrationPartial".into(),
+								note: callback.clone(),
+								action: "Restore".into(),
+								secondary: Some(new_restore.object_ref(&())),
+							},
+							&replica.object_ref(&()),
+						)
+						.await
+					{
+						warn!(replica = %replica_name, error = %e, "failed to publish SchemaMigrationPartial event");
+					}
+				} else {
+					info!(replica = %replica_name, "migration Job succeeded");
+				}
+
+				let phase = if is_partial { "partial" } else { "complete" };
 				let replicas: Api<PostgresPhysicalReplica> =
 					Api::namespaced(client.clone(), namespace);
 				let patch = serde_json::json!({
 					"status": {
 						"schemaMigrationJob": null,
-						"schemaMigrationPhase": "complete",
+						"schemaMigrationPhase": phase,
 					}
 				});
 				replicas
