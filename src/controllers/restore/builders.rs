@@ -658,19 +658,6 @@ cp -a /usr/lib/locale/* /locale-data/
 	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
 	let read_only = effective_read_only.to_string();
 
-	// Comma-separated list of persistent_schemas for the init script. Used to
-	// reassign ownership of those schemas (where they exist in the restored
-	// data) to the analytics user, so the operator can drop and recreate
-	// them during migration without needing superuser. Empty when no
-	// persistent_schemas are configured — the corresponding init-script
-	// block is then a no-op.
-	let persistent_schemas_csv = replica
-		.spec
-		.persistent_schemas
-		.as_ref()
-		.map(|s| s.join(","))
-		.unwrap_or_default();
-
 	let extra_config_block = if let Some(ref extra) = replica.spec.postgres_extra_config {
 		format!(
 			r#"echo "Appending extra postgresql.conf settings..."
@@ -840,67 +827,22 @@ END
 SQLEOF
 
 if [ "$PG_MAJOR" -ge 14 ] && [ "{read_only}" = "true" ]; then
-  # PG >= 14 read-only: granular read role
+  # PG >= 14 read-only: granular read role keeps the surface area minimal
   psql -U postgres -d postgres << SQLEOF
 GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};
 SQLEOF
   echo "Read-only mode with PG >= 14, granted pg_read_all_data"
 
-elif [ "$PG_MAJOR" -ge 17 ] && [ "{read_only}" != "true" ]; then
-  # PG >= 17 read-write: granular roles including pg_maintain
-  psql -U postgres -d postgres << SQLEOF
-GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};
-GRANT pg_write_all_data TO ${{ANALYTICS_USERNAME}};
-GRANT pg_maintain TO ${{ANALYTICS_USERNAME}};
-DO \$\$
-DECLARE
-  dbname text;
-BEGIN
-  FOR dbname IN SELECT d.datname FROM pg_database d WHERE d.datname NOT IN ('template0', 'template1')
-  LOOP
-    EXECUTE format('GRANT CREATE ON DATABASE %I TO %I', dbname, '${{ANALYTICS_USERNAME}}');
-  END LOOP;
-END
-\$\$;
-SQLEOF
-  echo "Read-write mode with PG >= 17, granted pg_read_all_data + pg_write_all_data + pg_maintain + CREATE ON DATABASE"
-
 else
-  # PG < 14, or PG 14-16 read-write: superuser
-  echo "Granting superuser to analytics user (PG < 17 read-write or PG < 14)..."
+  # Read-write (any PG version) and PG < 14 read-only both go to superuser.
+  # The analytics user needs DDL on existing schemas it does not own
+  # (e.g. CREATE TABLE in public on PG >= 15, schema drops for
+  # persistent_schemas migration, etc.), which the predefined roles
+  # don't cover.
+  echo "Granting superuser to analytics user..."
   psql -U postgres -d postgres << SQLEOF
 ALTER ROLE ${{ANALYTICS_USERNAME}} WITH SUPERUSER;
 SQLEOF
-fi
-
-# When persistent_schemas is configured, reassign ownership of those schemas
-# (where they exist in the restored data) to the analytics user. The migration
-# step in the operator then drops and re-creates these schemas as part of
-# copying the persistent copy from the previous restore — but on PG >= 17
-# the analytics user only has pg_write_all_data + pg_maintain + CREATE ON
-# DATABASE, which is not enough to DROP SCHEMA owned by another user. Doing
-# the ownership reassignment here, while we still have the postgres
-# superuser via local trust auth, keeps the runtime grants minimal.
-PERSISTENT_SCHEMAS_CSV="{persistent_schemas_csv}"
-if [ -n "$PERSISTENT_SCHEMAS_CSV" ]; then
-  echo "Reassigning ownership of persistent schemas (if present) to ${{ANALYTICS_USERNAME}}..."
-  for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname NOT IN ('template0', 'template1')"); do
-    psql -U postgres -d "$db" << SQLEOF
-DO \$DO\$
-DECLARE
-  schema_name text;
-BEGIN
-  FOR schema_name IN
-    SELECT unnest(string_to_array('$PERSISTENT_SCHEMAS_CSV', ','))
-    INTERSECT
-    SELECT nspname FROM pg_namespace
-  LOOP
-    EXECUTE format('ALTER SCHEMA %I OWNER TO %I', schema_name, '${{ANALYTICS_USERNAME}}');
-  END LOOP;
-END
-\$DO\$;
-SQLEOF
-  done
 fi
 
 if [ -f /pgdata/needs-reindex ]; then
