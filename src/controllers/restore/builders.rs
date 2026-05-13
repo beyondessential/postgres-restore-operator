@@ -707,12 +707,15 @@ cp -a /usr/lib/locale/* /locale-data/
 	if replica.spec.redaction.is_some() {
 		// PG 18+ uses these path GUCs to load extensions whose files live
 		// outside the system extension directories. The dalibo
-		// postgresql_anonymizer image is mounted at /extensions/anon by
-		// the Pod builder below.
-		extra_config.push_str(
-			"extension_control_path = '$system:/extensions/anon/share/extension'\n\
-			 dynamic_library_path = '$libdir:/extensions/anon/lib/postgresql/18/lib'\n",
-		);
+		// postgresql_anonymizer image is a full Debian-based Postgres
+		// image whose filesystem is mounted at /extensions/anon by the
+		// Pod builder below — so we point the GUCs at the Debian
+		// extension layout inside that mount.
+		let pg_major: i32 = pg_version.parse().unwrap_or(18);
+		extra_config.push_str(&format!(
+			"extension_control_path = '$system:/extensions/anon/usr/share/postgresql/{pg_major}/extension'\n\
+			 dynamic_library_path = '$libdir:/extensions/anon/usr/lib/postgresql/{pg_major}/lib'\n",
+		));
 	}
 	let extra_config_block = if extra_config.is_empty() {
 		String::new()

@@ -1,0 +1,138 @@
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+    name: setup-kopia-repo-pg18
+    namespace: default
+spec:
+    backoffLimit: 3
+    template:
+        spec:
+            securityContext:
+                fsGroup: 999
+            initContainers:
+                - name: create-bucket
+                  image: minio/mc:latest
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+                          mc alias set minio http://minio.minio.svc:9000 minioadmin minioadmin
+                          mc mb minio/test-bucket-pg18 --ignore-existing
+                          echo "Bucket created"
+                - name: init-pgdata
+                  image: postgres:18
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                      runAsUser: 0
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+                          echo "Initializing PostgreSQL 18 data directory..."
+                          mkdir -p /pgdata/18/main
+                          chown postgres:postgres /pgdata/18/main
+                          gosu postgres initdb -D /pgdata/18/main --no-locale --encoding=UTF8 --auth=trust
+
+                          echo "Starting temporary PostgreSQL to create application database..."
+                          gosu postgres pg_ctl -D /pgdata/18/main -l /tmp/pg.log start -w
+
+                          gosu postgres psql -d postgres -c "CREATE DATABASE myapp"
+
+                          # Tamanu-shaped local_system_facts table so the operator's
+                          # versionQuery has something to read. The value is the
+                          # manifest version the test harness will serve.
+                          gosu postgres psql -d myapp <<'SQL'
+                          CREATE TABLE local_system_facts (
+                            key text PRIMARY KEY,
+                            value text
+                          );
+                          INSERT INTO local_system_facts (key, value) VALUES ('currentVersion', '1.0.0');
+
+                          -- A users table mirroring the dbt-masking contract:
+                          -- email, name, dob (date) and a non-redacted column
+                          -- to make sure unmarked columns are preserved.
+                          CREATE TABLE users (
+                            id serial PRIMARY KEY,
+                            email text NOT NULL,
+                            full_name text NOT NULL,
+                            single_name text NOT NULL,
+                            dob date,
+                            phone text,
+                            heart_rate int,
+                            unmasked text NOT NULL
+                          );
+                          INSERT INTO users (email, full_name, single_name, dob, phone, heart_rate, unmasked) VALUES
+                            ('a@example.com', 'Alice Apple',   'Alice', '1980-01-15', '+64211234567', 70, 'keep-1'),
+                            ('b@example.com', 'Bob Banana',    'Bob',   '1975-05-22', '+64211234568', 80, 'keep-2'),
+                            ('c@example.com', 'Carol Cherry',  'Carol', '1990-11-30', '+64211234569', 90, 'keep-3'),
+                            ('d@example.com', 'Dave Date',     'Dave',  '1985-07-04', '+64211234570', 60, 'keep-4'),
+                            ('e@example.com', 'Eve Elderberry','Eve',   '2000-12-25', '+64211234571', 75, 'keep-5');
+
+                          -- A throwaway table to verify the table-level
+                          -- "truncate" mask works.
+                          CREATE TABLE sync_lookup (
+                            id serial PRIMARY KEY,
+                            data text NOT NULL
+                          );
+                          INSERT INTO sync_lookup (data)
+                            SELECT 'row-' || i FROM generate_series(1, 50) AS i;
+                          SQL
+                          echo "Application database 'myapp' created with test data"
+
+                          gosu postgres pg_ctl -D /pgdata/18/main stop -w
+
+                          echo "PostgreSQL data directory initialized"
+                          ls -la /pgdata/18/main/
+                          cat /pgdata/18/main/PG_VERSION
+                  volumeMounts:
+                      - name: pgdata
+                        mountPath: /pgdata
+            containers:
+                - name: create-snapshot
+                  image: kopia/kopia:0.22.3
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+
+                          mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
+
+                          echo "Creating kopia repository..."
+                          kopia repository create s3 \
+                            --bucket=test-bucket-pg18 \
+                            --endpoint=minio.minio.svc:9000 \
+                            --region=us-east-1 \
+                            --access-key=minioadmin \
+                            --secret-access-key=minioadmin \
+                            --password=test-repo-password \
+                            --disable-tls \
+                            --disable-tls-verification
+
+                          echo "Creating snapshot..."
+                          kopia snapshot create /pgdata
+
+                          echo "Verifying snapshot..."
+                          kopia snapshot list --json --all
+
+                          echo "Done"
+                  env:
+                      - name: KOPIA_CONFIG_PATH
+                        value: /tmp/kopia/config/repository.config
+                      - name: KOPIA_LOG_DIR
+                        value: /tmp/kopia/logs
+                      - name: KOPIA_CACHE_DIRECTORY
+                        value: /tmp/kopia/cache
+                      - name: KOPIA_PASSWORD
+                        value: test-repo-password
+                      - name: USER
+                        value: kopia
+                  volumeMounts:
+                      - name: pgdata
+                        mountPath: /pgdata
+            volumes:
+                - name: pgdata
+                  emptyDir: {}
+            restartPolicy: Never

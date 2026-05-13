@@ -1,0 +1,34 @@
+# Minimal PG-18 anon extension image for the redaction integration test.
+#
+# Dalibo's published :stable image is built against PG 16, so for our PG 18
+# restore we install postgresql_anonymizer_18 from Dalibo's apt repo and
+# strip the result down to the extension files. The result is a tiny image
+# that's mounted at /extensions/anon on the restore Pod via the image-
+# volume mechanism.
+FROM debian:bookworm-slim AS builder
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        curl ca-certificates gnupg lsb-release \
+ && rm -rf /var/lib/apt/lists/*
+
+# PGDG repo for postgresql-server-dev-18 (the anon package's hard dep)
+RUN curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+        | gpg --dearmor -o /etc/apt/trusted.gpg.d/postgresql.gpg \
+ && echo "deb https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list
+
+# Dalibo Labs repo for postgresql_anonymizer_18
+RUN curl -fsSL https://apt.dalibo.org/labs/debian-dalibo.gpg \
+        -o /etc/apt/trusted.gpg.d/dalibo-labs.gpg \
+ && echo "deb http://apt.dalibo.org/labs $(lsb_release -cs)-dalibo main" \
+        > /etc/apt/sources.list.d/dalibo-labs.list
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends postgresql_anonymizer_18 \
+ && rm -rf /var/lib/apt/lists/*
+
+# scratch destination: only the extension files end up in the final image
+FROM scratch
+COPY --from=builder /usr/share/postgresql/18/extension/ /usr/share/postgresql/18/extension/
+COPY --from=builder /usr/lib/postgresql/18/lib/anon.so /usr/lib/postgresql/18/lib/anon.so

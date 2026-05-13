@@ -63,6 +63,12 @@ jobs:
               test-ps-all-missing
             needs_non_pg_snapshot: false
 
+          - name: redaction
+            namespaces: >-
+              test-redaction
+            needs_non_pg_snapshot: false
+            needs_pg18_snapshot: true
+
     steps:
       - uses: actions/checkout@v6
 
@@ -164,6 +170,20 @@ jobs:
           load_image postgres:16-alpine
           load_image alpine:latest
 
+          if [ "${{ matrix.needs_pg18_snapshot }}" = "true" ]; then
+            load_image postgres:18
+            load_image nginx:alpine
+          fi
+
+      - name: Build PG-18 anon extension image
+        if: matrix.needs_pg18_snapshot
+        run: |
+          docker build \
+            -t test-anon-pg18:integ \
+            -f tests/fixtures/Dockerfile.anon-pg18 \
+            tests/fixtures/
+          kind load docker-image test-anon-pg18:integ
+
       - name: Deploy MinIO
         run: |
           kubectl apply -f tests/fixtures/minio.yaml
@@ -200,6 +220,34 @@ jobs:
           echo "--- Setup job logs ---"
           kubectl logs job/setup-kopia-repo --all-containers --prefix
           echo "--- Kopia repository ready ---"
+
+      - name: Set up PG-18 kopia snapshot
+        if: matrix.needs_pg18_snapshot
+        run: |
+          kubectl apply -f tests/fixtures/setup-kopia-repo-pg18.yaml
+          for i in $(seq 1 60); do
+            STATUS=$(kubectl get job/setup-kopia-repo-pg18 -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)
+            FAILED=$(kubectl get job/setup-kopia-repo-pg18 -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+            if [ "$STATUS" = "True" ]; then
+              echo "PG-18 setup job completed successfully"
+              break
+            fi
+            if [ "$FAILED" = "True" ]; then
+              echo "PG-18 setup job failed!"
+              kubectl describe job/setup-kopia-repo-pg18
+              kubectl logs job/setup-kopia-repo-pg18 --all-containers --prefix
+              exit 1
+            fi
+            if [ "$i" = "60" ]; then
+              echo "PG-18 setup job timed out after 300s"
+              kubectl describe job/setup-kopia-repo-pg18
+              kubectl logs job/setup-kopia-repo-pg18 --all-containers --prefix 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "--- PG-18 setup job logs ---"
+          kubectl logs job/setup-kopia-repo-pg18 --all-containers --prefix
 
       - name: Set up non-postgres kopia snapshot
         if: matrix.needs_non_pg_snapshot
