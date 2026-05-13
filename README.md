@@ -139,8 +139,9 @@ spec:
 
 Notes:
 
-- Requires PostgreSQL 18+ on the restore (uses the runtime-settable `extension_control_path` and `dynamic_library_path` GUCs).
-- An `install-anon` init container apt-installs `postgresql_anonymizer_$N` from [Dalibo Labs](https://apt.dalibo.org/labs/) and stages the extension files onto the restore PVC under `/pgdata/extensions/anon/`. This adds roughly 30 seconds to each restore, and avoids needing a pre-built per-PG-version extension image. The install is idempotent across pod restarts (skipped if the files are already staged).
+- Works on any PostgreSQL major the operator otherwise supports. There's no PG-version gate because the prelude apt-installs `postgresql_anonymizer_$N` from [Dalibo Labs](https://apt.dalibo.org/labs/) per the running restore's PG version and copies the files into the standard system extension dirs (`/usr/share/postgresql/$N/extension`, `/usr/lib/postgresql/$N/lib`).
+- The download is cached on the restore PVC at `/pgdata/.anon-cache/`, so a pod restart doesn't re-fetch the package — it just re-copies the cached files into the (fresh) container writable layer.
+- The postgres container runs as root for the prelude (to apt-install and write to system paths) then drops back to UID 999 via `gosu` before exec'ing `postgres`. `gosu` is preinstalled in the official `postgres` image.
 - During redaction the database is writable; once anonymisation completes, the operator sets `default_transaction_read_only = on` at the database level and demotes the analytics user back to non-superuser when `spec.readOnly` is true.
 
 #### SnapshotFilter

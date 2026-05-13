@@ -648,44 +648,70 @@ fn deployment_shared_buffers_with_custom_resources() {
 }
 
 #[test]
-fn deployment_without_redaction_has_no_anon_volume() {
+fn deployment_with_redaction_runs_postgres_as_root_and_sets_redaction_env() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must be present");
+
+	let sec = postgres
+		.security_context
+		.as_ref()
+		.expect("postgres container must override securityContext when redaction is set");
+	assert_eq!(sec.run_as_user, Some(0), "postgres must run as root");
+
+	let env = postgres.env.as_ref().unwrap();
+	assert!(
+		env.iter()
+			.any(|e| e.name == "REDACTION_ENABLED" && e.value.as_deref() == Some("1")),
+		"REDACTION_ENABLED=1 must be set so the prelude installs anon"
+	);
+
+	let script = &postgres.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("PG_MAJOR=18"),
+		"prelude must pin PG_MAJOR to the restore's PG version, got: {script}"
+	);
+	assert!(
+		script.contains("postgresql_anonymizer_${PG_MAJOR}"),
+		"prelude must apt-install the PG-major-specific anon package"
+	);
+	assert!(
+		script.contains("exec gosu postgres postgres"),
+		"prelude must drop privileges via gosu before exec'ing postgres"
+	);
+}
+
+#[test]
+fn deployment_without_redaction_keeps_default_securitycontext() {
 	let (mut restore, replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("18".to_string()),
 		..Default::default()
 	});
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
-	let pod = deploy
-		.spec
-		.as_ref()
-		.unwrap()
-		.template
-		.spec
-		.as_ref()
-		.unwrap();
-	let volume_names: Vec<&str> = pod
-		.volumes
-		.as_ref()
-		.unwrap()
-		.iter()
-		.map(|v| v.name.as_str())
-		.collect();
-	assert!(!volume_names.contains(&"anon-extension"));
-}
-
-#[test]
-fn deployment_with_redaction_adds_install_anon_init_container() {
-	let (mut restore, mut replica) = test_restore_and_replica();
-	restore.status = Some(PostgresPhysicalRestoreStatus {
-		postgres_version: Some("18".to_string()),
-		..Default::default()
-	});
-	replica.spec.redaction = Some(RedactionSpec {
-		manifest_url: "https://example.com/m.json".into(),
-		version: None,
-		version_query: None,
-		version_fallback_to_base: false,
-	});
 
 	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
 	let pod = deploy
@@ -696,51 +722,32 @@ fn deployment_with_redaction_adds_install_anon_init_container() {
 		.spec
 		.as_ref()
 		.unwrap();
-
-	let install_anon = pod
-		.init_containers
-		.as_ref()
-		.unwrap()
+	let postgres = pod
+		.containers
 		.iter()
-		.find(|c| c.name == "install-anon")
-		.expect("install-anon init container must be present");
-	let script = &install_anon.args.as_ref().unwrap()[0];
+		.find(|c| c.name == "postgres")
+		.unwrap();
 	assert!(
-		script.contains("PG_MAJOR=18"),
-		"install script must pin PG_MAJOR to the restore's PG version, got: {script}"
+		postgres.security_context.is_none(),
+		"postgres container must inherit the pod-level UID 999 when redaction is off"
 	);
+	let env = postgres.env.as_ref().unwrap();
 	assert!(
-		script.contains("postgresql_anonymizer_${PG_MAJOR}"),
-		"install script must apt-install the PG-major-specific anon package, got: {script}"
-	);
-	assert!(
-		script.contains("/pgdata/extensions/anon"),
-		"install script must stage files under the redaction destination, got: {script}"
-	);
-
-	let postgres = &pod.containers[0];
-	let postgres_mounts = postgres.volume_mounts.as_ref().unwrap();
-	assert!(
-		postgres_mounts.iter().any(|m| m.name == "pgdata"),
-		"postgres container must mount pgdata"
-	);
-
-	let setup_auth = deploy_init_setup_auth_script(&deploy);
-	assert!(
-		setup_auth.contains("extension_control_path"),
-		"init script must append extension_control_path GUC"
-	);
-	assert!(
-		setup_auth.contains("/pgdata/extensions/anon/share/extension"),
-		"extension_control_path must point at the PVC staging directory"
+		!env.iter().any(|e| e.name == "REDACTION_ENABLED"),
+		"REDACTION_ENABLED must not be set when redaction is off"
 	);
 }
 
 #[test]
-fn deployment_with_redaction_rejects_pg17() {
+fn deployment_with_redaction_builds_for_pg16() {
+	// Redaction used to be gated to PG 18+ when we relied on the
+	// extension_control_path GUC. Now the postgres container's prelude
+	// drops the files into /usr/share/postgresql/$N/extension and
+	// /usr/lib/postgresql/$N/lib of its own writable layer, so any PG
+	// major works.
 	let (mut restore, mut replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
-		postgres_version: Some("17".to_string()),
+		postgres_version: Some("16".to_string()),
 		..Default::default()
 	});
 	replica.spec.redaction = Some(RedactionSpec {
@@ -750,11 +757,25 @@ fn deployment_with_redaction_rejects_pg17() {
 		version_fallback_to_base: false,
 	});
 
-	let err = build_deployment(&restore, "test-restore", "default", &replica).unwrap_err();
-	let msg = format!("{err}");
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica)
+		.expect("redaction should build on PG 16");
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.unwrap();
+	let script = &postgres.args.as_ref().unwrap()[0];
 	assert!(
-		msg.contains("PostgreSQL 18"),
-		"error should mention PG 18+ requirement, got: {msg}"
+		script.contains("PG_MAJOR=16"),
+		"prelude must use the restore's PG major (16), got: {script}"
 	);
 }
 

@@ -658,15 +658,6 @@ pub fn build_deployment(
 		.cloned()
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
-	if replica.spec.redaction.is_some() {
-		let major: i32 = pg_version.parse().unwrap_or(0);
-		if major < 18 {
-			return Err(Error::Redaction(format!(
-				"redaction requires PostgreSQL 18+, restore is PG {pg_version}",
-			)));
-		}
-	}
-
 	let pg_image = format!("postgres:{pg_version}");
 
 	let locale_script = r#"set -ex
@@ -699,67 +690,13 @@ cp -a /usr/lib/locale/* /locale-data/
 		&& replica.spec.redaction.is_none();
 	let read_only = effective_read_only.to_string();
 
-	let mut extra_config = String::new();
-	if let Some(ref extra) = replica.spec.postgres_extra_config {
-		extra_config.push_str(extra);
-		extra_config.push('\n');
-	}
-	if replica.spec.redaction.is_some() {
-		// The install-anon init container apt-installs
-		// postgresql_anonymizer_$N from Dalibo's Labs repo and stages the
-		// extension files under /pgdata/extensions/anon on the restore
-		// PVC. PG 18+'s runtime-settable path GUCs then point postgres at
-		// them. PG <18 isn't supported because those GUCs were
-		// introduced in 18 — older versions would need the files
-		// overlaid onto /usr/share/postgresql/$N/extension and
-		// /usr/lib/postgresql/$N/lib at pod-start time, which is a
-		// separate, larger change.
-		extra_config.push_str(
-			"extension_control_path = '$system:/pgdata/extensions/anon/share/extension'\n\
-			 dynamic_library_path = '$libdir:/pgdata/extensions/anon/lib'\n",
-		);
-	}
+	let extra_config = replica
+		.spec
+		.postgres_extra_config
+		.clone()
+		.map(|s| format!("{s}\n"))
+		.unwrap_or_default();
 
-	let install_anon_script = format!(
-		r#"set -ex
-PG_MAJOR={pg_version}
-DEST=/pgdata/extensions/anon
-
-if [ -f "$DEST/lib/anon.so" ] && [ -f "$DEST/share/extension/anon.control" ]; then
-  echo "anon already staged at $DEST, skipping install"
-  exit 0
-fi
-
-echo "Installing postgresql_anonymizer_${{PG_MAJOR}} from Dalibo Labs..."
-export DEBIAN_FRONTEND=noninteractive
-
-# Bring in Dalibo Labs repo. PGDG (which the postgres:N image is already
-# configured against) supplies the postgresql-server-dev-$N runtime
-# dependency.
-apt-get update
-apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
-
-curl -fsSL https://apt.dalibo.org/labs/debian-dalibo.gpg \
-    -o /etc/apt/trusted.gpg.d/dalibo-labs.gpg
-echo "deb http://apt.dalibo.org/labs $(lsb_release -cs)-dalibo main" \
-    > /etc/apt/sources.list.d/dalibo-labs.list
-
-apt-get update
-apt-get install -y --no-install-recommends "postgresql_anonymizer_${{PG_MAJOR}}"
-
-echo "Staging extension files to $DEST..."
-mkdir -p "$DEST/share/extension" "$DEST/lib"
-cp -a "/usr/share/postgresql/${{PG_MAJOR}}/extension/anon"*       "$DEST/share/extension/"
-cp -a "/usr/lib/postgresql/${{PG_MAJOR}}/lib/anon.so"             "$DEST/lib/"
-
-# Postgres runs as UID 999 and only needs read access.
-chown -R 999:999 "$DEST"
-chmod -R a+rX "$DEST"
-
-ls -la "$DEST/share/extension" "$DEST/lib"
-echo "anon staged"
-"#
-	);
 	let extra_config_block = if extra_config.is_empty() {
 		String::new()
 	} else {
@@ -1056,34 +993,31 @@ echo "Auth setup complete"
 						fs_group: Some(999),
 						..Default::default()
 					}),
-					init_containers: Some({
-						let mut inits = vec![
-							Container {
-								name: "fix-locale".to_string(),
-								image: Some(pg_image.clone()),
-								command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-								args: Some(vec![locale_script]),
-								security_context: Some(
-									k8s_openapi::api::core::v1::SecurityContext {
-										run_as_user: Some(0),
-										run_as_group: Some(0),
-										..Default::default()
-									},
-								),
-								volume_mounts: Some(vec![VolumeMount {
-									name: "locale-data".to_string(),
-									mount_path: "/locale-data".to_string(),
-									..Default::default()
-								}]),
-								resources: Some(ResourceRequirements {
-									requests: Some(BTreeMap::from([
-										("cpu".to_string(), Quantity("50m".to_string())),
-										("memory".to_string(), Quantity("64Mi".to_string())),
-									])),
-									..Default::default()
-								}),
+					init_containers: Some(vec![
+						Container {
+							name: "fix-locale".to_string(),
+							image: Some(pg_image.clone()),
+							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+							args: Some(vec![locale_script]),
+							security_context: Some(k8s_openapi::api::core::v1::SecurityContext {
+								run_as_user: Some(0),
+								run_as_group: Some(0),
 								..Default::default()
-							},
+							}),
+							volume_mounts: Some(vec![VolumeMount {
+								name: "locale-data".to_string(),
+								mount_path: "/locale-data".to_string(),
+								..Default::default()
+							}]),
+							resources: Some(ResourceRequirements {
+								requests: Some(BTreeMap::from([
+									("cpu".to_string(), Quantity("50m".to_string())),
+									("memory".to_string(), Quantity("64Mi".to_string())),
+								])),
+								..Default::default()
+							}),
+							..Default::default()
+						},
 						Container {
 							name: "setup-auth".to_string(),
 							image: Some(pg_image.clone()),
@@ -1115,46 +1049,47 @@ echo "Auth setup complete"
 							}),
 							..Default::default()
 						},
-						];
-						if replica.spec.redaction.is_some() {
-							inits.push(Container {
-								name: "install-anon".to_string(),
-								image: Some(pg_image.clone()),
-								command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-								args: Some(vec![install_anon_script]),
-								security_context: Some(
-									k8s_openapi::api::core::v1::SecurityContext {
-										run_as_user: Some(0),
-										run_as_group: Some(0),
-										..Default::default()
-									},
-								),
-								volume_mounts: Some(vec![VolumeMount {
-									name: "pgdata".to_string(),
-									mount_path: "/pgdata".to_string(),
-									..Default::default()
-								}]),
-								resources: Some(ResourceRequirements {
-									requests: Some(BTreeMap::from([
-										("cpu".to_string(), Quantity("100m".to_string())),
-										("memory".to_string(), Quantity("128Mi".to_string())),
-									])),
-									limits: Some(BTreeMap::from([
-										("cpu".to_string(), Quantity("1".to_string())),
-										("memory".to_string(), Quantity("512Mi".to_string())),
-									])),
-									..Default::default()
-								}),
-								..Default::default()
-							});
-						}
-						inits
-					}),
+					]),
 					containers: vec![Container {
 						name: "postgres".to_string(),
 						image: Some(pg_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![r#"
+						args: Some(vec![format!(
+							r#"
+PG_MAJOR={pg_version}
+
+# When spec.redaction is configured, the operator sets REDACTION_ENABLED=1
+# so that we apt-install postgresql_anonymizer_$PG_MAJOR and drop the
+# files into the standard system extension dirs of this container's
+# (fresh) writable filesystem layer. The PVC-backed cache at
+# /pgdata/.anon-cache avoids re-downloading on every pod restart.
+if [ "${{REDACTION_ENABLED:-0}}" = "1" ]; then
+  if [ ! -f /pgdata/.anon-cache/anon.so ] || [ ! -f /pgdata/.anon-cache/anon.control ]; then
+    echo "Installing postgresql_anonymizer_${{PG_MAJOR}} from Dalibo Labs..."
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
+    curl -fsSL https://apt.dalibo.org/labs/debian-dalibo.gpg \
+        -o /etc/apt/trusted.gpg.d/dalibo-labs.gpg
+    echo "deb http://apt.dalibo.org/labs $(lsb_release -cs)-dalibo main" \
+        > /etc/apt/sources.list.d/dalibo-labs.list
+    apt-get update
+    apt-get install -y --no-install-recommends "postgresql_anonymizer_${{PG_MAJOR}}"
+    mkdir -p /pgdata/.anon-cache
+    cp -a "/usr/share/postgresql/${{PG_MAJOR}}/extension/anon"*  /pgdata/.anon-cache/
+    cp -a "/usr/lib/postgresql/${{PG_MAJOR}}/lib/anon.so"        /pgdata/.anon-cache/
+    chown -R 999:999 /pgdata/.anon-cache
+  else
+    echo "anon already cached on PVC, skipping install"
+  fi
+
+  # Drop the files into this container's writable layer at the standard
+  # system paths. Cheap (<1s) and has to happen every pod start because
+  # the writable layer doesn't persist across restarts.
+  cp -a /pgdata/.anon-cache/anon*       "/usr/share/postgresql/${{PG_MAJOR}}/extension/"
+  cp -a /pgdata/.anon-cache/anon.so     "/usr/lib/postgresql/${{PG_MAJOR}}/lib/"
+fi
+
 if [ -f /pgdata/needs-reindex ]; then
   PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
   (
@@ -1186,20 +1121,49 @@ if [ -f /pgdata/needs-reindex ]; then
     echo "Background reindex complete"
   ) &
 fi
-exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}
-"#.to_string()]),
-						env: Some(vec![
-							EnvVar {
-								name: "PGDATA".to_string(),
-								value: Some("/pgdata/pgdata".to_string()),
+
+# Drop privileges to UID 999 (postgres) before launching the server.
+# The pod's PodSecurityContext requests UID 999 for the entire pod, but
+# this container overrides to root via runAsUser=0 above so we can do
+# the apt install + cp prelude. gosu hands off cleanly without a
+# trampoline shell.
+exec gosu postgres postgres -D /pgdata/pgdata ${{PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}}
+"#
+						)]),
+						env: Some({
+							let mut env = vec![
+								EnvVar {
+									name: "PGDATA".to_string(),
+									value: Some("/pgdata/pgdata".to_string()),
+									..Default::default()
+								},
+								EnvVar {
+									name: "POSTGRES_HOST_AUTH_METHOD".to_string(),
+									value: Some("scram-sha-256".to_string()),
+									..Default::default()
+								},
+							];
+							if replica.spec.redaction.is_some() {
+								env.push(EnvVar {
+									name: "REDACTION_ENABLED".to_string(),
+									value: Some("1".to_string()),
+									..Default::default()
+								});
+							}
+							env
+						}),
+						security_context: replica.spec.redaction.is_some().then(|| {
+							// When redaction is set, the postgres container's
+							// prelude apt-installs anon and copies files into
+							// /usr/{share,lib}/postgresql/$N/... — both root-
+							// only operations. gosu drops back to UID 999
+							// before exec'ing postgres itself.
+							k8s_openapi::api::core::v1::SecurityContext {
+								run_as_user: Some(0),
+								run_as_group: Some(0),
 								..Default::default()
-							},
-							EnvVar {
-								name: "POSTGRES_HOST_AUTH_METHOD".to_string(),
-								value: Some("scram-sha-256".to_string()),
-								..Default::default()
-							},
-						]),
+							}
+						}),
 						ports: Some(vec![ContainerPort {
 							name: Some("postgres".to_string()),
 							container_port: 5432,
@@ -1276,12 +1240,10 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 						},
 						Volume {
 							name: "dshm".to_string(),
-							empty_dir: Some(
-								k8s_openapi::api::core::v1::EmptyDirVolumeSource {
-									medium: Some("Memory".to_string()),
-									size_limit: Some(shm_size),
-								},
-							),
+							empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+								medium: Some("Memory".to_string()),
+								size_limit: Some(shm_size),
+							}),
 							..Default::default()
 						},
 					]),

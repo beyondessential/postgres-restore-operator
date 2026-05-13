@@ -58,21 +58,6 @@ pub async fn reconcile_redaction_step(
 		_ => {}
 	}
 
-	let pg_version = switching
-		.status
-		.as_ref()
-		.and_then(|s| s.postgres_version.as_deref());
-	let major: i32 = pg_version.and_then(|v| v.parse().ok()).unwrap_or(0);
-	if major < 18 {
-		let msg = format!(
-			"failed: redaction requires PostgreSQL 18+, restore is PG {}",
-			pg_version.unwrap_or("unknown")
-		);
-		warn!(replica = %replica_name, version = pg_version, %msg);
-		patch_phase_only(ctx, &replica_name, &namespace, &msg).await?;
-		return Ok(false);
-	}
-
 	if phase != Some("active") {
 		patch_phase_only(ctx, &replica_name, &namespace, "active").await?;
 	}
