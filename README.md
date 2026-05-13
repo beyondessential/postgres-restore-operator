@@ -103,6 +103,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. |
+| `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. Requires PostgreSQL 18+. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -113,6 +114,34 @@ Jitter is applied to the scheduled time after the cron expression is evaluated.
 The jitter is a random duration between -time/2 and +time/2.
 For example, `10m` will result in a jitter between -5m and 5m.
 When using `H` in the cron expression, you might want to set the jitter to zero to properly take advantage of the spread-but-stable behaviour.
+
+#### RedactionSpec
+
+Configures applying a column-masking manifest to the restored data using the [postgresql_anonymizer](https://gitlab.com/dalibo/postgresql_anonymizer) extension.
+The manifest follows the [Tamanu masking spec](https://github.com/beyondessential/tamanu/tree/main/database#masking) — any dbt project that publishes the same `meta.masking` annotation shape can be pointed at.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `manifestUrl` | `string` | Yes | — | HTTP(S) URL of the masking manifest. May contain a literal `{version}` placeholder. |
+| `version` | `string` | No | — | Pinned version substituted into `{version}`. Mutually exclusive with `versionQuery`. |
+| `versionQuery` | `string` | No | — | SQL query that returns one row, one text column with the version string. Run as the operator's superuser against the restore. Mutually exclusive with `version`. |
+| `versionFallbackToBase` | `bool` | No | `false` | If the manifest URL with the discovered/pinned version 404s, retry with the `major.minor.0` base version. |
+| `extensionImage` | `string` | No | `registry.gitlab.com/dalibo/postgresql_anon:latest` | OCI image mounted as an image volume on the restore Pod to source the `anon` extension files. |
+
+Example (Tamanu):
+
+```yaml
+spec:
+  redaction:
+    manifestUrl: "https://docs.data.bes.au/tamanu/v{version}/manifest.json"
+    versionQuery: "SELECT value FROM local_system_facts WHERE key = 'currentVersion'"
+    versionFallbackToBase: true
+```
+
+Notes:
+
+- Requires PostgreSQL 18+ on the restore (uses the runtime-settable `extension_control_path` and `dynamic_library_path` GUCs to load the extension from the mounted image).
+- During redaction the database is writable; once anonymisation completes, the operator sets `default_transaction_read_only = on` at the database level and demotes the analytics user back to non-superuser when `spec.readOnly` is true.
 
 #### SnapshotFilter
 
@@ -165,6 +194,9 @@ Additional fields for `target: graphQL`:
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
 | `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, or `failed: <reason>`). |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
+| `redactionPhase` | `string` | Phase of the current restore's redaction (`active`, `complete`, `partial`, or `failed: <reason>`). `partial` means anonymisation ran but some per-column SECURITY LABEL statements were tolerated as errors (e.g. column missing on this DB version). `failed:` is sticky — it doesn't auto-retry; the next scheduled restore clears it. |
+| `redactionVersion` | `string` | The manifest version resolved during the last redaction run (when `manifestUrl` is version-templated). |
+| `redactionColumnsApplied` | `uint32` | Number of columns the last redaction run attempted to mask. |
 | `consecutiveRestoreFailures` | `uint32` | Number of consecutive restore failures. Reset to 0 on success. After 3 consecutive failures the operator stops scheduling new restores until the counter is reset (automatically on next successful restore, or manually via `kubectl patch --subresource=status`). |
 
 ---
