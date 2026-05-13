@@ -95,7 +95,9 @@ pub fn fragment_for(mask: &ColumnMask, info: Option<&ColumnInfo>) -> Result<Frag
 		"name" => Ok(Fragment::Function(null_pres(
 			&col,
 			format!(
-				"CASE WHEN {col} LIKE '% %' THEN anon.fake_name() ELSE anon.fake_first_name() END"
+				"CASE WHEN {col} LIKE '% %' \
+				 THEN anon.fake_first_name() || ' ' || anon.fake_last_name() \
+				 ELSE anon.fake_first_name() END"
 			),
 		))),
 
@@ -271,8 +273,10 @@ mod tests {
 		let f = fragment_for(&cm("name", None), None).unwrap();
 		let rendered = f.render();
 		assert!(rendered.contains("LIKE '% %'"));
-		assert!(rendered.contains("fake_name()"));
-		assert!(rendered.contains("fake_first_name()"));
+		// anon doesn't ship fake_name(); compose first + last for the
+		// with-space branch.
+		assert!(rendered.contains("fake_first_name() || ' ' || anon.fake_last_name()"));
+		assert!(rendered.contains("ELSE anon.fake_first_name()"));
 	}
 
 	#[test]
