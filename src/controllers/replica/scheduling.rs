@@ -188,6 +188,7 @@ mod tests {
 				),
 
 				persistent_schemas: None,
+				redaction: None,
 			},
 			status: Some(PostgresPhysicalReplicaStatus {
 				next_scheduled_restore: next_scheduled.map(Time),

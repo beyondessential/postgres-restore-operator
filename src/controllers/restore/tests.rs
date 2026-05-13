@@ -39,6 +39,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			notifications: vec![],
 
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);
@@ -123,6 +124,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			notifications: vec![],
 
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);

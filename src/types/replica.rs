@@ -101,7 +101,51 @@ pub struct PostgresPhysicalReplicaSpec {
 	/// computed size exceeds this limit. Defaults to 2Ti.
 	#[serde(default = "default_storage_size_maximum")]
 	pub storage_size_maximum: Quantity,
+
+	/// If set, apply a redaction manifest to the restored data before the
+	/// replica becomes eligible for switchover. Requires Postgres 18+ and
+	/// the postgresql_anonymizer extension (loaded via image-volume mount
+	/// on the restore Pod).
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction: Option<RedactionSpec>,
 }
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactionSpec {
+	/// HTTP(S) URL of the dbt-style masking manifest. May contain a
+	/// `{version}` placeholder, in which case `version` or `versionQuery`
+	/// must be set.
+	pub manifest_url: String,
+
+	/// Pinned version to substitute into `{version}`. Mutually exclusive
+	/// with `versionQuery`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub version: Option<String>,
+
+	/// SQL query that returns a single text column with the version string.
+	/// Run against the restore's main database as the operator's superuser.
+	/// Mutually exclusive with `version`.
+	///
+	/// Example (Tamanu):
+	/// `SELECT value FROM local_system_facts WHERE key = 'currentVersion'`
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub version_query: Option<String>,
+
+	/// If the manifest URL with the discovered/pinned version 404s, retry
+	/// with the major.minor.0 base version.
+	#[serde(default)]
+	pub version_fallback_to_base: bool,
+
+	/// Override the OCI image used as the source of the
+	/// postgresql_anonymizer extension files (mounted as an image volume
+	/// on the restore Pod). Defaults to
+	/// `registry.gitlab.com/dalibo/postgresql_anon:latest`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub extension_image: Option<String>,
+}
+
+pub const DEFAULT_ANON_IMAGE: &str = "registry.gitlab.com/dalibo/postgresql_anon:latest";
 
 fn default_storage_size_maximum() -> Quantity {
 	Quantity("2Ti".to_string())
@@ -296,6 +340,19 @@ pub struct PostgresPhysicalReplicaStatus {
 	/// cleared (e.g. by a spec change or manual intervention).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub consecutive_restore_failures: Option<u32>,
+
+	/// Phase of redaction for the current restore:
+	/// pending, active, complete, partial, failed.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction_phase: Option<String>,
+
+	/// Resolved manifest version used by the last redaction run.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction_version: Option<String>,
+
+	/// Number of columns redacted in the last run.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction_columns_applied: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]

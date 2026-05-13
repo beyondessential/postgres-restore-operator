@@ -159,6 +159,7 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 			postgres_extra_config: None,
 			notifications: vec![],
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	)
