@@ -136,16 +136,7 @@ pub struct RedactionSpec {
 	/// with the major.minor.0 base version.
 	#[serde(default)]
 	pub version_fallback_to_base: bool,
-
-	/// Override the OCI image used as the source of the
-	/// postgresql_anonymizer extension files (mounted as an image volume
-	/// on the restore Pod). Defaults to
-	/// `registry.gitlab.com/dalibo/postgresql_anonymizer:stable`.
-	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub extension_image: Option<String>,
 }
-
-pub const DEFAULT_ANON_IMAGE: &str = "registry.gitlab.com/dalibo/postgresql_anonymizer:stable";
 
 fn default_storage_size_maximum() -> Quantity {
 	Quantity("2Ti".to_string())

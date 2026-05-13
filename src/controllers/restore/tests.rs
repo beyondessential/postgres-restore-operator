@@ -674,7 +674,7 @@ fn deployment_without_redaction_has_no_anon_volume() {
 }
 
 #[test]
-fn deployment_with_redaction_mounts_anon_image_volume() {
+fn deployment_with_redaction_adds_install_anon_init_container() {
 	let (mut restore, mut replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("18".to_string()),
@@ -685,7 +685,6 @@ fn deployment_with_redaction_mounts_anon_image_volume() {
 		version: None,
 		version_query: None,
 		version_fallback_to_base: false,
-		extension_image: None,
 	});
 
 	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
@@ -698,31 +697,42 @@ fn deployment_with_redaction_mounts_anon_image_volume() {
 		.as_ref()
 		.unwrap();
 
-	let anon_volume = pod
-		.volumes
+	let install_anon = pod
+		.init_containers
 		.as_ref()
 		.unwrap()
 		.iter()
-		.find(|v| v.name == "anon-extension")
-		.expect("anon-extension volume must be present");
-	let image = anon_volume.image.as_ref().expect("must be an image volume");
-	assert_eq!(image.reference.as_deref(), Some(DEFAULT_ANON_IMAGE));
+		.find(|c| c.name == "install-anon")
+		.expect("install-anon init container must be present");
+	let script = &install_anon.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("PG_MAJOR=18"),
+		"install script must pin PG_MAJOR to the restore's PG version, got: {script}"
+	);
+	assert!(
+		script.contains("postgresql_anonymizer_${PG_MAJOR}"),
+		"install script must apt-install the PG-major-specific anon package, got: {script}"
+	);
+	assert!(
+		script.contains("/pgdata/extensions/anon"),
+		"install script must stage files under the redaction destination, got: {script}"
+	);
 
 	let postgres = &pod.containers[0];
+	let postgres_mounts = postgres.volume_mounts.as_ref().unwrap();
 	assert!(
-		postgres
-			.volume_mounts
-			.as_ref()
-			.unwrap()
-			.iter()
-			.any(|m| m.name == "anon-extension" && m.mount_path == "/extensions/anon"),
-		"postgres container must mount anon-extension at /extensions/anon"
+		postgres_mounts.iter().any(|m| m.name == "pgdata"),
+		"postgres container must mount pgdata"
 	);
 
 	let setup_auth = deploy_init_setup_auth_script(&deploy);
 	assert!(
 		setup_auth.contains("extension_control_path"),
 		"init script must append extension_control_path GUC"
+	);
+	assert!(
+		setup_auth.contains("/pgdata/extensions/anon/share/extension"),
+		"extension_control_path must point at the PVC staging directory"
 	);
 }
 
@@ -738,7 +748,6 @@ fn deployment_with_redaction_rejects_pg17() {
 		version: None,
 		version_query: None,
 		version_fallback_to_base: false,
-		extension_image: None,
 	});
 
 	let err = build_deployment(&restore, "test-restore", "default", &replica).unwrap_err();
@@ -762,7 +771,6 @@ fn deployment_with_redaction_forces_writable() {
 		version: None,
 		version_query: None,
 		version_fallback_to_base: false,
-		extension_image: None,
 	});
 
 	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();

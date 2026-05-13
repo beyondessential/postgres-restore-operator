@@ -175,15 +175,6 @@ jobs:
             load_image nginx:alpine
           fi
 
-      - name: Build PG-18 anon extension image
-        if: matrix.needs_pg18_snapshot
-        run: |
-          docker build \
-            -t test-anon-pg18:integ \
-            -f tests/fixtures/Dockerfile.anon-pg18 \
-            tests/fixtures/
-          kind load docker-image test-anon-pg18:integ
-
       - name: Deploy MinIO
         run: |
           kubectl apply -f tests/fixtures/minio.yaml

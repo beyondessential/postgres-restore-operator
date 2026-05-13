@@ -293,12 +293,6 @@ fn build_redaction_replica(name: &str, secret_ref: &str) -> PostgresPhysicalRepl
 					"SELECT value FROM local_system_facts WHERE key = 'currentVersion'".into(),
 				),
 				version_fallback_to_base: false,
-				// The default registry.gitlab.com/.../postgresql_anonymizer:stable
-				// is built against PG 16 today; the workflow builds a tiny
-				// PG-18 anon image from Dalibo's apt repo (see
-				// tests/fixtures/Dockerfile.anon-pg18) and `kind load`s it
-				// under this tag.
-				extension_image: Some("test-anon-pg18:integ".into()),
 			}),
 			storage_size_maximum: Quantity("2Ti".into()),
 		},

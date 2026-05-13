@@ -335,7 +335,6 @@ mod tests {
 			version: ver.map(str::to_string),
 			version_query: vq.map(str::to_string),
 			version_fallback_to_base: false,
-			extension_image: None,
 		}
 	}
 

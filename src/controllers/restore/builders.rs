@@ -705,18 +705,61 @@ cp -a /usr/lib/locale/* /locale-data/
 		extra_config.push('\n');
 	}
 	if replica.spec.redaction.is_some() {
-		// PG 18+ uses these path GUCs to load extensions whose files live
-		// outside the system extension directories. The dalibo
-		// postgresql_anonymizer image is a full Debian-based Postgres
-		// image whose filesystem is mounted at /extensions/anon by the
-		// Pod builder below — so we point the GUCs at the Debian
-		// extension layout inside that mount.
-		let pg_major: i32 = pg_version.parse().unwrap_or(18);
-		extra_config.push_str(&format!(
-			"extension_control_path = '$system:/extensions/anon/usr/share/postgresql/{pg_major}/extension'\n\
-			 dynamic_library_path = '$libdir:/extensions/anon/usr/lib/postgresql/{pg_major}/lib'\n",
-		));
+		// The install-anon init container apt-installs
+		// postgresql_anonymizer_$N from Dalibo's Labs repo and stages the
+		// extension files under /pgdata/extensions/anon on the restore
+		// PVC. PG 18+'s runtime-settable path GUCs then point postgres at
+		// them. PG <18 isn't supported because those GUCs were
+		// introduced in 18 — older versions would need the files
+		// overlaid onto /usr/share/postgresql/$N/extension and
+		// /usr/lib/postgresql/$N/lib at pod-start time, which is a
+		// separate, larger change.
+		extra_config.push_str(
+			"extension_control_path = '$system:/pgdata/extensions/anon/share/extension'\n\
+			 dynamic_library_path = '$libdir:/pgdata/extensions/anon/lib'\n",
+		);
 	}
+
+	let install_anon_script = format!(
+		r#"set -ex
+PG_MAJOR={pg_version}
+DEST=/pgdata/extensions/anon
+
+if [ -f "$DEST/lib/anon.so" ] && [ -f "$DEST/share/extension/anon.control" ]; then
+  echo "anon already staged at $DEST, skipping install"
+  exit 0
+fi
+
+echo "Installing postgresql_anonymizer_${{PG_MAJOR}} from Dalibo Labs..."
+export DEBIAN_FRONTEND=noninteractive
+
+# Bring in Dalibo Labs repo. PGDG (which the postgres:N image is already
+# configured against) supplies the postgresql-server-dev-$N runtime
+# dependency.
+apt-get update
+apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
+
+curl -fsSL https://apt.dalibo.org/labs/debian-dalibo.gpg \
+    -o /etc/apt/trusted.gpg.d/dalibo-labs.gpg
+echo "deb http://apt.dalibo.org/labs $(lsb_release -cs)-dalibo main" \
+    > /etc/apt/sources.list.d/dalibo-labs.list
+
+apt-get update
+apt-get install -y --no-install-recommends "postgresql_anonymizer_${{PG_MAJOR}}"
+
+echo "Staging extension files to $DEST..."
+mkdir -p "$DEST/share/extension" "$DEST/lib"
+cp -a "/usr/share/postgresql/${{PG_MAJOR}}/extension/anon"*       "$DEST/share/extension/"
+cp -a "/usr/lib/postgresql/${{PG_MAJOR}}/lib/anon.so"             "$DEST/lib/"
+
+# Postgres runs as UID 999 and only needs read access.
+chown -R 999:999 "$DEST"
+chmod -R a+rX "$DEST"
+
+ls -la "$DEST/share/extension" "$DEST/lib"
+echo "anon staged"
+"#
+	);
 	let extra_config_block = if extra_config.is_empty() {
 		String::new()
 	} else {
@@ -1013,33 +1056,34 @@ echo "Auth setup complete"
 						fs_group: Some(999),
 						..Default::default()
 					}),
-					init_containers: Some(vec![
-						Container {
-							name: "fix-locale".to_string(),
-							image: Some(pg_image.clone()),
-							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-							args: Some(vec![locale_script]),
-							security_context: Some(
-								k8s_openapi::api::core::v1::SecurityContext {
-									run_as_user: Some(0),
-									run_as_group: Some(0),
+					init_containers: Some({
+						let mut inits = vec![
+							Container {
+								name: "fix-locale".to_string(),
+								image: Some(pg_image.clone()),
+								command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+								args: Some(vec![locale_script]),
+								security_context: Some(
+									k8s_openapi::api::core::v1::SecurityContext {
+										run_as_user: Some(0),
+										run_as_group: Some(0),
+										..Default::default()
+									},
+								),
+								volume_mounts: Some(vec![VolumeMount {
+									name: "locale-data".to_string(),
+									mount_path: "/locale-data".to_string(),
 									..Default::default()
-								},
-							),
-							volume_mounts: Some(vec![VolumeMount {
-								name: "locale-data".to_string(),
-								mount_path: "/locale-data".to_string(),
+								}]),
+								resources: Some(ResourceRequirements {
+									requests: Some(BTreeMap::from([
+										("cpu".to_string(), Quantity("50m".to_string())),
+										("memory".to_string(), Quantity("64Mi".to_string())),
+									])),
+									..Default::default()
+								}),
 								..Default::default()
-							}]),
-							resources: Some(ResourceRequirements {
-								requests: Some(BTreeMap::from([
-									("cpu".to_string(), Quantity("50m".to_string())),
-									("memory".to_string(), Quantity("64Mi".to_string())),
-								])),
-								..Default::default()
-							}),
-							..Default::default()
-						},
+							},
 						Container {
 							name: "setup-auth".to_string(),
 							image: Some(pg_image.clone()),
@@ -1071,7 +1115,41 @@ echo "Auth setup complete"
 							}),
 							..Default::default()
 						},
-					]),
+						];
+						if replica.spec.redaction.is_some() {
+							inits.push(Container {
+								name: "install-anon".to_string(),
+								image: Some(pg_image.clone()),
+								command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+								args: Some(vec![install_anon_script]),
+								security_context: Some(
+									k8s_openapi::api::core::v1::SecurityContext {
+										run_as_user: Some(0),
+										run_as_group: Some(0),
+										..Default::default()
+									},
+								),
+								volume_mounts: Some(vec![VolumeMount {
+									name: "pgdata".to_string(),
+									mount_path: "/pgdata".to_string(),
+									..Default::default()
+								}]),
+								resources: Some(ResourceRequirements {
+									requests: Some(BTreeMap::from([
+										("cpu".to_string(), Quantity("100m".to_string())),
+										("memory".to_string(), Quantity("128Mi".to_string())),
+									])),
+									limits: Some(BTreeMap::from([
+										("cpu".to_string(), Quantity("1".to_string())),
+										("memory".to_string(), Quantity("512Mi".to_string())),
+									])),
+									..Default::default()
+								}),
+								..Default::default()
+							});
+						}
+						inits
+					}),
 					containers: vec![Container {
 						name: "postgres".to_string(),
 						image: Some(pg_image),
@@ -1128,34 +1206,23 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							protocol: Some("TCP".to_string()),
 							..Default::default()
 						}]),
-						volume_mounts: Some({
-							let mut mounts = vec![
-								VolumeMount {
-									name: "pgdata".to_string(),
-									mount_path: "/pgdata".to_string(),
-									..Default::default()
-								},
-								VolumeMount {
-									name: "locale-data".to_string(),
-									mount_path: "/usr/lib/locale".to_string(),
-									..Default::default()
-								},
-								VolumeMount {
-									name: "dshm".to_string(),
-									mount_path: "/dev/shm".to_string(),
-									..Default::default()
-								},
-							];
-							if replica.spec.redaction.is_some() {
-								mounts.push(VolumeMount {
-									name: "anon-extension".to_string(),
-									mount_path: "/extensions/anon".to_string(),
-									read_only: Some(true),
-									..Default::default()
-								});
-							}
-							mounts
-						}),
+						volume_mounts: Some(vec![
+							VolumeMount {
+								name: "pgdata".to_string(),
+								mount_path: "/pgdata".to_string(),
+								..Default::default()
+							},
+							VolumeMount {
+								name: "locale-data".to_string(),
+								mount_path: "/usr/lib/locale".to_string(),
+								..Default::default()
+							},
+							VolumeMount {
+								name: "dshm".to_string(),
+								mount_path: "/dev/shm".to_string(),
+								..Default::default()
+							},
+						]),
 						readiness_probe: Some(Probe {
 							exec: Some(ExecAction {
 								command: Some(vec![
@@ -1189,54 +1256,35 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 						resources: replica.spec.resources.clone(),
 						..Default::default()
 					}],
-					volumes: Some({
-						let mut volumes = vec![
-							Volume {
-								name: "pgdata".to_string(),
-								persistent_volume_claim: Some(
-									k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-										claim_name: pvc_name,
-										read_only: Some(false),
-									},
-								),
-								..Default::default()
-							},
-							Volume {
-								name: "locale-data".to_string(),
-								empty_dir: Some(
-									k8s_openapi::api::core::v1::EmptyDirVolumeSource::default(),
-								),
-								..Default::default()
-							},
-							Volume {
-								name: "dshm".to_string(),
-								empty_dir: Some(
-									k8s_openapi::api::core::v1::EmptyDirVolumeSource {
-										medium: Some("Memory".to_string()),
-										size_limit: Some(shm_size),
-									},
-								),
-								..Default::default()
-							},
-						];
-						if let Some(ref redaction) = replica.spec.redaction {
-							let image = redaction
-								.extension_image
-								.clone()
-								.unwrap_or_else(|| crate::types::DEFAULT_ANON_IMAGE.to_string());
-							volumes.push(Volume {
-								name: "anon-extension".to_string(),
-								image: Some(
-									k8s_openapi::api::core::v1::ImageVolumeSource {
-										reference: Some(image),
-										pull_policy: None,
-									},
-								),
-								..Default::default()
-							});
-						}
-						volumes
-					}),
+					volumes: Some(vec![
+						Volume {
+							name: "pgdata".to_string(),
+							persistent_volume_claim: Some(
+								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+									claim_name: pvc_name,
+									read_only: Some(false),
+								},
+							),
+							..Default::default()
+						},
+						Volume {
+							name: "locale-data".to_string(),
+							empty_dir: Some(
+								k8s_openapi::api::core::v1::EmptyDirVolumeSource::default(),
+							),
+							..Default::default()
+						},
+						Volume {
+							name: "dshm".to_string(),
+							empty_dir: Some(
+								k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+									medium: Some("Memory".to_string()),
+									size_limit: Some(shm_size),
+								},
+							),
+							..Default::default()
+						},
+					]),
 					affinity: replica.spec.affinity.clone(),
 					tolerations: Some(replica.spec.tolerations.clone()),
 					..Default::default()

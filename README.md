@@ -126,7 +126,6 @@ The manifest follows the [Tamanu masking spec](https://github.com/beyondessentia
 | `version` | `string` | No | — | Pinned version substituted into `{version}`. Mutually exclusive with `versionQuery`. |
 | `versionQuery` | `string` | No | — | SQL query that returns one row, one text column with the version string. Run as the operator's superuser against the restore. Mutually exclusive with `version`. |
 | `versionFallbackToBase` | `bool` | No | `false` | If the manifest URL with the discovered/pinned version 404s, retry with the `major.minor.0` base version. |
-| `extensionImage` | `string` | No | `registry.gitlab.com/dalibo/postgresql_anonymizer:stable` | OCI image mounted as an image volume on the restore Pod to source the `anon` extension files. |
 
 Example (Tamanu):
 
@@ -140,8 +139,8 @@ spec:
 
 Notes:
 
-- Requires PostgreSQL 18+ on the restore (uses the runtime-settable `extension_control_path` and `dynamic_library_path` GUCs to load the extension from the mounted image).
-- The default `extensionImage` tag (`:stable` on Dalibo's registry) is currently built against PG 16; until Dalibo publishes a PG-18 build, set `extensionImage` to an image with `anon.control` and `anon.so` at the standard Debian PG-18 paths (`/usr/share/postgresql/18/extension/` and `/usr/lib/postgresql/18/lib/`). See `tests/fixtures/Dockerfile.anon-pg18` for a minimal recipe.
+- Requires PostgreSQL 18+ on the restore (uses the runtime-settable `extension_control_path` and `dynamic_library_path` GUCs).
+- An `install-anon` init container apt-installs `postgresql_anonymizer_$N` from [Dalibo Labs](https://apt.dalibo.org/labs/) and stages the extension files onto the restore PVC under `/pgdata/extensions/anon/`. This adds roughly 30 seconds to each restore, and avoids needing a pre-built per-PG-version extension image. The install is idempotent across pod restarts (skipped if the files are already staged).
 - During redaction the database is writable; once anonymisation completes, the operator sets `default_transaction_read_only = on` at the database level and demotes the analytics user back to non-superuser when `spec.readOnly` is true.
 
 #### SnapshotFilter
