@@ -5,7 +5,10 @@
 //! See `docs/plans/replica-redaction.md` for the full design.
 
 use k8s_openapi::api::core::v1::Secret;
-use kube::{Api, ResourceExt as _};
+use kube::{
+	Api, ResourceExt as _,
+	api::{Patch, PatchParams},
+};
 use tracing::{debug, info, warn};
 
 use crate::context::Context;
@@ -13,7 +16,7 @@ use crate::controllers::postgres::{
 	self, PgConnection, discover_restore_database, read_secret_field,
 };
 use crate::error::{Error, Result};
-use crate::types::{PostgresPhysicalReplica, RedactionSpec};
+use crate::types::{PostgresPhysicalReplica, PostgresPhysicalRestore, RedactionSpec};
 
 use self::manifest::{Manifest, base_version, parse_manifest};
 
@@ -24,6 +27,137 @@ pub mod manifest;
 pub mod mask;
 
 const VERSION_PLACEHOLDER: &str = "{version}";
+
+/// Reconciler entry point: runs redaction against `switching` if the
+/// replica has a redaction spec and the current `redactionPhase` is not
+/// already `complete` / `partial` / `failed: …`. Returns `true` when the
+/// redaction is settled (complete, partial, or failed — anything that
+/// won't change on the next reconcile), `false` when more work is
+/// pending and the controller should requeue.
+pub async fn reconcile_redaction_step(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	switching: &PostgresPhysicalRestore,
+) -> Result<bool> {
+	let replica_name = replica.name_any();
+	let namespace = replica.namespace().expect("replica is namespaced");
+	let phase = replica
+		.status
+		.as_ref()
+		.and_then(|s| s.redaction_phase.as_deref());
+
+	match phase {
+		Some("complete") | Some("partial") => return Ok(true),
+		// `failed: …` is sticky: don't auto-retry. The user clears the
+		// phase by triggering a new restore (the sweep resets it) or
+		// editing status manually. Treat it as settled so the
+		// switchover branch can run if the operator decides to proceed
+		// without redaction — but `false` here means "redaction is not
+		// healthy, do not let the switchover proceed".
+		Some(p) if p.starts_with("failed:") => return Ok(false),
+		_ => {}
+	}
+
+	let pg_version = switching
+		.status
+		.as_ref()
+		.and_then(|s| s.postgres_version.as_deref());
+	let major: i32 = pg_version.and_then(|v| v.parse().ok()).unwrap_or(0);
+	if major < 18 {
+		let msg = format!(
+			"failed: redaction requires PostgreSQL 18+, restore is PG {}",
+			pg_version.unwrap_or("unknown")
+		);
+		warn!(replica = %replica_name, version = pg_version, %msg);
+		patch_phase_only(ctx, &replica_name, &namespace, &msg).await?;
+		return Ok(false);
+	}
+
+	if phase != Some("active") {
+		patch_phase_only(ctx, &replica_name, &namespace, "active").await?;
+	}
+
+	let switching_name = switching.name_any();
+	match reconcile_redaction(ctx, replica, &switching_name).await {
+		Ok((version, outcome)) => {
+			let phase = if outcome.is_partial() {
+				"partial"
+			} else {
+				"complete"
+			};
+			info!(
+				replica = %replica_name,
+				restore = %switching_name,
+				phase,
+				columns_attempted = outcome.columns_attempted,
+				columns_failed = outcome.columns_failed,
+				tables_attempted = outcome.tables_attempted,
+				tables_failed = outcome.tables_failed,
+				"redaction finished"
+			);
+			patch_settled(
+				ctx,
+				&replica_name,
+				&namespace,
+				phase,
+				version.as_deref(),
+				outcome.columns_attempted,
+			)
+			.await?;
+			Ok(true)
+		}
+		Err(e) => {
+			let msg = format!("failed: {e}");
+			warn!(replica = %replica_name, error = %e, "redaction failed");
+			patch_phase_only(ctx, &replica_name, &namespace, &msg).await?;
+			Ok(false)
+		}
+	}
+}
+
+async fn patch_phase_only(
+	ctx: &Context,
+	replica_name: &str,
+	namespace: &str,
+	phase: &str,
+) -> Result<()> {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
+	let patch = serde_json::json!({ "status": { "redactionPhase": phase } });
+	replicas
+		.patch_status(
+			replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+	Ok(())
+}
+
+async fn patch_settled(
+	ctx: &Context,
+	replica_name: &str,
+	namespace: &str,
+	phase: &str,
+	version: Option<&str>,
+	columns_applied: u32,
+) -> Result<()> {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
+	let patch = serde_json::json!({
+		"status": {
+			"redactionPhase": phase,
+			"redactionVersion": version,
+			"redactionColumnsApplied": columns_applied,
+		}
+	});
+	replicas
+		.patch_status(
+			replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+	Ok(())
+}
 
 /// Run the full redaction step against the given restore.
 ///
@@ -91,7 +225,15 @@ pub async fn reconcile_redaction(
 		"manifest parsed"
 	);
 
-	let outcome = apply::apply(&conn, &manifest, &dbname).await?;
+	let outcome = apply::apply(&conn, &manifest).await?;
+
+	if replica.spec.read_only {
+		debug!(
+			replica = %replica.name_any(),
+			"re-enabling read-only on redacted database"
+		);
+		apply::enforce_read_only(&conn, &dbname, &replica.spec.analytics_username).await?;
+	}
 
 	Ok((version, outcome))
 }

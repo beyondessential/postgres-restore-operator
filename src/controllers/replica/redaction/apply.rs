@@ -32,7 +32,7 @@ impl Outcome {
 ///
 /// The connection must be made as a superuser (CREATE EXTENSION, SECURITY
 /// LABEL, TRUNCATE and `anon.anonymize_database()` all require it).
-pub async fn apply(conn: &PgConnection, manifest: &Manifest, dbname: &str) -> Result<Outcome> {
+pub async fn apply(conn: &PgConnection, manifest: &Manifest) -> Result<Outcome> {
 	let mut outcome = Outcome::default();
 
 	conn.client
@@ -136,16 +136,47 @@ pub async fn apply(conn: &PgConnection, manifest: &Manifest, dbname: &str) -> Re
 		.await
 		.map_err(|e| Error::Redaction(format!("anon.anonymize_database() failed: {e}")))?;
 
-	let alter = format!(
+	Ok(outcome)
+}
+
+/// Lock the freshly-redacted database back to read-only by:
+/// - setting the DB-level `default_transaction_read_only` GUC, and
+/// - demoting the analytics user back to NOSUPERUSER + granting
+///   `pg_read_all_data` (matching the role posture the restore init
+///   script applies when `effective_read_only` is true).
+pub async fn enforce_read_only(
+	conn: &PgConnection,
+	dbname: &str,
+	analytics_user: &str,
+) -> Result<()> {
+	let alter_db = format!(
 		"ALTER DATABASE {} SET default_transaction_read_only = on",
 		quote_ident(dbname),
 	);
 	conn.client
-		.simple_query(&alter)
+		.simple_query(&alter_db)
 		.await
-		.map_err(|e| Error::Redaction(format!("re-enabling read-only failed: {e}")))?;
+		.map_err(|e| Error::Redaction(format!("ALTER DATABASE for read-only failed: {e}")))?;
 
-	Ok(outcome)
+	let demote = format!(
+		"ALTER ROLE {user} WITH NOSUPERUSER",
+		user = quote_ident(analytics_user),
+	);
+	conn.client
+		.simple_query(&demote)
+		.await
+		.map_err(|e| Error::Redaction(format!("demoting analytics user failed: {e}")))?;
+
+	let grant = format!(
+		"GRANT pg_read_all_data TO {user}",
+		user = quote_ident(analytics_user),
+	);
+	conn.client
+		.simple_query(&grant)
+		.await
+		.map_err(|e| Error::Redaction(format!("granting pg_read_all_data failed: {e}")))?;
+
+	Ok(())
 }
 
 /// Key used to join `ColumnMask` with the `information_schema` results.
