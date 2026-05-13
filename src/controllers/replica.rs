@@ -36,6 +36,7 @@ use crate::{
 };
 use scheduling::ScheduleDecision;
 
+mod redaction;
 mod resources;
 mod scheduling;
 mod schema_migration;

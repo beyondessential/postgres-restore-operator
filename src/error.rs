@@ -43,6 +43,9 @@ pub enum Error {
 
 	#[error("Database connection error: {0}")]
 	Postgres(#[from] tokio_postgres::Error),
+
+	#[error("Redaction error: {0}")]
+	Redaction(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
