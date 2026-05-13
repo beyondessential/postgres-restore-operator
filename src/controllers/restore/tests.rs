@@ -646,3 +646,151 @@ fn deployment_shared_buffers_with_custom_resources() {
 		"init script must set shared_buffers for 2Gi request"
 	);
 }
+
+#[test]
+fn deployment_without_redaction_has_no_anon_volume() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let volume_names: Vec<&str> = pod
+		.volumes
+		.as_ref()
+		.unwrap()
+		.iter()
+		.map(|v| v.name.as_str())
+		.collect();
+	assert!(!volume_names.contains(&"anon-extension"));
+}
+
+#[test]
+fn deployment_with_redaction_mounts_anon_image_volume() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+		extension_image: None,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+
+	let anon_volume = pod
+		.volumes
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|v| v.name == "anon-extension")
+		.expect("anon-extension volume must be present");
+	let image = anon_volume.image.as_ref().expect("must be an image volume");
+	assert_eq!(image.reference.as_deref(), Some(DEFAULT_ANON_IMAGE));
+
+	let postgres = &pod.containers[0];
+	assert!(
+		postgres
+			.volume_mounts
+			.as_ref()
+			.unwrap()
+			.iter()
+			.any(|m| m.name == "anon-extension" && m.mount_path == "/extensions/anon"),
+		"postgres container must mount anon-extension at /extensions/anon"
+	);
+
+	let setup_auth = deploy_init_setup_auth_script(&deploy);
+	assert!(
+		setup_auth.contains("extension_control_path"),
+		"init script must append extension_control_path GUC"
+	);
+}
+
+#[test]
+fn deployment_with_redaction_rejects_pg17() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("17".to_string()),
+		..Default::default()
+	});
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+		extension_image: None,
+	});
+
+	let err = build_deployment(&restore, "test-restore", "default", &replica).unwrap_err();
+	let msg = format!("{err}");
+	assert!(
+		msg.contains("PostgreSQL 18"),
+		"error should mention PG 18+ requirement, got: {msg}"
+	);
+}
+
+#[test]
+fn deployment_with_redaction_forces_writable() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	replica.spec.read_only = true;
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+		extension_image: None,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let script = deploy_init_setup_auth_script(&deploy);
+	// The init script uses `if [ "<read_only>" = "true" ]` and we want
+	// that variable substituted to "false" when redaction is set so the
+	// conditional doesn't fire at runtime.
+	assert!(
+		script.contains("if [ \"false\" = \"true\" ]"),
+		"redaction must defer read-only by substituting read_only=false into the init script"
+	);
+}
+
+fn deploy_init_setup_auth_script(deploy: &k8s_openapi::api::apps::v1::Deployment) -> String {
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let setup_auth = pod
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.unwrap();
+	setup_auth.args.as_ref().unwrap()[0].clone()
+}

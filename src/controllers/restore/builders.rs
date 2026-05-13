@@ -658,6 +658,15 @@ pub fn build_deployment(
 		.cloned()
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
+	if replica.spec.redaction.is_some() {
+		let major: i32 = pg_version.parse().unwrap_or(0);
+		if major < 18 {
+			return Err(Error::Redaction(format!(
+				"redaction requires PostgreSQL 18+, restore is PG {pg_version}",
+			)));
+		}
+	}
+
 	let pg_image = format!("postgres:{pg_version}");
 
 	let locale_script = r#"set -ex
@@ -682,19 +691,37 @@ cp -a /usr/lib/locale/* /locale-data/
 "#
 	.to_string();
 
-	// persistent_schemas needs write access to receive the migrated data
-	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
+	// persistent_schemas and redaction both need write access during their
+	// post-restore step. Redaction re-enables `default_transaction_read_only`
+	// at the database level itself after it's done.
+	let effective_read_only = replica.spec.read_only
+		&& replica.spec.persistent_schemas.is_none()
+		&& replica.spec.redaction.is_none();
 	let read_only = effective_read_only.to_string();
 
-	let extra_config_block = if let Some(ref extra) = replica.spec.postgres_extra_config {
+	let mut extra_config = String::new();
+	if let Some(ref extra) = replica.spec.postgres_extra_config {
+		extra_config.push_str(extra);
+		extra_config.push('\n');
+	}
+	if replica.spec.redaction.is_some() {
+		// PG 18+ uses these path GUCs to load extensions whose files live
+		// outside the system extension directories. The dalibo
+		// postgresql_anonymizer image is mounted at /extensions/anon by
+		// the Pod builder below.
+		extra_config.push_str(
+			"extension_control_path = '$system:/extensions/anon/share/extension'\n\
+			 dynamic_library_path = '$libdir:/extensions/anon/lib/postgresql/18/lib'\n",
+		);
+	}
+	let extra_config_block = if extra_config.is_empty() {
+		String::new()
+	} else {
 		format!(
 			r#"echo "Appending extra postgresql.conf settings..."
 cat >> "$PGDATA/postgresql.conf" << 'EXTRACONFEOF'
-{extra}
-EXTRACONFEOF"#
+{extra_config}EXTRACONFEOF"#
 		)
-	} else {
-		String::new()
 	};
 
 	let init_script = format!(
@@ -1098,23 +1125,34 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							protocol: Some("TCP".to_string()),
 							..Default::default()
 						}]),
-						volume_mounts: Some(vec![
-							VolumeMount {
-								name: "pgdata".to_string(),
-								mount_path: "/pgdata".to_string(),
-								..Default::default()
-							},
-							VolumeMount {
-								name: "locale-data".to_string(),
-								mount_path: "/usr/lib/locale".to_string(),
-								..Default::default()
-							},
-							VolumeMount {
-								name: "dshm".to_string(),
-								mount_path: "/dev/shm".to_string(),
-								..Default::default()
-							},
-						]),
+						volume_mounts: Some({
+							let mut mounts = vec![
+								VolumeMount {
+									name: "pgdata".to_string(),
+									mount_path: "/pgdata".to_string(),
+									..Default::default()
+								},
+								VolumeMount {
+									name: "locale-data".to_string(),
+									mount_path: "/usr/lib/locale".to_string(),
+									..Default::default()
+								},
+								VolumeMount {
+									name: "dshm".to_string(),
+									mount_path: "/dev/shm".to_string(),
+									..Default::default()
+								},
+							];
+							if replica.spec.redaction.is_some() {
+								mounts.push(VolumeMount {
+									name: "anon-extension".to_string(),
+									mount_path: "/extensions/anon".to_string(),
+									read_only: Some(true),
+									..Default::default()
+								});
+							}
+							mounts
+						}),
 						readiness_probe: Some(Probe {
 							exec: Some(ExecAction {
 								command: Some(vec![
@@ -1148,35 +1186,54 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 						resources: replica.spec.resources.clone(),
 						..Default::default()
 					}],
-					volumes: Some(vec![
-						Volume {
-							name: "pgdata".to_string(),
-							persistent_volume_claim: Some(
-								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-									claim_name: pvc_name,
-									read_only: Some(false),
-								},
-							),
-							..Default::default()
-						},
-						Volume {
-							name: "locale-data".to_string(),
-							empty_dir: Some(
-								k8s_openapi::api::core::v1::EmptyDirVolumeSource::default(),
-							),
-							..Default::default()
-						},
-						Volume {
-							name: "dshm".to_string(),
-							empty_dir: Some(
-								k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+					volumes: Some({
+						let mut volumes = vec![
+							Volume {
+								name: "pgdata".to_string(),
+								persistent_volume_claim: Some(
+									k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+										claim_name: pvc_name,
+										read_only: Some(false),
+									},
+								),
+								..Default::default()
+							},
+							Volume {
+								name: "locale-data".to_string(),
+								empty_dir: Some(
+									k8s_openapi::api::core::v1::EmptyDirVolumeSource::default(),
+								),
+								..Default::default()
+							},
+							Volume {
+								name: "dshm".to_string(),
+								empty_dir: Some(
+									k8s_openapi::api::core::v1::EmptyDirVolumeSource {
 										medium: Some("Memory".to_string()),
 										size_limit: Some(shm_size),
 									},
-							),
-							..Default::default()
-						},
-					]),
+								),
+								..Default::default()
+							},
+						];
+						if let Some(ref redaction) = replica.spec.redaction {
+							let image = redaction
+								.extension_image
+								.clone()
+								.unwrap_or_else(|| crate::types::DEFAULT_ANON_IMAGE.to_string());
+							volumes.push(Volume {
+								name: "anon-extension".to_string(),
+								image: Some(
+									k8s_openapi::api::core::v1::ImageVolumeSource {
+										reference: Some(image),
+										pull_policy: None,
+									},
+								),
+								..Default::default()
+							});
+						}
+						volumes
+					}),
 					affinity: replica.spec.affinity.clone(),
 					tolerations: Some(replica.spec.tolerations.clone()),
 					..Default::default()
