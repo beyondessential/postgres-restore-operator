@@ -19,7 +19,7 @@ kube_quantity = "0.9.0"
 prometheus = "0.14.0"
 rand = "0.10.1"
 reqwest = { version = "0.13.3", features = ["json"] }
-rust_decimal = "1.41.0"
+rust_decimal = "1.42.0"
 schemars = { version = "1.2.1", features = ["jiff02"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
