@@ -103,6 +103,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. |
+| `eventPublisher` | `EventPublisherConfig` | No | — | Publish restore-failure events to a canopy `/events` endpoint over mTLS. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -146,6 +147,18 @@ Additional fields for `target: graphQL`:
 |-------|------|----------|-------------|
 | `mutation` | `string` | Yes | GraphQL mutation string. |
 | `variablesTemplate` | `string` | Yes | Template for the GraphQL variables payload. |
+
+#### EventPublisherConfig
+
+Publishes restore-failure events to a canopy-style `/events` endpoint over
+mTLS. Repeated failures with the same `(source, ref)` are folded into a
+single rolling issue server-side.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `url` | `string` | Yes | — | Full URL of the events endpoint (e.g. `https://meta.tamanu.app/api/events`). |
+| `clientCertificateSecretRef` | `SecretReference` | Yes | — | Secret holding the mTLS client cert + key. Expected keys are `tls.crt` and `tls.key` (a standard `kubernetes.io/tls` Secret). |
+| `source` | `string` | No | `"pgro"` | Value placed in `NewEvent.source` on every published event. |
 
 #### Status
 
