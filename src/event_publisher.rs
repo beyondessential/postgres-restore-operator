@@ -52,7 +52,11 @@ pub struct NewEvent {
 /// Send a single event. Builds a fresh mTLS-configured `reqwest::Client` per
 /// call — these publishes are rare (one per failed restore) so caching gains
 /// nothing and a fresh client always picks up rotated certs.
-pub async fn publish(client: &Client, config: &EventPublisherConfig, event: &NewEvent) -> Result<()> {
+pub async fn publish(
+	client: &Client,
+	config: &EventPublisherConfig,
+	event: &NewEvent,
+) -> Result<()> {
 	let identity_pem = load_identity_pem(client, &config.client_certificate_secret_ref).await?;
 	let identity = reqwest::Identity::from_pem(&identity_pem)
 		.map_err(|e| Error::EventPublisher(format!("invalid client certificate: {e}")))?;
@@ -76,10 +80,9 @@ pub async fn publish(client: &Client, config: &EventPublisherConfig, event: &New
 /// Pull `tls.crt` and `tls.key` out of the referenced Secret and concatenate
 /// them into a single PEM buffer suitable for `Identity::from_pem`.
 async fn load_identity_pem(client: &Client, secret_ref: &SecretReference) -> Result<Vec<u8>> {
-	let name = secret_ref
-		.name
-		.as_deref()
-		.ok_or_else(|| Error::EventPublisher("clientCertificateSecretRef.name is required".into()))?;
+	let name = secret_ref.name.as_deref().ok_or_else(|| {
+		Error::EventPublisher("clientCertificateSecretRef.name is required".into())
+	})?;
 	let namespace = secret_ref.namespace.as_deref().ok_or_else(|| {
 		Error::EventPublisher("clientCertificateSecretRef.namespace is required".into())
 	})?;

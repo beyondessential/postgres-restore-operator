@@ -26,6 +26,7 @@ use super::read_job_termination_message;
 use crate::{
 	context::Context,
 	error::{Error, Result},
+	event_publisher::{self, NewEvent, Severity},
 	types::*,
 };
 
@@ -145,6 +146,7 @@ async fn fail_restore(
 	namespace: &str,
 	name: &str,
 	replica_name: &str,
+	reason: &str,
 	status_patch: serde_json::Value,
 ) -> Result<Action> {
 	update_restore_status(&ctx.client, namespace, name, status_patch).await?;
@@ -153,9 +155,11 @@ async fn fail_restore(
 		info!(promoted = %promoted_name, "promoted queued restore after failure");
 	}
 
-	// Increment consecutiveRestoreFailures on the parent replica
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
-	if let Ok(replica) = replicas.get(replica_name).await {
+	let replica = replicas.get(replica_name).await.ok();
+
+	// Increment consecutiveRestoreFailures on the parent replica
+	if let Some(replica) = &replica {
 		let current = replica
 			.status
 			.as_ref()
@@ -200,7 +204,7 @@ async fn fail_restore(
 			&Event {
 				type_: EventType::Warning,
 				reason: "RestoreFailed".into(),
-				note: Some(format!("Restore {name} failed")),
+				note: Some(format!("Restore {name} failed: {reason}")),
 				action: "Restore".into(),
 				secondary: None,
 			},
@@ -209,6 +213,27 @@ async fn fail_restore(
 		.await
 	{
 		warn!(replica = replica_name, error = %e, "failed to publish RestoreFailed event");
+	}
+
+	if let Some(replica) = &replica
+		&& let Some(publisher_config) = replica.spec.event_publisher.as_ref()
+	{
+		let event = NewEvent {
+			source: publisher_config.source.clone(),
+			ref_: format!("{namespace}/{replica_name}/restore-failed"),
+			message: format!("Restore {name} failed: {reason}"),
+			description: Some(format!("Restore failed: {namespace}/{replica_name}")),
+			severity: Some(Severity::Error),
+			occurred_at: Some(Timestamp::now()),
+			active: Some(true),
+		};
+		if let Err(e) = event_publisher::publish(&ctx.client, publisher_config, &event).await {
+			warn!(
+				replica = replica_name,
+				error = %e,
+				"failed to publish restore-failed event to canopy"
+			);
+		}
 	}
 
 	Ok(Action::requeue(Duration::from_secs(300)))
@@ -464,6 +489,7 @@ async fn reconcile_restoring(
 			namespace,
 			name,
 			replica_name,
+			"restore job exceeded backoff limit",
 			serde_json::json!({
 				"phase": "Failed",
 				"restoreJob": {
@@ -690,6 +716,7 @@ async fn reconcile_ready(
 						namespace,
 						name,
 						replica_name,
+						"version detection job returned no version",
 						serde_json::json!({ "phase": "Failed" }),
 					)
 					.await;
@@ -709,6 +736,7 @@ async fn reconcile_ready(
 						namespace,
 						name,
 						replica_name,
+						"version detection job exceeded backoff limit",
 						serde_json::json!({ "phase": "Failed" }),
 					)
 					.await;
@@ -772,6 +800,7 @@ async fn reconcile_ready(
 				namespace,
 				name,
 				replica_name,
+				"deployment not ready after 10 minutes",
 				serde_json::json!({ "phase": "Failed" }),
 			)
 			.await;
