@@ -1,6 +1,7 @@
 pub mod context;
 pub mod controllers;
 pub mod error;
+pub mod event_publisher;
 pub mod kopia;
 pub mod metrics;
 pub mod notifications;

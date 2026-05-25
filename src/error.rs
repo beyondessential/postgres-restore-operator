@@ -23,6 +23,9 @@ pub enum Error {
 	#[error("Notification error: {0}")]
 	Notification(String),
 
+	#[error("Event publisher error: {0}")]
+	EventPublisher(String),
+
 	#[error("Serialization error: {0}")]
 	Serialization(#[from] serde_json::Error),
 
