@@ -285,6 +285,7 @@ mod tests {
 				),
 
 				persistent_schemas: Some(schemas.into_iter().map(String::from).collect()),
+				event_publisher: None,
 			},
 			status: None,
 		}

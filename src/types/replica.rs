@@ -101,6 +101,33 @@ pub struct PostgresPhysicalReplicaSpec {
 	/// computed size exceeds this limit. Defaults to 2Ti.
 	#[serde(default = "default_storage_size_maximum")]
 	pub storage_size_maximum: Quantity,
+
+	/// Publish restore-failure events to a canopy-style `/events` endpoint
+	/// (https://meta.tamanu.app/api/events) over mTLS.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub event_publisher: Option<EventPublisherConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EventPublisherConfig {
+	/// Full URL of the events endpoint, e.g.
+	/// `https://meta.tamanu.app/api/events`.
+	pub url: String,
+
+	/// Secret holding the mTLS client cert + key. Expected keys are
+	/// `tls.crt` (PEM cert, optionally with chain) and `tls.key` (PEM
+	/// private key) — the conventional layout of a
+	/// `kubernetes.io/tls` Secret.
+	pub client_certificate_secret_ref: SecretReference,
+
+	/// Value placed in `NewEvent.source` on every published event.
+	#[serde(default = "default_event_source")]
+	pub source: String,
+}
+
+fn default_event_source() -> String {
+	"pgro".to_string()
 }
 
 fn default_storage_size_maximum() -> Quantity {
