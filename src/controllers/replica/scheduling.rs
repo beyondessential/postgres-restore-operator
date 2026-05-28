@@ -15,6 +15,34 @@ pub enum ScheduleDecision {
 	SkippedByTtl,
 }
 
+/// Geometric backoff to apply after consecutive restore failures, replacing
+/// the normal cron schedule until a restore succeeds.
+///
+/// Formula: `clamp(60s * 2^n, 2min, 1h)` where `n` is the consecutive
+/// failure count. Returns `None` for `n == 0` (no backoff needed; the cron
+/// schedule applies).
+///
+/// Hits the 1-hour ceiling at 6 consecutive failures, which means a
+/// sustained failure mode caps compute at ~1 retry/hour while a transient
+/// blip still gets a fast (2 min) retry. The operator never permanently
+/// suspends — failures are bounded by retry rate, not by a manual reset
+/// gate — because most failure modes in this system are *external*
+/// (Karpenter, AWS API, upstream snapshots) and resolve themselves; pgro
+/// must keep trying so it picks up the fix without human intervention.
+pub fn failure_backoff_delay(consecutive_failures: u32) -> Option<SignedDuration> {
+	if consecutive_failures == 0 {
+		return None;
+	}
+	const BASE_SECS: u64 = 60;
+	const MIN_SECS: u64 = 120;
+	const MAX_SECS: u64 = 3600;
+	// Saturate exponent so we don't overflow on absurd failure counts.
+	let exponent = consecutive_failures.min(20);
+	let unclamped = BASE_SECS.saturating_mul(1u64 << exponent);
+	let clamped = unclamped.clamp(MIN_SECS, MAX_SECS);
+	Some(SignedDuration::from_secs(clamped as i64))
+}
+
 impl PostgresPhysicalReplica {
 	/// Compute a stable hash of the schedule inputs (`schedule` + `scheduleJitter`)
 	/// so we can detect when the user changes either field without storing raw values.
@@ -195,6 +223,47 @@ mod tests {
 				..Default::default()
 			}),
 		}
+	}
+
+	#[test]
+	fn failure_backoff_progression() {
+		// No failures → no backoff (cron applies).
+		assert_eq!(failure_backoff_delay(0), None);
+		// Doubles each step until clamped at 1h (6+ failures).
+		assert_eq!(
+			failure_backoff_delay(1),
+			Some(SignedDuration::from_secs(120))
+		);
+		assert_eq!(
+			failure_backoff_delay(2),
+			Some(SignedDuration::from_secs(240))
+		);
+		assert_eq!(
+			failure_backoff_delay(3),
+			Some(SignedDuration::from_secs(480))
+		);
+		assert_eq!(
+			failure_backoff_delay(4),
+			Some(SignedDuration::from_secs(960))
+		);
+		assert_eq!(
+			failure_backoff_delay(5),
+			Some(SignedDuration::from_secs(1920))
+		);
+		// Capped at 1h from here on.
+		assert_eq!(
+			failure_backoff_delay(6),
+			Some(SignedDuration::from_secs(3600))
+		);
+		assert_eq!(
+			failure_backoff_delay(100),
+			Some(SignedDuration::from_secs(3600))
+		);
+		// Absurd values must not overflow.
+		assert_eq!(
+			failure_backoff_delay(u32::MAX),
+			Some(SignedDuration::from_secs(3600))
+		);
 	}
 
 	#[test]

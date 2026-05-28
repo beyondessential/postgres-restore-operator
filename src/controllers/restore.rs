@@ -153,7 +153,10 @@ async fn fail_restore(
 		info!(promoted = %promoted_name, "promoted queued restore after failure");
 	}
 
-	// Increment consecutiveRestoreFailures on the parent replica
+	// Increment consecutiveRestoreFailures on the parent replica and advance
+	// nextScheduledRestore by the failure backoff, so the next reconcile
+	// retries on a bounded, sub-cron cadence instead of waiting until the
+	// next cron tick.
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
 	if let Ok(replica) = replicas.get(replica_name).await {
 		let current = replica
@@ -162,9 +165,12 @@ async fn fail_restore(
 			.and_then(|s| s.consecutive_restore_failures)
 			.unwrap_or(0);
 		let new_count = current + 1;
+		let backoff = super::replica::scheduling::failure_backoff_delay(new_count);
+		let next_scheduled = backoff.map(|d| Time(Timestamp::now() + d));
 		let patch = serde_json::json!({
 			"status": {
 				"consecutiveRestoreFailures": new_count,
+				"nextScheduledRestore": next_scheduled,
 			}
 		});
 		if let Err(e) = replicas
@@ -180,7 +186,8 @@ async fn fail_restore(
 			info!(
 				replica = replica_name,
 				consecutive_failures = new_count,
-				"incremented consecutive restore failure count"
+				next_scheduled = ?next_scheduled.map(|t| t.0),
+				"incremented consecutive restore failure count, scheduled retry via backoff"
 			);
 		}
 	}

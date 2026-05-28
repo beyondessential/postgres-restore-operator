@@ -178,15 +178,33 @@ impl PostgresPhysicalReplica {
 		let replica_name = self.name_any();
 
 		// Guardrail: refuse to create another restore if we already have too
-		// many. Pruning normally keeps this at 1; if it doesn't, capping
-		// here prevents runaway PVC creation while the underlying issue is
-		// fixed.
+		// many *live* ones. Pruning normally keeps this at 1; if it
+		// doesn't, capping here prevents runaway PVC creation while the
+		// underlying issue is fixed.
+		//
+		// Failed restores are excluded from the count. They are
+		// operator-owned and cleaned up by the failed-restore sweep within
+		// minutes — counting them would cause the guardrail to spuriously
+		// trip during sustained-failure backoff (e.g. 1 active + 1 failed
+		// pending cleanup + 1 new attempt). The invariant we actually want
+		// to enforce is on live restores (Pending/Restoring/Ready/
+		// Switching/Active).
 		let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), &self.ns());
-		let existing = restores
+		let existing_all = restores
 			.list(&ListParams::default().labels(&format!("pgro.bes.au/replica={replica_name}")))
 			.await?;
-		if existing.items.len() >= MAX_RESTORES_PER_REPLICA {
-			let names: Vec<String> = existing.items.iter().map(|r| r.name_any()).collect();
+		let live: Vec<&PostgresPhysicalRestore> = existing_all
+			.items
+			.iter()
+			.filter(|r| {
+				!matches!(
+					r.status.as_ref().and_then(|s| s.phase.as_ref()),
+					Some(&RestorePhase::Failed)
+				)
+			})
+			.collect();
+		if live.len() >= MAX_RESTORES_PER_REPLICA {
+			let names: Vec<String> = live.iter().map(|r| r.name_any()).collect();
 			warn!(
 				replica = replica_name,
 				existing = ?names,
@@ -199,10 +217,10 @@ impl PostgresPhysicalReplica {
 				"True",
 				"TooManyRestores",
 				&format!(
-					"Refusing to create new restore: {} restores already exist for this \
+					"Refusing to create new restore: {} live restores already exist for this \
 					 replica (limit {}). Existing: [{}]. Reduce the count by deleting stale \
 					 restores or fix the pruning issue.",
-					existing.items.len(),
+					live.len(),
 					MAX_RESTORES_PER_REPLICA,
 					names.join(", "),
 				),
