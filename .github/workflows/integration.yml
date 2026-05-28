@@ -48,13 +48,6 @@ jobs:
               test-switchover
             needs_non_pg_snapshot: false
 
-          - name: consecutive_failures
-            namespaces: >-
-              test-consecutive-failures
-              test-phase-stuck
-              test-subresource-reset
-            needs_non_pg_snapshot: true
-
           - name: persistent_schemas
             namespaces: >-
               test-persistent-schemas

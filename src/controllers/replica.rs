@@ -37,7 +37,7 @@ use crate::{
 use scheduling::ScheduleDecision;
 
 mod resources;
-mod scheduling;
+pub(super) mod scheduling;
 mod schema_migration;
 mod status;
 
@@ -676,59 +676,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// Check consecutive failures before the in-progress restore early return,
-	// so that suspension takes priority and the phase doesn't get stuck at
-	// Restoring when all restores are failing.
-	let consecutive_failures = replica
-		.status
-		.as_ref()
-		.and_then(|s| s.consecutive_restore_failures)
-		.unwrap_or(0);
-
-	const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-	if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-		if active_restore.is_some() {
-			replica.update_phase(client, ReplicaPhase::Ready).await?;
-		} else {
-			replica.update_phase(client, ReplicaPhase::Pending).await?;
-		}
-
-		let already_suspended = replica
-			.status
-			.as_ref()
-			.and_then(|s| {
-				s.conditions
-					.iter()
-					.find(|c| c.type_ == "RestoreSchedulingSuspended")
-			})
-			.is_some_and(|c| c.status == "True");
-
-		if !already_suspended {
-			warn!(
-				replica = name,
-				consecutive_failures,
-				"restore scheduling suspended after {MAX_CONSECUTIVE_FAILURES} consecutive failures"
-			);
-			replica
-				.update_condition(
-					client,
-					"RestoreSchedulingSuspended",
-					"True",
-					"ConsecutiveFailures",
-					&format!(
-						"Scheduling suspended after {consecutive_failures} consecutive restore failures. \
-						 Fix the underlying issue and reset with: kubectl patch postgresphysicalreplica {name} \
-						 -n {namespace} --subresource=status --type=merge \
-						 -p '{{\"status\":{{\"consecutiveRestoreFailures\":0}}}}'"
-					),
-				)
-				.await?;
-		}
-		return Ok(Action::requeue(Duration::from_secs(300)));
-	}
-
-	// Clear RestoreSchedulingSuspended if it was previously set but the
-	// counter has since been reset below the threshold (e.g. manual patch).
+	// Clear the legacy RestoreSchedulingSuspended condition on existing
+	// replicas if still True (left over from the suspension behaviour we
+	// removed — see commit dropping MAX_CONSECUTIVE_FAILURES). The
+	// operator no longer suspends; bounded backoff via
+	// scheduling::failure_backoff_delay is the new rate limit, applied in
+	// fail_restore when each failure increments the counter.
 	if replica
 		.status
 		.as_ref()
@@ -741,16 +694,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	{
 		info!(
 			replica = name,
-			consecutive_failures,
-			"clearing RestoreSchedulingSuspended condition (counter below threshold)"
+			"clearing legacy RestoreSchedulingSuspended condition (suspension removed)"
 		);
 		replica
 			.update_condition(
 				client,
 				"RestoreSchedulingSuspended",
 				"False",
-				"CounterReset",
-				"Consecutive failure counter reset below threshold",
+				"SuspensionRemoved",
+				"Operator no longer suspends on consecutive failures; backoff is used instead",
 			)
 			.await?;
 	}
