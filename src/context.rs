@@ -10,6 +10,7 @@ use kube::runtime::events::{Recorder, Reporter};
 use crate::{controllers::jobs::CallbackStore, metrics::Metrics};
 
 pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
+pub const DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS: u64 = 30 * 60;
 
 pub struct Context {
 	pub client: Client,
@@ -27,6 +28,12 @@ pub struct Context {
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
 	pub callback_base_url: String,
+	/// Seconds to wait for a restore's postgres Deployment to become Ready
+	/// after the kopia restore Job completes, before marking the restore
+	/// Failed. Configurable via the `DEPLOYMENT_READY_TIMEOUT_SECS` env
+	/// var so it can be raised for replicas with large data dirs (slower
+	/// WAL replay) without needing a code release.
+	pub deployment_ready_timeout_secs: u64,
 	/// Unix timestamp of the last successful entry into a reconcile function.
 	/// Used by `/livez` to detect a stuck reconciliation loop.
 	pub last_reconcile: Arc<AtomicI64>,
@@ -39,6 +46,7 @@ impl Context {
 		kopia_image: String,
 		use_port_forward: bool,
 		callback_base_url: String,
+		deployment_ready_timeout_secs: u64,
 	) -> Self {
 		let reporter = Reporter::from("postgres-restore-operator");
 		let recorder = Recorder::new(client.clone(), reporter);
@@ -55,6 +63,7 @@ impl Context {
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
 			callback_base_url,
+			deployment_ready_timeout_secs,
 			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
 		}
 	}

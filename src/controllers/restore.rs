@@ -766,13 +766,18 @@ async fn reconcile_ready(
 		return Ok(Action::requeue(Duration::from_secs(5)));
 	}
 
-	// Check for timeout (10 minutes)
+	// Deployment readiness timeout. Replicas with larger data dirs need
+	// time for postgres to open the data dir and replay WAL after a
+	// fresh kopia restore. Default is 30 minutes; tunable per-cluster
+	// via the `DEPLOYMENT_READY_TIMEOUT_SECS` env var so larger replicas
+	// can raise it without a code release.
 	if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref()) {
 		let elapsed = Timestamp::now().duration_since(created_at.0);
-		if elapsed > SignedDuration::from_secs(10 * 60) {
+		let timeout_secs = ctx.deployment_ready_timeout_secs;
+		if elapsed > SignedDuration::from_secs(timeout_secs as i64) {
 			warn!(
 				restore = name,
-				"deployment not ready after 10 minutes, marking as Failed"
+				timeout_secs, "deployment not ready within configured timeout, marking as Failed"
 			);
 			return fail_restore(
 				ctx,
