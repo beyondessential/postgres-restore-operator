@@ -11,18 +11,18 @@ axum = "0.8.9"
 cronexpr = "1.5.0"
 futures = "0.3.31"
 globset = "0.4.18"
-handlebars = "6.4.0"
-jiff = { version = "0.2.23", features = ["serde"] }
+handlebars = "6.4.1"
+jiff = { version = "0.2.25", features = ["serde"] }
 k8s-openapi = { version = "0.27.1", features = ["latest", "schemars"] }
 kube = { version = "3.1.0", default-features = false, features = ["runtime", "derive", "client", "rustls-tls", "ws"] }
 kube_quantity = "0.9.0"
 prometheus = "0.14.0"
 rand = "0.10.1"
-reqwest = { version = "0.13.3", features = ["json"] }
-rust_decimal = "1.41.0"
+reqwest = { version = "0.13.4", features = ["json"] }
+rust_decimal = "1.42.0"
 schemars = { version = "1.2.1", features = ["jiff02"] }
 serde = { version = "1.0.228", features = ["derive"] }
-serde_json = "1.0.149"
+serde_json = "1.0.150"
 serde_yaml = "0.9.34"
 thiserror = "2.0.18"
 tokio = { version = "1.50.0", features = ["full"] }
