@@ -20,7 +20,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
-	context::{Context, DEFAULT_KOPIA_IMAGE},
+	context::{Context, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS, DEFAULT_KOPIA_IMAGE},
 	controllers,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
@@ -169,12 +169,28 @@ async fn main() -> anyhow::Result<()> {
 
 	annotate_own_pod(&client, &namespace).await;
 
+	let deployment_ready_timeout_secs = std::env::var("DEPLOYMENT_READY_TIMEOUT_SECS")
+		.ok()
+		.and_then(|v| {
+			v.parse::<u64>()
+				.map_err(
+					|e| warn!(value = v, error = %e, "invalid DEPLOYMENT_READY_TIMEOUT_SECS, using default"),
+				)
+				.ok()
+		})
+		.unwrap_or(DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS);
+	info!(
+		deployment_ready_timeout_secs,
+		"deployment readiness timeout configured"
+	);
+
 	let ctx = Arc::new(Context::new(
 		client.clone(),
 		max_concurrent_restores,
 		kopia_image,
 		use_port_forward,
 		callback_base_url,
+		deployment_ready_timeout_secs,
 	));
 
 	// Heartbeat: a background task updates this timestamp every 5s.
@@ -494,6 +510,7 @@ mod tests {
 			DEFAULT_KOPIA_IMAGE.to_string(),
 			false,
 			"http://test.svc:8080".to_string(),
+			DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
 		));
 		let heartbeat = Arc::new(AtomicI64::new(Timestamp::now().as_second()));
 		let state = ServerState { heartbeat, ctx };
