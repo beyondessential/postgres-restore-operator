@@ -493,6 +493,69 @@ fn deployment_init_script_grants_read_only_on_pg14_plus() {
 }
 
 #[test]
+fn deployment_init_script_two_stage_pg_resetwal_fallback() {
+	// When a snapshot is taken mid-online-backup the trailing WAL isn't
+	// included, and postgres recovery fails with "WAL ends before end of
+	// online backup" (or a similar signature). For an analytics replica
+	// we prefer "comes up at the snapshotted state" over "permanently
+	// stuck", so the init script runs `pg_resetwal -f` as a fallback.
+	//
+	// Two stages:
+	//   - Detected WAL signature → short-circuit straight to pg_resetwal
+	//     (retrying the same command won't help when recovery itself is
+	//     blocking startup).
+	//   - Undetected failure → retry once with the same settings (could
+	//     be a transient I/O / catalog blip), then pg_resetwal as a
+	//     last resort.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let setup_auth = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = setup_auth.args.unwrap().remove(0);
+
+	// pg_resetwal appears multiple times — once in each fallback branch.
+	let resetwal_calls = script.matches("pg_resetwal -f").count();
+	assert!(
+		resetwal_calls >= 2,
+		"init script must reference pg_resetwal -f in both the detected and last-resort branches (saw {resetwal_calls})"
+	);
+	// Detection signatures.
+	for sig in [
+		"WAL ends before end of online backup",
+		"invalid record length at",
+		"database system was interrupted while in recovery",
+	] {
+		assert!(
+			script.contains(sig),
+			"fallback must detect WAL signature: {sig}"
+		);
+	}
+	// Stage-2 retry message — verifies the script attempts the same
+	// command once more before reset when no signature matched.
+	assert!(
+		script.contains("retrying once before falling back to pg_resetwal"),
+		"init script must do a same-settings retry before the last-resort reset"
+	);
+	assert!(
+		script.contains("last resort"),
+		"init script must label the second pg_resetwal as a last resort"
+	);
+}
+
+#[test]
 fn deployment_init_script_overrides_listen_addresses() {
 	// Some source backups carry `listen_addresses = 'localhost'` in
 	// postgresql.conf, which restricts the restored postgres to localhost
