@@ -779,13 +779,66 @@ if [ ! -d "$PGDATA/pg_wal" ]; then
   mkdir -p "$PGDATA/pg_wal"
 fi
 
+# Run a postgres --single SQL command with a two-stage pg_resetwal -f
+# fallback for snapshots whose trailing WAL is missing (e.g. taken
+# mid-online-backup). For an analytics replica the priority is
+# availability over byte-perfect consistency — pg_resetwal leaves the
+# data dir at whatever state the snapshot captured, which is good
+# enough for read-only analytics, and the alternative is a permanently
+# unrecoverable replica.
+#
+# Stage 1: if the first attempt fails with a WAL-recovery signature,
+# short-circuit straight to pg_resetwal + retry. Retrying the same
+# command won't help when recovery itself is the blocker.
+# Stage 2: if the first attempt fails for some other reason, try once
+# more (could be transient — locked catalog, transient I/O blip).
+# If the retry still fails, pg_resetwal as a last resort, then retry.
+postgres_single_or_resetwal() {{
+  local sql_input="$1"
+  local logfile
+  logfile=$(mktemp)
+  set +e
+  echo "$sql_input" | postgres --single -D "$PGDATA" postgres > "$logfile" 2>&1
+  local rc=$?
+  set -e
+  cat "$logfile"
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$logfile"
+    return 0
+  fi
+
+  if grep -qE 'WAL ends before end of online backup|invalid record length at|database system was interrupted while in recovery|could not locate required checkpoint record' "$logfile"; then
+    echo "WAL recovery failed (snapshot likely captured mid-online-backup) — running pg_resetwal -f and retrying" >&2
+    rm -f "$logfile"
+    pg_resetwal -f "$PGDATA"
+    echo "$sql_input" | postgres --single -D "$PGDATA" postgres
+    return $?
+  fi
+
+  echo "postgres --single failed without a recognised WAL signature — retrying once before falling back to pg_resetwal" >&2
+  rm -f "$logfile"
+  logfile=$(mktemp)
+  set +e
+  echo "$sql_input" | postgres --single -D "$PGDATA" postgres > "$logfile" 2>&1
+  rc=$?
+  set -e
+  cat "$logfile"
+  if [ "$rc" -eq 0 ]; then
+    rm -f "$logfile"
+    return 0
+  fi
+
+  echo "second attempt also failed — running pg_resetwal -f as a last resort and retrying" >&2
+  rm -f "$logfile"
+  pg_resetwal -f "$PGDATA"
+  echo "$sql_input" | postgres --single -D "$PGDATA" postgres
+}}
+
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
 if [ "$PG_MAJOR" -ge 13 ]; then
-  echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
-    | postgres --single -D "$PGDATA" postgres
+  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
 else
-  echo "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');" \
-    | postgres --single -D "$PGDATA" postgres
+  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
 fi
 LOCALE_CHANGED=1
 
