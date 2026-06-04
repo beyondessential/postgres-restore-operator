@@ -25,6 +25,14 @@ use postgres_restore_operator::{
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
 
+// Use mimalloc instead of the default glibc allocator. Long-running Rust
+// services on glibc commonly hold significantly more RSS than their actual
+// live heap due to fragmentation and retained chunks; mimalloc keeps RSS
+// closer to working-set size, which matters for an operator that runs
+// indefinitely and was previously OOMKilled at a tight limit.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 2;
 const DEFAULT_METRICS_ADDR: &str = "[::]:8080";
 const DEFAULT_METRICS_PORT: u16 = 8080;
@@ -324,12 +332,23 @@ async fn main() -> anyhow::Result<()> {
 				namespace.map(|ns| ObjectRef::new(&replica_name).within(&ns))
 			},
 		)
-		.watches(Api::<Job>::all(client.clone()), Config::default(), |job| {
-			let labels = job.metadata.labels.as_ref()?;
-			let replica_name = labels.get("pgro.bes.au/replica")?;
-			let namespace = job.metadata.namespace.as_ref()?;
-			Some(ObjectRef::new(replica_name).within(namespace))
-		})
+		// Scope the Job watch to pgro-owned Jobs. Without a label selector
+		// kube-rs caches every Job in every namespace (CI runners, batch
+		// jobs, cert-manager, etc.) in the in-memory store, which scales
+		// with cluster activity rather than pgro's working set. Limiting
+		// to Jobs that carry the pgro.bes.au/replica label cuts that to
+		// only restore Jobs, snapshot-list Jobs, schema-migration Jobs,
+		// and credential-reset Jobs — all of which the operator builds.
+		.watches(
+			Api::<Job>::all(client.clone()),
+			Config::default().labels("pgro.bes.au/replica"),
+			|job| {
+				let labels = job.metadata.labels.as_ref()?;
+				let replica_name = labels.get("pgro.bes.au/replica")?;
+				let namespace = job.metadata.namespace.as_ref()?;
+				Some(ObjectRef::new(replica_name).within(namespace))
+			},
+		)
 		.run(
 			controllers::replica::reconcile,
 			controllers::replica::error_policy,
