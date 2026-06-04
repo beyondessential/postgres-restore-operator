@@ -1279,20 +1279,26 @@ async fn reconcile_schema_migration(
 		Err(e) => return Err(e),
 	};
 
-	// Filter out schemas that don't exist on the source. This happens when the
-	// user adds a schema to persistent_schemas before actually creating it.
+	// Source-side queries: schema existence + database size. Both run on
+	// (source restore, source_dbname), so we open one connection and
+	// reuse it across both queries to halve the connection count for
+	// this leg of the reconcile.
 	let all_schemas: &[String] = schemas;
-	let schemas = query_existing_schemas(
-		client,
-		namespace,
-		&old_restore_name,
-		&source_dbname,
-		&reader_user,
-		&reader_password,
-		all_schemas,
-		ctx.use_port_forward(),
-	)
-	.await?;
+	let (schemas, db_size_bytes) = {
+		let conn = postgres::connect_to_restore(
+			client,
+			namespace,
+			&old_restore_name,
+			&source_dbname,
+			&reader_user,
+			&reader_password,
+			ctx.use_port_forward(),
+		)
+		.await?;
+		let existing = postgres::existing_schemas_on(&conn.client, all_schemas).await?;
+		let size = postgres::database_size_on(&conn.client).await?;
+		(existing, size)
+	};
 	let existing_set: HashSet<&str> = schemas.iter().map(String::as_str).collect();
 	let skipped: Vec<&String> = all_schemas
 		.iter()
@@ -1314,21 +1320,6 @@ async fn reconcile_schema_migration(
 		mark_schema_migration_complete(client, &replica_name, namespace).await?;
 		return Ok(true);
 	}
-
-	// Measure the actual on-disk database size of the source restore and
-	// compute how much the persistent schemas have grown beyond the original
-	// snapshot.  This delta is stored in the replica status so the next
-	// restore PVC can be sized accordingly.
-	let db_size_bytes = postgres::measure_database_size(
-		client,
-		namespace,
-		&old_restore_name,
-		&source_dbname,
-		&reader_user,
-		&reader_password,
-		ctx.use_port_forward(),
-	)
-	.await?;
 
 	let snapshot_size_bytes: ParsedQuantity = old_restore
 		.spec
@@ -1394,42 +1385,36 @@ async fn reconcile_schema_migration(
 		Err(e) => return Err(e),
 	};
 
-	// Drop any persistent_schemas that are already present in the new
-	// restore. They are operator-owned: whatever was in the restored data
-	// is junk (typically because the schema has leaked back into the source
-	// DB), and the migration Job is about to write the canonical copy
-	// from the previous restore via pg_dump | psql, which would otherwise
-	// conflict on existing objects. Idempotent and no-op when the schemas
-	// are absent — safe to run unconditionally before every migration.
-	let preexisting = query_existing_schemas(
-		client,
-		namespace,
-		&new_restore_name,
-		&target_dbname,
-		&reader_user,
-		&reader_password,
-		&schemas,
-		ctx.use_port_forward(),
-	)
-	.await?;
-	if !preexisting.is_empty() {
-		info!(
-			replica = %replica_name,
-			restore = %new_restore_name,
-			schemas = ?preexisting,
-			"dropping pre-existing persistent schemas in target before migration"
-		);
-		postgres::drop_schemas_in_restore(
+	// Target-side: detect any persistent_schemas that are already present
+	// in the new restore and drop them. Both queries run on (new restore,
+	// target_dbname), so open one connection and reuse it for both. The
+	// schemas to drop are operator-owned — whatever was in the restored
+	// data is junk (typically because the schema has leaked back into
+	// the source DB) — and the migration Job is about to write the
+	// canonical copy from the previous restore via pg_dump | psql,
+	// which would otherwise conflict on existing objects. Idempotent
+	// and no-op when the schemas are absent.
+	{
+		let conn = postgres::connect_to_restore(
 			client,
 			namespace,
 			&new_restore_name,
 			&target_dbname,
 			&reader_user,
 			&reader_password,
-			&preexisting,
 			ctx.use_port_forward(),
 		)
 		.await?;
+		let preexisting = postgres::existing_schemas_on(&conn.client, &schemas).await?;
+		if !preexisting.is_empty() {
+			info!(
+				replica = %replica_name,
+				restore = %new_restore_name,
+				schemas = ?preexisting,
+				"dropping pre-existing persistent schemas in target before migration"
+			);
+			postgres::drop_schemas_on(&conn.client, &preexisting).await?;
+		}
 	}
 
 	// The analytics user is granted SUPERUSER on every read-write restore
@@ -1480,51 +1465,6 @@ async fn reconcile_schema_migration(
 		.await?;
 
 	Ok(false) // Job created, not complete yet
-}
-
-/// Query which of the requested schemas actually exist in a restore's database.
-/// Returns schemas in the same order as the input slice, using the system
-/// catalog (`pg_catalog.pg_namespace`) which is always fully visible regardless
-/// of schema-level privileges.
-#[expect(
-	clippy::too_many_arguments,
-	reason = "internal helper with tightly-coupled params"
-)]
-async fn query_existing_schemas(
-	client: &Client,
-	namespace: &str,
-	restore_name: &str,
-	dbname: &str,
-	user: &str,
-	password: &str,
-	schemas: &[String],
-	use_port_forward: bool,
-) -> Result<Vec<String>> {
-	let conn = postgres::connect_to_restore(
-		client,
-		namespace,
-		restore_name,
-		dbname,
-		user,
-		password,
-		use_port_forward,
-	)
-	.await?;
-
-	let rows = conn
-		.client
-		.query(
-			"SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = ANY($1)",
-			&[&schemas],
-		)
-		.await?;
-
-	let found: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-	Ok(schemas
-		.iter()
-		.filter(|s| found.contains(s.as_str()))
-		.cloned()
-		.collect())
 }
 
 pub fn error_policy(

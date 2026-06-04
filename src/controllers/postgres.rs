@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::{
 	Api, Client, ResourceExt,
@@ -219,6 +221,19 @@ pub async fn discover_restore_database(
 	}
 }
 
+/// Query the on-disk size of the current database on an already-open
+/// connection. The connection-opening variant is `measure_database_size`,
+/// kept for callers that only need this single query; prefer this when
+/// you're going to make multiple queries on the same database so the
+/// connection can be reused.
+pub async fn database_size_on(pg: &tokio_postgres::Client) -> Result<u64> {
+	let row = pg
+		.query_one("SELECT pg_database_size(current_database())", &[])
+		.await?;
+	let size: i64 = row.get(0);
+	Ok(size as u64)
+}
+
 /// Query the on-disk size of the given database (bytes) via `pg_database_size()`.
 pub async fn measure_database_size(
 	client: &Client,
@@ -239,19 +254,46 @@ pub async fn measure_database_size(
 		use_port_forward,
 	)
 	.await?;
-
-	let row = conn
-		.client
-		.query_one("SELECT pg_database_size(current_database())", &[])
-		.await?;
-
-	let size: i64 = row.get(0);
-	Ok(size as u64)
+	database_size_on(&conn.client).await
 }
 
 /// Escape a SQL identifier by double-quoting it.
 pub fn quote_ident(s: &str) -> String {
 	format!("\"{}\"", s.replace('"', "\"\""))
+}
+
+/// Return the subset of `candidates` that exist as schemas in the
+/// database the connection is bound to. Reusable on an open connection.
+pub async fn existing_schemas_on(
+	pg: &tokio_postgres::Client,
+	candidates: &[String],
+) -> Result<Vec<String>> {
+	if candidates.is_empty() {
+		return Ok(Vec::new());
+	}
+	let rows = pg
+		.query(
+			"SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = ANY($1)",
+			&[&candidates],
+		)
+		.await?;
+	let found: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+	Ok(candidates
+		.iter()
+		.filter(|s| found.contains(s.as_str()))
+		.cloned()
+		.collect())
+}
+
+/// Drop the given schemas (and all contents) on an already-open connection.
+/// Idempotent: missing schemas are skipped via `DROP SCHEMA IF EXISTS`.
+pub async fn drop_schemas_on(pg: &tokio_postgres::Client, schemas: &[String]) -> Result<()> {
+	for schema in schemas {
+		let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
+		debug!(schema = schema, "dropping schema");
+		pg.execute(stmt.as_str(), &[]).await?;
+	}
+	Ok(())
 }
 
 /// Drop the given schemas (and all their contents) from the named database
@@ -290,12 +332,7 @@ pub async fn drop_schemas_in_restore(
 		use_port_forward,
 	)
 	.await?;
-	for schema in schemas {
-		let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
-		debug!(restore = restore_name, schema = schema, "dropping schema");
-		conn.client.execute(stmt.as_str(), &[]).await?;
-	}
-	Ok(())
+	drop_schemas_on(&conn.client, schemas).await
 }
 
 #[cfg(test)]
