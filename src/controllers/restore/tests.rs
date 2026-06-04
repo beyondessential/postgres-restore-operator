@@ -237,6 +237,77 @@ fn kopia_cache_pvc_owned_by_replica() {
 }
 
 #[test]
+fn kopia_content_cache_mb_floor_for_small_pvc() {
+	// 10Gi PVC (the floor for small snapshots) minus the 2Gi reserve =
+	// 8 Gi content cache, expressed in MiB.
+	let small = Quantity("1Gi".to_string());
+	let mb = super::builders::kopia_content_cache_mb(&small);
+	let expected = 10 * 1024 - super::builders::KOPIA_CACHE_RESERVE_MB;
+	assert_eq!(mb, expected);
+	assert!(
+		mb >= super::builders::KOPIA_CONTENT_CACHE_FLOOR_MB,
+		"content cache must always be at least the floor"
+	);
+}
+
+#[test]
+fn kopia_content_cache_mb_scales_with_snapshot() {
+	// 100Gi snapshot → 20Gi PVC → 20Gi - 2Gi reserve = 18Gi cache.
+	let big = Quantity("100Gi".to_string());
+	let mb = super::builders::kopia_content_cache_mb(&big);
+	let expected = 20 * 1024 - super::builders::KOPIA_CACHE_RESERVE_MB;
+	assert_eq!(mb, expected);
+}
+
+#[test]
+fn restore_job_passes_cache_caps_and_log_rotation() {
+	// The restore Job's pod spec must set KOPIA_CONTENT_CACHE_MB and
+	// KOPIA_METADATA_CACHE_MB so the embedded script can cap kopia's
+	// caches, and the script must rotate CLI logs. Without these the
+	// cache PVC fills up and every subsequent restore Job pod exits
+	// in 1–2 minutes ("no space left on device").
+	let (restore, replica) = test_restore_and_replica();
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+	)
+	.unwrap();
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+	let container = &pod_spec.containers[0];
+	let env = container.env.as_ref().expect("container must declare env");
+	let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+	assert!(
+		names.contains(&"KOPIA_CONTENT_CACHE_MB"),
+		"restore Job env must include KOPIA_CONTENT_CACHE_MB"
+	);
+	assert!(
+		names.contains(&"KOPIA_METADATA_CACHE_MB"),
+		"restore Job env must include KOPIA_METADATA_CACHE_MB"
+	);
+
+	let script = &container.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("--content-cache-size-mb=\"$KOPIA_CONTENT_CACHE_MB\""),
+		"connect command must cap content cache via env var"
+	);
+	assert!(
+		script.contains("--metadata-cache-size-mb=\"$KOPIA_METADATA_CACHE_MB\""),
+		"connect command must cap metadata cache"
+	);
+	assert!(
+		script.contains("--log-dir-max-files=20"),
+		"kopia invocations must rotate CLI logs by file count"
+	);
+	assert!(
+		script.contains("--log-dir-max-age=24h"),
+		"kopia invocations must rotate CLI logs by age"
+	);
+}
+
+#[test]
 fn cache_size_needs_grow_ratchet() {
 	let small = Quantity("10Gi".to_string());
 	let bigger = Quantity("20Gi".to_string());

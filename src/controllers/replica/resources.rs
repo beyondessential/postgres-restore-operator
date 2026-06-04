@@ -84,7 +84,11 @@ if [ "$KOPIA_DISABLE_TLS" = "true" ]; then
   ENDPOINT_ARGS="$ENDPOINT_ARGS --disable-tls --disable-tls-verification"
 fi
 
-kopia repository connect s3 \
+# Global kopia flags: rotate CLI logs so they don't accumulate over
+# many snapshot-list invocations.
+KOPIA_GLOBAL_FLAGS="--log-dir-max-files=20 --log-dir-max-age=24h"
+
+kopia $KOPIA_GLOBAL_FLAGS repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
   --region="$KOPIA_REGION" \
   --access-key="$AWS_ACCESS_KEY_ID" \
@@ -95,7 +99,7 @@ kopia repository connect s3 \
 
 SNAP_FILE=$(mktemp)
 trap 'rm -f "$SNAP_FILE"' EXIT
-kopia snapshot list --json --all > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
+kopia $KOPIA_GLOBAL_FLAGS snapshot list --json --all > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
 cat "$SNAP_FILE"
 if [ -n "$SNAPSHOT_CALLBACK_URL" ]; then
   SNAP_SIZE=$(wc -c < "$SNAP_FILE")

@@ -387,6 +387,37 @@ pub fn kopia_cache_pvc_size(snapshot_size: &Quantity) -> Quantity {
 	chosen.into()
 }
 
+/// MB to leave free on the cache PVC for kopia's metadata cache, its
+/// rolling CLI logs, and slop. Subtracted from the PVC capacity to
+/// derive the content-cache hard cap.
+pub const KOPIA_CACHE_RESERVE_MB: u64 = 2048;
+/// Hardcoded metadata-cache cap. Kopia's metadata cache is small
+/// (indices and manifest data) so a fixed allocation is fine.
+pub const KOPIA_METADATA_CACHE_MB: u64 = 512;
+/// Floor for the content-cache cap in MB, so degenerate-small PVCs
+/// still get a useful cache.
+pub const KOPIA_CONTENT_CACHE_FLOOR_MB: u64 = 1024;
+
+/// Compute the content-cache cap (MB) passed to `kopia repository
+/// connect --content-cache-size-mb`. Sized to the cache PVC minus a
+/// fixed reserve for metadata cache + logs + slop.
+///
+/// Without a cap kopia's content cache grows unbounded and eventually
+/// fills the PVC, after which kopia can't even write its config and
+/// every restore Job pod exits in 1–2 minutes. The cap turns that into
+/// kopia's own LRU eviction, which is what we want.
+pub fn kopia_content_cache_mb(snapshot_size: &Quantity) -> u64 {
+	let pvc_size = kopia_cache_pvc_size(snapshot_size);
+	let pvc_bytes = ParsedQuantity::try_from(pvc_size)
+		.ok()
+		.and_then(|q| q.to_bytes_f64())
+		.unwrap_or(0.0);
+	let pvc_mb = (pvc_bytes / 1024.0 / 1024.0) as u64;
+	pvc_mb
+		.saturating_sub(KOPIA_CACHE_RESERVE_MB)
+		.max(KOPIA_CONTENT_CACHE_FLOOR_MB)
+}
+
 pub fn build_kopia_cache_pvc(
 	replica: &PostgresPhysicalReplica,
 	snapshot_size: &Quantity,
@@ -446,17 +477,29 @@ if [ "$KOPIA_DISABLE_TLS" = "true" ]; then
   ENDPOINT_ARGS="$ENDPOINT_ARGS --disable-tls --disable-tls-verification"
 fi
 
+# Global kopia flags applied to every invocation: rotate CLI logs so
+# they don't fill the cache PVC. Cap at 20 most-recent files and
+# 24 hours, plenty for debugging a current restore without growing
+# without bound.
+KOPIA_GLOBAL_FLAGS="--log-dir-max-files=20 --log-dir-max-age=24h"
+
 echo "Connecting to kopia repository..."
-kopia repository connect s3 \
+# --content-cache-size-mb / --metadata-cache-size-mb are persisted to
+# the local config on connect, so subsequent operations inherit the
+# bound. Without them kopia's content cache grows unbounded and
+# eventually fills the cache PVC (observed across multiple replicas).
+kopia $KOPIA_GLOBAL_FLAGS repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
   --region="$KOPIA_REGION" \
   --access-key="$AWS_ACCESS_KEY_ID" \
   --secret-access-key="$AWS_SECRET_ACCESS_KEY" \
   --password="$KOPIA_PASSWORD" \
+  --content-cache-size-mb="$KOPIA_CONTENT_CACHE_MB" \
+  --metadata-cache-size-mb="$KOPIA_METADATA_CACHE_MB" \
   $ENDPOINT_ARGS
 
 echo "Starting restore..."
-kopia snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
+kopia $KOPIA_GLOBAL_FLAGS snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
 
 echo "Restore complete"
 ls -la /pgdata/
@@ -544,11 +587,26 @@ echo -n "$VERSION" > /dev/termination-log
 						args: Some(vec![restore_script.to_string()]),
 						env: Some(
 							[
-								vec![EnvVar {
-									name: "SNAPSHOT_ID".to_string(),
-									value: Some(restore.spec.snapshot.clone()),
-									..Default::default()
-								}],
+								vec![
+									EnvVar {
+										name: "SNAPSHOT_ID".to_string(),
+										value: Some(restore.spec.snapshot.clone()),
+										..Default::default()
+									},
+									EnvVar {
+										name: "KOPIA_CONTENT_CACHE_MB".to_string(),
+										value: Some(
+											kopia_content_cache_mb(&restore.spec.snapshot_size)
+												.to_string(),
+										),
+										..Default::default()
+									},
+									EnvVar {
+										name: "KOPIA_METADATA_CACHE_MB".to_string(),
+										value: Some(KOPIA_METADATA_CACHE_MB.to_string()),
+										..Default::default()
+									},
+								],
 								kopia_writable_env(),
 								vec![
 									env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
