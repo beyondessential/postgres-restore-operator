@@ -419,6 +419,10 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			"/api/v1/schema-migration-results/{namespace}/{replica}",
 			axum::routing::post(post_schema_migration_results),
 		)
+		.route(
+			"/api/v1/cache-pressure/{namespace}/{restore}",
+			axum::routing::post(post_cache_pressure),
+		)
 		.with_state(state)
 		.layer(TraceLayer::new_for_http())
 }
@@ -454,6 +458,24 @@ async fn post_schema_migration_results(
 		.ctx
 		.schema_migration_results
 		.store(&namespace, &replica, body);
+	StatusCode::NO_CONTENT
+}
+
+/// Accept the cache-pressure callback a restore Job POSTs when its
+/// pre-flight check had to evict cache content. Bumps the replica's
+/// cache PVC requested storage so chronically-pressured replicas
+/// self-tune over a few restore cycles.
+async fn post_cache_pressure(
+	State(state): State<ServerState>,
+	Path((namespace, restore)): Path<(String, String)>,
+) -> StatusCode {
+	info!(
+		namespace = namespace,
+		restore = restore,
+		"received cache-pressure callback"
+	);
+	controllers::restore::grow_cache_pvc_after_pressure(&state.ctx.client, &namespace, &restore)
+		.await;
 	StatusCode::NO_CONTENT
 }
 

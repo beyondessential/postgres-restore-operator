@@ -140,6 +140,84 @@ async fn ensure_kopia_cache_pvc(
 	Ok(())
 }
 
+/// Bump the kopia cache PVC's requested storage by
+/// [`builders::KOPIA_CACHE_PRESSURE_GROWTH_FACTOR`] in response to a
+/// `PGRO_CACHE_PRESSURE` HTTP callback from a restore Job. Best-effort:
+/// any failure to look up the restore or patch the PVC is logged but
+/// doesn't escalate, since the callback itself isn't the source of truth
+/// (the next pressure event will re-fire).
+pub async fn grow_cache_pvc_after_pressure(client: &Client, namespace: &str, restore_name: &str) {
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
+	let Ok(restore) = restores.get(restore_name).await else {
+		warn!(
+			restore = restore_name,
+			"cannot grow cache PVC after pressure: restore not found"
+		);
+		return;
+	};
+	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+	let cache_pvc_name = builders::kopia_cache_pvc_name(&restore.spec.replica.name);
+	let Ok(Some(existing)) = pvcs.get_opt(&cache_pvc_name).await else {
+		warn!(
+			pvc = cache_pvc_name,
+			"cannot grow cache PVC after pressure: PVC not found"
+		);
+		return;
+	};
+	let Some(current) = existing
+		.spec
+		.as_ref()
+		.and_then(|s| s.resources.as_ref())
+		.and_then(|r| r.requests.as_ref())
+		.and_then(|reqs| reqs.get("storage"))
+		.cloned()
+	else {
+		warn!(
+			pvc = cache_pvc_name,
+			"cannot grow cache PVC after pressure: no storage request set"
+		);
+		return;
+	};
+	let next = builders::next_cache_pvc_size_after_pressure(&current, &restore.spec.snapshot_size);
+	if !builders::cache_size_needs_grow(&current, &next) {
+		info!(
+			pvc = cache_pvc_name,
+			current = current.0,
+			"cache PVC already at growth cap; not growing further despite pressure"
+		);
+		return;
+	}
+	info!(
+		pvc = cache_pvc_name,
+		current = current.0,
+		next = next.0,
+		"PGRO_CACHE_PRESSURE observed; growing cache PVC"
+	);
+	let patch = serde_json::json!({
+		"spec": {
+			"resources": {
+				"requests": {
+					"storage": next,
+				}
+			}
+		}
+	});
+	if let Err(e) = pvcs
+		.patch(
+			&cache_pvc_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await
+	{
+		warn!(
+			pvc = cache_pvc_name,
+			error = %e,
+			"failed to grow cache PVC after pressure (storage class may not support volume expansion)"
+		);
+	}
+}
+
 async fn fail_restore(
 	ctx: &Context,
 	namespace: &str,
@@ -367,8 +445,15 @@ async fn reconcile_restoring(
 			let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 			let replica = replicas.get(replica_name).await?;
 
-			let job =
-				build_restore_job(restore, &job_name, namespace, &replica, &ctx.kopia_image())?;
+			let cache_pressure_url = ctx.cache_pressure_callback_url(namespace, name);
+			let job = build_restore_job(
+				restore,
+				&job_name,
+				namespace,
+				&replica,
+				&ctx.kopia_image(),
+				&cache_pressure_url,
+			)?;
 			jobs.create(&PostParams::default(), &job).await?
 		}
 	};
