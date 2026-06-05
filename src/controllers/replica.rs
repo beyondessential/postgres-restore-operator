@@ -1074,6 +1074,133 @@ async fn mark_schema_migration_complete(
 	Ok(())
 }
 
+/// True if the running schema-migration Job has been alive longer than the
+/// replica's per-cycle migration budget (see
+/// [`PostgresPhysicalReplica::schema_migration_timeout`]). Uses the Job's
+/// `creationTimestamp` as the start; falls back to "not exceeded" if the
+/// Job has no creation timestamp (which shouldn't happen in practice).
+fn migration_exceeded_budget(replica: &PostgresPhysicalReplica, job: &Job) -> bool {
+	let Some(created) = job
+		.metadata
+		.creation_timestamp
+		.as_ref()
+		.map(|t| Timestamp::from(t.0))
+	else {
+		return false;
+	};
+	let elapsed = Timestamp::now().duration_since(created);
+	elapsed > replica.schema_migration_timeout()
+}
+
+/// Abandon a stuck schema migration: drop the Job, DROP SCHEMA … CASCADE
+/// the configured `persistent_schemas` on the new restore, record a
+/// Warning event, and mark the migration phase as `timeout-skipped`.
+/// Lets switchover proceed so the replica gets a usable (if
+/// schema-less) database instead of being blocked indefinitely. The
+/// next restore cycle re-attempts migration if the schemas reappear on
+/// the source.
+async fn timeout_schema_migration(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	new_restore: &PostgresPhysicalRestore,
+	job_name: &str,
+) -> Result<()> {
+	let replica_name = replica.name_any();
+	let new_restore_name = new_restore.name_any();
+	let schemas: Vec<String> = replica.spec.persistent_schemas.clone().unwrap_or_default();
+
+	warn!(
+		replica = %replica_name,
+		restore = %new_restore_name,
+		schemas = ?schemas,
+		timeout = ?replica.schema_migration_timeout(),
+		"schema migration exceeded budget; dropping persistent schemas on new restore and proceeding to switchover"
+	);
+
+	// Cancel the Job (background propagation so its pods are GC'd too).
+	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+	let dp = kube::api::DeleteParams::background();
+	if let Err(e) = jobs.delete(job_name, &dp).await {
+		warn!(job = %job_name, error = %e, "failed to delete timed-out migration Job");
+	}
+
+	// DROP SCHEMA … CASCADE the persistent_schemas on the new restore so
+	// the operator's "owned" schemas don't carry stale leftovers from the
+	// restored data. Best-effort per-schema via IF EXISTS.
+	if !schemas.is_empty() {
+		let reader_secret_name = replica.creds_secret_name();
+		let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+		let reader_secret = secrets.get(&reader_secret_name).await?;
+		let reader_user = postgres::read_secret_field(&reader_secret, "username")?;
+		let reader_password = postgres::read_secret_field(&reader_secret, "password")?;
+		let target_dbname = postgres::discover_restore_database(
+			client,
+			namespace,
+			&new_restore_name,
+			&reader_user,
+			&reader_password,
+			ctx.use_port_forward(),
+		)
+		.await?;
+		let conn = postgres::connect_to_restore(
+			client,
+			namespace,
+			&new_restore_name,
+			&target_dbname,
+			&reader_user,
+			&reader_password,
+			ctx.use_port_forward(),
+		)
+		.await?;
+		postgres::drop_schemas_on(&conn.client, &schemas).await?;
+	}
+
+	// Surface as a Warning event so this is visible on the replica CR.
+	let note = format!(
+		"Schema migration exceeded its time budget (20% of cron interval). \
+		 Persistent schemas [{}] were dropped on the new restore so it can come up. \
+		 The next restore cycle will reattempt migration if the schemas have been regenerated upstream.",
+		schemas.join(", ")
+	);
+	if let Err(e) = ctx
+		.recorder
+		.publish(
+			&Event {
+				type_: EventType::Warning,
+				reason: "SchemaMigrationTimedOut".into(),
+				note: Some(note),
+				action: "Restore".into(),
+				secondary: Some(new_restore.object_ref(&())),
+			},
+			&replica.object_ref(&()),
+		)
+		.await
+	{
+		warn!(replica = %replica_name, error = %e, "failed to publish SchemaMigrationTimedOut event");
+	}
+
+	// Status: phase = timeout-skipped so it's distinguishable from
+	// complete/partial/failed.
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let patch = serde_json::json!({
+		"status": {
+			"schemaMigrationJob": null,
+			"schemaMigrationPhase": "timeout-skipped",
+		}
+	});
+	replicas
+		.patch_status(
+			&replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+
+	Ok(())
+}
+
 async fn reconcile_schema_migration(
 	client: &Client,
 	ctx: &Arc<Context>,
@@ -1131,6 +1258,18 @@ async fn reconcile_schema_migration(
 	if let Some(job) = jobs.get_opt(&job_name).await? {
 		match classify_job(&job) {
 			JobStatus::Active => {
+				if migration_exceeded_budget(replica, &job) {
+					timeout_schema_migration(
+						client,
+						ctx,
+						replica,
+						namespace,
+						new_restore,
+						&job_name,
+					)
+					.await?;
+					return Ok(true);
+				}
 				debug!(replica = %replica_name, job = %job_name, "migration Job still running");
 				return Ok(false);
 			}
