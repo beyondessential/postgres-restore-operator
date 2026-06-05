@@ -387,10 +387,18 @@ pub fn kopia_cache_pvc_size(snapshot_size: &Quantity) -> Quantity {
 	chosen.into()
 }
 
-/// MB to leave free on the cache PVC for kopia's metadata cache, its
-/// rolling CLI logs, and slop. Subtracted from the PVC capacity to
-/// derive the content-cache hard cap.
-pub const KOPIA_CACHE_RESERVE_MB: u64 = 2048;
+/// Minimum MB to leave free on the cache PVC. Combined with the
+/// proportional reserve below — the actual reserve is the max of this
+/// floor and the proportional value.
+pub const KOPIA_CACHE_RESERVE_MIN_MB: u64 = 2048;
+/// Fraction of the PVC capacity reserved for everything other than the
+/// content cache: ext4's ~5% reserved blocks, the metadata cache, kopia's
+/// CLI + content logs, the live config, and the soft-cap overshoot that
+/// happens when kopia downloads new content faster than its LRU eviction
+/// can keep up. A fixed 2GB reserve broke down on a 10Gi PVC (88% full,
+/// failed restores) and a ~22Gi PVC (100% full); scaling with PVC size
+/// keeps the headroom proportionate.
+pub const KOPIA_CACHE_RESERVE_FRACTION: f64 = 0.30;
 /// Hardcoded metadata-cache cap. Kopia's metadata cache is small
 /// (indices and manifest data) so a fixed allocation is fine.
 pub const KOPIA_METADATA_CACHE_MB: u64 = 512;
@@ -400,7 +408,8 @@ pub const KOPIA_CONTENT_CACHE_FLOOR_MB: u64 = 1024;
 
 /// Compute the content-cache cap (MB) passed to `kopia repository
 /// connect --content-cache-size-mb`. Sized to the cache PVC minus a
-/// fixed reserve for metadata cache + logs + slop.
+/// reserve for metadata cache + logs + ext4 reserved blocks + soft-cap
+/// overshoot slop.
 ///
 /// Without a cap kopia's content cache grows unbounded and eventually
 /// fills the PVC, after which kopia can't even write its config and
@@ -413,8 +422,10 @@ pub fn kopia_content_cache_mb(snapshot_size: &Quantity) -> u64 {
 		.and_then(|q| q.to_bytes_f64())
 		.unwrap_or(0.0);
 	let pvc_mb = (pvc_bytes / 1024.0 / 1024.0) as u64;
+	let proportional_reserve = ((pvc_mb as f64) * KOPIA_CACHE_RESERVE_FRACTION) as u64;
+	let reserve = proportional_reserve.max(KOPIA_CACHE_RESERVE_MIN_MB);
 	pvc_mb
-		.saturating_sub(KOPIA_CACHE_RESERVE_MB)
+		.saturating_sub(reserve)
 		.max(KOPIA_CONTENT_CACHE_FLOOR_MB)
 }
 
