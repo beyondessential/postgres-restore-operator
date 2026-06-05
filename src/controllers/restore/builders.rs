@@ -429,6 +429,46 @@ pub fn kopia_content_cache_mb(snapshot_size: &Quantity) -> u64 {
 		.max(KOPIA_CONTENT_CACHE_FLOOR_MB)
 }
 
+/// Maximum cache PVC size the operator will grow to in response to
+/// cache-pressure signals. Caps [`next_cache_pvc_size_after_pressure`]
+/// so a pathological scenario (e.g. a leak in the pre-flight cleanup
+/// logic) can't grow the PVC unboundedly. 2× the default gives roughly
+/// 40% of snapshot as cache PVC — well beyond any observed working set.
+pub fn kopia_cache_pvc_max(snapshot_size: &Quantity) -> Quantity {
+	let default = kopia_cache_pvc_size(snapshot_size);
+	let default_pq =
+		ParsedQuantity::try_from(default).unwrap_or_else(|_| ParsedQuantity::from(Decimal::ZERO));
+	let two_x = default_pq * Decimal::from(2);
+	two_x.into()
+}
+
+/// Multiplicative bump applied to the cache PVC's requested storage each
+/// time a restore Job reports `PGRO_CACHE_PRESSURE` in its log. 1.15 →
+/// ~5 pressure events to grow from the snapshot-derived default to the
+/// 2× cap. Slow enough that one-off spikes don't accidentally double the
+/// PVC; fast enough that a chronically-pressured replica self-tunes
+/// within a few restore cycles.
+pub const KOPIA_CACHE_PRESSURE_GROWTH_FACTOR: Decimal = Decimal::from_parts(115, 0, 0, false, 2);
+
+/// Given the current cache PVC's requested storage, compute the next
+/// requested storage after a cache-pressure event. Multiplies by
+/// [`KOPIA_CACHE_PRESSURE_GROWTH_FACTOR`] and caps at
+/// [`kopia_cache_pvc_max`]. Never shrinks: if `current` is already
+/// at or above the cap, returns the cap.
+pub fn next_cache_pvc_size_after_pressure(
+	current: &Quantity,
+	snapshot_size: &Quantity,
+) -> Quantity {
+	let Ok(current_pq) = ParsedQuantity::try_from(current.clone()) else {
+		return current.clone();
+	};
+	let bumped = current_pq.clone() * KOPIA_CACHE_PRESSURE_GROWTH_FACTOR;
+	let max_pq = ParsedQuantity::try_from(kopia_cache_pvc_max(snapshot_size))
+		.unwrap_or_else(|_| current_pq.clone());
+	let chosen = if bumped > max_pq { max_pq } else { bumped };
+	chosen.into()
+}
+
 pub fn build_kopia_cache_pvc(
 	replica: &PostgresPhysicalReplica,
 	snapshot_size: &Quantity,
@@ -471,6 +511,7 @@ pub fn build_restore_job(
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
 	kopia_image: &str,
+	cache_pressure_callback_url: &str,
 ) -> Result<Job> {
 	let kopia_secret = &replica.spec.kopia_secret_ref;
 	let pvc_name = format!("{}-data", restore.name_any());
@@ -479,6 +520,26 @@ pub fn build_restore_job(
 	let restore_script = r#"set -e
 
 mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
+
+# Pre-flight: if the cache PVC is critically full, evict everything kopia
+# can regenerate from S3 before starting. Without this, kopia exits in
+# 1-2 seconds with "no space left on device" when it can't write its
+# config file, and the restore Job retries forever. The 85% threshold
+# is well below ext4 reserved-blocks territory but high enough that a
+# healthy cache isn't evicted on every run. Also POST to the operator's
+# cache-pressure callback so it can bump the PVC's requested storage —
+# chronically-pressured replicas self-tune over a few restore cycles.
+USAGE_PCT=$(df -P /tmp/kopia | awk 'NR==2 {gsub("%","",$5); print $5}')
+if [ -n "$USAGE_PCT" ] && [ "$USAGE_PCT" -ge 85 ]; then
+  echo "PGRO_CACHE_PRESSURE: cache PVC ${USAGE_PCT}% full — evicting regenerable content"
+  rm -rf /tmp/kopia/cache /tmp/kopia/logs/content-logs
+  mkdir -p /tmp/kopia/cache /tmp/kopia/logs
+  if [ -n "$CACHE_PRESSURE_CALLBACK_URL" ]; then
+    HTTP_CODE=$(curl -fsS -o /dev/stderr -w '%{http_code}' -X POST \
+      "$CACHE_PRESSURE_CALLBACK_URL" 2>&1) || true
+    echo "cache-pressure callback: HTTP $HTTP_CODE" >&2
+  fi
+fi
 
 ENDPOINT_ARGS=""
 if [ -n "$KOPIA_ENDPOINT" ]; then
@@ -615,6 +676,11 @@ echo -n "$VERSION" > /dev/termination-log
 									EnvVar {
 										name: "KOPIA_METADATA_CACHE_MB".to_string(),
 										value: Some(KOPIA_METADATA_CACHE_MB.to_string()),
+										..Default::default()
+									},
+									EnvVar {
+										name: "CACHE_PRESSURE_CALLBACK_URL".to_string(),
+										value: Some(cache_pressure_callback_url.to_string()),
 										..Default::default()
 									},
 								],

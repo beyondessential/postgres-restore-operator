@@ -96,6 +96,17 @@ impl Context {
 		)
 	}
 
+	/// Build the callback URL a restore Job hits when it had to evict cache
+	/// content pre-flight (PGRO_CACHE_PRESSURE). Keyed off the restore name
+	/// — the handler fetches the restore to get its replica + snapshot size
+	/// before patching the cache PVC.
+	pub fn cache_pressure_callback_url(&self, namespace: &str, restore: &str) -> String {
+		format!(
+			"{}/api/v1/cache-pressure/{namespace}/{restore}",
+			self.callback_base_url
+		)
+	}
+
 	/// Remove a restore from the queue, promote the next pending one if there
 	/// is capacity, and update the related gauges. Returns the name of the
 	/// promoted restore, if any.

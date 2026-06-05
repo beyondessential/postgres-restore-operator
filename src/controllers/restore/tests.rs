@@ -153,6 +153,7 @@ fn restore_job_has_ttl_seconds_after_finished() {
 		"default",
 		&replica,
 		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
 	)
 	.unwrap();
 	let ttl = job
@@ -178,6 +179,7 @@ fn restore_job_mounts_persistent_kopia_cache() {
 		"default",
 		&replica,
 		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -267,6 +269,49 @@ fn kopia_content_cache_mb_scales_with_snapshot() {
 }
 
 #[test]
+fn next_cache_pvc_size_after_pressure_bumps_and_caps() {
+	// 10Gi PVC → first bump → 11.5Gi. Eventually caps at 2×10Gi = 20Gi.
+	let snapshot = Quantity("1Gi".to_string());
+	let mut size = Quantity("10Gi".to_string());
+	let original_bytes = parsed_bytes(&size);
+	let max_bytes = parsed_bytes(&super::builders::kopia_cache_pvc_max(&snapshot));
+	assert_eq!(max_bytes, original_bytes * 2);
+
+	let first = super::builders::next_cache_pvc_size_after_pressure(&size, &snapshot);
+	let first_bytes = parsed_bytes(&first);
+	assert!(first_bytes > original_bytes, "first bump must grow");
+	assert!(first_bytes <= max_bytes, "first bump must not exceed cap");
+
+	// Loop until we hit the cap. Should take a bounded number of steps.
+	for _ in 0..50 {
+		size = super::builders::next_cache_pvc_size_after_pressure(&size, &snapshot);
+		if parsed_bytes(&size) >= max_bytes {
+			break;
+		}
+	}
+	assert!(
+		parsed_bytes(&size) >= max_bytes,
+		"repeated bumps must eventually reach the cap; got {}",
+		size.0
+	);
+
+	// Once at the cap, further bumps don't push past it.
+	let after_cap = super::builders::next_cache_pvc_size_after_pressure(&size, &snapshot);
+	assert!(
+		parsed_bytes(&after_cap) <= max_bytes,
+		"at-cap bump must not exceed cap"
+	);
+}
+
+fn parsed_bytes(q: &Quantity) -> u64 {
+	kube_quantity::ParsedQuantity::try_from(q.clone())
+		.ok()
+		.and_then(|p| p.to_bytes_f64())
+		.map(|b| b as u64)
+		.unwrap_or(0)
+}
+
+#[test]
 fn restore_job_passes_cache_caps_and_log_rotation() {
 	// The restore Job's pod spec must set KOPIA_CONTENT_CACHE_MB and
 	// KOPIA_METADATA_CACHE_MB so the embedded script can cap kopia's
@@ -280,6 +325,7 @@ fn restore_job_passes_cache_caps_and_log_rotation() {
 		"default",
 		&replica,
 		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -311,6 +357,18 @@ fn restore_job_passes_cache_caps_and_log_rotation() {
 	assert!(
 		script.contains("--log-dir-max-age=24h"),
 		"kopia invocations must rotate CLI logs by age"
+	);
+	assert!(
+		names.contains(&"CACHE_PRESSURE_CALLBACK_URL"),
+		"restore Job env must include CACHE_PRESSURE_CALLBACK_URL"
+	);
+	assert!(
+		script.contains("PGRO_CACHE_PRESSURE"),
+		"restore script must emit pre-flight pressure marker"
+	);
+	assert!(
+		script.contains("$CACHE_PRESSURE_CALLBACK_URL"),
+		"restore script must POST to the cache-pressure callback URL on pressure"
 	);
 }
 
