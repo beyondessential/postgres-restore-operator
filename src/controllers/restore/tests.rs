@@ -238,11 +238,14 @@ fn kopia_cache_pvc_owned_by_replica() {
 
 #[test]
 fn kopia_content_cache_mb_floor_for_small_pvc() {
-	// 10Gi PVC (the floor for small snapshots) minus the 2Gi reserve =
-	// 8 Gi content cache, expressed in MiB.
+	// 10Gi PVC (the floor for small snapshots): reserve = max(2Gi,
+	// 30% × 10Gi) = 3Gi → content cache = 7Gi.
 	let small = Quantity("1Gi".to_string());
 	let mb = super::builders::kopia_content_cache_mb(&small);
-	let expected = 10 * 1024 - super::builders::KOPIA_CACHE_RESERVE_MB;
+	let pvc_mb = 10 * 1024;
+	let proportional = (pvc_mb as f64 * super::builders::KOPIA_CACHE_RESERVE_FRACTION) as u64;
+	let reserve = proportional.max(super::builders::KOPIA_CACHE_RESERVE_MIN_MB);
+	let expected = pvc_mb - reserve;
 	assert_eq!(mb, expected);
 	assert!(
 		mb >= super::builders::KOPIA_CONTENT_CACHE_FLOOR_MB,
@@ -252,10 +255,14 @@ fn kopia_content_cache_mb_floor_for_small_pvc() {
 
 #[test]
 fn kopia_content_cache_mb_scales_with_snapshot() {
-	// 100Gi snapshot → 20Gi PVC → 20Gi - 2Gi reserve = 18Gi cache.
+	// 100Gi snapshot → 20Gi PVC. Reserve = max(2Gi, 30% × 20Gi) = 6Gi
+	// → content cache = 14Gi.
 	let big = Quantity("100Gi".to_string());
 	let mb = super::builders::kopia_content_cache_mb(&big);
-	let expected = 20 * 1024 - super::builders::KOPIA_CACHE_RESERVE_MB;
+	let pvc_mb = 20 * 1024;
+	let proportional = (pvc_mb as f64 * super::builders::KOPIA_CACHE_RESERVE_FRACTION) as u64;
+	let reserve = proportional.max(super::builders::KOPIA_CACHE_RESERVE_MIN_MB);
+	let expected = pvc_mb - reserve;
 	assert_eq!(mb, expected);
 }
 
