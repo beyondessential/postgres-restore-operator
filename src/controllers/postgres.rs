@@ -309,9 +309,40 @@ pub async fn existing_schemas_on(
 		.collect())
 }
 
+/// Terminate every other client backend connected to the current database.
+/// The operator owns each restore's database fully until handover, so any
+/// other session is a transient or stray client whose lock-holding would
+/// block our DDL. Best-effort: rows where `pg_terminate_backend` returns
+/// false (already gone, raced with another terminator) are ignored.
+///
+/// Note: this only dislodges sessions PG can interrupt. A backend stuck in
+/// an uninterruptible kernel wait (rare but it happens — e.g. a long-dead
+/// client whose TCP socket the kernel hasn't reaped) will not exit. For
+/// those, the restore pod must be restarted.
+pub async fn terminate_other_backends(pg: &tokio_postgres::Client) -> Result<u64> {
+	let row = pg
+		.query_one(
+			"SELECT count(*) FILTER (WHERE pg_terminate_backend(pid)) \
+			 FROM pg_stat_activity \
+			 WHERE datname = current_database() \
+			   AND backend_type = 'client backend' \
+			   AND pid <> pg_backend_pid()",
+			&[],
+		)
+		.await?;
+	let killed: i64 = row.get(0);
+	if killed > 0 {
+		info!(count = killed, "terminated other client backends");
+	}
+	Ok(killed as u64)
+}
+
 /// Drop the given schemas (and all contents) on an already-open connection.
+/// Terminates other client backends on the database first so stray sessions
+/// holding locks on the target schemas don't queue our DDL behind them.
 /// Idempotent: missing schemas are skipped via `DROP SCHEMA IF EXISTS`.
 pub async fn drop_schemas_on(pg: &tokio_postgres::Client, schemas: &[String]) -> Result<()> {
+	terminate_other_backends(pg).await?;
 	for schema in schemas {
 		let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
 		debug!(schema = schema, "dropping schema");
