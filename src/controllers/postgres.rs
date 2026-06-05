@@ -1,17 +1,103 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, time::Duration};
 
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::{
 	Api, Client, ResourceExt,
 	api::{ListParams, Portforwarder},
 };
+use socket2::{SockRef, TcpKeepalive};
 use tokio::net::TcpStream;
-use tokio_postgres::NoTls;
+use tokio_postgres::{NoTls, Row, ToStatement, types::ToSql};
 use tracing::{debug, info, warn};
 
 use crate::error::{Error, Result};
 
 pub const DEFAULT_PG_VERSION: i32 = 18;
+
+/// Per-query timeout. Backstop for hung connections that survive TCP
+/// keepalives (e.g. a server that ACKs keepalive probes but the query
+/// itself wedges). Generous because `DROP SCHEMA ... CASCADE` on a
+/// populated dbt schema can take minutes; intent is runaway detection,
+/// not a query SLA.
+const QUERY_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+
+/// TCP keepalive parameters for operator-side libpq sockets. Matches the
+/// settings the migration Job uses in its libpq URI (see [[fix(migration)
+/// TCP keepalives]]). Detects NAT-evicted / silently-dead sockets within
+/// ~90s so reconciles can fail and retry instead of hanging forever.
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
+const KEEPALIVE_RETRIES: u32 = 3;
+
+fn set_tcp_keepalive(stream: &TcpStream) -> Result<()> {
+	let ka = TcpKeepalive::new()
+		.with_time(KEEPALIVE_IDLE)
+		.with_interval(KEEPALIVE_INTERVAL)
+		.with_retries(KEEPALIVE_RETRIES);
+	SockRef::from(stream)
+		.set_tcp_keepalive(&ka)
+		.map_err(|e| Error::MissingField(format!("failed to set TCP keepalive: {e}")))?;
+	Ok(())
+}
+
+/// Run a parameterised query with the global [`QUERY_TIMEOUT`]. Returns a
+/// timeout-shaped error if the query doesn't complete in time, so the
+/// reconcile fails fast instead of hanging on a wedged connection.
+pub async fn query_timeout<T>(
+	pg: &tokio_postgres::Client,
+	stmt: &T,
+	params: &[&(dyn ToSql + Sync)],
+) -> Result<Vec<Row>>
+where
+	T: ?Sized + ToStatement,
+{
+	tokio::time::timeout(QUERY_TIMEOUT, pg.query(stmt, params))
+		.await
+		.map_err(|_| Error::MissingField(format!("query timed out after {QUERY_TIMEOUT:?}")))?
+		.map_err(Into::into)
+}
+
+pub async fn query_one_timeout<T>(
+	pg: &tokio_postgres::Client,
+	stmt: &T,
+	params: &[&(dyn ToSql + Sync)],
+) -> Result<Row>
+where
+	T: ?Sized + ToStatement,
+{
+	tokio::time::timeout(QUERY_TIMEOUT, pg.query_one(stmt, params))
+		.await
+		.map_err(|_| Error::MissingField(format!("query timed out after {QUERY_TIMEOUT:?}")))?
+		.map_err(Into::into)
+}
+
+pub async fn query_opt_timeout<T>(
+	pg: &tokio_postgres::Client,
+	stmt: &T,
+	params: &[&(dyn ToSql + Sync)],
+) -> Result<Option<Row>>
+where
+	T: ?Sized + ToStatement,
+{
+	tokio::time::timeout(QUERY_TIMEOUT, pg.query_opt(stmt, params))
+		.await
+		.map_err(|_| Error::MissingField(format!("query timed out after {QUERY_TIMEOUT:?}")))?
+		.map_err(Into::into)
+}
+
+pub async fn execute_timeout<T>(
+	pg: &tokio_postgres::Client,
+	stmt: &T,
+	params: &[&(dyn ToSql + Sync)],
+) -> Result<u64>
+where
+	T: ?Sized + ToStatement,
+{
+	tokio::time::timeout(QUERY_TIMEOUT, pg.execute(stmt, params))
+		.await
+		.map_err(|_| Error::MissingField(format!("execute timed out after {QUERY_TIMEOUT:?}")))?
+		.map_err(Into::into)
+}
 
 /// Holds a Postgres client and any resources that must stay alive for the
 /// duration of the connection (e.g. a port-forwarder).
@@ -67,6 +153,7 @@ async fn connect_via_tcp(
 	let stream = TcpStream::connect(&addr)
 		.await
 		.map_err(|e| Error::MissingField(format!("failed to connect to {addr}: {e}")))?;
+	set_tcp_keepalive(&stream)?;
 
 	let mut config = tokio_postgres::Config::new();
 	config.user(user);
@@ -195,15 +282,15 @@ pub async fn discover_restore_database(
 	.await?;
 	let pg = &conn.client;
 
-	let row = pg
-		.query_opt(
-			"SELECT datname FROM pg_database \
-			 WHERE datname NOT IN ('postgres', 'template0', 'template1') \
-			 ORDER BY pg_database_size(datname) DESC \
-			 LIMIT 1",
-			&[],
-		)
-		.await?;
+	let row = query_opt_timeout(
+		pg,
+		"SELECT datname FROM pg_database \
+		 WHERE datname NOT IN ('postgres', 'template0', 'template1') \
+		 ORDER BY pg_database_size(datname) DESC \
+		 LIMIT 1",
+		&[],
+	)
+	.await?;
 
 	match row {
 		Some(r) => {
@@ -227,9 +314,7 @@ pub async fn discover_restore_database(
 /// you're going to make multiple queries on the same database so the
 /// connection can be reused.
 pub async fn database_size_on(pg: &tokio_postgres::Client) -> Result<u64> {
-	let row = pg
-		.query_one("SELECT pg_database_size(current_database())", &[])
-		.await?;
+	let row = query_one_timeout(pg, "SELECT pg_database_size(current_database())", &[]).await?;
 	let size: i64 = row.get(0);
 	Ok(size as u64)
 }
@@ -271,12 +356,12 @@ pub async fn existing_schemas_on(
 	if candidates.is_empty() {
 		return Ok(Vec::new());
 	}
-	let rows = pg
-		.query(
-			"SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = ANY($1)",
-			&[&candidates],
-		)
-		.await?;
+	let rows = query_timeout(
+		pg,
+		"SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = ANY($1)",
+		&[&candidates],
+	)
+	.await?;
 	let found: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
 	Ok(candidates
 		.iter()
@@ -291,7 +376,7 @@ pub async fn drop_schemas_on(pg: &tokio_postgres::Client, schemas: &[String]) ->
 	for schema in schemas {
 		let stmt = format!("DROP SCHEMA IF EXISTS {} CASCADE", quote_ident(schema));
 		debug!(schema = schema, "dropping schema");
-		pg.execute(stmt.as_str(), &[]).await?;
+		execute_timeout(pg, stmt.as_str(), &[]).await?;
 	}
 	Ok(())
 }
