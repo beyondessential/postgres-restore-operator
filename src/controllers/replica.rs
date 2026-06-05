@@ -190,6 +190,14 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			"performing blue-green switchover"
 		);
 
+		// Mark the new restore's pod ready for traffic BEFORE pointing the
+		// Service at it. The Service selector requires the
+		// `ready-for-traffic=true` label (see [[READY_FOR_TRAFFIC_LABEL]]),
+		// so until the operator sets the label, no external client can
+		// reach the restore via the Service — operator-side prep work
+		// (DROP SCHEMA, migration Job) runs without external interference.
+		switching.mark_pod_ready_for_traffic(client).await?;
+
 		// Update Service selector to point to the new restore
 		switching.update_service_selector(client, &name).await?;
 

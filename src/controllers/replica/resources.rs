@@ -6,7 +6,7 @@ use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, EnvVar, LocalObjectReference, PodSpec, PodTemplateSpec,
+			Container, EnvVar, LocalObjectReference, Pod, PodSpec, PodTemplateSpec,
 			ResourceRequirements, Secret, Service, ServicePort, ServiceSpec,
 		},
 	},
@@ -415,13 +415,60 @@ impl PostgresPhysicalReplica {
 	}
 }
 
+/// Label the operator sets on a restore's postgres pod once schema
+/// migration (and anything else that must run pre-handover) has completed
+/// and the pod is safe to receive external traffic. The per-replica
+/// Service selector requires this label, so a restore in `Switching`
+/// can't be reached via the Service — operator-side work (DROP SCHEMA,
+/// `pg_dump | psql` migration Job, etc.) runs without external clients
+/// racing to grab locks on the schemas being touched.
+pub const READY_FOR_TRAFFIC_LABEL: &str = "pgro.bes.au/ready-for-traffic";
+
 impl PostgresPhysicalRestore {
+	/// Patch this restore's postgres pod to add the [`READY_FOR_TRAFFIC_LABEL`].
+	/// Idempotent and resilient to the pod not existing yet (the restore's
+	/// deployment may be mid-rollout); callers that need the label to be
+	/// present should retry on the next reconcile pass.
+	pub async fn mark_pod_ready_for_traffic(&self, client: &Client) -> Result<()> {
+		let pods: Api<Pod> = Api::namespaced(client.clone(), &self.ns());
+		let selector = format!("pgro.bes.au/restore={}", self.name_any());
+		let list = pods.list(&ListParams::default().labels(&selector)).await?;
+		let pod = list
+			.items
+			.into_iter()
+			.find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"));
+		let Some(pod) = pod else {
+			warn!(
+				restore = self.name_any(),
+				"no running pod for restore yet; will retry next reconcile"
+			);
+			return Ok(());
+		};
+		let pod_name = pod.name_any();
+		let patch = serde_json::json!({
+			"metadata": {
+				"labels": {
+					READY_FOR_TRAFFIC_LABEL: "true",
+				}
+			}
+		});
+		pods.patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch))
+			.await?;
+		info!(
+			restore = self.name_any(),
+			pod = pod_name,
+			"marked restore pod ready for traffic"
+		);
+		Ok(())
+	}
+
 	pub async fn update_service_selector(&self, client: &Client, service_name: &str) -> Result<()> {
 		let services: Api<Service> = Api::namespaced(client.clone(), &self.ns());
 		let patch = serde_json::json!({
 			"spec": {
 				"selector": {
 					"pgro.bes.au/restore": self.name_any(),
+					READY_FOR_TRAFFIC_LABEL: "true",
 				}
 			}
 		});

@@ -617,6 +617,13 @@ async fn reconcile_active(
 		apply_restore_deployment(client, restore, &replica, name, namespace).await?;
 	}
 
+	// Defensively ensure the ready-for-traffic label is on the pod. If the
+	// pod restarted (OOM, eviction, node loss), the label is gone from the
+	// new pod and the Service stops routing to it; re-applying every pass
+	// closes that gap. Also handles the upgrade path where existing Active
+	// pods predate the label.
+	restore.mark_pod_ready_for_traffic(client).await?;
+
 	Ok(Action::requeue(Duration::from_secs(300)))
 }
 
