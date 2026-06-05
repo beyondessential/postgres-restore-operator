@@ -53,6 +53,46 @@ impl PostgresPhysicalReplica {
 		format!("{:016x}", hasher.finish())
 	}
 
+	/// Wall-clock budget for the schema migration step inside a single
+	/// restore cycle. Returns 20% of the interval between consecutive
+	/// cron firings; e.g. a `0 */6 * * *` schedule (every 6h) gets a
+	/// ~72 min budget. A healthy migration completes in seconds, so this
+	/// is a generous backstop, not a tight SLA — the goal is to keep a
+	/// pathological migration (postgres backend stuck on a single DDL,
+	/// for example) from blocking the replica from coming up at all.
+	/// Falls back to 1h if the cron expression can't be parsed or there
+	/// is no schedule. When the timeout fires, the operator drops the
+	/// `persistent_schemas` on the new restore (DROP SCHEMA … CASCADE)
+	/// and proceeds to switchover. The next restore reattempts the
+	/// migration if the schemas were regenerated upstream in between.
+	pub fn schema_migration_timeout(&self) -> SignedDuration {
+		const FALLBACK: SignedDuration = SignedDuration::from_secs(3600);
+		const BUDGET_FRACTION_DENOMINATOR: i64 = 5; // 1/5 == 20%
+		let Some(interval) = self.cron_interval(Timestamp::now()) else {
+			return FALLBACK;
+		};
+		SignedDuration::from_secs(interval.as_secs() / BUDGET_FRACTION_DENOMINATOR)
+	}
+
+	/// Interval between two consecutive cron firings of this replica's
+	/// schedule, measured from `now`. Returns `None` when the schedule
+	/// can't be parsed or doesn't have a second next-fire.
+	fn cron_interval(&self, now: Timestamp) -> Option<SignedDuration> {
+		let schedule = &self.spec.schedule;
+		let cron = parse_crontab_with(schedule, {
+			let mut options = ParseOptions::default();
+			options.fallback_timezone_option = cronexpr::FallbackTimezoneOption::UTC;
+			options
+		})
+		.ok()?;
+		let next = cron.find_next(now).ok()?;
+		let next_ts = next.timestamp();
+		let after = cron
+			.find_next(next_ts + SignedDuration::from_secs(1))
+			.ok()?;
+		Some(after.timestamp().duration_since(next_ts))
+	}
+
 	pub fn compute_next_scheduled_restore(&self, now: Timestamp) -> Option<Timestamp> {
 		let schedule = &self.spec.schedule;
 
@@ -346,6 +386,29 @@ mod tests {
 		let next = replica.compute_next_scheduled_restore(now);
 		assert!(next.is_some());
 		assert!(next.unwrap() > now);
+	}
+
+	#[test]
+	fn schema_migration_timeout_six_hourly_cron_is_twenty_percent() {
+		// `0 */6 * * *` fires every 6h → 21600s → 20% = 4320s = 72min.
+		let replica = make_replica("0 */6 * * *", None, None, None);
+		let timeout = replica.schema_migration_timeout();
+		assert_eq!(timeout, SignedDuration::from_secs(4320));
+	}
+
+	#[test]
+	fn schema_migration_timeout_daily_cron_is_twenty_percent() {
+		// Daily at midnight → 86400s → 20% = 17280s = 288min.
+		let replica = make_replica("0 0 * * *", None, None, None);
+		let timeout = replica.schema_migration_timeout();
+		assert_eq!(timeout, SignedDuration::from_secs(17280));
+	}
+
+	#[test]
+	fn schema_migration_timeout_falls_back_on_invalid_cron() {
+		let replica = make_replica("not a cron", None, None, None);
+		let timeout = replica.schema_migration_timeout();
+		assert_eq!(timeout, SignedDuration::from_secs(3600));
 	}
 
 	#[test]

@@ -102,7 +102,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `readOnly` | `bool` | No | `true` | Set the restored database to read-only mode. |
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
-| `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. |
+| `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. See [Persistent schemas](#persistent-schemas) below for the migration time budget and what happens on timeout. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -113,6 +113,24 @@ Jitter is applied to the scheduled time after the cron expression is evaluated.
 The jitter is a random duration between -time/2 and +time/2.
 For example, `10m` will result in a jitter between -5m and 5m.
 When using `H` in the cron expression, you might want to set the jitter to zero to properly take advantage of the spread-but-stable behaviour.
+
+#### Persistent schemas
+
+Each switchover normally drops the new restore (so it carries only what was in the snapshot) and is fast.
+The `persistentSchemas` field opts a schema (e.g. `dbt`) into being **carried across restores** via a `pg_dump | psql` migration Job that runs between the previous restore and the new one.
+A healthy migration takes seconds.
+
+The migration has a **hard time budget of 20% of the cron interval** (e.g. ~72 min on a 6-hourly schedule, ~5 h on a daily one).
+If the budget is exceeded — most realistically because some external upstream condition wedges postgres mid-migration — the operator:
+
+1. Cancels the migration Job.
+2. Runs `DROP SCHEMA <name> CASCADE` for each persistent schema on the new restore.
+3. Records a `SchemaMigrationTimedOut` Warning event on the replica.
+4. Sets `status.schemaMigrationPhase = "timeout-skipped"`.
+5. Proceeds with the switchover.
+
+The intent is that **a usable replica beats carrying the schema through**.
+The next restore cycle will re-attempt the migration if the schemas have been regenerated on the source in the meantime; until then the replica is up and serving the snapshot contents.
 
 #### SnapshotFilter
 
@@ -163,7 +181,7 @@ Additional fields for `target: graphQL`:
 | `notifications` | `[]NotificationStatus` | Status of each configured notification target. |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions. |
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
-| `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, or `failed: <reason>`). |
+| `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, `partial`, `timeout-skipped`, or `failed: <reason>`). See [Persistent schemas](#persistent-schemas). |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
 | `consecutiveRestoreFailures` | `uint32` | Number of consecutive restore failures. Reset to 0 on success. After 3 consecutive failures the operator stops scheduling new restores until the counter is reset (automatically on next successful restore, or manually via `kubectl patch --subresource=status`). |
 
