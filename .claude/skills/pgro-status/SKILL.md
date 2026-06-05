@@ -36,6 +36,8 @@ Look for:
 - Restore objects: each replica should have **exactly one** `Active` restore in steady state. A transient `Pending` / `Restoring` / `Ready` / `Switching` restore is normal during a cycle. More than one `Active` indicates the sweep isn't pruning.
 - Pending pod count > 0 is worth digging into before reporting healthy — could be a scheduling problem (Karpenter, taints, resource pressure).
 
+**A `Ready` phase replica is not necessarily healthy.** `Ready` only means the operator's switchover state machine is at rest — the previous restore is still serving traffic. If `consecutiveRestoreFailures > 0` and growing, *every restore attempt since the last good one has failed*, so the data is staler than its `lastRestoreCompletedAt` claims. To users, "the replica isn't working" usually means the data is days behind, not that connections are refused. Always cross-check `consecutiveRestoreFailures` against `lastRestoreCompletedAt` and the replica's expected cadence before calling a `Ready` replica healthy.
+
 ### Phase 2 — per-replica detail
 
 For each replica that looks off — and whenever a thorough check is requested — fetch the key status fields and conditions:
