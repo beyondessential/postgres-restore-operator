@@ -60,11 +60,11 @@ pub fn persistent_schemas_migration_settled(replica: &PostgresPhysicalReplica) -
 	if replica.spec.persistent_schemas.is_none() {
 		return true;
 	}
-	let phase = replica
+	replica
 		.status
 		.as_ref()
-		.and_then(|s| s.schema_migration_phase.as_deref());
-	!matches!(phase, Some("active"))
+		.and_then(|s| s.schema_migration_phase.as_ref())
+		.is_none_or(SchemaMigrationPhase::is_settled)
 }
 
 /// Generate a random password for analytics credentials.
@@ -1077,7 +1077,7 @@ async fn mark_schema_migration_complete(
 	let patch = serde_json::json!({
 		"status": {
 			"schemaMigrationJob": null,
-			"schemaMigrationPhase": "complete",
+			"schemaMigrationPhase": SchemaMigrationPhase::Complete,
 		}
 	});
 	replicas
@@ -1249,7 +1249,7 @@ async fn timeout_schema_migration(
 	let patch = serde_json::json!({
 		"status": {
 			"schemaMigrationJob": null,
-			"schemaMigrationPhase": "timeout-skipped",
+			"schemaMigrationPhase": SchemaMigrationPhase::TimeoutSkipped,
 		}
 	});
 	replicas
@@ -1307,7 +1307,7 @@ async fn reconcile_schema_migration(
 		.status
 		.as_ref()
 		.and_then(|s| s.schema_migration_phase.as_ref())
-		.is_some_and(|p| p == "complete")
+		.is_some_and(|p| matches!(p, SchemaMigrationPhase::Complete))
 	{
 		debug!(replica = %replica_name, "migration already complete in status");
 		return Ok(true);
@@ -1373,7 +1373,11 @@ async fn reconcile_schema_migration(
 					info!(replica = %replica_name, "migration Job succeeded");
 				}
 
-				let phase = if is_partial { "partial" } else { "complete" };
+				let phase = if is_partial {
+					SchemaMigrationPhase::Partial
+				} else {
+					SchemaMigrationPhase::Complete
+				};
 				let replicas: Api<PostgresPhysicalReplica> =
 					Api::namespaced(client.clone(), namespace);
 				let patch = serde_json::json!({
@@ -1422,7 +1426,7 @@ async fn reconcile_schema_migration(
 				let patch = serde_json::json!({
 					"status": {
 						"schemaMigrationJob": null,
-						"schemaMigrationPhase": format!("failed: {}", last_error),
+						"schemaMigrationPhase": SchemaMigrationPhase::Failed(last_error.clone()),
 					}
 				});
 				replicas
@@ -1662,7 +1666,7 @@ async fn reconcile_schema_migration(
 	let patch = serde_json::json!({
 		"status": {
 			"schemaMigrationJob": job_name,
-			"schemaMigrationPhase": "active",
+			"schemaMigrationPhase": SchemaMigrationPhase::Active,
 		}
 	});
 	replicas

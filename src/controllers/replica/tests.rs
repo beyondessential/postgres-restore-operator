@@ -9,7 +9,7 @@ use super::{
 
 fn make_replica(
 	persistent_schemas: Option<Vec<String>>,
-	schema_migration_phase: Option<String>,
+	schema_migration_phase: Option<SchemaMigrationPhase>,
 ) -> PostgresPhysicalReplica {
 	PostgresPhysicalReplica {
 		metadata: ObjectMeta {
@@ -64,8 +64,14 @@ fn migration_settled_when_no_status() {
 
 #[test]
 fn migration_settled_in_terminal_phases() {
-	for phase in ["complete", "partial", "timeout-skipped", "failed: stuff"] {
-		let replica = make_replica(Some(vec!["dbt".into()]), Some(phase.into()));
+	let terminal = [
+		SchemaMigrationPhase::Complete,
+		SchemaMigrationPhase::Partial,
+		SchemaMigrationPhase::TimeoutSkipped,
+		SchemaMigrationPhase::Failed("stuff".into()),
+	];
+	for phase in terminal {
+		let replica = make_replica(Some(vec!["dbt".into()]), Some(phase.clone()));
 		assert!(
 			persistent_schemas_migration_settled(&replica),
 			"phase {phase:?} should let sweep proceed"
@@ -75,7 +81,7 @@ fn migration_settled_in_terminal_phases() {
 
 #[test]
 fn migration_blocks_sweep_only_when_active() {
-	let replica = make_replica(Some(vec!["dbt".into()]), Some("active".into()));
+	let replica = make_replica(Some(vec!["dbt".into()]), Some(SchemaMigrationPhase::Active));
 	assert!(
 		!persistent_schemas_migration_settled(&replica),
 		"active phase must block sweep so we don't delete the migration source"
