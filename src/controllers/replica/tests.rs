@@ -3,7 +3,84 @@ use kube::api::ObjectMeta;
 
 use crate::{kopia::Snapshot, types::*, util::TimeSpan};
 
-use super::{generate_password, resources::build_snapshot_list_job};
+use super::{
+	generate_password, persistent_schemas_migration_settled, resources::build_snapshot_list_job,
+};
+
+fn make_replica(
+	persistent_schemas: Option<Vec<String>>,
+	schema_migration_phase: Option<String>,
+) -> PostgresPhysicalReplica {
+	PostgresPhysicalReplica {
+		metadata: ObjectMeta {
+			name: Some("test".into()),
+			namespace: Some("default".into()),
+			..Default::default()
+		},
+		spec: PostgresPhysicalReplicaSpec {
+			kopia_secret_ref: SecretReference {
+				name: Some("creds".into()),
+				namespace: None,
+			},
+			snapshot_filter: None,
+			schedule: "0 * * * *".into(),
+			schedule_jitter: TimeSpan(jiff::Span::new()),
+			minimum_ttl: None,
+			switchover_grace_period: TimeSpan(jiff::Span::new()),
+			analytics_username: "analytics".into(),
+			storage_class: None,
+			storage_size_override: None,
+			resources: None,
+			service_annotations: None,
+			pod_annotations: None,
+			affinity: None,
+			tolerations: vec![],
+			read_only: true,
+			postgres_extra_config: None,
+			notifications: vec![],
+			persistent_schemas,
+			storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
+				"2Ti".to_string(),
+			),
+		},
+		status: schema_migration_phase.map(|p| PostgresPhysicalReplicaStatus {
+			schema_migration_phase: Some(p),
+			..Default::default()
+		}),
+	}
+}
+
+#[test]
+fn migration_settled_when_persistent_schemas_unset() {
+	let replica = make_replica(None, None);
+	assert!(persistent_schemas_migration_settled(&replica));
+}
+
+#[test]
+fn migration_settled_when_no_status() {
+	let replica = make_replica(Some(vec!["dbt".into()]), None);
+	assert!(persistent_schemas_migration_settled(&replica));
+}
+
+#[test]
+fn migration_settled_in_terminal_phases() {
+	for phase in ["complete", "partial", "timeout-skipped", "failed: stuff"] {
+		let replica = make_replica(Some(vec!["dbt".into()]), Some(phase.into()));
+		assert!(
+			persistent_schemas_migration_settled(&replica),
+			"phase {phase:?} should let sweep proceed"
+		);
+	}
+}
+
+#[test]
+fn migration_blocks_sweep_only_when_active() {
+	let replica = make_replica(Some(vec!["dbt".into()]), Some("active".into()));
+	assert!(
+		!persistent_schemas_migration_settled(&replica),
+		"active phase must block sweep so we don't delete the migration source"
+	);
+}
 
 #[test]
 fn generate_password_length_and_charset() {
