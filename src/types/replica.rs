@@ -281,9 +281,9 @@ pub struct PostgresPhysicalReplicaStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub schema_migration_job: Option<String>,
 
-	/// Phase of schema migration: pending, active, complete, failed
+	/// Phase of schema migration. See [`SchemaMigrationPhase`].
 	#[serde(default, skip_serializing_if = "Option::is_none")]
-	pub schema_migration_phase: Option<String>,
+	pub schema_migration_phase: Option<SchemaMigrationPhase>,
 
 	/// Measured size of persistent schema data from the last successful migration (bytes).
 	/// Used to size the next restore PVC.
@@ -304,6 +304,106 @@ pub enum ReplicaPhase {
 	Restoring,
 	Ready,
 	Failed,
+}
+
+/// Lifecycle phase of the operator's schema-migration step that runs
+/// during a switchover when `persistent_schemas` is configured on the
+/// replica. The serialized form is a flat string matching the historical
+/// wire format (`active` / `complete` / `partial` / `timeout-skipped` /
+/// `failed: <reason>`) so existing replica status objects round-trip
+/// unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaMigrationPhase {
+	/// Migration Job is running. The sweep must not delete the source
+	/// restore while we're in this state.
+	Active,
+	/// Migration Job finished cleanly; persistent schemas were carried
+	/// across to the new restore.
+	Complete,
+	/// Migration Job finished but psql logged statement errors (typical
+	/// when dbt views reference renamed/dropped upstream columns). Some
+	/// persistent_schemas objects may need regenerating upstream.
+	Partial,
+	/// Migration exceeded the per-cycle wall-clock budget (20% of the
+	/// cron interval). The operator dropped the persistent_schemas on
+	/// the new restore and proceeded to switchover anyway — a usable
+	/// replica beats carrying the schema through indefinitely. The next
+	/// cycle re-attempts migration if the schemas have regenerated.
+	TimeoutSkipped,
+	/// Migration Job failed. The old restore stays Active; the new
+	/// restore stays in Switching. The wrapped string is the reason
+	/// surfaced from the Job's callback body (or "no callback received").
+	Failed(String),
+}
+
+impl SchemaMigrationPhase {
+	/// True for every phase except [`Self::Active`]. Used by the sweep
+	/// gate: as long as the migration isn't currently running, deleting
+	/// the previous Active restore is safe (nothing depends on it being
+	/// around). Coded as "not Active" rather than enumerating terminal
+	/// variants so adding a new variant doesn't risk silently
+	/// reintroducing the deadlock that originally motivated this enum.
+	pub fn is_settled(&self) -> bool {
+		!matches!(self, Self::Active)
+	}
+}
+
+impl std::fmt::Display for SchemaMigrationPhase {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Active => f.write_str("active"),
+			Self::Complete => f.write_str("complete"),
+			Self::Partial => f.write_str("partial"),
+			Self::TimeoutSkipped => f.write_str("timeout-skipped"),
+			Self::Failed(reason) => write!(f, "failed: {reason}"),
+		}
+	}
+}
+
+impl std::str::FromStr for SchemaMigrationPhase {
+	type Err = String;
+
+	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+		match s {
+			"active" => Ok(Self::Active),
+			"complete" => Ok(Self::Complete),
+			"partial" => Ok(Self::Partial),
+			"timeout-skipped" => Ok(Self::TimeoutSkipped),
+			other => {
+				if let Some(reason) = other.strip_prefix("failed:") {
+					Ok(Self::Failed(reason.trim().to_string()))
+				} else {
+					Err(format!("unknown schema migration phase: {other:?}"))
+				}
+			}
+		}
+	}
+}
+
+impl Serialize for SchemaMigrationPhase {
+	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+		s.serialize_str(&self.to_string())
+	}
+}
+
+impl<'de> Deserialize<'de> for SchemaMigrationPhase {
+	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+		let s = String::deserialize(d)?;
+		s.parse().map_err(serde::de::Error::custom)
+	}
+}
+
+impl JsonSchema for SchemaMigrationPhase {
+	fn schema_name() -> Cow<'static, str> {
+		"SchemaMigrationPhase".into()
+	}
+
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {
+		json_schema!({
+			"type": "string",
+			"description": "Schema migration phase: 'active' (Job running), 'complete' (succeeded), 'partial' (succeeded with statement errors), 'timeout-skipped' (budget exceeded; persistent schemas dropped and switchover proceeded), or 'failed: <reason>' (Job failed).",
+		})
+	}
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -347,5 +447,66 @@ impl PostgresPhysicalReplica {
 
 	pub fn creds_secret_name(&self) -> String {
 		format!("{name}-creds", name = self.name_any())
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn schema_migration_phase_roundtrips_terminal_variants() {
+		for phase in [
+			SchemaMigrationPhase::Active,
+			SchemaMigrationPhase::Complete,
+			SchemaMigrationPhase::Partial,
+			SchemaMigrationPhase::TimeoutSkipped,
+		] {
+			let s = serde_json::to_string(&phase).expect("serialize");
+			let back: SchemaMigrationPhase = serde_json::from_str(&s).expect("deserialize");
+			assert_eq!(phase, back, "round-trip mismatch for {phase:?}");
+		}
+	}
+
+	#[test]
+	fn schema_migration_phase_failed_preserves_reason() {
+		let phase = SchemaMigrationPhase::Failed("connection refused".into());
+		let s = serde_json::to_string(&phase).expect("serialize");
+		assert_eq!(s, "\"failed: connection refused\"");
+		let back: SchemaMigrationPhase = serde_json::from_str(&s).expect("deserialize");
+		assert_eq!(phase, back);
+	}
+
+	#[test]
+	fn schema_migration_phase_wire_strings_match_history() {
+		// The wire format is documented in the README and consumed by
+		// external tooling (dashboards, alerts). These strings are part
+		// of pgro's public contract; renaming them is a breaking change.
+		assert_eq!(SchemaMigrationPhase::Active.to_string(), "active");
+		assert_eq!(SchemaMigrationPhase::Complete.to_string(), "complete");
+		assert_eq!(SchemaMigrationPhase::Partial.to_string(), "partial");
+		assert_eq!(
+			SchemaMigrationPhase::TimeoutSkipped.to_string(),
+			"timeout-skipped"
+		);
+		assert_eq!(
+			SchemaMigrationPhase::Failed("boom".into()).to_string(),
+			"failed: boom"
+		);
+	}
+
+	#[test]
+	fn schema_migration_phase_rejects_unknown_string() {
+		let r: Result<SchemaMigrationPhase, _> = "what".parse();
+		assert!(r.is_err());
+	}
+
+	#[test]
+	fn schema_migration_phase_is_settled() {
+		assert!(!SchemaMigrationPhase::Active.is_settled());
+		assert!(SchemaMigrationPhase::Complete.is_settled());
+		assert!(SchemaMigrationPhase::Partial.is_settled());
+		assert!(SchemaMigrationPhase::TimeoutSkipped.is_settled());
+		assert!(SchemaMigrationPhase::Failed("x".into()).is_settled());
 	}
 }
