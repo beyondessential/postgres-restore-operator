@@ -1,0 +1,3 @@
+[default.extend-words]
+# BRIN: postgres "Block Range Index" type.
+BRIN = "BRIN"

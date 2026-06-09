@@ -922,6 +922,14 @@ fi
 # enough for read-only analytics, and the alternative is a permanently
 # unrecoverable replica.
 #
+# Every pg_resetwal -f invocation also touches /pgdata/needs-reindex-all:
+# pg_resetwal bypasses WAL replay, so any index update that was in flight
+# at snapshot time may have left torn pages ("unexpected zero page at
+# block N" surfaces in queries later, which is hard to debug after the
+# fact). The main container's startup hook picks up that flag and runs
+# REINDEX DATABASE on every user database before marking the replica
+# Ready.
+#
 # Stage 1: if the first attempt fails with a WAL-recovery signature,
 # short-circuit straight to pg_resetwal + retry. Retrying the same
 # command won't help when recovery itself is the blocker.
@@ -946,6 +954,7 @@ postgres_single_or_resetwal() {{
     echo "WAL recovery failed (snapshot likely captured mid-online-backup) — running pg_resetwal -f and retrying" >&2
     rm -f "$logfile"
     pg_resetwal -f "$PGDATA"
+    touch /pgdata/needs-reindex-all
     echo "$sql_input" | postgres --single -D "$PGDATA" postgres
     return $?
   fi
@@ -966,6 +975,7 @@ postgres_single_or_resetwal() {{
   echo "second attempt also failed — running pg_resetwal -f as a last resort and retrying" >&2
   rm -f "$logfile"
   pg_resetwal -f "$PGDATA"
+  touch /pgdata/needs-reindex-all
   echo "$sql_input" | postgres --single -D "$PGDATA" postgres
 }}
 
@@ -1061,7 +1071,7 @@ ALTER ROLE ${{ANALYTICS_USERNAME}} WITH SUPERUSER;
 SQLEOF
 fi
 
-if [ -f /pgdata/needs-reindex ]; then
+if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
   PGRO_STAGE=restored
 else
   PGRO_STAGE=ready
@@ -1235,33 +1245,112 @@ echo "Auth setup complete"
 						image: Some(pg_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 						args: Some(vec![r#"
-if [ -f /pgdata/needs-reindex ]; then
+if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
   PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
   (
     while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
     psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
-    for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
-      INDEXES=$(psql -U postgres -d "$db" -At -c "
-        SELECT DISTINCT indexrelid::regclass::text
-        FROM pg_index i
-        JOIN pg_attribute a ON a.attrelid = i.indexrelid
-        WHERE a.attcollation <> 0 AND i.indisvalid;
-      ")
-      COUNT=$(echo "$INDEXES" | grep -c . || true)
-      echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
-      N=0
-      echo "$INDEXES" | while IFS= read -r idx; do
-        [ -z "$idx" ] && continue
-        N=$((N + 1))
-        echo "  [$N/$COUNT] $db: $idx"
-        if [ "$PG_MAJOR" -ge 14 ]; then
-          psql -U postgres -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 || true
-        else
-          psql -U postgres -d "$db" -c "REINDEX INDEX $idx;" 2>&1 || true
-        fi
+    # needs-reindex-all (pg_resetwal aftermath) can leave torn pages in
+    # ANY index, not just collation-dependent ones. A blind REINDEX
+    # DATABASE takes hours on the prod DBs; instead do a two-step
+    # smart pass:
+    #
+    #  1. Use the amcheck contrib extension to read each valid btree
+    #     index and verify its structural invariants. Indexes that
+    #     fail the check (including "unexpected zero page" corruption)
+    #     get queued for REINDEX. Indexes that pass are left alone.
+    #     For a healthy snapshot this finds nothing and reads
+    #     ~index-size of disk instead of ~table-size to rewrite.
+    #
+    #  2. Blindly REINDEX every non-btree index in the DB (GIN, GiST,
+    #     BRIN, hash). amcheck only covers btree; non-btree indexes
+    #     are typically a small fraction of total index size so the
+    #     cost is bounded, and skipping them risks the same
+    #     post-resetwal corruption sneaking through.
+    #
+    # CONCURRENTLY when available (PG ≥ 14) so the work overlaps with
+    # whatever clients hit the pod after the readiness gate lifts.
+    if [ -f /pgdata/needs-reindex-all ]; then
+      for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+        echo "Reindex after pg_resetwal: $db (smart pass via amcheck)"
+        psql -U postgres -d "$db" -c "CREATE EXTENSION IF NOT EXISTS amcheck;" 2>&1 || true
+
+        # Step 1: scan btree indexes; collect those that fail amcheck.
+        BTREE_INDEXES=$(psql -U postgres -d "$db" -At -c "
+          SELECT c.oid::regclass::text
+          FROM pg_class c
+          JOIN pg_am a ON a.oid = c.relam
+          JOIN pg_index i ON i.indexrelid = c.oid
+          WHERE c.relkind = 'i' AND a.amname = 'btree' AND i.indisvalid;
+        ")
+        BTREE_COUNT=$(echo "$BTREE_INDEXES" | grep -c . || true)
+        echo "  amcheck scanning $BTREE_COUNT btree indexes in $db"
+        CORRUPT_BTREE=""
+        N=0
+        for idx in $BTREE_INDEXES; do
+          [ -z "$idx" ] && continue
+          N=$((N + 1))
+          # bt_index_check raises an error if the index is corrupt.
+          # Suppress its output and check exit code; an error → queue it.
+          if ! psql -U postgres -d "$db" -At -c "SELECT bt_index_check('$idx'::regclass);" > /dev/null 2>&1; then
+            echo "  [$N/$BTREE_COUNT] CORRUPT: $db: $idx"
+            CORRUPT_BTREE="$CORRUPT_BTREE $idx"
+          fi
+        done
+
+        # Step 2: list non-btree indexes for blind reindex.
+        NONBTREE_INDEXES=$(psql -U postgres -d "$db" -At -c "
+          SELECT c.oid::regclass::text
+          FROM pg_class c
+          JOIN pg_am a ON a.oid = c.relam
+          JOIN pg_index i ON i.indexrelid = c.oid
+          WHERE c.relkind = 'i' AND a.amname <> 'btree' AND i.indisvalid;
+        ")
+        NONBTREE_COUNT=$(echo "$NONBTREE_INDEXES" | grep -c . || true)
+
+        TO_REINDEX="$CORRUPT_BTREE $NONBTREE_INDEXES"
+        TOTAL=$(echo "$TO_REINDEX" | tr ' ' '\n' | grep -c . || true)
+        echo "  $db: $TOTAL indexes to REINDEX (corrupt btree + all non-btree=$NONBTREE_COUNT)"
+        N=0
+        for idx in $TO_REINDEX; do
+          [ -z "$idx" ] && continue
+          N=$((N + 1))
+          echo "  [$N/$TOTAL] $db: REINDEX $idx"
+          if [ "$PG_MAJOR" -ge 14 ]; then
+            psql -U postgres -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 || true
+          else
+            psql -U postgres -d "$db" -c "REINDEX INDEX $idx;" 2>&1 || true
+          fi
+        done
       done
-    done
-    rm -f /pgdata/needs-reindex
+      rm -f /pgdata/needs-reindex-all
+      # needs-reindex (collation-dependent only) is a strict subset of
+      # what we just did, so clear it too.
+      rm -f /pgdata/needs-reindex
+    elif [ -f /pgdata/needs-reindex ]; then
+      for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+        INDEXES=$(psql -U postgres -d "$db" -At -c "
+          SELECT DISTINCT indexrelid::regclass::text
+          FROM pg_index i
+          JOIN pg_attribute a ON a.attrelid = i.indexrelid
+          WHERE a.attcollation <> 0 AND i.indisvalid;
+        ")
+        COUNT=$(echo "$INDEXES" | grep -c . || true)
+        echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
+        N=0
+        echo "$INDEXES" | while IFS= read -r idx; do
+          [ -z "$idx" ] && continue
+          N=$((N + 1))
+          echo "  [$N/$COUNT] $db: $idx"
+          if [ "$PG_MAJOR" -ge 14 ]; then
+            psql -U postgres -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 || true
+          else
+            psql -U postgres -d "$db" -c "REINDEX INDEX $idx;" 2>&1 || true
+          fi
+        done
+      done
+      rm -f /pgdata/needs-reindex
+    fi
     psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
     echo "Background reindex complete"
   ) &
@@ -1308,7 +1397,7 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 								command: Some(vec![
 									"/bin/sh".to_string(),
 									"-c".to_string(),
-									"pg_isready -U postgres -d postgres && [ ! -f /pgdata/needs-reindex ]".to_string(),
+									"pg_isready -U postgres -d postgres && [ ! -f /pgdata/needs-reindex ] && [ ! -f /pgdata/needs-reindex-all ]".to_string(),
 								]),
 							}),
 							initial_delay_seconds: Some(5),

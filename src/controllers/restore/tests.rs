@@ -692,6 +692,150 @@ fn deployment_init_script_two_stage_pg_resetwal_fallback() {
 }
 
 #[test]
+fn deployment_init_script_flags_full_reindex_after_resetwal() {
+	// pg_resetwal bypasses WAL replay, so any in-flight index write at
+	// snapshot time can leave torn pages (postgres later surfaces these
+	// as "unexpected zero page at block N" when queries hit the index).
+	// Every pg_resetwal call must therefore touch /pgdata/needs-reindex-all
+	// so the main container's startup hook runs REINDEX DATABASE on every
+	// user database before the readiness probe lets traffic in.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let setup_auth = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = setup_auth.args.unwrap().remove(0);
+
+	// The flag must be set every time pg_resetwal -f runs (currently
+	// twice — detected-signature branch and last-resort branch). The
+	// quick check: at least one `touch /pgdata/needs-reindex-all`
+	// follows each pg_resetwal invocation, and the count of the touch
+	// matches the count of resets.
+	// Count actual invocations (the literal command line) — using just
+	// "pg_resetwal -f" picks up comments and echo messages too.
+	let resetwal_calls = script.matches("pg_resetwal -f \"$PGDATA\"").count();
+	let touch_calls = script.matches("touch /pgdata/needs-reindex-all").count();
+	assert_eq!(
+		touch_calls, resetwal_calls,
+		"every pg_resetwal -f invocation must be paired with `touch /pgdata/needs-reindex-all` (got {touch_calls} touches for {resetwal_calls} resets)"
+	);
+	assert!(
+		resetwal_calls >= 2,
+		"expected at least two pg_resetwal invocation sites; got {resetwal_calls}"
+	);
+}
+
+#[test]
+fn deployment_runtime_reindex_handles_full_database_flag() {
+	// The main container's startup hook handles the broad flag
+	// (needs-reindex-all) via amcheck: scan all btree indexes, REINDEX
+	// only those that fail the structural check (caught the
+	// "unexpected zero page" failure mode reported in prod) plus all
+	// non-btree indexes (amcheck only covers btree, so non-btree get
+	// a blind REINDEX). A blind REINDEX DATABASE would take hours on
+	// the prod size; the smart pass reads index-size and rewrites
+	// only the corrupt ones.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let postgres = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.containers
+		.into_iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	let script = postgres.args.unwrap().remove(0);
+
+	assert!(
+		script.contains("/pgdata/needs-reindex-all"),
+		"runtime startup hook must check the needs-reindex-all flag"
+	);
+	assert!(
+		script.contains("CREATE EXTENSION IF NOT EXISTS amcheck"),
+		"needs-reindex-all branch must enable amcheck for the structural scan"
+	);
+	assert!(
+		script.contains("bt_index_check("),
+		"needs-reindex-all branch must call bt_index_check on each btree index"
+	);
+	assert!(
+		script.contains("a.amname <> 'btree'"),
+		"needs-reindex-all branch must collect non-btree indexes for blind REINDEX"
+	);
+	assert!(
+		script.contains("REINDEX INDEX"),
+		"needs-reindex-all branch must REINDEX (targeted, not the whole DB)"
+	);
+	assert!(
+		!script.contains("REINDEX DATABASE"),
+		"needs-reindex-all must not REINDEX DATABASE — it's the expensive hammer the smart pass avoids"
+	);
+	assert!(
+		script.contains("rm -f /pgdata/needs-reindex-all"),
+		"runtime hook must clear the needs-reindex-all flag after the reindex"
+	);
+}
+
+#[test]
+fn deployment_readiness_probe_waits_for_full_reindex() {
+	// The readiness probe gates traffic on both reindex flags being
+	// absent, otherwise queries see torn-page indexes between pod-start
+	// and reindex-complete. The probe used to check only the narrow
+	// needs-reindex flag.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let postgres = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.containers
+		.into_iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	let probe_cmd = postgres
+		.readiness_probe
+		.expect("readiness probe must exist")
+		.exec
+		.expect("readiness probe must be an exec probe")
+		.command
+		.expect("exec probe must have a command");
+	let probe_script = probe_cmd.join(" ");
+	assert!(
+		probe_script.contains("[ ! -f /pgdata/needs-reindex-all ]"),
+		"readiness probe must wait for needs-reindex-all to clear; got: {probe_script}"
+	);
+	assert!(
+		probe_script.contains("[ ! -f /pgdata/needs-reindex ]"),
+		"readiness probe must still wait for needs-reindex; got: {probe_script}"
+	);
+}
+
+#[test]
 fn deployment_init_script_overrides_listen_addresses() {
 	// Some source backups carry `listen_addresses = 'localhost'` in
 	// postgresql.conf, which restricts the restored postgres to localhost
