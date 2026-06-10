@@ -1251,77 +1251,46 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
     while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
     psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
     # needs-reindex-all (pg_resetwal aftermath) can leave torn pages in
-    # ANY index, not just collation-dependent ones. A blind REINDEX
-    # DATABASE takes hours on the prod DBs; instead do a two-step
-    # smart pass:
+    # ANY index, not just collation-dependent ones. We tried a "smart
+    # pass" using the amcheck contrib extension (scan each btree, queue
+    # only the corrupt ones for REINDEX) — empirically that hits the
+    # same postgres-internal pathology that wedges other vanilla DDL on
+    # this dataset: bt_index_check itself burns 100% CPU forever on
+    # specific indexes with no visible progress, blocking the whole
+    # reindex behind it.
     #
-    #  1. Use the amcheck contrib extension to read each valid btree
-    #     index and verify its structural invariants. Indexes that
-    #     fail the check (including "unexpected zero page" corruption)
-    #     get queued for REINDEX. Indexes that pass are left alone.
-    #     For a healthy snapshot this finds nothing and reads
-    #     ~index-size of disk instead of ~table-size to rewrite.
+    # Fall back to blind REINDEX DATABASE. REINDEX reads the heap and
+    # rebuilds the index from scratch (different code path from amcheck,
+    # which reads the corrupt index pages directly) and so isn't subject
+    # to the same wedge. Slow on prod-sized DBs but it makes progress;
+    # the alternative was a permanently-stuck restore.
     #
-    #  2. Blindly REINDEX every non-btree index in the DB (GIN, GiST,
-    #     BRIN, hash). amcheck only covers btree; non-btree indexes
-    #     are typically a small fraction of total index size so the
-    #     cost is bounded, and skipping them risks the same
-    #     post-resetwal corruption sneaking through.
-    #
-    # CONCURRENTLY when available (PG ≥ 14) so the work overlaps with
-    # whatever clients hit the pod after the readiness gate lifts.
+    # Crucially this branch does NOT remove needs-reindex-all at the
+    # top of the work — the readiness probe ignores -all for exactly
+    # this reason (see the probe spec below). The pod becomes Ready as
+    # soon as postgres accepts connections; clients hitting a not-yet-
+    # reindexed corrupt index get the explicit "unexpected zero page"
+    # error, retry, succeed once the rebuild lands. After REINDEX
+    # DATABASE completes for every user db, the flag is cleared and
+    # _pgro.restore_info.stage flips to ready.
     if [ -f /pgdata/needs-reindex-all ]; then
+      # CONCURRENTLY (PG ≥ 12) builds replacement indexes alongside the
+      # existing ones and atomically swaps. Clients can keep using the
+      # old indexes during the rebuild — they'll see "unexpected zero
+      # page" only if a query happens to hit a corrupt page on the old
+      # side; once the swap lands the corruption is gone.
+      #
+      # REINDEX DATABASE CONCURRENTLY skips system catalogs (PG won't
+      # CONCURRENTLY them). For an analytics replica that's the right
+      # trade: user-data indexes matter for client queries, system
+      # catalog corruption shows up as different errors and is rare.
       for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
-        echo "Reindex after pg_resetwal: $db (smart pass via amcheck)"
-        psql -U postgres -d "$db" -c "CREATE EXTENSION IF NOT EXISTS amcheck;" 2>&1 || true
-
-        # Step 1: scan btree indexes; collect those that fail amcheck.
-        BTREE_INDEXES=$(psql -U postgres -d "$db" -At -c "
-          SELECT c.oid::regclass::text
-          FROM pg_class c
-          JOIN pg_am a ON a.oid = c.relam
-          JOIN pg_index i ON i.indexrelid = c.oid
-          WHERE c.relkind = 'i' AND a.amname = 'btree' AND i.indisvalid;
-        ")
-        BTREE_COUNT=$(echo "$BTREE_INDEXES" | grep -c . || true)
-        echo "  amcheck scanning $BTREE_COUNT btree indexes in $db"
-        CORRUPT_BTREE=""
-        N=0
-        for idx in $BTREE_INDEXES; do
-          [ -z "$idx" ] && continue
-          N=$((N + 1))
-          # bt_index_check raises an error if the index is corrupt.
-          # Suppress its output and check exit code; an error → queue it.
-          if ! psql -U postgres -d "$db" -At -c "SELECT bt_index_check('$idx'::regclass);" > /dev/null 2>&1; then
-            echo "  [$N/$BTREE_COUNT] CORRUPT: $db: $idx"
-            CORRUPT_BTREE="$CORRUPT_BTREE $idx"
-          fi
-        done
-
-        # Step 2: list non-btree indexes for blind reindex.
-        NONBTREE_INDEXES=$(psql -U postgres -d "$db" -At -c "
-          SELECT c.oid::regclass::text
-          FROM pg_class c
-          JOIN pg_am a ON a.oid = c.relam
-          JOIN pg_index i ON i.indexrelid = c.oid
-          WHERE c.relkind = 'i' AND a.amname <> 'btree' AND i.indisvalid;
-        ")
-        NONBTREE_COUNT=$(echo "$NONBTREE_INDEXES" | grep -c . || true)
-
-        TO_REINDEX="$CORRUPT_BTREE $NONBTREE_INDEXES"
-        TOTAL=$(echo "$TO_REINDEX" | tr ' ' '\n' | grep -c . || true)
-        echo "  $db: $TOTAL indexes to REINDEX (corrupt btree + all non-btree=$NONBTREE_COUNT)"
-        N=0
-        for idx in $TO_REINDEX; do
-          [ -z "$idx" ] && continue
-          N=$((N + 1))
-          echo "  [$N/$TOTAL] $db: REINDEX $idx"
-          if [ "$PG_MAJOR" -ge 14 ]; then
-            psql -U postgres -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 || true
-          else
-            psql -U postgres -d "$db" -c "REINDEX INDEX $idx;" 2>&1 || true
-          fi
-        done
+        echo "Reindex after pg_resetwal: $db (REINDEX DATABASE CONCURRENTLY)"
+        if [ "$PG_MAJOR" -ge 12 ]; then
+          psql -U postgres -d "$db" -c "REINDEX DATABASE CONCURRENTLY \"$db\";" 2>&1 || true
+        else
+          psql -U postgres -d "$db" -c "REINDEX DATABASE \"$db\";" 2>&1 || true
+        fi
       done
       rm -f /pgdata/needs-reindex-all
       # needs-reindex (collation-dependent only) is a strict subset of
@@ -1397,7 +1366,15 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 								command: Some(vec![
 									"/bin/sh".to_string(),
 									"-c".to_string(),
-									"pg_isready -U postgres -d postgres && [ ! -f /pgdata/needs-reindex ] && [ ! -f /pgdata/needs-reindex-all ]".to_string(),
+									// Gate readiness on the locale-only needs-reindex flag
+								// (small, fast, finishes in seconds-to-minutes) but NOT on
+								// needs-reindex-all (post-pg_resetwal blind REINDEX DATABASE
+								// — takes hours on prod-sized indexes; gating here would
+								// trip the operator's deployment_ready_timeout). The -all
+								// reindex runs in the background; clients hitting a
+								// not-yet-reindexed corrupt index see the explicit
+								// "unexpected zero page" error and retry.
+								"pg_isready -U postgres -d postgres && [ ! -f /pgdata/needs-reindex ]".to_string(),
 								]),
 							}),
 							initial_delay_seconds: Some(5),

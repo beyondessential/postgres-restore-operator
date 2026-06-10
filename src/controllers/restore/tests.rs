@@ -740,13 +740,12 @@ fn deployment_init_script_flags_full_reindex_after_resetwal() {
 #[test]
 fn deployment_runtime_reindex_handles_full_database_flag() {
 	// The main container's startup hook handles the broad flag
-	// (needs-reindex-all) via amcheck: scan all btree indexes, REINDEX
-	// only those that fail the structural check (caught the
-	// "unexpected zero page" failure mode reported in prod) plus all
-	// non-btree indexes (amcheck only covers btree, so non-btree get
-	// a blind REINDEX). A blind REINDEX DATABASE would take hours on
-	// the prod size; the smart pass reads index-size and rewrites
-	// only the corrupt ones.
+	// (needs-reindex-all) via blind REINDEX DATABASE on every user DB.
+	// The earlier amcheck-driven smart pass turned out to hit the same
+	// postgres-internal pathology that wedges other vanilla DDL on
+	// the prod data — bt_index_check burned 100% CPU forever on
+	// individual indexes. REINDEX uses a different code path (reads
+	// the heap, rebuilds from scratch) and doesn't trip that wedge.
 	let (mut restore, replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("16".to_string()),
@@ -770,24 +769,20 @@ fn deployment_runtime_reindex_handles_full_database_flag() {
 		"runtime startup hook must check the needs-reindex-all flag"
 	);
 	assert!(
-		script.contains("CREATE EXTENSION IF NOT EXISTS amcheck"),
-		"needs-reindex-all branch must enable amcheck for the structural scan"
+		script.contains("REINDEX DATABASE CONCURRENTLY"),
+		"needs-reindex-all branch must run REINDEX DATABASE CONCURRENTLY on PG ≥ 12 so clients can keep querying the old indexes during the rebuild"
+	);
+	// The PG < 12 fallback uses plain REINDEX DATABASE — verify the
+	// version gate exists in the script. (We can't string-match on the
+	// literal SQL because the shell-quoted `\"` form differs from a
+	// Rust string literal.)
+	assert!(
+		script.contains(r#""$PG_MAJOR" -ge 12"#),
+		"needs-reindex-all branch must gate CONCURRENTLY behind a PG ≥ 12 check"
 	);
 	assert!(
-		script.contains("bt_index_check("),
-		"needs-reindex-all branch must call bt_index_check on each btree index"
-	);
-	assert!(
-		script.contains("a.amname <> 'btree'"),
-		"needs-reindex-all branch must collect non-btree indexes for blind REINDEX"
-	);
-	assert!(
-		script.contains("REINDEX INDEX"),
-		"needs-reindex-all branch must REINDEX (targeted, not the whole DB)"
-	);
-	assert!(
-		!script.contains("REINDEX DATABASE"),
-		"needs-reindex-all must not REINDEX DATABASE — it's the expensive hammer the smart pass avoids"
+		!script.contains("bt_index_check("),
+		"runtime hook must not call bt_index_check — amcheck wedges on the prod data"
 	);
 	assert!(
 		script.contains("rm -f /pgdata/needs-reindex-all"),
@@ -796,11 +791,15 @@ fn deployment_runtime_reindex_handles_full_database_flag() {
 }
 
 #[test]
-fn deployment_readiness_probe_waits_for_full_reindex() {
-	// The readiness probe gates traffic on both reindex flags being
-	// absent, otherwise queries see torn-page indexes between pod-start
-	// and reindex-complete. The probe used to check only the narrow
-	// needs-reindex flag.
+fn deployment_readiness_probe_only_gates_on_locale_reindex() {
+	// The readiness probe waits for the locale-only `needs-reindex`
+	// flag to clear (small, fast, finishes in seconds) but NOT for
+	// `needs-reindex-all` (the post-pg_resetwal blind REINDEX DATABASE
+	// — takes hours on prod-sized indexes; gating here would trip the
+	// operator's deployment_ready_timeout and block restores
+	// indefinitely). The -all reindex runs in the background; clients
+	// hitting a not-yet-reindexed corrupt index see the explicit
+	// "unexpected zero page" error and can retry.
 	let (mut restore, replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("16".to_string()),
@@ -826,12 +825,12 @@ fn deployment_readiness_probe_waits_for_full_reindex() {
 		.expect("exec probe must have a command");
 	let probe_script = probe_cmd.join(" ");
 	assert!(
-		probe_script.contains("[ ! -f /pgdata/needs-reindex-all ]"),
-		"readiness probe must wait for needs-reindex-all to clear; got: {probe_script}"
+		probe_script.contains("[ ! -f /pgdata/needs-reindex ]"),
+		"readiness probe must still wait for the locale-only needs-reindex flag; got: {probe_script}"
 	);
 	assert!(
-		probe_script.contains("[ ! -f /pgdata/needs-reindex ]"),
-		"readiness probe must still wait for needs-reindex; got: {probe_script}"
+		!probe_script.contains("needs-reindex-all"),
+		"readiness probe must NOT gate on needs-reindex-all (the long-running post-resetwal reindex); got: {probe_script}"
 	);
 }
 
