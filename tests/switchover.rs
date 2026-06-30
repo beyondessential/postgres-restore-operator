@@ -230,7 +230,7 @@ async fn second_restore_and_switchover() {
 
 	// The second restore's pod should be labeled ready-for-traffic.
 	let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
-		kube::Api::namespaced(client.clone(), &ns);
+		kube::Api::namespaced(client.clone(), ns);
 	let pod_list = pods
 		.list(
 			&kube::api::ListParams::default()
