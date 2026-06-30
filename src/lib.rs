@@ -1,3 +1,4 @@
+pub mod canopy;
 pub mod context;
 pub mod controllers;
 pub mod error;
