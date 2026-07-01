@@ -546,12 +546,18 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// Process any existing snapshot-list job regardless of scheduling state.
-	// This runs before the in-progress / should_restore gates so that
-	// completed jobs are always cleaned up promptly.
+	// Canopy-sourced replicas don't run snapshot-list Jobs — the desired
+	// snapshot ID is written into `status.canopyDesiredSnapshotId` by the
+	// canopy worklist syncer. We still allocate the job-name here so the
+	// downstream `if snapshot_job.is_none()` gate reads uniformly.
+	let is_canopy = replica.spec.canopy_source.is_some();
 	let snapshot_job_name = format!("{name}-snapshot-list");
 	let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
-	let snapshot_job = jobs.get_opt(&snapshot_job_name).await?;
+	let snapshot_job = if is_canopy {
+		None
+	} else {
+		jobs.get_opt(&snapshot_job_name).await?
+	};
 
 	if let Some(ref job) = snapshot_job {
 		match classify_job(job) {
@@ -887,6 +893,78 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			return Ok(Action::requeue(Duration::from_secs(30)));
 		}
 		drop(queue);
+
+		if is_canopy {
+			// Canopy path: the worklist syncer has already picked a
+			// snapshot for us. Use `status.canopyDesiredSnapshotId`
+			// directly and skip the snapshot-list Job entirely.
+			let desired = replica
+				.status
+				.as_ref()
+				.and_then(|s| s.canopy_desired_snapshot_id.as_ref());
+			let Some(desired) = desired else {
+				debug!(
+					replica = name,
+					"canopy-sourced replica has no canopyDesiredSnapshotId yet, waiting for syncer"
+				);
+				replica
+					.update_condition(
+						client,
+						"SnapshotAvailable",
+						"False",
+						"CanopyPending",
+						"Waiting for canopy worklist syncer to set canopyDesiredSnapshotId",
+					)
+					.await?;
+				return Ok(Action::requeue(Duration::from_secs(30)));
+			};
+
+			let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
+			if current_snapshot_id == Some(desired.as_str()) {
+				debug!(
+					replica = name,
+					snapshot = desired,
+					"canopy desired snapshot already active, skipping"
+				);
+			} else {
+				info!(
+					replica = name,
+					snapshot = desired,
+					"canopy desired snapshot changed, creating restore"
+				);
+				// Canopy replicas rely on intent-driven
+				// `storage_size_override` for sizing; snapshot size is
+				// not known upfront so we pass 0. The override branch
+				// in create_restore_for_snapshot then picks the fixed
+				// PVC size.
+				let info = SnapshotInfo {
+					id: desired.clone(),
+					size: 0,
+					start_time: String::new(),
+				};
+				let created = replica.create_restore_for_snapshot(client, &info).await?;
+				if created {
+					ctx.metrics.restores_started_total.inc();
+					if let Err(e) = ctx
+						.recorder
+						.publish(
+							&Event {
+								type_: EventType::Normal,
+								reason: "RestoreStarted".into(),
+								note: Some(format!("Started restore from snapshot {desired}")),
+								action: "Restore".into(),
+								secondary: None,
+							},
+							&replica.object_ref(&()),
+						)
+						.await
+					{
+						warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
+					}
+				}
+			}
+			return Ok(Action::requeue(Duration::from_secs(30)));
+		}
 
 		info!(replica = name, "creating snapshot list job");
 		let callback_url = ctx.snapshot_callback_url(&namespace, &name);
