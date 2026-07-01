@@ -151,6 +151,8 @@ async fn main() -> anyhow::Result<()> {
 
 	let client = Client::try_default().await?;
 
+	postgres_restore_operator::crd_install::ensure_crds(&client).await?;
+
 	let namespace = operator_namespace();
 	let (max_concurrent_restores, kopia_image, use_port_forward) =
 		read_config(&client, &namespace).await;

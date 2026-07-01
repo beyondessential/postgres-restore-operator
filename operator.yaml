@@ -1,5 +1,7 @@
 # postgres-restore-operator install manifest
-# CRDs are not included — generate them with: cargo run --bin gen-crds
+# CRDs are installed by the operator at startup. Generate them
+# manually with `cargo run --bin gen-crds` if you want to apply them
+# out-of-band (e.g. install-time gating on schema changes).
 ---
 apiVersion: v1
 kind: Namespace
@@ -17,6 +19,10 @@ kind: ClusterRole
 metadata:
     name: postgres-restore-operator
 rules:
+    # CRD install (operator applies its own CRDs on startup).
+    - apiGroups: ["apiextensions.k8s.io"]
+      resources: ["customresourcedefinitions"]
+      verbs: ["get", "list", "create", "update", "patch"]
     # CRD access
     - apiGroups: ["pgro.bes.au"]
       resources:
