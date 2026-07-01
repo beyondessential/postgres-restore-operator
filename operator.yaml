@@ -222,9 +222,6 @@ spec:
                       # operators can pin to a specific tag.
                       # - name: CANOPY_PROXY_IMAGE
                       #   value: ghcr.io/beyondessential/pgro-canopy-proxy:latest
-                      # Default PVC size for canopy-provisioned pgdata.
-                      # - name: CANOPY_PGDATA_PVC_SIZE
-                      #   value: "20Gi"
                   ports:
                       - name: http
                         containerPort: 8080
