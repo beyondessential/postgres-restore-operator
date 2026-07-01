@@ -296,6 +296,24 @@ async fn fail_restore(
 		warn!(replica = replica_name, error = %e, "failed to publish RestoreFailed event");
 	}
 
+	// Canopy verification (signal 3, failure) — no-op unless the replica
+	// has spec.canopy_source. The status_patch usually carries an error
+	// message on `.status.conditions[?type=='RestoreFailed'].message`, but
+	// we don't have it in a stable spot here; keep the report to
+	// outcome+snapshot for now.
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(ctx.client.clone(), namespace);
+	if let (Ok(restore), Ok(replica)) = (restores.get(name).await, replicas.get(replica_name).await)
+	{
+		crate::controllers::canopy::verification::report(
+			ctx,
+			&replica,
+			&restore,
+			bestool_canopy::Outcome::Failure,
+			None,
+		)
+		.await;
+	}
+
 	Ok(Action::requeue(Duration::from_secs(300)))
 }
 

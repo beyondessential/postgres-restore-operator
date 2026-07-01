@@ -343,6 +343,17 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.send_notifications(client, &ctx.http_client, switching, &ctx.metrics)
 			.await;
 
+		// Canopy verification (signal 3) — no-op unless the replica has
+		// spec.canopy_source.
+		crate::controllers::canopy::verification::report(
+			&ctx,
+			&replica,
+			switching,
+			bestool_canopy::Outcome::Success,
+			None,
+		)
+		.await;
+
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 

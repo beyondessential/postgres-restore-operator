@@ -41,6 +41,7 @@ use crate::{
 };
 
 pub mod intent;
+pub mod verification;
 
 /// How many per-entry reconciliations run concurrently within one tick.
 /// Keeps the k8s apiserver from being hit by a stampede when the worklist
