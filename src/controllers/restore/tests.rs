@@ -17,10 +17,11 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 */6 * * *".into(),
 			schedule_jitter: TimeSpan(Span::new().minutes(10)),
@@ -101,10 +102,11 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 */6 * * *".into(),
 			schedule_jitter: TimeSpan(Span::new().minutes(10)),

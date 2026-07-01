@@ -94,63 +94,109 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	let client = &ctx.client;
 
-	// Validate kopia Secret
-	let secret_name = replica
-		.spec
-		.kopia_secret_ref
-		.name
-		.as_deref()
-		.unwrap_or_default();
-	let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
-	let secret = match secrets.get(secret_name).await {
-		Ok(s) => s,
-		Err(e) => {
+	// Validate the credential source: exactly one of kopiaSecretRef or
+	// canopySource must be set. Legacy replicas take the Secret path;
+	// canopy-managed ones take the proxy-sidecar path and get their
+	// creds via the operator's in-cluster broker at Job time.
+	match (&replica.spec.kopia_secret_ref, &replica.spec.canopy_source) {
+		(Some(_), Some(_)) => {
 			warn!(
 				replica = name,
-				secret = ?replica.spec.kopia_secret_ref,
-				error = %e,
-				"kopia secret not found"
+				"kopiaSecretRef and canopySource are mutually exclusive"
 			);
 			replica
 				.update_condition(
 					client,
 					"KopiaSecretValid",
 					"False",
-					"SecretNotFound",
-					&format!("Secret {secret_name} not found: {e}"),
+					"SecretRefAndCanopySource",
+					"kopiaSecretRef and canopySource are mutually exclusive; set exactly one",
 				)
 				.await?;
 			return Ok(Action::requeue(Duration::from_secs(60)));
 		}
-	};
-
-	let _creds = match kopia::validate_kopia_secret(&secret) {
-		Ok(c) => {
-			replica
-				.update_condition(
-					client,
-					"KopiaSecretValid",
-					"True",
-					"SecretValid",
-					"All required keys present",
-				)
-				.await?;
-			c
-		}
-		Err(e) => {
-			warn!(replica = name, error = %e, "kopia secret invalid");
+		(None, None) => {
+			warn!(
+				replica = name,
+				"neither kopiaSecretRef nor canopySource set"
+			);
 			replica
 				.update_condition(
 					client,
 					"KopiaSecretValid",
 					"False",
-					"SecretInvalid",
-					&e.to_string(),
+					"NoCredentialSource",
+					"one of kopiaSecretRef or canopySource must be set",
 				)
 				.await?;
 			return Ok(Action::requeue(Duration::from_secs(60)));
 		}
-	};
+		(Some(secret_ref), None) => {
+			let secret_name = secret_ref.name.as_deref().unwrap_or_default();
+			let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
+			let secret = match secrets.get(secret_name).await {
+				Ok(s) => s,
+				Err(e) => {
+					warn!(
+						replica = name,
+						secret = ?secret_ref,
+						error = %e,
+						"kopia secret not found"
+					);
+					replica
+						.update_condition(
+							client,
+							"KopiaSecretValid",
+							"False",
+							"SecretNotFound",
+							&format!("Secret {secret_name} not found: {e}"),
+						)
+						.await?;
+					return Ok(Action::requeue(Duration::from_secs(60)));
+				}
+			};
+			match kopia::validate_kopia_secret(&secret) {
+				Ok(_) => {
+					replica
+						.update_condition(
+							client,
+							"KopiaSecretValid",
+							"True",
+							"SecretValid",
+							"All required keys present",
+						)
+						.await?;
+				}
+				Err(e) => {
+					warn!(replica = name, error = %e, "kopia secret invalid");
+					replica
+						.update_condition(
+							client,
+							"KopiaSecretValid",
+							"False",
+							"SecretInvalid",
+							&e.to_string(),
+						)
+						.await?;
+					return Ok(Action::requeue(Duration::from_secs(60)));
+				}
+			}
+		}
+		(None, Some(_canopy_source)) => {
+			// Nothing to pre-validate at this stage — the proxy sidecar
+			// fetches short-lived creds at Job time via the operator's
+			// broker; any auth failure surfaces there.
+			replica
+				.update_condition(
+					client,
+					"KopiaSecretValid",
+					"True",
+					"CanopySourced",
+					"canopy-managed replica; credentials issued by canopy at Job time",
+				)
+				.await?;
+		}
+	}
 
 	replica.ensure_credentials_secret(client).await?;
 

@@ -513,7 +513,15 @@ pub fn build_restore_job(
 	kopia_image: &str,
 	cache_pressure_callback_url: &str,
 ) -> Result<Job> {
-	let kopia_secret = &replica.spec.kopia_secret_ref;
+	// Legacy-path restore Job builder. The canopy path uses a different
+	// Job shape (proxy sidecar) that will be wired in a follow-up commit
+	// via a `KopiaSource` enum; for now the reconciler's credential-source
+	// validation guarantees `kopia_secret_ref` is set before we reach here.
+	let kopia_secret = replica
+		.spec
+		.kopia_secret_ref
+		.as_ref()
+		.expect("build_restore_job called on legacy path; kopia_secret_ref must be set");
 	let pvc_name = format!("{}-data", restore.name_any());
 	let cache_pvc_name = kopia_cache_pvc_name(&restore.spec.replica.name);
 

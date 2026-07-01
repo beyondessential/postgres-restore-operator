@@ -35,8 +35,30 @@ use super::HeaderValue;
 )]
 #[serde(rename_all = "camelCase")]
 pub struct PostgresPhysicalReplicaSpec {
-	/// Reference to a Secret containing kopia repository credentials
-	pub kopia_secret_ref: SecretReference,
+	/// Reference to a Secret containing kopia repository credentials.
+	/// Mutually exclusive with `canopySource`. Exactly one of the two
+	/// must be set; the reconciler surfaces `KopiaSecretValid=False`
+	/// with reason `SecretRefAndCanopySource` if both (or neither) are
+	/// present.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub kopia_secret_ref: Option<SecretReference>,
+
+	/// Route kopia through the canopy-mediated proxy sidecar instead of
+	/// a static credentials Secret. Mutually exclusive with
+	/// `kopiaSecretRef`.
+	///
+	/// When set:
+	/// - the restore + snapshot-list Jobs get the pgro-canopy-proxy
+	///   sidecar and dummy AWS keys (kopia talks to `[::1]:<port>`);
+	/// - the reconciler skips the snapshot-list step and instead reads
+	///   the snapshot to restore from `status.canopyDesiredSnapshotId`
+	///   (populated by the canopy worklist syncer);
+	/// - the replica is treated as pgro-internal state — the canopy
+	///   syncer materialises + tears down these CRs based on canopy's
+	///   worklist. Manual edits to a canopy-managed CR are re-asserted
+	///   on the next tick.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub canopy_source: Option<CanopySource>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub snapshot_filter: Option<SnapshotFilter>,
@@ -118,6 +140,20 @@ fn default_schedule_jitter() -> TimeSpan {
 }
 fn default_analytics_username() -> String {
 	"analytics".to_string()
+}
+
+/// Points a replica at a canopy-declared restore-replica instead of a
+/// static kopia Secret. Set via the canopy worklist syncer; humans
+/// shouldn't hand-author these — they're managed for you.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CanopySource {
+	/// Canopy server-group id (UUID) whose backups this replica restores.
+	pub group: String,
+	/// Canopy backup type (e.g. `tamanu-postgres`). The
+	/// `(consumer, group, type)` external-restore grant on canopy's side
+	/// gates access.
+	pub r#type: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -259,6 +295,13 @@ pub struct PostgresPhysicalReplicaStatus {
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub latest_available_snapshot: Option<String>,
+
+	/// Snapshot id the canopy worklist syncer wants restored. Populated
+	/// each syncer tick for canopy-sourced replicas (`spec.canopySource`
+	/// is set); unused otherwise. The reconciler triggers a new restore
+	/// when this differs from the current one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub canopy_desired_snapshot_id: Option<String>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub connection_info: Option<ConnectionInfo>,

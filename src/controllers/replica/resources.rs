@@ -55,7 +55,16 @@ pub fn build_snapshot_list_job(
 	kopia_image: &str,
 	callback_url: &str,
 ) -> Result<Job> {
-	let kopia_secret = &replica.spec.kopia_secret_ref;
+	// Legacy-path Job builder — `kopia_secret_ref` is guaranteed set by
+	// the reconciler's credential-source validation before we reach
+	// here. The canopy path uses a different Job shape (proxy sidecar)
+	// wired in a follow-up commit; snapshot-list is skipped entirely
+	// for canopy-sourced replicas.
+	let kopia_secret = replica
+		.spec
+		.kopia_secret_ref
+		.as_ref()
+		.expect("build_snapshot_list_job called on legacy path; kopia_secret_ref must be set");
 	let replica_name = replica.name_any();
 
 	let mut env_vars = vec![

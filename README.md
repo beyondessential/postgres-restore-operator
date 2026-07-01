@@ -83,7 +83,8 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `kopiaSecretRef` | `SecretReference` | Yes | — | Reference to a Secret containing Kopia repository credentials (`bucket`, `region`, `repositoryPassword`, `accessKeyId`, `secretAccessKey`). |
+| `kopiaSecretRef` | `SecretReference` | One of | — | Reference to a Secret containing Kopia repository credentials (`bucket`, `region`, `repositoryPassword`, `accessKeyId`, `secretAccessKey`). Mutually exclusive with `canopySource`. |
+| `canopySource` | `CanopySource` | One of | — | Route kopia through the canopy-mediated proxy sidecar instead of a static Secret. `{ group, type }`. Managed by the canopy worklist syncer; humans usually don't hand-author these. Mutually exclusive with `kopiaSecretRef`. |
 | `snapshotFilter` | `SnapshotFilter` | No | — | Filter criteria to select which Kopia snapshot to restore. |
 | `schedule` | `string` | Yes | — | Cron expression controlling how often new restores are triggered. |
 | `scheduleJitter` | `string` | No | `"10m"` | Random jitter added to scheduled restores (friendly duration, e.g. `"5m"`, `"1h"`). |
@@ -175,6 +176,7 @@ Additional fields for `target: graphQL`:
 | `lastRestoreCompletedAt` | `Time` | When the last restore completed. |
 | `nextScheduledRestore` | `Time` | When the next scheduled restore will occur. |
 | `latestAvailableSnapshot` | `string` | Snapshot ID of the latest available snapshot matching the filter. |
+| `canopyDesiredSnapshotId` | `string` | For canopy-sourced replicas: the snapshot the canopy worklist syncer wants restored. The reconciler triggers a new restore when this differs from the current one. |
 | `connectionInfo` | `ConnectionInfo` | Connection details (host, port, database, username, password secret). |
 | `queuePosition` | `uint32` | Position in the global restore queue. |
 | `notifications` | `[]NotificationStatus` | Status of each configured notification target. |

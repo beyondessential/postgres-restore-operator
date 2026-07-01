@@ -18,10 +18,11 @@ fn make_replica(
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 * * * *".into(),
 			schedule_jitter: TimeSpan(jiff::Span::new()),
@@ -176,10 +177,11 @@ fn snapshot_list_job_rotates_kopia_logs() {
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 * * * *".into(),
 			schedule_jitter: TimeSpan(jiff::Span::new()),

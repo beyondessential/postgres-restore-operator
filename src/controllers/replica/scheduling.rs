@@ -231,10 +231,11 @@ mod tests {
 				..Default::default()
 			},
 			spec: PostgresPhysicalReplicaSpec {
-				kopia_secret_ref: SecretReference {
+				kopia_secret_ref: Some(SecretReference {
 					name: Some("test-secret".into()),
 					namespace: None,
-				},
+				}),
+				canopy_source: None,
 				snapshot_filter: None,
 				schedule: schedule.into(),
 				schedule_jitter: TimeSpan(Span::new().seconds(0)),

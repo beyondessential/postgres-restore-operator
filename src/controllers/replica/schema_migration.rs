@@ -285,7 +285,8 @@ mod tests {
 				..Default::default()
 			},
 			spec: crate::types::PostgresPhysicalReplicaSpec {
-				kopia_secret_ref: Default::default(),
+				kopia_secret_ref: Some(Default::default()),
+				canopy_source: None,
 				snapshot_filter: None,
 				schedule: "0 * * * *".into(),
 				schedule_jitter: crate::util::TimeSpan(jiff::Span::new()),

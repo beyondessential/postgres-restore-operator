@@ -138,10 +138,11 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 	PostgresPhysicalReplica::new(
 		name,
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some(secret_ref.into()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: opts.schedule,
 			schedule_jitter: opts.schedule_jitter.unwrap_or_default(),
