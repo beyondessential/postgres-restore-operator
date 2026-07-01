@@ -37,6 +37,7 @@ use uuid::Uuid;
 use crate::{context::Context, error::Result};
 
 mod builders;
+pub mod intent;
 mod reporter;
 pub use builders::{
 	CanopyRestoreJobConfig, KOPIA_JOB_NAME, PGDATA_PVC_NAME, POSTGRES_DEPLOYMENT_NAME,
@@ -44,6 +45,7 @@ pub use builders::{
 	build_canopy_postgres_deployment, build_canopy_postgres_service, build_canopy_restore_job,
 	build_pgdata_pvc,
 };
+pub use intent::PGRO_SUPPORTED_INTENTS;
 
 /// How many per-entry reconciliations run concurrently within one tick.
 /// Keeps the k8s apiserver from being hit by a stampede when the worklist
@@ -80,6 +82,10 @@ pub mod annotations {
 	pub const LAST_RESTORED_SNAPSHOT_ID: &str = "pgro.bes.au/last-restored-snapshot-id";
 	pub const LAST_RESTORED_AT: &str = "pgro.bes.au/last-restored-at";
 	pub const RESTORE_STATE: &str = "pgro.bes.au/restore-state";
+	/// Mirror of `WorklistEntry.name` — the operator-set declaration name.
+	/// Kept on the Namespace so the reporter can substitute it into
+	/// service-annotation templates without re-fetching the worklist.
+	pub const DECLARATION_NAME: &str = "pgro.bes.au/name";
 	pub const LAST_VERIFICATION_REPORTED_AT: &str = "pgro.bes.au/last-verification-reported-at";
 	pub const LAST_VERIFICATION_ERROR: &str = "pgro.bes.au/last-verification-error";
 	/// Operator escape hatch: setting this annotation to any value triggers
@@ -258,13 +264,35 @@ pub fn diff(entries: &[WorklistEntry], namespaces: &[Namespace]) -> Vec<(String,
 /// Refresh decision for an existing namespace vs its worklist entry. Pure.
 fn evaluate_existing(entry: &WorklistEntry, ns: &Namespace) -> Action {
 	let annos = ns.annotations();
+	// Force-refresh always wins over min_ttl.
 	if annos.get(annotations::FORCE_REFRESH).is_some() {
 		return Action::Refresh(RefreshReason::Forced);
 	}
+
+	// Look up the intent's min_ttl. If we're within it, hold off on
+	// snapshot-driven or freshness-driven refreshes.
+	let intent_cfg = intent::config_for(&entry.intent.to_string());
+	let within_min_ttl = intent_cfg
+		.min_ttl
+		.and_then(|ttl| {
+			let last_at = annos
+				.get(annotations::LAST_RESTORED_AT)
+				.and_then(|s| s.parse::<jiff::Timestamp>().ok())?;
+			let elapsed_secs = jiff::Timestamp::now()
+				.duration_since(last_at)
+				.as_secs()
+				.max(0) as u64;
+			Some(elapsed_secs < ttl.as_secs())
+		})
+		.unwrap_or(false);
+
 	let last_restored = annos.get(annotations::LAST_RESTORED_SNAPSHOT_ID);
 	if let (Some(desired), Some(last)) = (entry.snapshot_id.as_ref(), last_restored)
 		&& desired != last
 	{
+		if within_min_ttl {
+			return Action::NoOp;
+		}
 		return Action::Refresh(RefreshReason::NewerSnapshot);
 	}
 	if entry.snapshot_id.is_some() && last_restored.is_none() {
@@ -283,7 +311,7 @@ fn evaluate_existing(entry: &WorklistEntry, ns: &Namespace) -> Action {
 			.duration_since(last_at)
 			.as_secs()
 			.max(0);
-		if (elapsed_secs as u64) > (fresh_secs as u64) {
+		if (elapsed_secs as u64) > (fresh_secs as u64) && !within_min_ttl {
 			return Action::Refresh(RefreshReason::FreshnessExpired);
 		}
 	}
@@ -413,6 +441,22 @@ async fn dispatch(
 async fn provision(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Result<()> {
 	info!(namespace = %ns_name, replica_id = %entry.replica_id, "canopy: provisioning replica namespace");
 
+	// Warn if the intent asks for behaviour we haven't shipped yet. The
+	// canopy-path refresh flow is still in-place (drops the PVC + spawns
+	// a new Job) rather than blue/green with a pg_dump migration Job
+	// between the old and new restore — until that lands,
+	// persistent_schemas silently doesn't do anything, and the
+	// switchover_grace value is unused.
+	let intent_cfg = intent::config_for(&entry.intent.to_string());
+	if !intent_cfg.persistent_schemas.is_empty() {
+		warn!(
+			namespace = %ns_name,
+			intent = %entry.intent,
+			schemas = ?intent_cfg.persistent_schemas,
+			"canopy: intent declares persistent_schemas but the blue/green refresh flow is not yet implemented on the canopy path — schemas will NOT be migrated across refreshes"
+		);
+	}
+
 	let mut labels_map = std::collections::BTreeMap::new();
 	labels_map.insert(labels::MANAGED_BY.into(), labels::MANAGED_BY_VALUE.into());
 	labels_map.insert(labels::DECLARATION_ID.into(), entry.replica_id.to_string());
@@ -426,6 +470,7 @@ async fn provision(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Resul
 		annotations::RESTORE_STATE.into(),
 		restore_state::PENDING.into(),
 	);
+	annos.insert(annotations::DECLARATION_NAME.into(), entry.name.clone());
 	if let Some(sid) = &entry.snapshot_id {
 		annos.insert(annotations::DESIRED_SNAPSHOT_ID.into(), sid.clone());
 	}

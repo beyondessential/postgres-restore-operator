@@ -265,8 +265,15 @@ async fn ensure_postgres(ctx: &Context, ns: &Namespace) -> Result<()> {
 		Err(err) => return Err(err.into()),
 	}
 
-	// Ensure the Service.
-	let svc = super::build_canopy_postgres_service(&ns_name);
+	// Ensure the Service. Intent + declaration name feed the intent-driven
+	// service annotations (e.g. `tailscale.com/hostname: infra-replica-{name}`
+	// for `analytics-dbt`).
+	let declaration_name = ns
+		.annotations()
+		.get("pgro.bes.au/name")
+		.cloned()
+		.unwrap_or_default();
+	let svc = super::build_canopy_postgres_service(&ns_name, intent, &declaration_name);
 	let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns_name);
 	match svc_api.create(&PostParams::default(), &svc).await {
 		Ok(_) => info!(namespace = %ns_name, "canopy: created postgres Service"),

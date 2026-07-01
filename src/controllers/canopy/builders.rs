@@ -395,17 +395,12 @@ pub struct PostgresDeploymentConfig<'a> {
 }
 
 /// Build the postgres Deployment for a canopy-backed replica by
-/// forwarding to the shared CRD/canopy builder. Both currently-supported
-/// intents (`verify`, `analytics`) run the replica read-only; `analytics`
-/// gets heavier default resources since it serves queries. Unknown
-/// intents fall through to the verify-shaped defaults; canopy won't
-/// dispatch them because pgro doesn't register them via
-/// `PGRO_SUPPORTED_INTENTS`.
-///
-/// All the heavy lifting (pg_resetwal fallback, locale fixing,
-/// analytics-user creation, REINDEX-on-startup) comes from the shared
-/// builder — see `src/controllers/restore/builders.rs::
-/// build_postgres_deployment_with`.
+/// forwarding to the shared CRD/canopy builder. Intent-driven defaults
+/// (resources, read_only, shm floor) come from
+/// [`super::intent::config_for`]. All the heavy lifting (pg_resetwal
+/// fallback, locale fixing, analytics-user creation, REINDEX-on-startup)
+/// comes from the shared builder — see
+/// `src/controllers/restore/builders.rs::build_postgres_deployment_with`.
 pub fn build_canopy_postgres_deployment(
 	cfg: &PostgresDeploymentConfig<'_>,
 ) -> Result<Deployment, crate::error::Error> {
@@ -413,30 +408,17 @@ pub fn build_canopy_postgres_deployment(
 		PostgresDeploymentInputs, build_postgres_deployment_with,
 	};
 
-	let read_only = true;
+	let intent_cfg = super::intent::config_for(cfg.intent);
 
-	let (cpu_req, mem_req, cpu_lim, mem_lim, shm) = match cfg.intent {
-		"analytics" => ("500m", "2Gi", "4", "8Gi", "2Gi"),
-		_ => ("250m", "512Mi", "2", "2Gi", "512Mi"),
-	};
-	let (shm_size, shared_buffers_mb) =
-		crate::quantity::compute_shm_and_shared_buffers(&Some(ResourceRequirements {
-			requests: Some(BTreeMap::from([
-				("cpu".into(), Quantity(cpu_req.into())),
-				("memory".into(), Quantity(mem_req.into())),
-			])),
-			limits: Some(BTreeMap::from([
-				("cpu".into(), Quantity(cpu_lim.into())),
-				("memory".into(), Quantity(mem_lim.into())),
-			])),
-			..Default::default()
-		}));
-	// The compute helper may pick a shm size smaller than what we want per
-	// intent; take max of the two.
-	let shm_size_final = if quantity_ge(&shm_size, &Quantity(shm.into())) {
+	let (shm_size, shared_buffers_mb) = crate::quantity::compute_shm_and_shared_buffers(&Some(
+		intent_cfg.postgres_resources.clone(),
+	));
+	// The compute helper may pick a shm size smaller than the intent's
+	// floor; take max of the two.
+	let shm_size_final = if quantity_ge(&shm_size, &intent_cfg.shm_floor) {
 		shm_size
 	} else {
-		Quantity(shm.into())
+		intent_cfg.shm_floor.clone()
 	};
 
 	let mut labels: BTreeMap<String, String> = BTreeMap::new();
@@ -461,7 +443,7 @@ pub fn build_canopy_postgres_deployment(
 		pg_version: cfg.postgres_major_version,
 		shm_size: shm_size_final,
 		shared_buffers_mb,
-		read_only,
+		read_only: intent_cfg.read_only,
 		postgres_extra_config: None,
 		analytics_username: CANOPY_ANALYTICS_USERNAME,
 		analytics_password_secret: cfg.analytics_secret,
@@ -474,17 +456,7 @@ pub fn build_canopy_postgres_deployment(
 		// Canopy path uses namespace-cascade deletion for teardown; no
 		// per-Deployment owner reference.
 		owner_references: None,
-		postgres_resources: Some(ResourceRequirements {
-			requests: Some(BTreeMap::from([
-				("cpu".into(), Quantity(cpu_req.into())),
-				("memory".into(), Quantity(mem_req.into())),
-			])),
-			limits: Some(BTreeMap::from([
-				("cpu".into(), Quantity(cpu_lim.into())),
-				("memory".into(), Quantity(mem_lim.into())),
-			])),
-			..Default::default()
-		}),
+		postgres_resources: Some(intent_cfg.postgres_resources.clone()),
 		affinity: None,
 		tolerations: Vec::new(),
 	};
@@ -511,14 +483,35 @@ fn quantity_ge(a: &Quantity, b: &Quantity) -> bool {
 /// ClusterIP Service exposing the postgres Deployment inside the
 /// replica namespace. Selects by the same labels the shared Deployment
 /// builder puts on the pod template.
-pub fn build_canopy_postgres_service(namespace: &str) -> Service {
+///
+/// `declaration_name` is the operator-set name from the worklist entry;
+/// used to substitute `{name}` in service annotation values (e.g. the
+/// `tailscale.com/hostname: infra-replica-{name}` pattern for
+/// `analytics-dbt`).
+pub fn build_canopy_postgres_service(
+	namespace: &str,
+	intent: &str,
+	declaration_name: &str,
+) -> Service {
 	let mut selector = BTreeMap::new();
 	selector.insert("app.kubernetes.io/name".into(), "postgres".into());
 	selector.insert("pgro.bes.au/canopy-replica".into(), "true".into());
+
+	let intent_cfg = super::intent::config_for(intent);
+	let annotations = if intent_cfg.service_annotations.is_empty() {
+		None
+	} else {
+		Some(super::intent::substitute_service_annotations(
+			&intent_cfg.service_annotations,
+			declaration_name,
+		))
+	};
+
 	Service {
 		metadata: ObjectMeta {
 			name: Some(POSTGRES_SERVICE_NAME.into()),
 			namespace: Some(namespace.into()),
+			annotations,
 			..Default::default()
 		},
 		spec: Some(ServiceSpec {

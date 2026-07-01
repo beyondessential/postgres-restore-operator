@@ -44,12 +44,6 @@ const DEFAULT_BROKER_ADDR: &str = "[::]:9091";
 const DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS: u64 = 30;
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
 
-/// Intent set pgro registers with canopy on startup; only worklist entries
-/// with a matching intent will be dispatched. `disaster-recovery` is not
-/// yet supported — the code has no rehearsal lifecycle beyond "make it
-/// writable", which is not what DR actually needs.
-const PGRO_SUPPORTED_INTENTS: &[&str] = &["verify", "analytics"];
-
 /// Annotate the operator's own pod with the running version.
 async fn annotate_own_pod(client: &Client, namespace: &str) {
 	let pod_name = match std::env::var("HOSTNAME") {
@@ -669,10 +663,13 @@ async fn register_capabilities(ctx: Arc<Context>) {
 	let mut delay = Duration::from_secs(1);
 	let max_delay = Duration::from_secs(300);
 	for attempt in 1..=8u32 {
-		match canopy.restore_capabilities(PGRO_SUPPORTED_INTENTS).await {
+		match canopy
+			.restore_capabilities(controllers::canopy::PGRO_SUPPORTED_INTENTS)
+			.await
+		{
 			Ok(_) => {
 				info!(
-					intents = ?PGRO_SUPPORTED_INTENTS,
+					intents = ?controllers::canopy::PGRO_SUPPORTED_INTENTS,
 					"registered supported intents with canopy"
 				);
 				return;
