@@ -501,6 +501,10 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			"/api/v1/cache-pressure/{namespace}/{restore}",
 			axum::routing::post(post_cache_pressure),
 		)
+		.route(
+			"/api/v1/canopy-stats/{namespace}/{job}",
+			axum::routing::post(post_canopy_stats),
+		)
 		.with_state(state)
 		.layer(TraceLayer::new_for_http())
 }
@@ -554,6 +558,24 @@ async fn post_cache_pressure(
 	);
 	controllers::restore::grow_cache_pvc_after_pressure(&state.ctx.client, &namespace, &restore)
 		.await;
+	StatusCode::NO_CONTENT
+}
+
+/// Accept the canopy-proxy sidecar's final TrafficStats POST on shutdown.
+/// The body is opaque JSON — the reporter deserializes it when building
+/// the RestoreVerification.
+async fn post_canopy_stats(
+	State(state): State<ServerState>,
+	Path((namespace, job)): Path<(String, String)>,
+	body: String,
+) -> StatusCode {
+	info!(
+		namespace = namespace,
+		job = job,
+		bytes = body.len(),
+		"received canopy-proxy stats callback"
+	);
+	state.ctx.canopy_stats.store(&namespace, &job, body);
 	StatusCode::NO_CONTENT
 }
 

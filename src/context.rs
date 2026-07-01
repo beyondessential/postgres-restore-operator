@@ -46,6 +46,11 @@ pub struct Context {
 	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for schema migration results POSTed by jobs.
 	pub schema_migration_results: Arc<CallbackStore>,
+	/// In-memory store for canopy-proxy sidecar TrafficStats keyed by
+	/// `{namespace}/{job}`. Written on sidecar exit via the operator's
+	/// `/api/v1/canopy-stats/...` callback; read by the reporter when
+	/// building `RestoreVerification.s3_*_bytes`.
+	pub canopy_stats: Arc<CallbackStore>,
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
 	pub callback_base_url: String,
@@ -87,6 +92,7 @@ impl Context {
 			canopy_pgdata_pvc_size: DEFAULT_CANOPY_PGDATA_PVC_SIZE.to_string(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
+			canopy_stats: Arc::new(CallbackStore::default()),
 			callback_base_url,
 			deployment_ready_timeout_secs,
 			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
@@ -128,6 +134,16 @@ impl Context {
 	pub fn cache_pressure_callback_url(&self, namespace: &str, restore: &str) -> String {
 		format!(
 			"{}/api/v1/cache-pressure/{namespace}/{restore}",
+			self.callback_base_url
+		)
+	}
+
+	/// Callback URL the canopy-proxy sidecar POSTs its final TrafficStats
+	/// to on shutdown. Keyed by `{namespace}/{job}` so the reporter can
+	/// look them up when building `RestoreVerification`.
+	pub fn canopy_stats_callback_url(&self, namespace: &str, job: &str) -> String {
+		format!(
+			"{}/api/v1/canopy-stats/{namespace}/{job}",
 			self.callback_base_url
 		)
 	}

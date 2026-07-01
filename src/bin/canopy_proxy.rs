@@ -36,7 +36,11 @@ struct Config {
 	backup_type: String,
 	region: String,
 	port_file: PathBuf,
-	stats_file: PathBuf,
+	/// URL the operator serves the stats-callback on; the sidecar POSTs
+	/// its final TrafficStats there on shutdown so the reporter can
+	/// include them in the RestoreVerification. Constructed by the Job
+	/// builder from `Context::canopy_stats_callback_url`.
+	stats_callback_url: String,
 }
 
 impl Config {
@@ -47,7 +51,7 @@ impl Config {
 			backup_type: env_required("PGRO_TYPE")?,
 			region: env_required("PGRO_REGION")?,
 			port_file: env_or("PGRO_PROXY_PORT_FILE", "/var/run/pgro/proxy-port").into(),
-			stats_file: env_or("PGRO_PROXY_STATS_FILE", "/var/run/pgro/proxy-stats.json").into(),
+			stats_callback_url: env_required("PGRO_STATS_CALLBACK_URL")?,
 		})
 	}
 }
@@ -161,12 +165,24 @@ fn write_port_atomic(port_file: &std::path::Path, port: u16) -> std::io::Result<
 	std::fs::rename(&tmp, port_file)
 }
 
-fn write_stats(stats_file: &std::path::Path, stats: &StatsFile) -> std::io::Result<()> {
-	if let Some(parent) = stats_file.parent() {
-		std::fs::create_dir_all(parent)?;
+/// POST the sidecar's final stats to the operator's callback endpoint.
+/// Best-effort with a short timeout; failures are logged, not fatal.
+async fn post_stats(url: &str, stats: &StatsFile) -> Result<(), String> {
+	let client = reqwest::Client::builder()
+		.timeout(Duration::from_secs(5))
+		.build()
+		.map_err(|e| format!("building stats client: {e}"))?;
+	let resp = client
+		.post(url)
+		.json(stats)
+		.send()
+		.await
+		.map_err(|e| format!("posting stats: {e}"))?;
+	let status = resp.status();
+	if !status.is_success() {
+		return Err(format!("stats callback returned {status}"));
 	}
-	let json = serde_json::to_string(stats).expect("stats serialize");
-	std::fs::write(stats_file, json)
+	Ok(())
 }
 
 async fn run(cfg: Config) -> Result<(), String> {
@@ -205,10 +221,18 @@ async fn run(cfg: Config) -> Result<(), String> {
 		received_raw_bytes: traffic.received_raw,
 		received_payload_bytes: traffic.received_payload,
 	};
-	if let Err(err) = write_stats(&cfg.stats_file, &stats) {
-		error!(error = %err, stats_file = %cfg.stats_file.display(), "writing stats file failed");
+	if let Err(err) = post_stats(&cfg.stats_callback_url, &stats).await {
+		error!(
+			error = %err,
+			stats_callback_url = %cfg.stats_callback_url,
+			"posting stats callback failed"
+		);
 	} else {
-		info!(?stats.sent_raw_bytes, ?stats.received_raw_bytes, "wrote stats file");
+		info!(
+			sent_raw_bytes = stats.sent_raw_bytes,
+			received_raw_bytes = stats.received_raw_bytes,
+			"posted stats callback"
+		);
 	}
 	Ok(())
 }

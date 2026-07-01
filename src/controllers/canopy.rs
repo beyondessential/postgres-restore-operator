@@ -489,6 +489,7 @@ async fn spawn_pvc_and_job(
 	}
 
 	let job_name = format!("restore-{}", short_id(snapshot_id));
+	let stats_callback_url = ctx.canopy_stats_callback_url(ns_name, &job_name);
 	let cfg = builders::CanopyRestoreJobConfig {
 		entry,
 		namespace: ns_name,
@@ -496,6 +497,7 @@ async fn spawn_pvc_and_job(
 		kopia_image: &ctx.kopia_image(),
 		canopy_proxy_image: &ctx.canopy_proxy_image,
 		broker_base_url: &ctx.canopy_broker_base_url,
+		stats_callback_url: &stats_callback_url,
 		snapshot_id,
 		repo_password,
 		pgdata_pvc_size: &ctx.canopy_pgdata_pvc_size,

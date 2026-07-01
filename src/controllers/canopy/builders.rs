@@ -53,6 +53,9 @@ pub struct CanopyRestoreJobConfig<'a> {
 	/// `http://postgres-restore-operator.pgro-system.svc:9091`. From
 	/// `Context::canopy_broker_base_url`.
 	pub broker_base_url: &'a str,
+	/// Callback URL the sidecar POSTs its final TrafficStats to on
+	/// shutdown, from `Context::canopy_stats_callback_url`.
+	pub stats_callback_url: &'a str,
 	/// Snapshot the operator wants restored — comes from the worklist
 	/// entry when Provision or Refresh, but callers pass it explicitly
 	/// because the syncer may know a more recent value.
@@ -232,6 +235,11 @@ pub fn build_canopy_restore_job(cfg: &CanopyRestoreJobConfig<'_>) -> Job {
 				value: Some(cfg.entry.region.clone()),
 				..Default::default()
 			},
+			EnvVar {
+				name: "PGRO_STATS_CALLBACK_URL".into(),
+				value: Some(cfg.stats_callback_url.into()),
+				..Default::default()
+			},
 		]),
 		volume_mounts: Some(vec![VolumeMount {
 			name: "proxy-shared".into(),
@@ -366,8 +374,9 @@ mod tests {
 			namespace: "pgro-r-abc",
 			job_name: "restore-1",
 			kopia_image: "kopia/kopia:0.22.3",
-			canopy_proxy_image: "ghcr.io/beyondessential/pgro-canopy-proxy:latest",
+			canopy_proxy_image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
 			broker_base_url: "http://postgres-restore-operator.pgro-system.svc:9091",
+			stats_callback_url: "http://postgres-restore-operator.pgro-system.svc:8080/api/v1/canopy-stats/pgro-r-abc/restore-1",
 			snapshot_id: "abc123",
 			repo_password: "supersecret",
 			pgdata_pvc_size: "10Gi",

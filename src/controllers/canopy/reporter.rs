@@ -265,6 +265,13 @@ async fn send_verification(
 		.map(String::as_str);
 	let replica_healthy = matches!(outcome, Outcome::Success);
 
+	// Stats are POSTed by the sidecar on shutdown to /api/v1/canopy-stats/...
+	// and land in ctx.canopy_stats keyed by `{namespace}/{job}`. We look
+	// them up by the terminal Job's name. Missing stats are non-fatal —
+	// the report goes out without them.
+	let ns_name = ns.name_any();
+	let stats = latest_stats_for_namespace(ctx, ns).await;
+
 	let report = RestoreVerification {
 		replica_id,
 		group,
@@ -277,13 +284,52 @@ async fn send_verification(
 		replica_healthy,
 		postgres_version: None,
 		observed_at: jiff::Timestamp::now(),
-		s3_sent_raw_bytes: None,
-		s3_sent_payload_bytes: None,
-		s3_received_raw_bytes: None,
-		s3_received_payload_bytes: None,
+		s3_sent_raw_bytes: stats.as_ref().map(|s| s.sent_raw_bytes as i64),
+		s3_sent_payload_bytes: stats.as_ref().map(|s| s.sent_payload_bytes as i64),
+		s3_received_raw_bytes: stats.as_ref().map(|s| s.received_raw_bytes as i64),
+		s3_received_payload_bytes: stats.as_ref().map(|s| s.received_payload_bytes as i64),
 	};
 
-	canopy.restore_verification(&report).await
+	let result = canopy.restore_verification(&report).await;
+	drop(ns_name); // silence unused-let warning if the field isn't consumed
+	result
+}
+
+/// Sidecar-reported stats. Mirrors the shape the sidecar POSTs on
+/// shutdown (see `src/bin/canopy_proxy.rs::StatsFile`).
+#[derive(Debug, serde::Deserialize)]
+struct SidecarStats {
+	sent_raw_bytes: u64,
+	sent_payload_bytes: u64,
+	received_raw_bytes: u64,
+	received_payload_bytes: u64,
+}
+
+/// Pull the latest sidecar stats for this namespace's most-recent restore
+/// Job out of `ctx.canopy_stats`. Non-destructive read via `take` — a
+/// second reporter pass wouldn't find them, but we've already stamped
+/// `last-verification-reported-at` at that point so this doesn't matter.
+async fn latest_stats_for_namespace(ctx: &Context, ns: &Namespace) -> Option<SidecarStats> {
+	let job_api: Api<Job> = Api::namespaced(ctx.client.clone(), &ns.name_any());
+	let jobs = job_api
+		.list(&ListParams::default().labels("pgro.bes.au/job-kind=canopy-restore"))
+		.await
+		.ok()?;
+	let job = latest_job(&jobs.items)?;
+	let job_name = job.name_any();
+	let raw = ctx.canopy_stats.take(&ns.name_any(), &job_name)?;
+	match serde_json::from_str::<SidecarStats>(&raw) {
+		Ok(s) => Some(s),
+		Err(err) => {
+			warn!(
+				namespace = %ns.name_any(),
+				job = %job_name,
+				error = %err,
+				"canopy reporter: sidecar stats callback body did not parse"
+			);
+			None
+		}
+	}
 }
 
 /// Patch the given annotations on a Namespace. `None` values delete the
