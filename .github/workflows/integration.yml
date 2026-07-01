@@ -56,6 +56,11 @@ jobs:
               test-ps-all-missing
             needs_non_pg_snapshot: false
 
+          - name: canopy_integration
+            namespaces: >-
+              test-canopy-restore
+            needs_non_pg_snapshot: false
+
     steps:
       - uses: actions/checkout@v6.0.2
 
