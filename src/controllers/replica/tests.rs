@@ -206,8 +206,15 @@ fn snapshot_list_job_rotates_kopia_logs() {
 		status: None,
 	};
 
-	let job = build_snapshot_list_job(&replica, "test-snap", "default", "kopia:latest", "http://x")
-		.expect("job builds");
+	let job = build_snapshot_list_job(
+		&replica,
+		"test-snap",
+		"default",
+		"kopia:latest",
+		"http://x",
+		None,
+	)
+	.expect("job builds");
 	let script = job.spec.unwrap().template.spec.unwrap().containers[0]
 		.args
 		.as_ref()

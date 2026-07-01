@@ -557,18 +557,13 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// Canopy-sourced replicas don't run snapshot-list Jobs — the desired
-	// snapshot ID is written into `status.canopyDesiredSnapshotId` by the
-	// canopy worklist syncer. We still allocate the job-name here so the
-	// downstream `if snapshot_job.is_none()` gate reads uniformly.
+	// Snapshot-list runs on both paths. Canopy-sourced replicas fetch the
+	// same snapshot metadata but the result handler filters by
+	// `status.canopyDesiredSnapshotId` instead of the CR's snapshot_filter.
 	let is_canopy = replica.spec.canopy_source.is_some();
 	let snapshot_job_name = format!("{name}-snapshot-list");
 	let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
-	let snapshot_job = if is_canopy {
-		None
-	} else {
-		jobs.get_opt(&snapshot_job_name).await?
-	};
+	let snapshot_job = jobs.get_opt(&snapshot_job_name).await?;
 
 	if let Some(ref job) = snapshot_job {
 		match classify_job(job) {
@@ -606,13 +601,28 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 				match kopia::parse_snapshot_list_output(raw) {
 					Ok(all_snapshots) => {
-						let filtered = kopia::filter_snapshots(
-							&all_snapshots,
-							replica.spec.snapshot_filter.as_ref(),
-						);
-						let latest = kopia::latest_snapshot(&filtered);
+						// Canopy path: canopy already picked a specific
+						// snapshot; select the metadata for that ID
+						// instead of applying snapshot_filter + "latest".
+						// Legacy path: filter by snapshot_filter, pick
+						// latest.
+						let picked = if is_canopy {
+							let desired = replica
+								.status
+								.as_ref()
+								.and_then(|s| s.canopy_desired_snapshot_id.as_deref());
+							desired
+								.and_then(|id| all_snapshots.iter().find(|s| s.id == id))
+								.cloned()
+						} else {
+							let filtered = kopia::filter_snapshots(
+								&all_snapshots,
+								replica.spec.snapshot_filter.as_ref(),
+							);
+							kopia::latest_snapshot(&filtered).cloned()
+						};
 
-						if let Some(snap) = latest {
+						if let Some(ref snap) = picked {
 							let size = snap.total_size_bytes();
 							replica
 								.update_status_field(client, "latestAvailableSnapshot", &snap.id)
@@ -693,6 +703,30 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 									warn!(replica = name, error = %e, "failed to publish RestoreCreationBlocked event");
 								}
 							}
+						} else if is_canopy {
+							let desired = replica
+								.status
+								.as_ref()
+								.and_then(|s| s.canopy_desired_snapshot_id.as_deref())
+								.unwrap_or("<none>");
+							warn!(
+								replica = name,
+								desired = desired,
+								"canopy: canopyDesiredSnapshotId not present in kopia snapshot list"
+							);
+							replica
+								.update_condition(
+									client,
+									"SnapshotAvailable",
+									"False",
+									"CanopyDesiredSnapshotMissing",
+									&format!(
+										"canopyDesiredSnapshotId {desired} was not found in the \
+										 kopia snapshot list — canopy may be pointing at a \
+										 snapshot that hasn't been indexed yet"
+									),
+								)
+								.await?;
 						} else {
 							warn!(
 								replica = name,
@@ -926,86 +960,25 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 		drop(queue);
 
-		if is_canopy {
-			// Canopy path: the worklist syncer has already picked a
-			// snapshot for us. Use `status.canopyDesiredSnapshotId`
-			// directly and skip the snapshot-list Job entirely.
-			let desired = replica
-				.status
-				.as_ref()
-				.and_then(|s| s.canopy_desired_snapshot_id.as_ref());
-			let Some(desired) = desired else {
-				debug!(
-					replica = name,
-					"canopy-sourced replica has no canopyDesiredSnapshotId yet, waiting for syncer"
-				);
-				replica
-					.update_condition(
-						client,
-						"SnapshotAvailable",
-						"False",
-						"CanopyPending",
-						"Waiting for canopy worklist syncer to set canopyDesiredSnapshotId",
-					)
-					.await?;
-				return Ok(Action::requeue(Duration::from_secs(30)));
-			};
-
-			let current_snapshot_id = active_restore.map(|r| r.spec.snapshot.as_str());
-			if current_snapshot_id == Some(desired.as_str()) {
-				debug!(
-					replica = name,
-					snapshot = desired,
-					"canopy desired snapshot already active, skipping"
-				);
-			} else {
-				info!(
-					replica = name,
-					snapshot = desired,
-					"canopy desired snapshot changed, creating restore"
-				);
-				// Canopy replicas rely on intent-driven
-				// `storage_size_override` for sizing; snapshot size is
-				// not known upfront so we pass 0. The override branch
-				// in create_restore_for_snapshot then picks the fixed
-				// PVC size.
-				let info = SnapshotInfo {
-					id: desired.clone(),
-					size: 0,
-					start_time: String::new(),
-				};
-				let created = replica.create_restore_for_snapshot(client, &info).await?;
-				if created {
-					ctx.metrics.restores_started_total.inc();
-					if let Err(e) = ctx
-						.recorder
-						.publish(
-							&Event {
-								type_: EventType::Normal,
-								reason: "RestoreStarted".into(),
-								note: Some(format!("Started restore from snapshot {desired}")),
-								action: "Restore".into(),
-								secondary: None,
-							},
-							&replica.object_ref(&()),
-						)
-						.await
-					{
-						warn!(replica = name, error = %e, "failed to publish RestoreStarted event");
-					}
-				}
-			}
-			return Ok(Action::requeue(Duration::from_secs(30)));
-		}
-
 		info!(replica = name, "creating snapshot list job");
 		let callback_url = ctx.snapshot_callback_url(&namespace, &name);
+		let stats_callback_url = ctx.canopy_stats_callback_url(&namespace, &snapshot_job_name);
+		let canopy_proxy = if is_canopy {
+			Some(crate::controllers::restore::builders::CanopyProxyArgs {
+				image: &ctx.canopy_proxy_image,
+				broker_base_url: &ctx.canopy_broker_base_url,
+				stats_callback_url: &stats_callback_url,
+			})
+		} else {
+			None
+		};
 		let job = build_snapshot_list_job(
 			&replica,
 			&snapshot_job_name,
 			&namespace,
 			&ctx.kopia_image(),
 			&callback_url,
+			canopy_proxy.as_ref(),
 		)?;
 		jobs.create(&PostParams::default(), &job).await?;
 		return Ok(Action::requeue(Duration::from_secs(10)));
