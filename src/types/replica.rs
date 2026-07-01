@@ -491,6 +491,36 @@ impl PostgresPhysicalReplica {
 	pub fn creds_secret_name(&self) -> String {
 		format!("{name}-creds", name = self.name_any())
 	}
+
+	/// Name of the operator-materialised Secret that holds the canopy path's
+	/// dummy AWS keys + canopy-provided bucket/region/prefix/repo-password.
+	/// Only meaningful when `spec.canopy_source` is set — the canopy syncer
+	/// creates this Secret before the reconciler spawns a restore Job.
+	pub fn canopy_creds_secret_name(&self) -> String {
+		format!("{name}-canopy-creds", name = self.name_any())
+	}
+
+	/// Derive the credential source for kopia Jobs — the reconciler has
+	/// already validated exactly one of `kopia_secret_ref` / `canopy_source`
+	/// is set before we reach any callsite that needs this, so the
+	/// `.expect` never fires in practice.
+	pub fn kopia_source(&self) -> crate::kopia::KopiaSource {
+		if let Some(canopy) = &self.spec.canopy_source {
+			crate::kopia::KopiaSource::CanopyProxy {
+				secret_name: self.canopy_creds_secret_name(),
+				group: canopy.group.clone(),
+				backup_type: canopy.r#type.clone(),
+			}
+		} else {
+			let secret_name = self
+				.spec
+				.kopia_secret_ref
+				.as_ref()
+				.and_then(|r| r.name.clone())
+				.expect("kopia_source called with neither kopia_secret_ref nor canopy_source set");
+			crate::kopia::KopiaSource::Secret { secret_name }
+		}
+	}
 }
 
 #[cfg(test)]

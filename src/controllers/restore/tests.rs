@@ -156,6 +156,7 @@ fn restore_job_has_ttl_seconds_after_finished() {
 		&replica,
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let ttl = job
@@ -182,6 +183,7 @@ fn restore_job_mounts_persistent_kopia_cache() {
 		&replica,
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -328,6 +330,7 @@ fn restore_job_passes_cache_caps_and_log_rotation() {
 		&replica,
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();

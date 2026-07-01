@@ -230,6 +230,50 @@ pub fn kopia_connect_args(creds: &KopiaCredentials) -> Vec<String> {
 	args
 }
 
+/// The credential source a kopia Job runs against — determines whether
+/// the Job uses a user-authored `kopiaSecretRef` Secret with real AWS
+/// keys, or the canopy proxy-sidecar path with dummy keys and STS creds
+/// refreshed by the sidecar. Derived from the parent
+/// `PostgresPhysicalReplica`'s spec.
+#[derive(Debug, Clone)]
+pub enum KopiaSource {
+	/// Legacy path: env vars sourced from a Secret containing real AWS
+	/// credentials + bucket/region/repo-password.
+	Secret {
+		/// Namespace-local Secret name (from `spec.kopiaSecretRef.name`).
+		secret_name: String,
+	},
+	/// Canopy path: proxy sidecar handles credential refresh; kopia sees
+	/// dummy keys pointing at a loopback endpoint. The named Secret holds
+	/// dummy AWS keys + canopy-provided bucket/region/prefix + repo
+	/// password; the canopy syncer materialises it before the Job runs.
+	CanopyProxy {
+		/// Namespace-local Secret name (materialised by the canopy syncer
+		/// as `<replica-name>-canopy-creds`).
+		secret_name: String,
+		/// Canopy group id, passed to the sidecar as `PGRO_GROUP`.
+		group: String,
+		/// Canopy backup type, passed to the sidecar as `PGRO_TYPE`.
+		backup_type: String,
+	},
+}
+
+impl KopiaSource {
+	/// Name of the namespace-local Secret that carries kopia's env vars
+	/// (bucket, region, prefix, repo password, and — for legacy — real
+	/// AWS keys; for canopy — dummy keys).
+	pub fn secret_name(&self) -> &str {
+		match self {
+			Self::Secret { secret_name } => secret_name,
+			Self::CanopyProxy { secret_name, .. } => secret_name,
+		}
+	}
+
+	pub fn is_canopy_proxy(&self) -> bool {
+		matches!(self, Self::CanopyProxy { .. })
+	}
+}
+
 /// Parameters for the kopia-via-canopy-proxy connect convention.
 ///
 /// kopia talks to a loopback bestool S3P proxy with dummy keys; the proxy holds
