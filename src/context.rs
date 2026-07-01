@@ -21,6 +21,10 @@ pub struct Context {
 	pub kopia_image: Arc<RwLock<String>>,
 	pub use_port_forward: Arc<AtomicBool>,
 	pub http_client: reqwest::Client,
+	/// Canopy integration client — `None` when the operator is running in
+	/// legacy-only mode (no canopy config provided). Populated at startup
+	/// by [`crate::canopy::Client::from_config`].
+	pub canopy: Option<Arc<crate::canopy::Client>>,
 	/// In-memory store for snapshot-list results POSTed by jobs.
 	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for schema migration results POSTed by jobs.
@@ -60,6 +64,7 @@ impl Context {
 			kopia_image: Arc::new(RwLock::new(kopia_image)),
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
+			canopy: None,
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
 			callback_base_url,
