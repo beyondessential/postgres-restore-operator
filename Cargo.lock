@@ -3154,7 +3154,6 @@ dependencies = [
  "k8s-openapi",
  "kube",
  "kube_quantity",
- "miette",
  "mimalloc",
  "prometheus",
  "rand 0.10.1",
