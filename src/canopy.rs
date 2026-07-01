@@ -36,19 +36,26 @@ pub struct CanopyConfig {
 }
 
 /// Build the inner `bestool_canopy::CanopyClient`. The SOCKS5 proxy URL is
-/// captured into the builder factory so every probe + reconnect uses it.
+/// captured into the builder factory and applied **only for tailnet-hosted
+/// URLs** (`*.ts.net`) — the mTLS fallback endpoint must be reachable
+/// directly even when the Tailscale sidecar is down, which is the whole
+/// point of it being a fallback. Without the per-URL predicate, a broken
+/// SOCKS proxy takes down both paths at once.
 async fn build_inner(cfg: &CanopyConfig) -> Result<CanopyClient> {
 	let socks5 = cfg.socks5_proxy.clone();
 	let version = env!("CARGO_PKG_VERSION").to_string();
 	let make_builder = move || {
 		let mut b = client_builder(&version);
 		if !socks5.is_empty() {
-			match reqwest::Proxy::all(&socks5) {
-				Ok(proxy) => b = b.proxy(proxy),
-				Err(err) => {
-					tracing::error!(socks5_proxy = %socks5, error = %err, "CanopyConfig: invalid SOCKS5 proxy URL");
+			let socks5 = socks5.clone();
+			let proxy = reqwest::Proxy::custom(move |url| {
+				if url.host_str().is_some_and(|h| h.ends_with(".ts.net")) {
+					Some(socks5.clone())
+				} else {
+					None
 				}
-			}
+			});
+			b = b.proxy(proxy);
 		}
 		b
 	};
