@@ -103,7 +103,7 @@ impl Client {
 		self.inner
 			.restore_capabilities(&self.base_url, intents)
 			.await
-			.map_err(|err| Error::Canopy(format!("restore_capabilities: {err}")))
+			.map_err(|err| Error::Canopy(format!("restore_capabilities: {}", chain(&err))))
 	}
 
 	/// Fetch the consumer's desired-state worklist. Each entry is one
@@ -112,7 +112,7 @@ impl Client {
 		self.inner
 			.restore_worklist(&self.base_url)
 			.await
-			.map_err(|err| Error::Canopy(format!("restore_worklist: {err}")))
+			.map_err(|err| Error::Canopy(format!("restore_worklist: {}", chain(&err))))
 	}
 
 	/// Fetch short-lived read-only STS creds plus the repo password for a
@@ -127,7 +127,8 @@ impl Client {
 			.await
 			.map_err(|err| {
 				Error::Canopy(format!(
-					"restore_credentials({backup_type}, {group}): {err}"
+					"restore_credentials({backup_type}, {group}): {}",
+					chain(&err)
 				))
 			})
 	}
@@ -137,7 +138,7 @@ impl Client {
 		self.inner
 			.restore_verification(&self.base_url, report)
 			.await
-			.map_err(|err| Error::Canopy(format!("restore_verification: {err}")))
+			.map_err(|err| Error::Canopy(format!("restore_verification: {}", chain(&err))))
 	}
 
 	/// Direct access to the public-mTLS base URL the client is configured
@@ -146,6 +147,19 @@ impl Client {
 	pub fn base_url(&self) -> &Url {
 		&self.base_url
 	}
+}
+
+/// Flatten a `miette::Report` (bestool-canopy's error type) to a single
+/// `outer: inner: root` line by walking its source chain. bestool wraps
+/// its errors with `.wrap_err(...)` which layers context around the
+/// underlying reqwest / io error, and plain `Display` on the report
+/// only shows the outermost message — losing the actually diagnostic
+/// bit.
+fn chain(err: &miette::Report) -> String {
+	err.chain()
+		.map(|e| e.to_string())
+		.collect::<Vec<_>>()
+		.join(": ")
 }
 
 /// Re-export the wire types pgro consumes verbatim from `bestool-canopy`.
