@@ -37,6 +37,7 @@ use uuid::Uuid;
 use crate::{context::Context, error::Result};
 
 mod builders;
+pub mod intent;
 mod reporter;
 pub use builders::{
 	CanopyRestoreJobConfig, KOPIA_JOB_NAME, PGDATA_PVC_NAME, POSTGRES_DEPLOYMENT_NAME,

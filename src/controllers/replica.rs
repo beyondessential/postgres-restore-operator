@@ -861,8 +861,29 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	let schedule_decision = replica.check_schedule();
 
+	// On the canopy path, the worklist syncer updates
+	// `status.canopyDesiredSnapshotId` when canopy offers a newer snapshot.
+	// Trigger a restore whenever the desired snapshot differs from what the
+	// active restore already carries, in addition to the usual schedule /
+	// never-restored / active-deleted triggers. minimum_ttl still gates:
+	// the intent may declare an explicit lower bound on restore frequency
+	// even in the face of a newer canopy snapshot.
+	let canopy_desired_changed = is_canopy
+		&& match (
+			replica
+				.status
+				.as_ref()
+				.and_then(|s| s.canopy_desired_snapshot_id.as_ref()),
+			active_restore.map(|r| r.spec.snapshot.as_str()),
+		) {
+			(Some(desired), Some(current)) => desired != current,
+			(Some(_), None) => true,
+			_ => false,
+		} && !replica.within_minimum_ttl(now);
+
 	let should_restore = never_restored
 		|| active_restore_deleted
+		|| canopy_desired_changed
 		|| matches!(schedule_decision, ScheduleDecision::Trigger);
 
 	if should_restore && snapshot_job.is_none() {

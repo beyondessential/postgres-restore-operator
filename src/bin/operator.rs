@@ -25,7 +25,7 @@ use postgres_restore_operator::{
 		Context, DEFAULT_CANOPY_PGDATA_PVC_SIZE, DEFAULT_CANOPY_PROXY_IMAGE,
 		DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS, DEFAULT_KOPIA_IMAGE,
 	},
-	controllers,
+	controllers::{self, canopy::intent::SUPPORTED as PGRO_SUPPORTED_INTENTS},
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
 
@@ -43,12 +43,6 @@ const DEFAULT_METRICS_PORT: u16 = 8080;
 const DEFAULT_BROKER_ADDR: &str = "[::]:9091";
 const DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS: u64 = 30;
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
-
-/// Intent set pgro registers with canopy on startup; only worklist entries
-/// with a matching intent will be dispatched. `disaster-recovery` is not
-/// yet supported — the code has no rehearsal lifecycle beyond "make it
-/// writable", which is not what DR actually needs.
-const PGRO_SUPPORTED_INTENTS: &[&str] = &["verify", "analytics"];
 
 /// Annotate the operator's own pod with the running version.
 async fn annotate_own_pod(client: &Client, namespace: &str) {
