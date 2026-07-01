@@ -12,18 +12,15 @@ use std::collections::BTreeMap;
 use bestool_canopy::WorklistEntry;
 use k8s_openapi::{
 	api::{
-		apps::v1::{Deployment, DeploymentSpec},
+		apps::v1::Deployment,
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction,
-			PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
-			PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Service, ServicePort,
-			ServiceSpec, TCPSocketAction, Volume, VolumeMount, VolumeResourceRequirements,
+			Container, EmptyDirVolumeSource, EnvVar, PersistentVolumeClaim,
+			PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, ResourceRequirements, Service,
+			ServicePort, ServiceSpec, Volume, VolumeMount, VolumeResourceRequirements,
 		},
 	},
-	apimachinery::pkg::{
-		api::resource::Quantity, apis::meta::v1::LabelSelector, util::intstr::IntOrString,
-	},
+	apimachinery::pkg::{api::resource::Quantity, util::intstr::IntOrString},
 };
 use kube::api::ObjectMeta;
 
@@ -371,164 +368,150 @@ pub fn build_canopy_restore_job(cfg: &CanopyRestoreJobConfig<'_>) -> Job {
 pub const POSTGRES_DEPLOYMENT_NAME: &str = "postgres";
 pub const POSTGRES_SERVICE_NAME: &str = "postgres";
 pub const POSTGRES_PORT: i32 = 5432;
+/// Default analytics role name for canopy-backed replicas. Overridable
+/// per-namespace via annotation later; for now, one name for every
+/// canopy-backed replica.
+pub const CANOPY_ANALYTICS_USERNAME: &str = "analytics";
 
-/// Config the syncer supplies to build the postgres Deployment.
+/// Everything the syncer's `ensure_postgres` needs to build the postgres
+/// Deployment via the shared [`crate::controllers::restore::builders::
+/// build_postgres_deployment_with`]. Fills the intent-driven defaults
+/// (read_only, resources, etc.) and threads the CRD-independent bits.
 pub struct PostgresDeploymentConfig<'a> {
 	pub namespace: &'a str,
-	/// Passed as the postgres image tag. Read from `/pgdata/.postgres-version`
-	/// by the restore Job's script and mirrored onto the replica namespace's
-	/// annotation by the reporter.
+	pub intent: &'a str,
+	pub replica_id: &'a str,
+	pub server_id: &'a str,
+	/// Detected postgres major version, e.g. `"16"`. Read from the
+	/// restore Job's termination message (via
+	/// `read_job_termination_message`).
 	pub postgres_major_version: &'a str,
-	/// Password for the `postgres` superuser. Mounted from a namespace-local
-	/// Secret by the caller — here we just reference the Secret name + key.
-	pub superuser_secret_name: &'a str,
-	pub superuser_secret_key: &'a str,
+	pub snapshot_id: &'a str,
+	pub snapshot_time: &'a str,
+	/// Analytics credentials Secret reference. The reporter creates the
+	/// Secret ahead of the Deployment.
+	pub analytics_secret: &'a k8s_openapi::api::core::v1::SecretReference,
+	pub analytics_secret_key: &'a str,
 }
 
-/// Build the postgres Deployment for a canopy-backed replica.
+/// Build the postgres Deployment for a canopy-backed replica by
+/// forwarding to the shared CRD/canopy builder. Intent drives:
+/// - `verify` / `analytics` → `read_only=true` (default_transaction_read_only)
+/// - `disaster-recovery` → `read_only=false` (writable, acts as primary)
 ///
-/// One replica per Deployment (`replicas: 1`, `strategy: Recreate`) — this
-/// is a restored physical replica, not a highly-available cluster. Mounts
-/// the pgdata PVC created earlier by [`build_pgdata_pvc`], picks the
-/// postgres image from the detected major version, and gates readiness on
-/// `pg_isready`.
-///
-/// Intentionally minimal for the first cut: no WAL-reset fallback, no
-/// locale rewriting, no analytics-user provisioning — those are follow-ups
-/// per intent. If postgres can't start on the restored data, the pod
-/// enters CrashLoopBackOff and the reporter's next tick will transition
-/// the namespace to `restore-state=failed`.
-pub fn build_canopy_postgres_deployment(cfg: &PostgresDeploymentConfig<'_>) -> Deployment {
-	let mut match_labels = BTreeMap::new();
-	match_labels.insert("app.kubernetes.io/name".into(), "postgres".into());
-	match_labels.insert("pgro.bes.au/canopy-replica".into(), "true".into());
-
-	let image = format!("postgres:{}", cfg.postgres_major_version);
-	let readiness_probe = Probe {
-		exec: Some(ExecAction {
-			command: Some(vec![
-				"pg_isready".into(),
-				"-U".into(),
-				"postgres".into(),
-				"-h".into(),
-				"127.0.0.1".into(),
-			]),
-		}),
-		initial_delay_seconds: Some(10),
-		period_seconds: Some(10),
-		timeout_seconds: Some(5),
-		failure_threshold: Some(6),
-		..Default::default()
-	};
-	let liveness_probe = Probe {
-		tcp_socket: Some(TCPSocketAction {
-			port: IntOrString::Int(POSTGRES_PORT),
-			..Default::default()
-		}),
-		initial_delay_seconds: Some(30),
-		period_seconds: Some(20),
-		timeout_seconds: Some(5),
-		failure_threshold: Some(3),
-		..Default::default()
+/// All the heavy lifting (pg_resetwal fallback, locale fixing,
+/// analytics-user creation, REINDEX-on-startup) comes from the shared
+/// builder — see `src/controllers/restore/builders.rs::
+/// build_postgres_deployment_with`.
+pub fn build_canopy_postgres_deployment(
+	cfg: &PostgresDeploymentConfig<'_>,
+) -> Result<Deployment, crate::error::Error> {
+	use crate::controllers::restore::builders::{
+		PostgresDeploymentInputs, build_postgres_deployment_with,
 	};
 
-	let postgres_container = Container {
-		name: POSTGRES_DEPLOYMENT_NAME.into(),
-		image: Some(image),
-		env: Some(vec![
-			EnvVar {
-				name: "PGDATA".into(),
-				value: Some("/pgdata/pgdata".into()),
-				..Default::default()
-			},
-			EnvVar {
-				name: "POSTGRES_HOST_AUTH_METHOD".into(),
-				value: Some("scram-sha-256".into()),
-				..Default::default()
-			},
-			EnvVar {
-				name: "POSTGRES_PASSWORD".into(),
-				value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
-					secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
-						name: cfg.superuser_secret_name.into(),
-						key: cfg.superuser_secret_key.into(),
-						optional: Some(false),
-					}),
-					..Default::default()
-				}),
-				..Default::default()
-			},
-		]),
-		ports: Some(vec![ContainerPort {
-			name: Some("postgres".into()),
-			container_port: POSTGRES_PORT,
-			protocol: Some("TCP".into()),
-			..Default::default()
-		}]),
-		readiness_probe: Some(readiness_probe),
-		liveness_probe: Some(liveness_probe),
-		volume_mounts: Some(vec![VolumeMount {
-			name: "pgdata".into(),
-			mount_path: "/pgdata".into(),
-			..Default::default()
-		}]),
-		resources: Some(ResourceRequirements {
+	let read_only = matches!(cfg.intent, "verify" | "analytics");
+
+	// Intent-driven default resources. Analytics replicas serve queries so
+	// they need more headroom than a verify-only pod that just runs once
+	// and gets torn down. Disaster-recovery mirrors analytics for now.
+	let (cpu_req, mem_req, cpu_lim, mem_lim, shm) = match cfg.intent {
+		"verify" => ("250m", "512Mi", "2", "2Gi", "512Mi"),
+		"analytics" | "disaster-recovery" => ("500m", "2Gi", "4", "8Gi", "2Gi"),
+		_ => ("250m", "512Mi", "2", "2Gi", "512Mi"),
+	};
+	let (shm_size, shared_buffers_mb) =
+		crate::quantity::compute_shm_and_shared_buffers(&Some(ResourceRequirements {
 			requests: Some(BTreeMap::from([
-				("cpu".into(), Quantity("250m".into())),
-				("memory".into(), Quantity("512Mi".into())),
+				("cpu".into(), Quantity(cpu_req.into())),
+				("memory".into(), Quantity(mem_req.into())),
 			])),
 			limits: Some(BTreeMap::from([
-				("cpu".into(), Quantity("2".into())),
-				("memory".into(), Quantity("4Gi".into())),
+				("cpu".into(), Quantity(cpu_lim.into())),
+				("memory".into(), Quantity(mem_lim.into())),
+			])),
+			..Default::default()
+		}));
+	// The compute helper may pick a shm size smaller than what we want per
+	// intent; take max of the two.
+	let shm_size_final = if quantity_ge(&shm_size, &Quantity(shm.into())) {
+		shm_size
+	} else {
+		Quantity(shm.into())
+	};
+
+	let mut labels: BTreeMap<String, String> = BTreeMap::new();
+	labels.insert(labels::MANAGED_BY.into(), labels::MANAGED_BY_VALUE.into());
+	labels.insert(labels::DECLARATION_ID.into(), cfg.replica_id.into());
+	labels.insert(labels::SERVER.into(), cfg.server_id.into());
+	labels.insert(labels::INTENT.into(), cfg.intent.into());
+	labels.insert("app.kubernetes.io/name".into(), "postgres".into());
+	labels.insert("pgro.bes.au/canopy-replica".into(), "true".into());
+	let match_labels: BTreeMap<_, _> = labels
+		.iter()
+		.filter(|(k, _)| {
+			k.as_str() == "app.kubernetes.io/name" || k.as_str() == "pgro.bes.au/canopy-replica"
+		})
+		.map(|(k, v)| (k.clone(), v.clone()))
+		.collect();
+
+	let inputs = PostgresDeploymentInputs {
+		name: POSTGRES_DEPLOYMENT_NAME,
+		namespace: cfg.namespace,
+		pvc_name: PGDATA_PVC_NAME,
+		pg_version: cfg.postgres_major_version,
+		shm_size: shm_size_final,
+		shared_buffers_mb,
+		read_only,
+		postgres_extra_config: None,
+		analytics_username: CANOPY_ANALYTICS_USERNAME,
+		analytics_password_secret: cfg.analytics_secret,
+		analytics_password_key: cfg.analytics_secret_key,
+		snapshot_id: cfg.snapshot_id,
+		snapshot_time: cfg.snapshot_time,
+		labels,
+		match_labels,
+		pod_annotations: None,
+		// Canopy path uses namespace-cascade deletion for teardown; no
+		// per-Deployment owner reference.
+		owner_references: None,
+		postgres_resources: Some(ResourceRequirements {
+			requests: Some(BTreeMap::from([
+				("cpu".into(), Quantity(cpu_req.into())),
+				("memory".into(), Quantity(mem_req.into())),
+			])),
+			limits: Some(BTreeMap::from([
+				("cpu".into(), Quantity(cpu_lim.into())),
+				("memory".into(), Quantity(mem_lim.into())),
 			])),
 			..Default::default()
 		}),
-		..Default::default()
+		affinity: None,
+		tolerations: Vec::new(),
 	};
 
-	Deployment {
-		metadata: ObjectMeta {
-			name: Some(POSTGRES_DEPLOYMENT_NAME.into()),
-			namespace: Some(cfg.namespace.into()),
-			labels: Some(match_labels.clone()),
-			..Default::default()
-		},
-		spec: Some(DeploymentSpec {
-			replicas: Some(1),
-			strategy: Some(k8s_openapi::api::apps::v1::DeploymentStrategy {
-				type_: Some("Recreate".into()),
-				..Default::default()
-			}),
-			selector: LabelSelector {
-				match_labels: Some(match_labels.clone()),
-				..Default::default()
-			},
-			template: PodTemplateSpec {
-				metadata: Some(ObjectMeta {
-					labels: Some(match_labels),
-					..Default::default()
-				}),
-				spec: Some(PodSpec {
-					containers: vec![postgres_container],
-					volumes: Some(vec![Volume {
-						name: "pgdata".into(),
-						persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-							claim_name: PGDATA_PVC_NAME.into(),
-							..Default::default()
-						}),
-						..Default::default()
-					}]),
-					..Default::default()
-				}),
-			},
-			..Default::default()
-		}),
-		..Default::default()
+	build_postgres_deployment_with(&inputs)
+}
+
+/// Rough Quantity comparison for the shm-size floor. Both sides are
+/// short mebibyte-suffix strings we generated; if parsing fails we treat
+/// LHS as smaller so the intent floor wins (safer default).
+fn quantity_ge(a: &Quantity, b: &Quantity) -> bool {
+	let parse = |q: &Quantity| -> Option<u64> {
+		let s = q.0.trim_end_matches("Mi").trim_end_matches("Gi");
+		s.parse::<u64>()
+			.ok()
+			.map(|n| if q.0.ends_with("Gi") { n * 1024 } else { n })
+	};
+	match (parse(a), parse(b)) {
+		(Some(av), Some(bv)) => av >= bv,
+		_ => false,
 	}
 }
 
-/// ClusterIP Service that exposes the postgres Deployment inside the
-/// replica namespace.
+/// ClusterIP Service exposing the postgres Deployment inside the
+/// replica namespace. Selects by the same labels the shared Deployment
+/// builder puts on the pod template.
 pub fn build_canopy_postgres_service(namespace: &str) -> Service {
 	let mut selector = BTreeMap::new();
 	selector.insert("app.kubernetes.io/name".into(), "postgres".into());

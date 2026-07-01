@@ -196,35 +196,66 @@ async fn observe_one(ctx: &Context, ns: &Namespace) -> Result<()> {
 	Ok(())
 }
 
-/// Ensure the postgres Deployment + Service exist for a namespace whose
-/// restore Job succeeded. Idempotent — 409s on creation are ignored so
-/// re-runs don't clobber state.
+/// Ensure the postgres Deployment + Service (and their prereq Secret)
+/// exist for a namespace whose restore Job succeeded. Idempotent — 409s
+/// on creation are ignored so re-runs don't clobber state.
+///
+/// Delegates the actual Deployment shape to the shared builder in
+/// `restore/builders.rs` so canopy-backed replicas get the same init
+/// treatment as the legacy CRD path (locale rewriting, pg_resetwal
+/// fallback, analytics-user provisioning, REINDEX-on-startup, restore
+/// metadata in `_pgro.restore_info`).
 async fn ensure_postgres(ctx: &Context, ns: &Namespace) -> Result<()> {
 	let ns_name = ns.name_any();
 
-	// Detect the postgres version the restore Job discovered. The Job's
-	// script writes /pgdata/.postgres-version but the reporter can't read
-	// PVC content directly; instead we probe the Job's termination
-	// message (set by writing to /dev/termination-log). The restore
-	// script for the CRD path does this today; for the canopy path
-	// we cache the version onto the namespace annotation as a
-	// side-effect the first time we detect it.
 	let version = annotations_version(ns).unwrap_or_else(|| "16".to_string());
+	let ns_labels = ns.labels();
+	let intent = ns_labels
+		.get("pgro.bes.au/intent")
+		.map(String::as_str)
+		.unwrap_or("verify");
+	let replica_id = ns_labels
+		.get("pgro.bes.au/declaration-id")
+		.map(String::as_str)
+		.unwrap_or("");
+	let server_id = ns_labels
+		.get("pgro.bes.au/server")
+		.map(String::as_str)
+		.unwrap_or("");
+	let annos = ns.annotations();
+	let snapshot_id = annos
+		.get(annotations::LAST_RESTORED_SNAPSHOT_ID)
+		.or_else(|| annos.get(annotations::DESIRED_SNAPSHOT_ID))
+		.map(String::as_str)
+		.unwrap_or("");
+	let snapshot_time = annos
+		.get(annotations::DESIRED_SNAPSHOT_AT)
+		.map(String::as_str)
+		.unwrap_or("");
 
-	// Ensure the superuser Secret. The password is randomly generated
-	// once per namespace and stored here; postgres reads it via env at
-	// container start.
-	let secret_name = "postgres-superuser";
+	// Ensure the analytics-user Secret. The password is randomly
+	// generated once per namespace; the setup-auth initContainer picks
+	// it up via env.
+	let secret_name = "analytics-credentials";
 	let secret_key = "password";
-	ensure_superuser_secret(ctx, &ns_name, secret_name, secret_key).await?;
+	ensure_analytics_secret(ctx, &ns_name, secret_name, secret_key).await?;
 
 	// Ensure the Deployment.
+	let secret_ref = k8s_openapi::api::core::v1::SecretReference {
+		name: Some(secret_name.into()),
+		namespace: Some(ns_name.clone()),
+	};
 	let dep = super::build_canopy_postgres_deployment(&super::PostgresDeploymentConfig {
 		namespace: &ns_name,
+		intent,
+		replica_id,
+		server_id,
 		postgres_major_version: &version,
-		superuser_secret_name: secret_name,
-		superuser_secret_key: secret_key,
-	});
+		snapshot_id,
+		snapshot_time,
+		analytics_secret: &secret_ref,
+		analytics_secret_key: secret_key,
+	})?;
 	let dep_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns_name);
 	match dep_api.create(&PostParams::default(), &dep).await {
 		Ok(_) => info!(namespace = %ns_name, "canopy: created postgres Deployment"),
@@ -257,7 +288,7 @@ fn annotations_version(ns: &Namespace) -> Option<String> {
 		.cloned()
 }
 
-async fn ensure_superuser_secret(
+async fn ensure_analytics_secret(
 	ctx: &Context,
 	namespace: &str,
 	name: &str,
