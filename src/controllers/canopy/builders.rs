@@ -395,9 +395,12 @@ pub struct PostgresDeploymentConfig<'a> {
 }
 
 /// Build the postgres Deployment for a canopy-backed replica by
-/// forwarding to the shared CRD/canopy builder. Intent drives:
-/// - `verify` / `analytics` → `read_only=true` (default_transaction_read_only)
-/// - `disaster-recovery` → `read_only=false` (writable, acts as primary)
+/// forwarding to the shared CRD/canopy builder. Both currently-supported
+/// intents (`verify`, `analytics`) run the replica read-only; `analytics`
+/// gets heavier default resources since it serves queries. Unknown
+/// intents fall through to the verify-shaped defaults; canopy won't
+/// dispatch them because pgro doesn't register them via
+/// `PGRO_SUPPORTED_INTENTS`.
 ///
 /// All the heavy lifting (pg_resetwal fallback, locale fixing,
 /// analytics-user creation, REINDEX-on-startup) comes from the shared
@@ -410,14 +413,10 @@ pub fn build_canopy_postgres_deployment(
 		PostgresDeploymentInputs, build_postgres_deployment_with,
 	};
 
-	let read_only = matches!(cfg.intent, "verify" | "analytics");
+	let read_only = true;
 
-	// Intent-driven default resources. Analytics replicas serve queries so
-	// they need more headroom than a verify-only pod that just runs once
-	// and gets torn down. Disaster-recovery mirrors analytics for now.
 	let (cpu_req, mem_req, cpu_lim, mem_lim, shm) = match cfg.intent {
-		"verify" => ("250m", "512Mi", "2", "2Gi", "512Mi"),
-		"analytics" | "disaster-recovery" => ("500m", "2Gi", "4", "8Gi", "2Gi"),
+		"analytics" => ("500m", "2Gi", "4", "8Gi", "2Gi"),
 		_ => ("250m", "512Mi", "2", "2Gi", "512Mi"),
 	};
 	let (shm_size, shared_buffers_mb) =
