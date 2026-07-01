@@ -1,10 +1,9 @@
-# pgro.bes.au — PostgreSQL Restore Operator
+# pgro — PostgreSQL Restore Operator
 
 Monitors a Kopia backup repository for "physical" backups of PostgreSQL databases and restores them regularly within a Kubernetes cluster.
 
 > [!WARNING]
-> This is an internal project of BES.au, used in our data and analytics infrastructure, as well as for backup operations and testing purposes.
-> As such no guarantees are made about stability beyond our internals.
+> This is an internal project of BES International, used in our data and analytics infrastructure, as well as for backup operations and testing purposes, and not supported outside that.
 
 ## Install
 
