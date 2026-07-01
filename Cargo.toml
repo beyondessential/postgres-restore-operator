@@ -21,7 +21,7 @@ kube_quantity = "0.9.0"
 mimalloc = { version = "0.1", default-features = false }
 prometheus = "0.14.0"
 rand = "0.10.1"
-reqwest = { version = "0.13.4", features = ["json"] }
+reqwest = { version = "0.13.4", features = ["json", "socks"] }
 rust_decimal = "1.42.0"
 schemars = { version = "1.2.1", features = ["jiff02"] }
 serde = { version = "1.0.228", features = ["derive"] }
