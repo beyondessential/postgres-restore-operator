@@ -135,7 +135,7 @@ jobs:
             type=semver,value=v${{ steps.version.outputs.version }},pattern={{major}}.{{minor}}
             type=semver,value=v${{ steps.version.outputs.version }},pattern={{major}}
           labels: |
-            org.opencontainers.image.vendor=BES
+            org.opencontainers.image.vendor=BES International
             org.opencontainers.image.title=Postgres Restore Operator
             org.opencontainers.image.url=https://github.com/beyondessential/postgres-restore-operator/
             org.opencontainers.image.source=https://github.com/beyondessential/postgres-restore-operator/
