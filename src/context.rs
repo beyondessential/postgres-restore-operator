@@ -11,7 +11,12 @@ use crate::{controllers::jobs::CallbackStore, metrics::Metrics};
 
 pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 pub const DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS: u64 = 30 * 60;
-pub const DEFAULT_CANOPY_PROXY_IMAGE: &str = "ghcr.io/beyondessential/pgro-canopy-proxy:latest";
+/// The canopy-proxy sidecar binary ships in the same image as the operator
+/// (Containerfile copies both binaries). By default, use the same image tag;
+/// operators can override with `CANOPY_PROXY_IMAGE` if they want to pin the
+/// sidecar to a different tag from the operator itself.
+pub const DEFAULT_CANOPY_PROXY_IMAGE: &str =
+	"ghcr.io/beyondessential/postgres-restore-operator:latest";
 pub const DEFAULT_CANOPY_PGDATA_PVC_SIZE: &str = "20Gi";
 
 pub struct Context {

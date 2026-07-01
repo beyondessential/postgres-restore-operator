@@ -71,7 +71,9 @@ jobs:
           key: ${{ matrix.arch }}-release
 
       - name: Build binaries
-        run: cargo build --locked --target ${{ matrix.target }} --release --bin operator
+        run: |
+          cargo build --locked --target ${{ matrix.target }} --release \
+            --bin operator --bin canopy-proxy
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
 
@@ -79,6 +81,7 @@ jobs:
         run: |
           mkdir -p artifacts/${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/operator artifacts/${{ matrix.arch }}/
+          cp target/${{ matrix.target }}/release/canopy-proxy artifacts/${{ matrix.arch }}/
 
       - uses: actions/upload-artifact@v7
         with:

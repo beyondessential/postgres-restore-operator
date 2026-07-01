@@ -208,6 +208,9 @@ pub fn build_canopy_restore_job(cfg: &CanopyRestoreJobConfig<'_>) -> Job {
 	let sidecar_container = Container {
 		name: "canopy-proxy".into(),
 		image: Some(cfg.canopy_proxy_image.into()),
+		// Override the image's default ENTRYPOINT (`operator`) — same image
+		// ships both binaries; the sidecar container runs `canopy-proxy`.
+		command: Some(vec!["canopy-proxy".into()]),
 		env: Some(vec![
 			EnvVar {
 				name: "PGRO_BROKER_URL".into(),
