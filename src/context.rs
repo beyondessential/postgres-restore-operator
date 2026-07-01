@@ -11,6 +11,8 @@ use crate::{controllers::jobs::CallbackStore, metrics::Metrics};
 
 pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 pub const DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS: u64 = 30 * 60;
+pub const DEFAULT_CANOPY_PROXY_IMAGE: &str = "ghcr.io/beyondessential/pgro-canopy-proxy:latest";
+pub const DEFAULT_CANOPY_PGDATA_PVC_SIZE: &str = "20Gi";
 
 pub struct Context {
 	pub client: Client,
@@ -25,6 +27,16 @@ pub struct Context {
 	/// legacy-only mode (no canopy config provided). Populated at startup
 	/// by [`crate::canopy::Client::from_config`].
 	pub canopy: Option<Arc<crate::canopy::Client>>,
+	/// Base URL the canopy-path proxy sidecar hits for STS creds, e.g.
+	/// `http://postgres-restore-operator.pgro-system.svc:9091`. Empty when
+	/// canopy is not configured.
+	pub canopy_broker_base_url: String,
+	/// Image reference for the pgro-canopy-proxy sidecar container. Set
+	/// by the operator startup from `CANOPY_PROXY_IMAGE`.
+	pub canopy_proxy_image: String,
+	/// Default pgdata PVC size used when the operator provisions a
+	/// canopy-backed replica (per intent).
+	pub canopy_pgdata_pvc_size: String,
 	/// In-memory store for snapshot-list results POSTed by jobs.
 	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for schema migration results POSTed by jobs.
@@ -65,6 +77,9 @@ impl Context {
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
 			canopy: None,
+			canopy_broker_base_url: String::new(),
+			canopy_proxy_image: DEFAULT_CANOPY_PROXY_IMAGE.to_string(),
+			canopy_pgdata_pvc_size: DEFAULT_CANOPY_PGDATA_PVC_SIZE.to_string(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
 			callback_base_url,

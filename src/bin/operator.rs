@@ -21,7 +21,10 @@ use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
 	canopy::{self, DEFAULT_SOCKS5_PROXY},
-	context::{Context, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS, DEFAULT_KOPIA_IMAGE},
+	context::{
+		Context, DEFAULT_CANOPY_PGDATA_PVC_SIZE, DEFAULT_CANOPY_PROXY_IMAGE,
+		DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS, DEFAULT_KOPIA_IMAGE,
+	},
 	controllers,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
@@ -213,6 +216,25 @@ async fn main() -> anyhow::Result<()> {
 			warn!(error = %err, "canopy client not configured; running in legacy-only mode");
 			None
 		});
+	ctx.canopy_proxy_image = std::env::var("CANOPY_PROXY_IMAGE")
+		.unwrap_or_else(|_| DEFAULT_CANOPY_PROXY_IMAGE.to_string());
+	ctx.canopy_pgdata_pvc_size = std::env::var("CANOPY_PGDATA_PVC_SIZE")
+		.unwrap_or_else(|_| DEFAULT_CANOPY_PGDATA_PVC_SIZE.to_string());
+	ctx.canopy_broker_base_url = if let Ok(url) = std::env::var("CANOPY_BROKER_BASE_URL") {
+		url
+	} else if let Ok(svc) = std::env::var("OPERATOR_SERVICE_NAME") {
+		// Broker listens on its own port; parse from PGRO_BROKER_LISTEN_ADDR
+		// (default [::]:9091).
+		let broker_addr = std::env::var("PGRO_BROKER_LISTEN_ADDR")
+			.unwrap_or_else(|_| DEFAULT_BROKER_ADDR.to_string());
+		let broker_port: u16 = broker_addr
+			.rsplit_once(':')
+			.and_then(|(_, p)| p.parse().ok())
+			.unwrap_or(9091);
+		format!("http://{svc}.{namespace}.svc:{broker_port}")
+	} else {
+		String::new()
+	};
 	let ctx = Arc::new(ctx);
 
 	// Heartbeat: a background task updates this timestamp every 5s.

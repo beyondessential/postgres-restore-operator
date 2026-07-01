@@ -36,6 +36,12 @@ use uuid::Uuid;
 
 use crate::{context::Context, error::Result};
 
+mod builders;
+pub use builders::{
+	CanopyRestoreJobConfig, KOPIA_JOB_NAME, PGDATA_PVC_NAME, PROXY_SIDECAR_POD_LABEL,
+	build_canopy_restore_job, build_pgdata_pvc,
+};
+
 /// How many per-entry reconciliations run concurrently within one tick.
 /// Keeps the k8s apiserver from being hit by a stampede when the worklist
 /// is large.
@@ -429,9 +435,88 @@ async fn provision(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Resul
 		..Default::default()
 	};
 
-	let api: Api<Namespace> = Api::all(ctx.client.clone());
-	api.create(&PostParams::default(), &ns).await?;
+	let ns_api: Api<Namespace> = Api::all(ctx.client.clone());
+	match ns_api.create(&PostParams::default(), &ns).await {
+		Ok(_) => info!(namespace = %ns_name, "canopy: created replica namespace"),
+		Err(kube::Error::Api(err)) if err.code == 409 => {
+			debug!(namespace = %ns_name, "canopy: namespace already exists");
+		}
+		Err(err) => return Err(err.into()),
+	}
+
+	// If canopy hasn't yet issued a snapshot for this (server, type) the
+	// entry has no snapshot_id — nothing to restore this tick. The next
+	// worklist tick will re-check.
+	let Some(snapshot_id) = entry.snapshot_id.as_deref() else {
+		info!(namespace = %ns_name, "canopy: entry has no snapshot yet, waiting");
+		return Ok(());
+	};
+
+	// The repo password comes from canopy's restore-credentials response
+	// (bundled with the STS creds). Fetch it once here; the proxy sidecar
+	// fetches STS creds itself on each refresh via the broker.
+	let Some(canopy) = ctx.canopy.as_ref() else {
+		return Ok(());
+	};
+	let creds = canopy
+		.restore_credentials(&entry.r#type.to_string(), entry.group_id)
+		.await?;
+
+	spawn_pvc_and_job(ctx, ns_name, entry, snapshot_id, &creds.repo_password.0).await?;
 	Ok(())
+}
+
+async fn spawn_pvc_and_job(
+	ctx: &Context,
+	ns_name: &str,
+	entry: &WorklistEntry,
+	snapshot_id: &str,
+	repo_password: &str,
+) -> Result<()> {
+	let pvc = builders::build_pgdata_pvc(ns_name, &ctx.canopy_pgdata_pvc_size);
+	let pvc_api: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
+		Api::namespaced(ctx.client.clone(), ns_name);
+	match pvc_api.create(&PostParams::default(), &pvc).await {
+		Ok(_) => {}
+		Err(kube::Error::Api(err)) if err.code == 409 => {}
+		Err(err) => return Err(err.into()),
+	}
+
+	let job_name = format!("restore-{}", short_id(snapshot_id));
+	let cfg = builders::CanopyRestoreJobConfig {
+		entry,
+		namespace: ns_name,
+		job_name: &job_name,
+		kopia_image: &ctx.kopia_image(),
+		canopy_proxy_image: &ctx.canopy_proxy_image,
+		broker_base_url: &ctx.canopy_broker_base_url,
+		snapshot_id,
+		repo_password,
+		pgdata_pvc_size: &ctx.canopy_pgdata_pvc_size,
+	};
+	let job = builders::build_canopy_restore_job(&cfg);
+	let job_api: Api<k8s_openapi::api::batch::v1::Job> =
+		Api::namespaced(ctx.client.clone(), ns_name);
+	match job_api.create(&PostParams::default(), &job).await {
+		Ok(_) => {
+			info!(namespace = %ns_name, job = %job_name, "canopy: created restore Job");
+		}
+		Err(kube::Error::Api(err)) if err.code == 409 => {
+			debug!(namespace = %ns_name, job = %job_name, "canopy: restore Job already exists");
+		}
+		Err(err) => return Err(err.into()),
+	}
+	Ok(())
+}
+
+/// First 8 chars of a snapshot id, DNS-safe. Used as a Job name suffix so
+/// the Job for the current desired snapshot is stably named.
+fn short_id(s: &str) -> String {
+	s.chars()
+		.filter(|c| c.is_ascii_alphanumeric())
+		.take(8)
+		.collect::<String>()
+		.to_ascii_lowercase()
 }
 
 /// Placeholder — refresh flow lands in the follow-up commit alongside the
