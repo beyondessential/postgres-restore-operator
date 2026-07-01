@@ -22,8 +22,8 @@ use tracing::{debug, info, warn};
 use postgres_restore_operator::{
 	canopy::{self, DEFAULT_SOCKS5_PROXY},
 	context::{
-		Context, DEFAULT_CANOPY_PGDATA_PVC_SIZE, DEFAULT_CANOPY_PROXY_IMAGE,
-		DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS, DEFAULT_KOPIA_IMAGE,
+		Context, DEFAULT_CANOPY_PROXY_IMAGE, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
+		DEFAULT_KOPIA_IMAGE,
 	},
 	controllers::{self, canopy::intent::SUPPORTED as PGRO_SUPPORTED_INTENTS},
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
@@ -214,8 +214,6 @@ async fn main() -> anyhow::Result<()> {
 		});
 	ctx.canopy_proxy_image = std::env::var("CANOPY_PROXY_IMAGE")
 		.unwrap_or_else(|_| DEFAULT_CANOPY_PROXY_IMAGE.to_string());
-	ctx.canopy_pgdata_pvc_size = std::env::var("CANOPY_PGDATA_PVC_SIZE")
-		.unwrap_or_else(|_| DEFAULT_CANOPY_PGDATA_PVC_SIZE.to_string());
 	ctx.canopy_broker_base_url = if let Ok(url) = std::env::var("CANOPY_BROKER_BASE_URL") {
 		url
 	} else if let Ok(svc) = std::env::var("OPERATOR_SERVICE_NAME") {
@@ -558,8 +556,8 @@ async fn post_cache_pressure(
 }
 
 /// Accept the canopy-proxy sidecar's final TrafficStats POST on shutdown.
-/// The body is opaque JSON — the reporter deserializes it when building
-/// the RestoreVerification.
+/// The body is opaque JSON — the canopy notification target deserializes
+/// it when building the RestoreVerification.
 async fn post_canopy_stats(
 	State(state): State<ServerState>,
 	Path((namespace, job)): Path<(String, String)>,

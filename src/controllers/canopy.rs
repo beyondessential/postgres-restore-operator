@@ -1,20 +1,18 @@
 //! Canopy worklist syncer — pgro's third top-level controller.
 //!
 //! Ticks periodically (default 30s, jittered ±20%), fetches
-//! `GET /restore-worklist`, discovers the pgro-managed Namespaces already
-//! in the cluster, and reconciles the diff by provisioning / refreshing /
-//! tearing down per-replica Namespaces. Unlike the `replica` and `restore`
-//! controllers this one is **not** CRD-watched: cluster state (labelled
-//! Namespaces + annotations) is the runtime model, canopy's worklist is
-//! the spec, and there is no intermediate CR.
+//! `GET /restore-worklist`, and reconciles the diff into pgro's own
+//! `PostgresPhysicalReplica` CRs. Each entry lives in its own labelled
+//! Namespace and carries a canopy-creds Secret + a
+//! `PostgresPhysicalReplica` CR with `spec.canopySource` set. The replica
+//! and restore controllers pick up from there.
 //!
-//! Actual Job creation for the restore itself is delegated to the Job
-//! builder (see step 7 in the integration spec); this module only writes
-//! Namespaces and their labels/annotations, leaving `restore-state`
-//! transitions for the follow-up commits.
+//! This module owns the "canopy is desired-state, pgro reconciles" edge
+//! only. Everything downstream — Job creation, Deployment, verification —
+//! goes through the same CR machinery as legacy replicas.
 
 use std::{
-	collections::{HashMap, HashSet},
+	collections::{BTreeMap, HashSet},
 	sync::Arc,
 	time::Duration,
 };
@@ -22,29 +20,27 @@ use std::{
 use bestool_canopy::WorklistEntry;
 use futures::stream::{self, StreamExt};
 use k8s_openapi::{
-	api::core::v1::Namespace,
+	ByteString,
+	api::core::v1::{Namespace, Secret},
 	apimachinery::pkg::apis::meta::v1::{ObjectMeta, Time},
 };
 use kube::{
 	Api, ResourceExt,
-	api::{DeleteParams, ListParams, PostParams},
+	api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 use rand::RngExt;
 use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::{context::Context, error::Result};
-
-mod builders;
-pub mod intent;
-mod reporter;
-pub use builders::{
-	CanopyRestoreJobConfig, KOPIA_JOB_NAME, PGDATA_PVC_NAME, POSTGRES_DEPLOYMENT_NAME,
-	POSTGRES_SERVICE_NAME, PROXY_SIDECAR_POD_LABEL, PostgresDeploymentConfig,
-	build_canopy_postgres_deployment, build_canopy_postgres_service, build_canopy_restore_job,
-	build_pgdata_pvc,
+use crate::{
+	context::Context,
+	controllers::canopy::intent::{IntentConfig, config_for},
+	error::Result,
+	types::{PostgresPhysicalReplica, PostgresPhysicalReplicaSpec},
 };
+
+pub mod intent;
 
 /// How many per-entry reconciliations run concurrently within one tick.
 /// Keeps the k8s apiserver from being hit by a stampede when the worklist
@@ -54,13 +50,7 @@ const RECONCILE_CONCURRENCY: usize = 8;
 /// Jitter multiplier applied to the reconcile interval each tick (±20%).
 const JITTER_RATIO: f64 = 0.2;
 
-/// Labels applied to canopy-managed Namespaces.
-///
-/// Labels are the discovery key: `LIST Namespaces
-/// label=pgro.bes.au/managed-by=pgro-canopy` returns every canopy-backed
-/// replica in one call. They also carry the immutable identity of the
-/// replica (declaration id, group, server, type, intent) — mutable
-/// runtime state lives in [`annotations`].
+/// Labels applied to canopy-managed Namespaces and CRs.
 pub mod labels {
 	pub const MANAGED_BY: &str = "pgro.bes.au/managed-by";
 	pub const MANAGED_BY_VALUE: &str = "pgro-canopy";
@@ -71,65 +61,9 @@ pub mod labels {
 	pub const INTENT: &str = "pgro.bes.au/intent";
 }
 
-/// Annotations on canopy-managed Namespaces — mutable per-replica state.
-pub mod annotations {
-	/// The snapshot canopy wants restored. Populated on every successful
-	/// worklist sync; compared against `LAST_RESTORED_SNAPSHOT_ID` to
-	/// detect the "newer snapshot available" refresh trigger.
-	pub const DESIRED_SNAPSHOT_ID: &str = "pgro.bes.au/desired-snapshot-id";
-	pub const DESIRED_SNAPSHOT_AT: &str = "pgro.bes.au/desired-snapshot-at";
-	pub const LAST_RESTORED_SNAPSHOT_ID: &str = "pgro.bes.au/last-restored-snapshot-id";
-	pub const LAST_RESTORED_AT: &str = "pgro.bes.au/last-restored-at";
-	pub const RESTORE_STATE: &str = "pgro.bes.au/restore-state";
-	pub const LAST_VERIFICATION_REPORTED_AT: &str = "pgro.bes.au/last-verification-reported-at";
-	pub const LAST_VERIFICATION_ERROR: &str = "pgro.bes.au/last-verification-error";
-	/// Operator escape hatch: setting this annotation to any value triggers
-	/// a refresh on the next tick and is cleared once the refresh Job is
-	/// spawned.
-	pub const FORCE_REFRESH: &str = "pgro.bes.au/force-refresh";
-}
-
-/// Values for the `RESTORE_STATE` annotation.
-pub mod restore_state {
-	pub const PENDING: &str = "pending";
-	pub const RESTORING: &str = "restoring";
-	pub const ACTIVE: &str = "active";
-	pub const FAILED: &str = "failed";
-	pub const TERMINATING: &str = "terminating";
-}
-
-/// The reconciliation decision for one (worklist entry, current namespace) pair.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Action {
-	/// Worklist has an entry, no matching namespace exists — create one.
-	Provision,
-	/// Both present, refresh needed for the given reason.
-	Refresh(RefreshReason),
-	/// Namespace exists but worklist has no entry — tear down.
-	Teardown,
-	/// Both present, in sync, healthy — nothing to do this tick.
-	NoOp,
-}
-
-#[derive(Debug, PartialEq, Eq)]
-pub enum RefreshReason {
-	/// Canopy is offering a snapshot newer than what we last restored.
-	NewerSnapshot,
-	/// `last-restored-at` exceeded the declaration's `freshness_seconds`.
-	FreshnessExpired,
-	/// Operator set the `force-refresh` annotation.
-	Forced,
-}
-
 /// Compute the k8s Namespace name for a worklist entry.
 ///
 /// Format: `<slug(entry.name)>-<8-hex(SHA-256(replica_id || server_id))>`.
-///
-/// The slug is derived from the operator-set declaration name in canopy so
-/// namespaces are human-recognisable; the 8-hex disambiguator covers the
-/// case where a group-wide declaration (`server_id=NULL` in canopy)
-/// expands to one worklist entry per live server in the group — all
-/// carrying the same `replica_id` and `name`, only `server_id` differs.
 pub fn namespace_name_for(entry: &WorklistEntry) -> String {
 	format!(
 		"{}-{}",
@@ -179,8 +113,7 @@ fn slug(s: &str) -> String {
 }
 
 /// Apply ±20% jitter to a Duration. Scopes the (non-Send) thread rng so the
-/// caller can `.await` after receiving the result — `run_forever` needs
-/// this since ThreadRng can't be held across an `await`.
+/// caller can `.await` after receiving the result.
 fn jittered(base: Duration) -> Duration {
 	let mut rng = rand::rng();
 	let jitter = rng.random_range(-JITTER_RATIO..JITTER_RATIO);
@@ -188,10 +121,6 @@ fn jittered(base: Duration) -> Duration {
 }
 
 /// 8-hex-char disambiguator from SHA-256 of `replica_id || server_id`.
-///
-/// Not cryptographic — just a stable, DNS-safe way to keep namespaces
-/// for different (replica, server) pairs from colliding when they share
-/// a `name` (group-wide declaration expanded across servers).
 fn short_hash(replica_id: Uuid, server_id: Uuid) -> String {
 	let mut hasher = Sha256::new();
 	hasher.update(replica_id.as_bytes());
@@ -204,92 +133,9 @@ fn short_hash(replica_id: Uuid, server_id: Uuid) -> String {
 	out
 }
 
-/// Diff the worklist against the discovered Namespaces and produce one
-/// [`Action`] per (namespace, entry) pair. Entries and namespaces are
-/// matched by `pgro.bes.au/declaration-id` label / `WorklistEntry.replica_id`;
-/// unmatched entries produce a `Provision`, unmatched namespaces produce a
-/// `Teardown`. Refresh vs NoOp decisions live in `evaluate_existing`.
-///
-/// Pure function; testable without a cluster.
-pub fn diff(entries: &[WorklistEntry], namespaces: &[Namespace]) -> Vec<(String, Action)> {
-	let mut by_replica: HashMap<Uuid, Vec<Namespace>> = HashMap::new();
-	for ns in namespaces {
-		if let Some(replica) = ns
-			.labels()
-			.get(labels::DECLARATION_ID)
-			.and_then(|s| Uuid::parse_str(s).ok())
-		{
-			by_replica.entry(replica).or_default().push(ns.clone());
-		}
-	}
-
-	let mut seen_replicas: HashSet<Uuid> = HashSet::new();
-	let mut actions = Vec::new();
-
-	for entry in entries {
-		let target_name = namespace_name_for(entry);
-		let matched = by_replica
-			.get(&entry.replica_id)
-			.and_then(|nss| nss.iter().find(|ns| ns.name_any() == target_name).cloned());
-		match matched {
-			Some(existing) => {
-				let action = evaluate_existing(entry, &existing);
-				actions.push((target_name, action));
-			}
-			None => actions.push((target_name, Action::Provision)),
-		}
-		seen_replicas.insert(entry.replica_id);
-	}
-
-	// Namespaces with no matching worklist entry → teardown. Match by the
-	// full derived name so a namespace lingering after a declaration was
-	// deleted and re-created with the same id but a different server won't
-	// be reused mid-flight.
-	for ns in namespaces {
-		let name = ns.name_any();
-		let already = actions.iter().any(|(n, _)| n == &name);
-		if !already {
-			actions.push((name, Action::Teardown));
-		}
-	}
-
-	actions
-}
-
-/// Refresh decision for an existing namespace vs its worklist entry. Pure.
-fn evaluate_existing(entry: &WorklistEntry, ns: &Namespace) -> Action {
-	let annos = ns.annotations();
-	if annos.get(annotations::FORCE_REFRESH).is_some() {
-		return Action::Refresh(RefreshReason::Forced);
-	}
-	let last_restored = annos.get(annotations::LAST_RESTORED_SNAPSHOT_ID);
-	if let (Some(desired), Some(last)) = (entry.snapshot_id.as_ref(), last_restored)
-		&& desired != last
-	{
-		return Action::Refresh(RefreshReason::NewerSnapshot);
-	}
-	if entry.snapshot_id.is_some() && last_restored.is_none() {
-		// Namespace exists but never completed a restore — treat as still
-		// in the initial provisioning attempt. The provision path will
-		// re-observe the Job on the next tick.
-		return Action::NoOp;
-	}
-	if let (Some(fresh_secs), Some(last_at_str)) = (
-		entry.freshness_seconds,
-		annos.get(annotations::LAST_RESTORED_AT),
-	) && fresh_secs > 0
-		&& let Ok(last_at) = last_at_str.parse::<jiff::Timestamp>()
-	{
-		let elapsed_secs = jiff::Timestamp::now()
-			.duration_since(last_at)
-			.as_secs()
-			.max(0);
-		if (elapsed_secs as u64) > (fresh_secs as u64) {
-			return Action::Refresh(RefreshReason::FreshnessExpired);
-		}
-	}
-	Action::NoOp
-}
+/// Name of the canopy-owned CR inside each per-replica Namespace. Fixed —
+/// each namespace holds exactly one canopy-managed CR.
+pub const CR_NAME: &str = "canopy-replica";
 
 /// The syncer controller. Holds a shared `Context`; runs a periodic tick
 /// via [`Self::run_forever`], or one-shot via [`Self::tick`] for tests.
@@ -318,8 +164,9 @@ impl CanopyController {
 		}
 	}
 
-	/// One reconciliation pass. Fetches the worklist, lists namespaces,
-	/// dispatches per-entry actions concurrently.
+	/// One reconciliation pass. Fetches the worklist, lists managed
+	/// Namespaces, provisions CRs where missing / patches desired-snapshot
+	/// where changed / tears down orphans.
 	pub async fn tick(&self) -> Result<()> {
 		let Some(canopy) = self.ctx.canopy.as_ref() else {
 			return Ok(());
@@ -335,86 +182,95 @@ impl CanopyController {
 		));
 		let namespaces = ns_api.list(&params).await?.items;
 
-		let actions = diff(&entries, &namespaces);
+		let entry_ns_names: HashSet<String> = entries.iter().map(namespace_name_for).collect();
+
 		info!(
 			worklist_entries = entries.len(),
 			existing_namespaces = namespaces.len(),
-			actions = actions.len(),
 			"canopy worklist syncer tick"
 		);
 
-		let entries_by_replica: HashMap<Uuid, &WorklistEntry> =
-			entries.iter().map(|e| (e.replica_id, e)).collect();
-		let ns_by_name: HashMap<String, &Namespace> =
-			namespaces.iter().map(|n| (n.name_any(), n)).collect();
-
+		// Provision / refresh each entry concurrently.
 		let ctx = self.ctx.clone();
-		stream::iter(actions)
-			.for_each_concurrent(RECONCILE_CONCURRENCY, |(ns_name, action)| {
+		stream::iter(entries)
+			.for_each_concurrent(RECONCILE_CONCURRENCY, |entry| {
 				let ctx = ctx.clone();
-				let entry = entries_by_replica
-					.iter()
-					.find_map(|(_, e)| {
-						if namespace_name_for(e) == ns_name {
-							Some(*e)
-						} else {
-							None
-						}
-					})
-					.cloned();
-				let existing = ns_by_name.get(&ns_name).map(|n| (*n).clone());
 				async move {
-					if let Err(err) = dispatch(&ctx, &ns_name, action, entry, existing).await {
+					let ns_name = namespace_name_for(&entry);
+					if let Err(err) = reconcile_entry(&ctx, &ns_name, &entry).await {
 						warn!(
 							namespace = %ns_name,
+							replica_id = %entry.replica_id,
 							error = %err,
-							"canopy per-namespace reconciliation failed"
+							"canopy reconcile_entry failed"
 						);
 					}
 				}
 			})
 			.await;
 
-		// Re-list namespaces so the reporter observes any state we just
-		// wrote. Cheap — one apiserver call for the pgro-canopy label.
-		let namespaces = ns_api.list(&params).await?.items;
-		reporter::observe_and_report(&self.ctx, &namespaces).await;
+		// Teardown namespaces with no matching worklist entry.
+		let orphans: Vec<Namespace> = namespaces
+			.into_iter()
+			.filter(|ns| !entry_ns_names.contains(&ns.name_any()))
+			.collect();
+		let ctx = self.ctx.clone();
+		stream::iter(orphans)
+			.for_each_concurrent(RECONCILE_CONCURRENCY, |ns| {
+				let ctx = ctx.clone();
+				async move {
+					let ns_name = ns.name_any();
+					if let Err(err) = teardown(&ctx, &ns_name).await {
+						warn!(
+							namespace = %ns_name,
+							error = %err,
+							"canopy teardown failed"
+						);
+					}
+				}
+			})
+			.await;
 
 		Ok(())
 	}
 }
 
-async fn dispatch(
-	ctx: &Context,
-	ns_name: &str,
-	action: Action,
-	entry: Option<WorklistEntry>,
-	existing: Option<Namespace>,
-) -> Result<()> {
-	match action {
-		Action::Provision => {
-			let Some(entry) = entry else {
-				return Ok(()); // shouldn't happen; diff produces Provision only with an entry
-			};
-			provision(ctx, ns_name, &entry).await
-		}
-		Action::Refresh(reason) => {
-			let Some(entry) = entry else { return Ok(()) };
-			refresh(ctx, ns_name, &entry, reason, existing).await
-		}
-		Action::Teardown => teardown(ctx, ns_name, existing).await,
-		Action::NoOp => Ok(()),
-	}
+/// Ensure the namespace, canopy-creds Secret, and PostgresPhysicalReplica
+/// CR exist and reflect the worklist entry. Patches
+/// `status.canopyDesiredSnapshotId` when canopy is offering a snapshot the
+/// CR hasn't seen yet.
+async fn reconcile_entry(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Result<()> {
+	let Some(intent) = config_for(&entry.intent) else {
+		warn!(
+			namespace = %ns_name,
+			intent = %entry.intent,
+			"worklist entry has unsupported intent — skipping"
+		);
+		return Ok(());
+	};
+
+	ensure_namespace(ctx, ns_name, entry).await?;
+
+	// Fetch the repo password (canopy's restore-credentials endpoint carries
+	// it alongside chained STS creds; the sidecar refreshes the STS half
+	// out-of-band). Bucket/region/prefix come from the worklist entry
+	// directly.
+	let Some(canopy) = ctx.canopy.as_ref() else {
+		return Ok(());
+	};
+	let creds = canopy
+		.restore_credentials(&entry.r#type.to_string(), entry.group_id)
+		.await?;
+
+	ensure_canopy_creds_secret(ctx, ns_name, entry, &creds.repo_password.0).await?;
+	ensure_replica_cr(ctx, ns_name, entry, &intent).await?;
+	set_desired_snapshot(ctx, ns_name, entry).await?;
+
+	Ok(())
 }
 
-/// Create the Namespace for a new worklist entry with immutable labels + the
-/// initial mutable annotations. Follow-up commits wire up the PVC / Deployment /
-/// restore Job (step 7 in the integration spec); this tick just records the
-/// intent by creating the Namespace and marking `restore-state=pending`.
-async fn provision(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Result<()> {
-	info!(namespace = %ns_name, replica_id = %entry.replica_id, "canopy: provisioning replica namespace");
-
-	let mut labels_map = std::collections::BTreeMap::new();
+async fn ensure_namespace(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Result<()> {
+	let mut labels_map = BTreeMap::new();
 	labels_map.insert(labels::MANAGED_BY.into(), labels::MANAGED_BY_VALUE.into());
 	labels_map.insert(labels::DECLARATION_ID.into(), entry.replica_id.to_string());
 	labels_map.insert(labels::GROUP.into(), entry.group_id.to_string());
@@ -422,23 +278,10 @@ async fn provision(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Resul
 	labels_map.insert(labels::TYPE.into(), entry.r#type.to_string());
 	labels_map.insert(labels::INTENT.into(), entry.intent.to_string());
 
-	let mut annos = std::collections::BTreeMap::new();
-	annos.insert(
-		annotations::RESTORE_STATE.into(),
-		restore_state::PENDING.into(),
-	);
-	if let Some(sid) = &entry.snapshot_id {
-		annos.insert(annotations::DESIRED_SNAPSHOT_ID.into(), sid.clone());
-	}
-	if let Some(sat) = &entry.snapshot_at {
-		annos.insert(annotations::DESIRED_SNAPSHOT_AT.into(), sat.clone());
-	}
-
 	let ns = Namespace {
 		metadata: ObjectMeta {
 			name: Some(ns_name.to_string()),
 			labels: Some(labels_map),
-			annotations: Some(annos),
 			..Default::default()
 		},
 		..Default::default()
@@ -452,110 +295,163 @@ async fn provision(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Resul
 		}
 		Err(err) => return Err(err.into()),
 	}
-
-	// If canopy hasn't yet issued a snapshot for this (server, type) the
-	// entry has no snapshot_id — nothing to restore this tick. The next
-	// worklist tick will re-check.
-	let Some(snapshot_id) = entry.snapshot_id.as_deref() else {
-		info!(namespace = %ns_name, "canopy: entry has no snapshot yet, waiting");
-		return Ok(());
-	};
-
-	// The repo password comes from canopy's restore-credentials response
-	// (bundled with the STS creds). Fetch it once here; the proxy sidecar
-	// fetches STS creds itself on each refresh via the broker.
-	let Some(canopy) = ctx.canopy.as_ref() else {
-		return Ok(());
-	};
-	let creds = canopy
-		.restore_credentials(&entry.r#type.to_string(), entry.group_id)
-		.await?;
-
-	spawn_pvc_and_job(ctx, ns_name, entry, snapshot_id, &creds.repo_password.0).await?;
 	Ok(())
 }
 
-async fn spawn_pvc_and_job(
+/// Materialise the canopy-creds Secret with the entry's bucket / region /
+/// prefix / repo password + dummy AWS keys. Kopia reads these via
+/// `env_from_secret` in the restore Job; the proxy sidecar overrides the
+/// AWS auth by re-signing upstream with real (refreshed) STS creds.
+async fn ensure_canopy_creds_secret(
 	ctx: &Context,
 	ns_name: &str,
 	entry: &WorklistEntry,
-	snapshot_id: &str,
 	repo_password: &str,
 ) -> Result<()> {
-	let pvc = builders::build_pgdata_pvc(ns_name, &ctx.canopy_pgdata_pvc_size);
-	let pvc_api: Api<k8s_openapi::api::core::v1::PersistentVolumeClaim> =
-		Api::namespaced(ctx.client.clone(), ns_name);
-	match pvc_api.create(&PostParams::default(), &pvc).await {
-		Ok(_) => {}
-		Err(kube::Error::Api(err)) if err.code == 409 => {}
-		Err(err) => return Err(err.into()),
-	}
+	let secret_name = IntentConfig::canopy_creds_secret_name(CR_NAME);
 
-	let job_name = format!("restore-{}", short_id(snapshot_id));
-	let stats_callback_url = ctx.canopy_stats_callback_url(ns_name, &job_name);
-	let cfg = builders::CanopyRestoreJobConfig {
-		entry,
-		namespace: ns_name,
-		job_name: &job_name,
-		kopia_image: &ctx.kopia_image(),
-		canopy_proxy_image: &ctx.canopy_proxy_image,
-		broker_base_url: &ctx.canopy_broker_base_url,
-		stats_callback_url: &stats_callback_url,
-		snapshot_id,
-		repo_password,
-		pgdata_pvc_size: &ctx.canopy_pgdata_pvc_size,
+	let mut data: BTreeMap<String, ByteString> = BTreeMap::new();
+	data.insert(
+		"bucket".into(),
+		ByteString(entry.bucket.clone().into_bytes()),
+	);
+	data.insert(
+		"region".into(),
+		ByteString(entry.region.clone().into_bytes()),
+	);
+	data.insert(
+		"prefix".into(),
+		ByteString(entry.prefix.clone().into_bytes()),
+	);
+	data.insert(
+		"repositoryPassword".into(),
+		ByteString(repo_password.as_bytes().to_vec()),
+	);
+	// Dummy AWS keys — kopia carries these to satisfy its s3 backend arg
+	// validation, but every request is re-signed by the proxy sidecar
+	// before it hits real S3.
+	data.insert(
+		"accessKeyId".into(),
+		ByteString(b"PROXY_DUMMY_ACCESS_KEY".to_vec()),
+	);
+	data.insert(
+		"secretAccessKey".into(),
+		ByteString(b"PROXY_DUMMY_SECRET_KEY".to_vec()),
+	);
+
+	let secret = Secret {
+		metadata: ObjectMeta {
+			name: Some(secret_name.clone()),
+			namespace: Some(ns_name.to_string()),
+			labels: Some(BTreeMap::from([(
+				labels::MANAGED_BY.into(),
+				labels::MANAGED_BY_VALUE.into(),
+			)])),
+			..Default::default()
+		},
+		type_: Some("Opaque".into()),
+		data: Some(data),
+		..Default::default()
 	};
-	let job = builders::build_canopy_restore_job(&cfg);
-	let job_api: Api<k8s_openapi::api::batch::v1::Job> =
-		Api::namespaced(ctx.client.clone(), ns_name);
-	match job_api.create(&PostParams::default(), &job).await {
-		Ok(_) => {
-			info!(namespace = %ns_name, job = %job_name, "canopy: created restore Job");
-		}
-		Err(kube::Error::Api(err)) if err.code == 409 => {
-			debug!(namespace = %ns_name, job = %job_name, "canopy: restore Job already exists");
-		}
-		Err(err) => return Err(err.into()),
-	}
+
+	let api: Api<Secret> = Api::namespaced(ctx.client.clone(), ns_name);
+	let mut patch_value = serde_json::to_value(&secret)?;
+	patch_value["apiVersion"] = serde_json::json!("v1");
+	patch_value["kind"] = serde_json::json!("Secret");
+	api.patch(
+		&secret_name,
+		&PatchParams::apply("postgres-restore-operator").force(),
+		&Patch::Apply(&patch_value),
+	)
+	.await?;
 	Ok(())
 }
 
-/// First 8 chars of a snapshot id, DNS-safe. Used as a Job name suffix so
-/// the Job for the current desired snapshot is stably named.
-fn short_id(s: &str) -> String {
-	s.chars()
-		.filter(|c| c.is_ascii_alphanumeric())
-		.take(8)
-		.collect::<String>()
-		.to_ascii_lowercase()
-}
-
-/// Placeholder — refresh flow lands in the follow-up commit alongside the
-/// Job builder. For now, just log the reason and update the desired-snapshot
-/// annotation so the next tick can pick up if the entry keeps changing.
-async fn refresh(
+/// Create the PostgresPhysicalReplica CR if it doesn't exist, or re-apply
+/// its spec to self-heal drift (canopy-managed CRs aren't user-editable).
+async fn ensure_replica_cr(
 	ctx: &Context,
 	ns_name: &str,
 	entry: &WorklistEntry,
-	reason: RefreshReason,
-	_existing: Option<Namespace>,
+	intent: &IntentConfig,
 ) -> Result<()> {
-	info!(namespace = %ns_name, replica_id = %entry.replica_id, ?reason, "canopy: refresh needed (Job spawn not yet implemented)");
-	let _ = (ctx, ns_name, entry);
+	let spec = intent.to_replica_spec(entry, Vec::new());
+
+	let mut labels_map = BTreeMap::new();
+	labels_map.insert(labels::MANAGED_BY.into(), labels::MANAGED_BY_VALUE.into());
+	labels_map.insert(labels::DECLARATION_ID.into(), entry.replica_id.to_string());
+	labels_map.insert(labels::GROUP.into(), entry.group_id.to_string());
+	labels_map.insert(labels::SERVER.into(), entry.server_id.to_string());
+	labels_map.insert(labels::TYPE.into(), entry.r#type.to_string());
+	labels_map.insert(labels::INTENT.into(), entry.intent.to_string());
+
+	let cr = replica_cr(CR_NAME, ns_name, labels_map, spec);
+	let api: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), ns_name);
+	let mut patch_value = serde_json::to_value(&cr)?;
+	patch_value["apiVersion"] = serde_json::json!("pgro.bes.au/v1alpha1");
+	patch_value["kind"] = serde_json::json!("PostgresPhysicalReplica");
+	api.patch(
+		CR_NAME,
+		&PatchParams::apply("postgres-restore-operator").force(),
+		&Patch::Apply(&patch_value),
+	)
+	.await?;
 	Ok(())
 }
 
-/// Placeholder — teardown flow (drain, delete children, delete namespace)
-/// lands in a follow-up commit. For now, mark the namespace terminating so
-/// operators can see it via `kubectl` and delete the namespace directly.
-async fn teardown(ctx: &Context, ns_name: &str, existing: Option<Namespace>) -> Result<()> {
-	info!(namespace = %ns_name, "canopy: worklist no longer covers this namespace; tearing down");
-	if existing.is_none() {
+fn replica_cr(
+	name: &str,
+	namespace: &str,
+	labels: BTreeMap<String, String>,
+	spec: PostgresPhysicalReplicaSpec,
+) -> PostgresPhysicalReplica {
+	PostgresPhysicalReplica {
+		metadata: ObjectMeta {
+			name: Some(name.to_string()),
+			namespace: Some(namespace.to_string()),
+			labels: Some(labels),
+			..Default::default()
+		},
+		spec,
+		status: None,
+	}
+}
+
+async fn set_desired_snapshot(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -> Result<()> {
+	let Some(desired) = entry.snapshot_id.as_deref() else {
+		return Ok(());
+	};
+
+	let api: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), ns_name);
+	let cr = api.get(CR_NAME).await?;
+	let current = cr
+		.status
+		.as_ref()
+		.and_then(|s| s.canopy_desired_snapshot_id.as_deref());
+	if current == Some(desired) {
 		return Ok(());
 	}
+
+	let patch = serde_json::json!({
+		"status": { "canopyDesiredSnapshotId": desired }
+	});
+	api.patch_status(
+		CR_NAME,
+		&PatchParams::apply("postgres-restore-operator"),
+		&Patch::Merge(&patch),
+	)
+	.await?;
+	info!(
+		namespace = %ns_name,
+		snapshot = desired,
+		"canopy: updated canopyDesiredSnapshotId"
+	);
+	Ok(())
+}
+
+async fn teardown(ctx: &Context, ns_name: &str) -> Result<()> {
+	info!(namespace = %ns_name, "canopy: worklist no longer covers this namespace; tearing down");
 	let api: Api<Namespace> = Api::all(ctx.client.clone());
-	// Namespace deletion cascades to everything inside it; k8s handles the
-	// child cleanup.
 	match api.delete(ns_name, &DeleteParams::default()).await {
 		Ok(_) => Ok(()),
 		Err(kube::Error::Api(err)) if err.code == 404 => Ok(()),
@@ -563,8 +459,8 @@ async fn teardown(ctx: &Context, ns_name: &str, existing: Option<Namespace>) -> 
 	}
 }
 
-/// Now-timestamp helper for annotation values. Keeps RFC3339 stringification
-/// centralised so tests can rely on the format.
+/// Now-timestamp helper for annotation values. Kept as a public helper for
+/// integration tests that assert on RFC3339 format.
 pub fn now_rfc3339() -> String {
 	Time(jiff::Timestamp::now()).0.to_string()
 }
@@ -649,101 +545,5 @@ mod tests {
 		let e = entry(&"A".repeat(200), Uuid::nil(), Uuid::nil());
 		let name = namespace_name_for(&e);
 		assert!(name.len() <= 63, "got {} chars: {name}", name.len());
-	}
-
-	#[test]
-	fn diff_missing_namespace_is_provision() {
-		let e = entry("nauru", Uuid::new_v4(), Uuid::new_v4());
-		let actions = diff(std::slice::from_ref(&e), &[]);
-		assert_eq!(actions.len(), 1);
-		assert_eq!(actions[0].1, Action::Provision);
-	}
-
-	#[test]
-	fn diff_orphan_namespace_is_teardown() {
-		let ns = Namespace {
-			metadata: ObjectMeta {
-				name: Some("orphan".into()),
-				labels: Some(std::collections::BTreeMap::from([(
-					labels::MANAGED_BY.into(),
-					labels::MANAGED_BY_VALUE.into(),
-				)])),
-				..Default::default()
-			},
-			..Default::default()
-		};
-		let actions = diff(&[], &[ns]);
-		assert_eq!(actions.len(), 1);
-		assert_eq!(actions[0].1, Action::Teardown);
-	}
-
-	#[test]
-	fn diff_matched_pair_is_noop_when_never_restored_yet() {
-		let replica = Uuid::new_v4();
-		let server = Uuid::new_v4();
-		let e = entry("nauru", replica, server);
-		let ns = Namespace {
-			metadata: ObjectMeta {
-				name: Some(namespace_name_for(&e)),
-				labels: Some(std::collections::BTreeMap::from([
-					(labels::MANAGED_BY.into(), labels::MANAGED_BY_VALUE.into()),
-					(labels::DECLARATION_ID.into(), replica.to_string()),
-				])),
-				..Default::default()
-			},
-			..Default::default()
-		};
-		let actions = diff(&[e], &[ns]);
-		assert_eq!(actions.len(), 1);
-		assert_eq!(actions[0].1, Action::NoOp);
-	}
-
-	#[test]
-	fn diff_newer_snapshot_triggers_refresh() {
-		let replica = Uuid::new_v4();
-		let server = Uuid::new_v4();
-		let mut e = entry("nauru", replica, server);
-		e.snapshot_id = Some("new-snap".into());
-		let ns = Namespace {
-			metadata: ObjectMeta {
-				name: Some(namespace_name_for(&e)),
-				labels: Some(std::collections::BTreeMap::from([
-					(labels::MANAGED_BY.into(), labels::MANAGED_BY_VALUE.into()),
-					(labels::DECLARATION_ID.into(), replica.to_string()),
-				])),
-				annotations: Some(std::collections::BTreeMap::from([(
-					annotations::LAST_RESTORED_SNAPSHOT_ID.into(),
-					"old-snap".into(),
-				)])),
-				..Default::default()
-			},
-			..Default::default()
-		};
-		let actions = diff(&[e], &[ns]);
-		assert_eq!(actions[0].1, Action::Refresh(RefreshReason::NewerSnapshot));
-	}
-
-	#[test]
-	fn diff_forced_refresh_annotation_wins() {
-		let replica = Uuid::new_v4();
-		let server = Uuid::new_v4();
-		let e = entry("nauru", replica, server);
-		let ns = Namespace {
-			metadata: ObjectMeta {
-				name: Some(namespace_name_for(&e)),
-				labels: Some(std::collections::BTreeMap::from([
-					(labels::MANAGED_BY.into(), labels::MANAGED_BY_VALUE.into()),
-					(labels::DECLARATION_ID.into(), replica.to_string()),
-				])),
-				annotations: Some(std::collections::BTreeMap::from([(
-					annotations::FORCE_REFRESH.into(),
-					"now".into(),
-				)])),
-				..Default::default()
-			},
-			..Default::default()
-		};
-		let actions = diff(&[e], &[ns]);
-		assert_eq!(actions[0].1, Action::Refresh(RefreshReason::Forced));
 	}
 }
