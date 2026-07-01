@@ -39,8 +39,10 @@ use crate::{context::Context, error::Result};
 mod builders;
 mod reporter;
 pub use builders::{
-	CanopyRestoreJobConfig, KOPIA_JOB_NAME, PGDATA_PVC_NAME, PROXY_SIDECAR_POD_LABEL,
-	build_canopy_restore_job, build_pgdata_pvc,
+	CanopyRestoreJobConfig, KOPIA_JOB_NAME, PGDATA_PVC_NAME, POSTGRES_DEPLOYMENT_NAME,
+	POSTGRES_SERVICE_NAME, PROXY_SIDECAR_POD_LABEL, PostgresDeploymentConfig,
+	build_canopy_postgres_deployment, build_canopy_postgres_service, build_canopy_restore_job,
+	build_pgdata_pvc,
 };
 
 /// How many per-entry reconciliations run concurrently within one tick.

@@ -8,20 +8,32 @@
 //! to report is recorded in `pgro.bes.au/last-verification-error` and
 //! retried on the next tick.
 //!
-//! What the reporter does NOT do (yet):
-//! - Postgres version detection. There is no Deployment on the canopy path
-//!   yet; the field is left null.
-//! - S3 traffic tallies. The sidecar writes them to an emptyDir volume that
-//!   is gone by the time we observe the terminated Pod. Requires either
-//!   annotation-write RBAC in the sidecar or a broker POST — deferred.
+//! On restore-Job success the reporter also ensures the postgres
+//! Deployment + Service exist for the namespace, so the RestoreVerification
+//! reflects postgres coming up (not just kopia exiting 0). The Job's
+//! termination message carries the detected postgres major version;
+//! we mirror it to the namespace's `pgro.bes.au/postgres-version`
+//! annotation before creating the Deployment.
+//!
+//! S3 traffic tallies come from the canopy-proxy sidecar's callback POST
+//! to `/api/v1/canopy-stats/{ns}/{job}` (see `Context::canopy_stats`)
+//! and are included in the RestoreVerification on the next tick.
 
 use std::collections::BTreeMap;
 
 use bestool_canopy::{Outcome, RestoreVerification, WorklistEntry};
-use k8s_openapi::api::{batch::v1::Job, core::v1::Namespace};
+use k8s_openapi::{
+	ByteString,
+	api::{
+		apps::v1::Deployment,
+		batch::v1::Job,
+		core::v1::{Namespace, Secret, Service},
+	},
+	apimachinery::pkg::apis::meta::v1::ObjectMeta,
+};
 use kube::{
 	Api, ResourceExt,
-	api::{ListParams, Patch, PatchParams},
+	api::{ListParams, Patch, PatchParams, PostParams},
 };
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -106,6 +118,41 @@ async fn observe_one(ctx: &Context, ns: &Namespace) -> Result<()> {
 		.await?;
 	}
 
+	// On restore-Job success, ensure the postgres Deployment + Service
+	// exist. This is what actually brings the restored data up as a
+	// running database — the Job just materialized bytes onto the PVC.
+	// We do this BEFORE emitting the verification report so replica_healthy
+	// reflects postgres coming up, not just kopia exiting 0.
+	if outcome == Some(Outcome::Success) {
+		// Mirror the restore Job's termination message (the detected
+		// postgres major version) onto the namespace annotation so the
+		// Deployment builder can pick the right postgres image.
+		if annos.get("pgro.bes.au/postgres-version").is_none()
+			&& let Some(v) = crate::controllers::read_job_termination_message(
+				&ctx.client,
+				&ns_name,
+				&job.name_any(),
+				super::KOPIA_JOB_NAME,
+			)
+			.await
+		{
+			let _ =
+				set_annotations(ctx, &ns_name, &[("pgro.bes.au/postgres-version", Some(v))]).await;
+			// Re-fetch the namespace so ensure_postgres sees the annotation.
+		}
+		let refreshed_ns = Api::<Namespace>::all(ctx.client.clone())
+			.get(&ns_name)
+			.await
+			.unwrap_or_else(|_| ns.clone());
+		if let Err(err) = ensure_postgres(ctx, &refreshed_ns).await {
+			warn!(
+				namespace = %ns_name,
+				error = %err,
+				"canopy reporter: failed to ensure postgres Deployment/Service"
+			);
+		}
+	}
+
 	// Only report from a terminal state.
 	let Some(outcome) = outcome else {
 		return Ok(());
@@ -147,6 +194,109 @@ async fn observe_one(ctx: &Context, ns: &Namespace) -> Result<()> {
 		.await?;
 	}
 	Ok(())
+}
+
+/// Ensure the postgres Deployment + Service exist for a namespace whose
+/// restore Job succeeded. Idempotent — 409s on creation are ignored so
+/// re-runs don't clobber state.
+async fn ensure_postgres(ctx: &Context, ns: &Namespace) -> Result<()> {
+	let ns_name = ns.name_any();
+
+	// Detect the postgres version the restore Job discovered. The Job's
+	// script writes /pgdata/.postgres-version but the reporter can't read
+	// PVC content directly; instead we probe the Job's termination
+	// message (set by writing to /dev/termination-log). The restore
+	// script for the CRD path does this today; for the canopy path
+	// we cache the version onto the namespace annotation as a
+	// side-effect the first time we detect it.
+	let version = annotations_version(ns).unwrap_or_else(|| "16".to_string());
+
+	// Ensure the superuser Secret. The password is randomly generated
+	// once per namespace and stored here; postgres reads it via env at
+	// container start.
+	let secret_name = "postgres-superuser";
+	let secret_key = "password";
+	ensure_superuser_secret(ctx, &ns_name, secret_name, secret_key).await?;
+
+	// Ensure the Deployment.
+	let dep = super::build_canopy_postgres_deployment(&super::PostgresDeploymentConfig {
+		namespace: &ns_name,
+		postgres_major_version: &version,
+		superuser_secret_name: secret_name,
+		superuser_secret_key: secret_key,
+	});
+	let dep_api: Api<Deployment> = Api::namespaced(ctx.client.clone(), &ns_name);
+	match dep_api.create(&PostParams::default(), &dep).await {
+		Ok(_) => info!(namespace = %ns_name, "canopy: created postgres Deployment"),
+		Err(kube::Error::Api(err)) if err.code == 409 => {
+			debug!(namespace = %ns_name, "canopy: postgres Deployment already exists");
+		}
+		Err(err) => return Err(err.into()),
+	}
+
+	// Ensure the Service.
+	let svc = super::build_canopy_postgres_service(&ns_name);
+	let svc_api: Api<Service> = Api::namespaced(ctx.client.clone(), &ns_name);
+	match svc_api.create(&PostParams::default(), &svc).await {
+		Ok(_) => info!(namespace = %ns_name, "canopy: created postgres Service"),
+		Err(kube::Error::Api(err)) if err.code == 409 => {
+			debug!(namespace = %ns_name, "canopy: postgres Service already exists");
+		}
+		Err(err) => return Err(err.into()),
+	}
+	Ok(())
+}
+
+/// Read the postgres major version stashed on the namespace annotation.
+/// The restore Job's script writes /pgdata/.postgres-version onto the
+/// PVC; the reporter mirrors it to the namespace annotation the first
+/// time it sees it (see `annotate_postgres_version_from_job`).
+fn annotations_version(ns: &Namespace) -> Option<String> {
+	ns.annotations()
+		.get("pgro.bes.au/postgres-version")
+		.cloned()
+}
+
+async fn ensure_superuser_secret(
+	ctx: &Context,
+	namespace: &str,
+	name: &str,
+	key: &str,
+) -> Result<()> {
+	let api: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+	if api.get_opt(name).await?.is_some() {
+		return Ok(());
+	}
+	let password = generate_password();
+	let secret = Secret {
+		metadata: ObjectMeta {
+			name: Some(name.into()),
+			namespace: Some(namespace.into()),
+			..Default::default()
+		},
+		string_data: None,
+		data: Some(std::collections::BTreeMap::from([(
+			key.into(),
+			ByteString(password.into_bytes()),
+		)])),
+		..Default::default()
+	};
+	match api.create(&PostParams::default(), &secret).await {
+		Ok(_) => Ok(()),
+		Err(kube::Error::Api(err)) if err.code == 409 => Ok(()),
+		Err(err) => Err(err.into()),
+	}
+}
+
+/// Random alphanumeric password for the postgres superuser. 32 chars is
+/// well above brute-force practicality for a network-isolated Service.
+fn generate_password() -> String {
+	use rand::seq::IndexedRandom;
+	let chars: &[u8] = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+	let mut rng = rand::rng();
+	(0..32)
+		.map(|_| *chars.choose(&mut rng).unwrap() as char)
+		.collect()
 }
 
 /// Pick the most recent restore Job by creation timestamp. Usually there

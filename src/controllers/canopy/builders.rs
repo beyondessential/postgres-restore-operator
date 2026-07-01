@@ -12,14 +12,18 @@ use std::collections::BTreeMap;
 use bestool_canopy::WorklistEntry;
 use k8s_openapi::{
 	api::{
+		apps::v1::{Deployment, DeploymentSpec},
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, EmptyDirVolumeSource, EnvVar, PersistentVolumeClaim,
-			PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, ResourceRequirements, Volume,
-			VolumeMount, VolumeResourceRequirements,
+			Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction,
+			PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
+			PodSpec, PodTemplateSpec, Probe, ResourceRequirements, Service, ServicePort,
+			ServiceSpec, TCPSocketAction, Volume, VolumeMount, VolumeResourceRequirements,
 		},
 	},
-	apimachinery::pkg::api::resource::Quantity,
+	apimachinery::pkg::{
+		api::resource::Quantity, apis::meta::v1::LabelSelector, util::intstr::IntOrString,
+	},
 };
 use kube::api::ObjectMeta;
 
@@ -89,8 +93,9 @@ pub fn build_pgdata_pvc(namespace: &str, size: &str) -> PersistentVolumeClaim {
 /// Shell wrapper the kopia container runs on the canopy path. Waits for the
 /// proxy sidecar to publish its ephemeral port to `/var/run/pgro/proxy-port`
 /// (30s timeout — the sidecar writes it as soon as the proxy binds, which
-/// is essentially instant), reads the port, then invokes kopia against the
-/// loopback endpoint.
+/// is essentially instant), reads the port, invokes kopia against the
+/// loopback endpoint, then discovers PGDATA + writes `.postgres-version`
+/// so the postgres Deployment can pick the right image.
 fn kopia_wrapper_script() -> &'static str {
 	r#"set -e
 
@@ -121,6 +126,41 @@ kopia $(cat "$CONNECT_ARGS_FILE" | sed "s|@ENDPOINT@|${CANOPY_ENDPOINT}|")
 echo "Starting restore..."
 kopia snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
 echo "Restore complete"
+
+# Discover PGDATA: prefer the 'current' symlink if present (org
+# convention), else pick the highest version directory containing
+# PG_VERSION.
+echo "Locating PGDATA directory..."
+PGDATA_DIR=""
+if [ -L /pgdata/postgres/current ]; then
+  LINK_TARGET=$(readlink /pgdata/postgres/current)
+  RELATIVE=$(echo "$LINK_TARGET" | sed 's|.*/\([0-9]\{1,\}/\)|/pgdata/postgres/\1|')
+  if [ -f "$RELATIVE/PG_VERSION" ]; then
+    PGDATA_DIR="$RELATIVE"
+    echo "Found PGDATA via 'current' symlink: $PGDATA_DIR"
+  fi
+fi
+if [ -z "$PGDATA_DIR" ]; then
+  PGDATA_DIR=$(find /pgdata/postgres -name PG_VERSION 2>/dev/null | while read -r f; do
+    dir=$(dirname "$f")
+    [ -d "$dir/global" ] && echo "$dir"
+  done | sort -t/ -k4 -rn | head -1)
+fi
+if [ -z "$PGDATA_DIR" ]; then
+  echo "ERROR: no PG_VERSION found in restored data" >&2
+  exit 1
+fi
+echo "Found PGDATA at: $PGDATA_DIR"
+ln -sfn "$PGDATA_DIR" /pgdata/pgdata
+rm -f "$PGDATA_DIR/postmaster.pid"
+VERSION=$(cat /pgdata/pgdata/PG_VERSION)
+echo "Detected postgres version: $VERSION"
+echo -n "$VERSION" > /pgdata/.postgres-version
+# Mirror the version to the container termination message so the operator
+# can read it back after the Pod terminates (via
+# read_job_termination_message) and mirror it onto the namespace
+# annotation the postgres Deployment reads.
+echo -n "$VERSION" > /dev/termination-log
 "#
 }
 
@@ -320,6 +360,194 @@ pub fn build_canopy_restore_job(cfg: &CanopyRestoreJobConfig<'_>) -> Job {
 			},
 			// The syncer polls Job status via labels; no need for a
 			// Selector-based ownership contract with the operator.
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
+/// Name of the Postgres Deployment + Service the canopy path creates in
+/// each replica namespace on restore success.
+pub const POSTGRES_DEPLOYMENT_NAME: &str = "postgres";
+pub const POSTGRES_SERVICE_NAME: &str = "postgres";
+pub const POSTGRES_PORT: i32 = 5432;
+
+/// Config the syncer supplies to build the postgres Deployment.
+pub struct PostgresDeploymentConfig<'a> {
+	pub namespace: &'a str,
+	/// Passed as the postgres image tag. Read from `/pgdata/.postgres-version`
+	/// by the restore Job's script and mirrored onto the replica namespace's
+	/// annotation by the reporter.
+	pub postgres_major_version: &'a str,
+	/// Password for the `postgres` superuser. Mounted from a namespace-local
+	/// Secret by the caller — here we just reference the Secret name + key.
+	pub superuser_secret_name: &'a str,
+	pub superuser_secret_key: &'a str,
+}
+
+/// Build the postgres Deployment for a canopy-backed replica.
+///
+/// One replica per Deployment (`replicas: 1`, `strategy: Recreate`) — this
+/// is a restored physical replica, not a highly-available cluster. Mounts
+/// the pgdata PVC created earlier by [`build_pgdata_pvc`], picks the
+/// postgres image from the detected major version, and gates readiness on
+/// `pg_isready`.
+///
+/// Intentionally minimal for the first cut: no WAL-reset fallback, no
+/// locale rewriting, no analytics-user provisioning — those are follow-ups
+/// per intent. If postgres can't start on the restored data, the pod
+/// enters CrashLoopBackOff and the reporter's next tick will transition
+/// the namespace to `restore-state=failed`.
+pub fn build_canopy_postgres_deployment(cfg: &PostgresDeploymentConfig<'_>) -> Deployment {
+	let mut match_labels = BTreeMap::new();
+	match_labels.insert("app.kubernetes.io/name".into(), "postgres".into());
+	match_labels.insert("pgro.bes.au/canopy-replica".into(), "true".into());
+
+	let image = format!("postgres:{}", cfg.postgres_major_version);
+	let readiness_probe = Probe {
+		exec: Some(ExecAction {
+			command: Some(vec![
+				"pg_isready".into(),
+				"-U".into(),
+				"postgres".into(),
+				"-h".into(),
+				"127.0.0.1".into(),
+			]),
+		}),
+		initial_delay_seconds: Some(10),
+		period_seconds: Some(10),
+		timeout_seconds: Some(5),
+		failure_threshold: Some(6),
+		..Default::default()
+	};
+	let liveness_probe = Probe {
+		tcp_socket: Some(TCPSocketAction {
+			port: IntOrString::Int(POSTGRES_PORT),
+			..Default::default()
+		}),
+		initial_delay_seconds: Some(30),
+		period_seconds: Some(20),
+		timeout_seconds: Some(5),
+		failure_threshold: Some(3),
+		..Default::default()
+	};
+
+	let postgres_container = Container {
+		name: POSTGRES_DEPLOYMENT_NAME.into(),
+		image: Some(image),
+		env: Some(vec![
+			EnvVar {
+				name: "PGDATA".into(),
+				value: Some("/pgdata/pgdata".into()),
+				..Default::default()
+			},
+			EnvVar {
+				name: "POSTGRES_HOST_AUTH_METHOD".into(),
+				value: Some("scram-sha-256".into()),
+				..Default::default()
+			},
+			EnvVar {
+				name: "POSTGRES_PASSWORD".into(),
+				value_from: Some(k8s_openapi::api::core::v1::EnvVarSource {
+					secret_key_ref: Some(k8s_openapi::api::core::v1::SecretKeySelector {
+						name: cfg.superuser_secret_name.into(),
+						key: cfg.superuser_secret_key.into(),
+						optional: Some(false),
+					}),
+					..Default::default()
+				}),
+				..Default::default()
+			},
+		]),
+		ports: Some(vec![ContainerPort {
+			name: Some("postgres".into()),
+			container_port: POSTGRES_PORT,
+			protocol: Some("TCP".into()),
+			..Default::default()
+		}]),
+		readiness_probe: Some(readiness_probe),
+		liveness_probe: Some(liveness_probe),
+		volume_mounts: Some(vec![VolumeMount {
+			name: "pgdata".into(),
+			mount_path: "/pgdata".into(),
+			..Default::default()
+		}]),
+		resources: Some(ResourceRequirements {
+			requests: Some(BTreeMap::from([
+				("cpu".into(), Quantity("250m".into())),
+				("memory".into(), Quantity("512Mi".into())),
+			])),
+			limits: Some(BTreeMap::from([
+				("cpu".into(), Quantity("2".into())),
+				("memory".into(), Quantity("4Gi".into())),
+			])),
+			..Default::default()
+		}),
+		..Default::default()
+	};
+
+	Deployment {
+		metadata: ObjectMeta {
+			name: Some(POSTGRES_DEPLOYMENT_NAME.into()),
+			namespace: Some(cfg.namespace.into()),
+			labels: Some(match_labels.clone()),
+			..Default::default()
+		},
+		spec: Some(DeploymentSpec {
+			replicas: Some(1),
+			strategy: Some(k8s_openapi::api::apps::v1::DeploymentStrategy {
+				type_: Some("Recreate".into()),
+				..Default::default()
+			}),
+			selector: LabelSelector {
+				match_labels: Some(match_labels.clone()),
+				..Default::default()
+			},
+			template: PodTemplateSpec {
+				metadata: Some(ObjectMeta {
+					labels: Some(match_labels),
+					..Default::default()
+				}),
+				spec: Some(PodSpec {
+					containers: vec![postgres_container],
+					volumes: Some(vec![Volume {
+						name: "pgdata".into(),
+						persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+							claim_name: PGDATA_PVC_NAME.into(),
+							..Default::default()
+						}),
+						..Default::default()
+					}]),
+					..Default::default()
+				}),
+			},
+			..Default::default()
+		}),
+		..Default::default()
+	}
+}
+
+/// ClusterIP Service that exposes the postgres Deployment inside the
+/// replica namespace.
+pub fn build_canopy_postgres_service(namespace: &str) -> Service {
+	let mut selector = BTreeMap::new();
+	selector.insert("app.kubernetes.io/name".into(), "postgres".into());
+	selector.insert("pgro.bes.au/canopy-replica".into(), "true".into());
+	Service {
+		metadata: ObjectMeta {
+			name: Some(POSTGRES_SERVICE_NAME.into()),
+			namespace: Some(namespace.into()),
+			..Default::default()
+		},
+		spec: Some(ServiceSpec {
+			selector: Some(selector),
+			ports: Some(vec![ServicePort {
+				name: Some("postgres".into()),
+				port: POSTGRES_PORT,
+				target_port: Some(IntOrString::String("postgres".into())),
+				protocol: Some("TCP".into()),
+				..Default::default()
+			}]),
 			..Default::default()
 		}),
 		..Default::default()
