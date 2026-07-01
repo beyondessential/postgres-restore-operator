@@ -205,11 +205,25 @@ pub fn build_canopy_restore_job(cfg: &CanopyRestoreJobConfig<'_>) -> Job {
 		args: Some(vec![script]),
 		env: Some(
 			[
-				vec![EnvVar {
-					name: "SNAPSHOT_ID".into(),
-					value: Some(cfg.snapshot_id.into()),
-					..Default::default()
-				}],
+				vec![
+					EnvVar {
+						name: "SNAPSHOT_ID".into(),
+						value: Some(cfg.snapshot_id.into()),
+						..Default::default()
+					},
+					// `snapshot restore` runs as a separate kopia process from
+					// `repository connect`, so it must re-open the repository and
+					// needs the password. Headless containers have no keyring for
+					// kopia to retrieve the persisted credential from, so without
+					// this env var it falls back to an interactive prompt and dies
+					// with "inappropriate ioctl for device". kopia reads
+					// KOPIA_PASSWORD on every invocation.
+					EnvVar {
+						name: "KOPIA_PASSWORD".into(),
+						value: Some(cfg.repo_password.into()),
+						..Default::default()
+					},
+				],
 				kopia_writable_env(),
 			]
 			.concat(),
@@ -635,6 +649,14 @@ mod tests {
 			kopia_env
 				.iter()
 				.any(|e| e.name == "SNAPSHOT_ID" && e.value.as_deref() == Some("abc123"))
+		);
+		// KOPIA_PASSWORD must be on the container env so `snapshot restore`
+		// (a separate process from `repository connect`) can re-open the
+		// repository without an interactive password prompt.
+		assert!(
+			kopia_env
+				.iter()
+				.any(|e| e.name == "KOPIA_PASSWORD" && e.value.as_deref() == Some("supersecret"))
 		);
 		let kopia_mounts = pod_spec.containers[0].volume_mounts.as_ref().unwrap();
 		assert!(
