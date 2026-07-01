@@ -168,6 +168,15 @@ fn slug(s: &str) -> String {
 	out
 }
 
+/// Apply ±20% jitter to a Duration. Scopes the (non-Send) thread rng so the
+/// caller can `.await` after receiving the result — `run_forever` needs
+/// this since ThreadRng can't be held across an `await`.
+fn jittered(base: Duration) -> Duration {
+	let mut rng = rand::rng();
+	let jitter = rng.random_range(-JITTER_RATIO..JITTER_RATIO);
+	base.mul_f64(1.0 + jitter)
+}
+
 /// 8-hex-char disambiguator from SHA-256 of `replica_id || server_id`.
 ///
 /// Not cryptographic — just a stable, DNS-safe way to keep namespaces
@@ -291,11 +300,8 @@ impl CanopyController {
 			info!("canopy client not configured; skipping worklist syncer");
 			return;
 		}
-		let mut rng = rand::rng();
 		loop {
-			let jitter = rng.random_range(-JITTER_RATIO..JITTER_RATIO);
-			let delay = self.interval.mul_f64(1.0 + jitter);
-			tokio::time::sleep(delay).await;
+			tokio::time::sleep(jittered(self.interval)).await;
 			if let Err(err) = self.tick().await {
 				error!(error = %err, "canopy worklist syncer tick failed");
 			}

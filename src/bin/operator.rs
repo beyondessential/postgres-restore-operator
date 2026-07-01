@@ -20,6 +20,7 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
+	canopy::{self, DEFAULT_SOCKS5_PROXY},
 	context::{Context, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS, DEFAULT_KOPIA_IMAGE},
 	controllers,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
@@ -36,7 +37,13 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 2;
 const DEFAULT_METRICS_ADDR: &str = "[::]:8080";
 const DEFAULT_METRICS_PORT: u16 = 8080;
+const DEFAULT_BROKER_ADDR: &str = "[::]:9091";
+const DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS: u64 = 30;
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
+
+/// Intent set pgro registers with canopy on startup; only worklist entries
+/// with a matching intent will be dispatched.
+const PGRO_SUPPORTED_INTENTS: &[&str] = &["verify", "analytics", "disaster-recovery"];
 
 /// Annotate the operator's own pod with the running version.
 async fn annotate_own_pod(client: &Client, namespace: &str) {
@@ -192,14 +199,21 @@ async fn main() -> anyhow::Result<()> {
 		"deployment readiness timeout configured"
 	);
 
-	let ctx = Arc::new(Context::new(
+	let mut ctx = Context::new(
 		client.clone(),
 		max_concurrent_restores,
 		kopia_image,
 		use_port_forward,
 		callback_base_url,
 		deployment_ready_timeout_secs,
-	));
+	);
+	ctx.canopy = load_canopy_client(&client, &namespace)
+		.await
+		.unwrap_or_else(|err| {
+			warn!(error = %err, "canopy client not configured; running in legacy-only mode");
+			None
+		});
+	let ctx = Arc::new(ctx);
 
 	// Heartbeat: a background task updates this timestamp every 5s.
 	// If the runtime is deadlocked, the timestamp goes stale and /livez fails.
@@ -312,6 +326,48 @@ async fn main() -> anyhow::Result<()> {
 		info!(addr = metrics_addr_clone, "server listening");
 		if let Err(e) = axum::serve(listener, app).await {
 			tracing::error!(error = %e, "server exited with error");
+		}
+	});
+
+	// Register pgro's supported intents with canopy + start the worklist
+	// syncer. Only runs when a canopy client was successfully constructed.
+	if ctx.canopy.is_some() {
+		let register_ctx = ctx.clone();
+		tokio::spawn(async move {
+			register_capabilities(register_ctx).await;
+		});
+
+		let interval_secs = std::env::var("CANOPY_RECONCILE_INTERVAL_SECS")
+			.ok()
+			.and_then(|v| v.parse::<u64>().ok())
+			.unwrap_or(DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS);
+		let syncer_ctx = ctx.clone();
+		tokio::spawn(async move {
+			let syncer = controllers::canopy::CanopyController::new(
+				syncer_ctx,
+				Duration::from_secs(interval_secs),
+			);
+			syncer.run_forever().await;
+			warn!("canopy worklist syncer exited");
+		});
+	}
+
+	// Broker HTTP server on a separate listener/port, gated by NetworkPolicy
+	// to accept only the proxy sidecars in canopy-backed Job pods.
+	let broker_addr = std::env::var("PGRO_BROKER_LISTEN_ADDR")
+		.unwrap_or_else(|_| DEFAULT_BROKER_ADDR.to_string());
+	let broker_ctx = ctx.clone();
+	tokio::spawn(async move {
+		let state = BrokerState::new(broker_ctx);
+		let app = broker_router(state);
+		match tokio::net::TcpListener::bind(&broker_addr).await {
+			Ok(listener) => {
+				info!(addr = broker_addr, "credential broker listening");
+				if let Err(e) = axum::serve(listener, app).await {
+					tracing::error!(error = %e, "broker exited with error");
+				}
+			}
+			Err(e) => tracing::error!(error = %e, addr = broker_addr, "broker bind failed"),
 		}
 	});
 
@@ -511,6 +567,192 @@ async fn livez(State(state): State<ServerState>) -> (StatusCode, &'static str) {
 		"livez ok"
 	);
 	(StatusCode::OK, "ok")
+}
+
+/// Try to build the canopy client from env config. `Ok(None)` means the
+/// integration is intentionally not configured (no `CANOPY_BASE_URL`); pgro
+/// runs in legacy-only mode. `Err(_)` means configuration was attempted but
+/// failed — logged and downgraded to `None` at the call site.
+async fn load_canopy_client(
+	client: &Client,
+	operator_namespace: &str,
+) -> anyhow::Result<Option<Arc<canopy::Client>>> {
+	let Ok(base_url_str) = std::env::var("CANOPY_BASE_URL") else {
+		return Ok(None);
+	};
+	let base_url = reqwest::Url::parse(&base_url_str)
+		.map_err(|e| anyhow::anyhow!("CANOPY_BASE_URL is not a valid URL: {e}"))?;
+
+	let socks5_proxy =
+		std::env::var("CANOPY_SOCKS5_PROXY").unwrap_or_else(|_| DEFAULT_SOCKS5_PROXY.to_string());
+
+	let device_key_pem = if let Ok(secret_name) = std::env::var("CANOPY_DEVICE_CERT_SECRET") {
+		let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+			Api::namespaced(client.clone(), operator_namespace);
+		let sec = secrets.get(&secret_name).await?;
+		let data = sec.data.and_then(|d| d.into_iter().next());
+		match data {
+			Some((_, v)) => Some(String::from_utf8(v.0).map_err(|e| {
+				anyhow::anyhow!("device cert secret {secret_name} not valid UTF-8: {e}")
+			})?),
+			None => {
+				warn!(secret = secret_name, "device cert secret has no data");
+				None
+			}
+		}
+	} else {
+		None
+	};
+
+	let cfg = canopy::CanopyConfig {
+		base_url,
+		socks5_proxy,
+		device_key_pem,
+	};
+	let cli = canopy::Client::from_config(Some(cfg)).await?;
+	Ok(cli.map(Arc::new))
+}
+
+/// POST `/restore-capabilities` to canopy with the intents pgro implements.
+/// Retries on transient failure with exponential-ish backoff up to ~5 min;
+/// past that, gives up and logs — the next operator restart will re-attempt.
+async fn register_capabilities(ctx: Arc<Context>) {
+	let Some(canopy) = ctx.canopy.as_ref() else {
+		return;
+	};
+	let mut delay = Duration::from_secs(1);
+	let max_delay = Duration::from_secs(300);
+	for attempt in 1..=8u32 {
+		match canopy.restore_capabilities(PGRO_SUPPORTED_INTENTS).await {
+			Ok(_) => {
+				info!(
+					intents = ?PGRO_SUPPORTED_INTENTS,
+					"registered supported intents with canopy"
+				);
+				return;
+			}
+			Err(err) => {
+				warn!(
+					attempt,
+					error = %err,
+					"canopy restore_capabilities failed; retrying"
+				);
+				tokio::time::sleep(delay).await;
+				delay = std::cmp::min(delay * 2, max_delay);
+			}
+		}
+	}
+	warn!("gave up registering supported intents with canopy after 8 attempts");
+}
+
+/// State passed to the credential-broker Router. Holds the operator's canopy
+/// client and a per-(group, type) cache so concurrent Job sidecars don't
+/// multiply upstream canopy calls.
+#[derive(Clone)]
+struct BrokerState {
+	ctx: Arc<Context>,
+	cache: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), CachedCreds>>>,
+}
+
+#[derive(Clone)]
+struct CachedCreds {
+	body: serde_json::Value,
+	/// Cached response expires this long before the STS creds' own expiry
+	/// so the sidecar's next refresh call gets a fresh cache miss.
+	expires_at: jiff::Timestamp,
+}
+
+impl BrokerState {
+	fn new(ctx: Arc<Context>) -> Self {
+		Self {
+			ctx,
+			cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+		}
+	}
+}
+
+fn broker_router(state: BrokerState) -> Router {
+	Router::new()
+		.route(
+			"/internal/restore-creds",
+			axum::routing::post(post_restore_creds),
+		)
+		.route("/healthz", get(|| async { StatusCode::OK }))
+		.with_state(state)
+		.layer(TraceLayer::new_for_http())
+}
+
+#[derive(serde::Deserialize)]
+struct BrokerCredsRequest {
+	group: uuid::Uuid,
+	r#type: String,
+}
+
+/// Broker endpoint the proxy sidecar hits to refresh its STS creds. Forwards
+/// to canopy's `POST /restore-credentials`, caches the response per-(group,
+/// type) up to 2 minutes before its expiry. 4xx failures propagate the
+/// upstream status verbatim so a missing external-restore grant surfaces
+/// clearly at the sidecar.
+async fn post_restore_creds(
+	State(state): State<BrokerState>,
+	axum::Json(req): axum::Json<BrokerCredsRequest>,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+	let Some(canopy) = state.ctx.canopy.as_ref() else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			axum::Json(serde_json::json!({
+				"error": "canopy client not configured on operator",
+			})),
+		);
+	};
+
+	let key = (req.group.to_string(), req.r#type.clone());
+	{
+		let cache = state.cache.lock().await;
+		if let Some(cached) = cache.get(&key)
+			&& cached.expires_at > jiff::Timestamp::now()
+		{
+			return (StatusCode::OK, axum::Json(cached.body.clone()));
+		}
+	}
+
+	match canopy.restore_credentials(&req.r#type, req.group).await {
+		Ok(resp) => {
+			let expires_at = resp
+				.credentials
+				.expiration
+				.checked_sub(jiff::SignedDuration::from_secs(120))
+				.unwrap_or(resp.credentials.expiration);
+			// bestool-canopy's RestoreCredentials only derives Deserialize; build
+			// the response JSON manually with the same shape the sidecar expects.
+			let body = serde_json::json!({
+				"credentials": {
+					"Version": resp.credentials.version,
+					"AccessKeyId": resp.credentials.access_key_id,
+					"SecretAccessKey": resp.credentials.secret_access_key.0,
+					"SessionToken": resp.credentials.session_token.0,
+					"Expiration": resp.credentials.expiration.to_string(),
+				},
+				"repo_password": resp.repo_password.0,
+			});
+			let mut cache = state.cache.lock().await;
+			cache.insert(
+				key,
+				CachedCreds {
+					body: body.clone(),
+					expires_at,
+				},
+			);
+			(StatusCode::OK, axum::Json(body))
+		}
+		Err(err) => {
+			warn!(error = %err, group = %req.group, r#type = %req.r#type, "broker: canopy restore_credentials failed");
+			(
+				StatusCode::BAD_GATEWAY,
+				axum::Json(serde_json::json!({ "error": err.to_string() })),
+			)
+		}
+	}
 }
 
 /// Readiness: checks that the heartbeat is fresh (runtime is responsive).
