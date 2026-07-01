@@ -269,7 +269,7 @@ spec:
                 # - the pgro-operator-tailscale-state Secret (empty,
                 #   writable by this pod for TS state persistence).
                 - name: tailscale
-                  image: ghcr.io/tailscale/tailscale:v1.80
+                  image: ghcr.io/tailscale/tailscale:v1.98.8
                   env:
                       - name: TS_USERSPACE
                         value: "true"
