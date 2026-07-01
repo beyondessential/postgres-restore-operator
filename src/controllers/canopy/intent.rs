@@ -41,6 +41,13 @@ pub struct IntentConfig {
 	pub service_annotations: Option<BTreeMap<String, String>>,
 	pub switchover_grace_period: TimeSpan,
 	pub storage_size_override: Quantity,
+	/// Floor on the postgres pod's `/dev/shm` sizing. Materialised into
+	/// `PostgresPhysicalReplicaSpec.shm_size_floor` so the shared
+	/// Deployment builder picks `max(computed_from_resources, floor)`.
+	/// Analytics workloads (`analytics-dev` / `analytics-dbt`) want a
+	/// higher shm than what a 2 GiB memory request would derive, without
+	/// paying the k8s scheduling cost of bumping the request.
+	pub shm_size_floor: Quantity,
 }
 
 fn resources(cpu_req: &str, mem_req: &str, cpu_lim: &str, mem_lim: &str) -> ResourceRequirements {
@@ -72,6 +79,7 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			service_annotations: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 			storage_size_override: Quantity("20Gi".to_string()),
+			shm_size_floor: Quantity("512Mi".to_string()),
 		}),
 		"analytics-dev" => Some(IntentConfig {
 			resources: Some(resources("500m", "2Gi", "4", "8Gi")),
@@ -81,6 +89,7 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			service_annotations: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 			storage_size_override: Quantity("50Gi".to_string()),
+			shm_size_floor: Quantity("2Gi".to_string()),
 		}),
 		"analytics-dbt" => Some(IntentConfig {
 			resources: Some(resources("500m", "2Gi", "4", "8Gi")),
@@ -96,6 +105,7 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			])),
 			switchover_grace_period: TimeSpan(Span::new().minutes(2)),
 			storage_size_override: Quantity("50Gi".to_string()),
+			shm_size_floor: Quantity("2Gi".to_string()),
 		}),
 		_ => None,
 	}
@@ -141,6 +151,7 @@ impl IntentConfig {
 			storage_class: None,
 			storage_size_override: Some(self.storage_size_override.clone()),
 			resources: self.resources.clone(),
+			shm_size_floor: Some(self.shm_size_floor.clone()),
 			service_annotations: self
 				.service_annotations
 				.clone()
