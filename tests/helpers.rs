@@ -152,6 +152,7 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,
 			affinity: None,

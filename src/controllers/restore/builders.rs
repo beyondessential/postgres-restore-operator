@@ -952,7 +952,13 @@ pub fn build_deployment(
 	replica: &PostgresPhysicalReplica,
 ) -> Result<Deployment> {
 	let pvc_name = format!("{name}-data");
-	let (shm_size, shared_buffers_mb) = compute_shm_and_shared_buffers(&replica.spec.resources);
+	let (computed_shm, computed_shared_buffers_mb) =
+		compute_shm_and_shared_buffers(&replica.spec.resources);
+	let (shm_size, shared_buffers_mb) = apply_shm_floor(
+		&computed_shm,
+		computed_shared_buffers_mb,
+		replica.spec.shm_size_floor.as_ref(),
+	);
 	let creds_secret = SecretReference {
 		name: Some(format!("{}-creds", restore.spec.replica.name)),
 		namespace: Some(namespace.to_string()),
@@ -999,6 +1005,35 @@ pub fn build_deployment(
 		affinity: replica.spec.affinity.clone(),
 		tolerations: replica.spec.tolerations.clone(),
 	})
+}
+
+/// Apply the caller's `shm_size_floor` (if any) to the resource-derived
+/// shm + shared_buffers pair. `shared_buffers` scales linearly with shm
+/// (postgres wants ~70 % of shm), so bumping shm bumps
+/// `shared_buffers_mb` proportionally.
+fn apply_shm_floor(
+	computed_shm: &Quantity,
+	computed_shared_buffers_mb: u64,
+	floor: Option<&Quantity>,
+) -> (Quantity, u64) {
+	let Some(floor) = floor else {
+		return (computed_shm.clone(), computed_shared_buffers_mb);
+	};
+	let computed_bytes = ParsedQuantity::try_from(computed_shm.clone())
+		.ok()
+		.and_then(|q| q.to_bytes_f64());
+	let floor_bytes = ParsedQuantity::try_from(floor.clone())
+		.ok()
+		.and_then(|q| q.to_bytes_f64());
+	match (computed_bytes, floor_bytes) {
+		(Some(c), Some(f)) if f > c => {
+			let ratio = f / c;
+			let scaled_shared_buffers =
+				((computed_shared_buffers_mb as f64) * ratio).floor() as u64;
+			(floor.clone(), scaled_shared_buffers.max(16))
+		}
+		_ => (computed_shm.clone(), computed_shared_buffers_mb),
+	}
 }
 
 /// Shared postgres Deployment builder — no CR dependencies. Both the

@@ -95,6 +95,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `storageSizeOverride` | `Quantity` | No | — | Override dynamic sizing with a fixed PVC size. When absent, PVC size is calculated from snapshot size. |
 | `storageSizeMaximum` | `Quantity` | No | `2Ti` | Maximum allowed PVC size. The restore will fail if the computed size exceeds this limit. |
 | `resources` | `ResourceRequirements` | No | — | CPU/memory resource requirements for the PostgreSQL pods. |
+| `shmSizeFloor` | `Quantity` | No | — | Floor on the postgres pod's `/dev/shm` sizing. When set, the Deployment uses `max(computed, shmSizeFloor)` — the computed value is derived from `resources` by [`compute_shm_and_shared_buffers`]. Useful when a workload's `shared_buffers` needs more shm than the resource-derived value provides, without wanting to bump the container's memory request. |
 | `serviceAnnotations` | `map[string]string` | No | — | Annotations applied to the Service. |
 | `podAnnotations` | `map[string]string` | No | — | Annotations applied to the PostgreSQL pods. |
 | `affinity` | `Affinity` | No | — | Pod scheduling affinity rules. |

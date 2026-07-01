@@ -92,6 +92,16 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub resources: Option<ResourceRequirements>,
 
+	/// Floor on the postgres pod's `/dev/shm` sizing. When set, the
+	/// Deployment builder uses `max(computed, shmSizeFloor)` — computed
+	/// comes from [`compute_shm_and_shared_buffers`] driven by
+	/// [`resources`]. Useful when the resource-derived value would be
+	/// smaller than what a workload's `shared_buffers` needs (analytics
+	/// / dbt) without wanting to bump the container's memory request
+	/// upward just to raise shm.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub shm_size_floor: Option<Quantity>,
+
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub service_annotations: Option<BTreeMap<String, String>>,
 
