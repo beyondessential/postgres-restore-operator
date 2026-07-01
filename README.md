@@ -7,17 +7,19 @@ Monitors a Kopia backup repository for "physical" backups of PostgreSQL database
 
 ## Install
 
-Generate the CRDs:
+Apply the operator manifest:
+
+```
+kubectl apply -f operator.yaml
+```
+
+The operator applies its own CRDs on startup, so no separate `crds.yaml`
+step is needed. If you'd rather manage CRD lifecycle out-of-band (e.g.
+gating schema changes at install time), generate + apply them manually:
 
 ```
 cargo run --bin gen-crds > crds.yaml
-```
-
-Apply both the CRDs and the operator:
-
-```
 kubectl apply -f crds.yaml
-kubectl apply -f operator.yaml
 ```
 
 ## Quick start

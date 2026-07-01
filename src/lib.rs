@@ -1,6 +1,7 @@
 pub mod canopy;
 pub mod context;
 pub mod controllers;
+pub mod crd_install;
 pub mod error;
 pub mod kopia;
 pub mod metrics;
