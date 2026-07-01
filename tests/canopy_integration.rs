@@ -1,19 +1,21 @@
 //! Canopy-path integration test.
 //!
-//! Exercises the worklist syncer end-to-end against a **stub canopy**: an
-//! in-cluster HTTP service that returns canned `WorklistEntry` /
-//! `RestoreCredentials` and captures the `RestoreVerification` reports pgro
-//! POSTs. The stub is a small nginx-backed service defined in
-//! `tests/fixtures/stub-canopy.yaml` (deployed by the CI matrix step, not
-//! this test).
+//! **STATUS: SCAFFOLD.** The in-cluster stub canopy this test expects
+//! doesn't exist yet. `tests/fixtures/stub-canopy.yaml` is a Namespace +
+//! ConfigMap-with-canned-JSON only — no Deployment, no Service, nothing
+//! that serves HTTP. All three tests below are `#[ignore]d` and will
+//! remain so until a stub-canopy HTTP server is built (small axum/Go
+//! binary that reads the ConfigMap and serves the four `/restore-*`
+//! endpoints).
 //!
-//! CI-only: this test assumes:
-//! - a real k8s cluster (kind) with the operator running with
-//!   `CANOPY_BASE_URL` pointing at the stub;
-//! - the `test-canopy-restore` namespace exists as the work root;
-//! - the stub is reachable at `stub-canopy.test-canopy-restore.svc`.
+//! What this file provides today:
+//! - The test shape + assertions the future stub-based CI job will run.
+//! - The matrix entry in `.github/workflows/integration.yml` — inert
+//!   until the stub is up.
+//! - Canned JSON in the fixture ConfigMap the stub will eventually serve.
 //!
-//! Do not run this file locally — nothing here works without the CI setup.
+//! Do not run this file locally — nothing here works without the CI
+//! setup, and even the CI setup is incomplete.
 
 #![allow(dead_code, reason = "shared helpers may not all be exercised yet")]
 
@@ -91,7 +93,7 @@ mod helpers {
 /// End-to-end happy path: stub canopy hands out a worklist entry, pgro
 /// provisions a namespace with the expected labels, creates the restore
 /// Job, and (eventually) reports a verification back.
-#[ignore = "integration test; run in CI with the stub-canopy fixture"]
+#[ignore = "requires stub-canopy HTTP server (not yet built — see module docstring)"]
 #[tokio::test]
 async fn worklist_provisions_namespace_and_job() {
 	let client = helpers::make_client().await;
@@ -161,7 +163,7 @@ async fn worklist_provisions_namespace_and_job() {
 
 /// Grant-absent: stub returns 403 on `/restore-credentials`. pgro should
 /// surface a clear failure on the namespace annotation and not crash-loop.
-#[ignore = "integration test; run in CI with the stub-canopy fixture"]
+#[ignore = "requires stub-canopy HTTP server (not yet built — see module docstring)"]
 #[tokio::test]
 async fn missing_grant_surfaces_clearly() {
 	let client = helpers::make_client().await;
@@ -185,7 +187,7 @@ async fn missing_grant_surfaces_clearly() {
 }
 
 /// Verification report emitted after a successful restore lands in the stub.
-#[ignore = "integration test; run in CI with the stub-canopy fixture"]
+#[ignore = "requires stub-canopy HTTP server (not yet built — see module docstring)"]
 #[tokio::test]
 async fn verification_report_arrives_after_success() {
 	let client = helpers::make_client().await;

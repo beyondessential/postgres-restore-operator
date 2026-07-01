@@ -557,20 +557,23 @@ legacy `kopia-credentials` Secret is theirs to delete.
 
 **Integration tests (CI-only; new matrix entry required):**
 
-- `tests/canopy_integration.rs` — a `test-canopy-restore` namespace
-  exercising the canopy path against a **stub canopy** (a small
-  in-cluster HTTP service implementing the four endpoints with canned
-  responses, reusing the existing `tests/fixtures/minio.yaml` +
-  `setup-kopia-repo.yaml` as the S3 backing store). Assert:
-  - worklist tick discovers no namespaces, creates one; restore Job
-    reaches `Active`; verification stub receives a `RestoreVerification`
-    with the expected `replica_id`/`snapshot_id`/`outcome=success`.
-  - worklist entry removed → namespace torn down within ~2 ticks.
-  - `RestoreReplica::authorizes`-style 403 from the stub → pgro
-    surfaces a clear failure (annotation + event) and doesn't
-    crash-loop.
-- Matrix entry added in `.github/workflows/integration.yml`. Flag to
-  the user that this only runs in CI.
+- `tests/canopy_integration.rs` (**scaffold only**) — three
+  `#[ignore]d` tests that would exercise the canopy path against a
+  stub canopy in the `test-canopy-restore` namespace: (1) worklist
+  tick provisions the labelled namespace + restore Job; (2) worklist
+  entry removed → namespace torn down within ~2 ticks; (3) 403 from
+  the stub's `/restore-credentials` → clear failure annotation, no
+  crash loop.
+- **The stub canopy HTTP server is not yet built.** The current
+  `tests/fixtures/stub-canopy.yaml` is a Namespace + ConfigMap with
+  canned JSON — no Deployment, no Service. A follow-up needs to add
+  a small axum/Go binary that reads the ConfigMap and serves the
+  four `/restore-*` endpoints (capturing POSTed verifications for
+  readback via `/tests/reports`).
+- Matrix entry added in `.github/workflows/integration.yml` but inert
+  until the stub lands. Flag to the user: this test suite only runs in
+  CI, and even the CI step will fail today because the stub is
+  missing.
 
 ---
 
