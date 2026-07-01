@@ -1,0 +1,59 @@
+# Stub canopy — placeholder scaffolding for the canopy integration test.
+#
+# A real stub-canopy needs to:
+# - respond to POST /restore-capabilities with 204;
+# - respond to GET /restore-worklist with a canned list of WorklistEntry
+#   whose group_id / server_id are stable (so the test can assert against
+#   them);
+# - respond to POST /restore-credentials with a canned {credentials, repo_password};
+# - respond to POST /restore-verification with 204 AND capture the body
+#   for the test to poll via a /tests/reports GET.
+#
+# This placeholder deploys nothing yet — the actual stub is a follow-up
+# (needs a small Rust or Go binary; nginx alone can't capture POST
+# bodies for later readback). Once ready, the canopy_integration CI
+# matrix entry will `kubectl apply -f` this file and wait for its
+# Deployment to become Ready.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: test-canopy-restore
+---
+# Placeholder ConfigMap — canned WorklistEntry JSON. Real stub will
+# read this at startup or via mounted volume.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: stub-canopy-fixtures
+  namespace: test-canopy-restore
+data:
+  worklist.json: |
+    [
+      {
+        "replica_id": "11111111-1111-1111-1111-111111111111",
+        "group_id": "22222222-2222-2222-2222-222222222222",
+        "server_id": "33333333-3333-3333-3333-333333333333",
+        "type": "tamanu-postgres",
+        "intent": "verify",
+        "name": "int-test",
+        "freshness_seconds": null,
+        "snapshot_id": "k000000000000000000000000000000f",
+        "snapshot_at": "2026-07-01T00:00:00Z",
+        "storage": "s3",
+        "bucket": "canopy-int-test",
+        "prefix": "",
+        "region": "us-east-1"
+      }
+    ]
+  restore-credentials.json: |
+    {
+      "credentials": {
+        "Version": 1,
+        "AccessKeyId": "AKIAIOSFODNN7EXAMPLE",
+        "SecretAccessKey": "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+        "SessionToken": "FQoGZXIvYXdzEXAMPLE",
+        "Expiration": "2099-12-31T23:59:59Z"
+      },
+      "repo_password": "stub-repo-password"
+    }

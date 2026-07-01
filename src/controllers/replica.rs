@@ -1096,12 +1096,7 @@ async fn mark_schema_migration_complete(
 /// `creationTimestamp` as the start; falls back to "not exceeded" if the
 /// Job has no creation timestamp (which shouldn't happen in practice).
 fn migration_exceeded_budget(replica: &PostgresPhysicalReplica, job: &Job) -> bool {
-	let Some(created) = job
-		.metadata
-		.creation_timestamp
-		.as_ref()
-		.map(|t| Timestamp::from(t.0))
-	else {
+	let Some(created) = job.metadata.creation_timestamp.as_ref().map(|t| t.0) else {
 		return false;
 	};
 	let elapsed = Timestamp::now().duration_since(created);

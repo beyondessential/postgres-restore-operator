@@ -11,6 +11,13 @@ use crate::{controllers::jobs::CallbackStore, metrics::Metrics};
 
 pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 pub const DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS: u64 = 30 * 60;
+/// The canopy-proxy sidecar binary ships in the same image as the operator
+/// (Containerfile copies both binaries). By default, use the same image tag;
+/// operators can override with `CANOPY_PROXY_IMAGE` if they want to pin the
+/// sidecar to a different tag from the operator itself.
+pub const DEFAULT_CANOPY_PROXY_IMAGE: &str =
+	"ghcr.io/beyondessential/postgres-restore-operator:latest";
+pub const DEFAULT_CANOPY_PGDATA_PVC_SIZE: &str = "20Gi";
 
 pub struct Context {
 	pub client: Client,
@@ -21,10 +28,29 @@ pub struct Context {
 	pub kopia_image: Arc<RwLock<String>>,
 	pub use_port_forward: Arc<AtomicBool>,
 	pub http_client: reqwest::Client,
+	/// Canopy integration client — `None` when the operator is running in
+	/// legacy-only mode (no canopy config provided). Populated at startup
+	/// by [`crate::canopy::Client::from_config`].
+	pub canopy: Option<Arc<crate::canopy::Client>>,
+	/// Base URL the canopy-path proxy sidecar hits for STS creds, e.g.
+	/// `http://postgres-restore-operator.pgro-system.svc:9091`. Empty when
+	/// canopy is not configured.
+	pub canopy_broker_base_url: String,
+	/// Image reference for the pgro-canopy-proxy sidecar container. Set
+	/// by the operator startup from `CANOPY_PROXY_IMAGE`.
+	pub canopy_proxy_image: String,
+	/// Default pgdata PVC size used when the operator provisions a
+	/// canopy-backed replica (per intent).
+	pub canopy_pgdata_pvc_size: String,
 	/// In-memory store for snapshot-list results POSTed by jobs.
 	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for schema migration results POSTed by jobs.
 	pub schema_migration_results: Arc<CallbackStore>,
+	/// In-memory store for canopy-proxy sidecar TrafficStats keyed by
+	/// `{namespace}/{job}`. Written on sidecar exit via the operator's
+	/// `/api/v1/canopy-stats/...` callback; read by the reporter when
+	/// building `RestoreVerification.s3_*_bytes`.
+	pub canopy_stats: Arc<CallbackStore>,
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
 	pub callback_base_url: String,
@@ -60,8 +86,13 @@ impl Context {
 			kopia_image: Arc::new(RwLock::new(kopia_image)),
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
 			http_client: reqwest::Client::new(),
+			canopy: None,
+			canopy_broker_base_url: String::new(),
+			canopy_proxy_image: DEFAULT_CANOPY_PROXY_IMAGE.to_string(),
+			canopy_pgdata_pvc_size: DEFAULT_CANOPY_PGDATA_PVC_SIZE.to_string(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
+			canopy_stats: Arc::new(CallbackStore::default()),
 			callback_base_url,
 			deployment_ready_timeout_secs,
 			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
@@ -103,6 +134,16 @@ impl Context {
 	pub fn cache_pressure_callback_url(&self, namespace: &str, restore: &str) -> String {
 		format!(
 			"{}/api/v1/cache-pressure/{namespace}/{restore}",
+			self.callback_base_url
+		)
+	}
+
+	/// Callback URL the canopy-proxy sidecar POSTs its final TrafficStats
+	/// to on shutdown. Keyed by `{namespace}/{job}` so the reporter can
+	/// look them up when building `RestoreVerification`.
+	pub fn canopy_stats_callback_url(&self, namespace: &str, job: &str) -> String {
+		format!(
+			"{}/api/v1/canopy-stats/{namespace}/{job}",
 			self.callback_base_url
 		)
 	}

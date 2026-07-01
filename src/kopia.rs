@@ -230,6 +230,50 @@ pub fn kopia_connect_args(creds: &KopiaCredentials) -> Vec<String> {
 	args
 }
 
+/// Parameters for the kopia-via-canopy-proxy connect convention.
+///
+/// kopia talks to a loopback bestool S3P proxy with dummy keys; the proxy holds
+/// the live STS creds and re-signs each request. Bucket/region/prefix come from
+/// the canopy worklist entry; the repo password comes from
+/// `/restore-credentials`.
+pub struct ProxyConnect<'a> {
+	/// Loopback endpoint the proxy bound to, including port and IPv6 brackets,
+	/// e.g. `[::1]:8421`.
+	pub endpoint: &'a str,
+	pub bucket: &'a str,
+	pub region: &'a str,
+	pub prefix: &'a str,
+	pub repository_password: &'a str,
+	/// The server whose snapshots this Job restores. kopia source-host filter:
+	/// snapshots taken by bestool on that server are tagged with this hostname.
+	pub server_id: &'a str,
+}
+
+/// Builds the kopia CLI args for connecting to a canopy-managed repo via the
+/// S3P proxy sidecar. kopia carries dummy keys + TLS disabled on the loopback
+/// leg; the proxy holds the real STS creds.
+pub fn kopia_connect_args_proxy(conn: &ProxyConnect<'_>) -> Vec<String> {
+	vec![
+		"repository".to_string(),
+		"connect".to_string(),
+		"s3".to_string(),
+		"--readonly".to_string(),
+		format!("--bucket={}", conn.bucket),
+		format!("--prefix={}", conn.prefix),
+		format!("--region={}", conn.region),
+		format!("--endpoint={}", conn.endpoint),
+		"--disable-tls".to_string(),
+		format!("--access-key={}", bestool_kopia::PROXY_DUMMY_ACCESS_KEY),
+		format!(
+			"--secret-access-key={}",
+			bestool_kopia::PROXY_DUMMY_SECRET_KEY
+		),
+		format!("--password={}", conn.repository_password),
+		"--override-username=canopy".to_string(),
+		format!("--override-hostname={}", conn.server_id),
+	]
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -664,5 +708,69 @@ mod tests {
 		let creds = validate_kopia_secret(&secret).unwrap();
 		assert_eq!(creds.endpoint, None);
 		assert!(!creds.disable_tls);
+	}
+
+	#[test]
+	fn kopia_connect_args_proxy_emits_dummy_keys_and_loopback() {
+		let conn = ProxyConnect {
+			endpoint: "[::1]:8421",
+			bucket: "canopy-prod-tongatongaisland",
+			region: "ap-southeast-2",
+			prefix: "",
+			repository_password: "secret-pass",
+			server_id: "11111111-1111-1111-1111-111111111111",
+		};
+		let args = kopia_connect_args_proxy(&conn);
+
+		assert_eq!(args[0..4], ["repository", "connect", "s3", "--readonly"]);
+		assert!(args.contains(&"--bucket=canopy-prod-tongatongaisland".to_string()));
+		assert!(args.contains(&"--region=ap-southeast-2".to_string()));
+		assert!(args.contains(&"--prefix=".to_string()));
+		assert!(args.contains(&"--endpoint=[::1]:8421".to_string()));
+		assert!(args.contains(&"--disable-tls".to_string()));
+		assert!(args.contains(&format!(
+			"--access-key={}",
+			bestool_kopia::PROXY_DUMMY_ACCESS_KEY
+		)));
+		assert!(args.contains(&format!(
+			"--secret-access-key={}",
+			bestool_kopia::PROXY_DUMMY_SECRET_KEY
+		)));
+		assert!(args.contains(&"--password=secret-pass".to_string()));
+		assert!(args.contains(&"--override-username=canopy".to_string()));
+		assert!(
+			args.contains(&"--override-hostname=11111111-1111-1111-1111-111111111111".to_string())
+		);
+	}
+
+	#[test]
+	fn kopia_connect_args_proxy_omits_tls_verification_flag() {
+		// On the loopback leg there's no TLS at all, so --disable-tls-verification
+		// (which applies to the TLS handshake) is irrelevant — only --disable-tls
+		// is needed. The legacy minio path is the only one that needs both.
+		let conn = ProxyConnect {
+			endpoint: "[::1]:1234",
+			bucket: "b",
+			region: "r",
+			prefix: "p",
+			repository_password: "rp",
+			server_id: "s",
+		};
+		let args = kopia_connect_args_proxy(&conn);
+		assert!(!args.contains(&"--disable-tls-verification".to_string()));
+	}
+
+	#[test]
+	fn kopia_connect_args_proxy_carries_prefix() {
+		let conn = ProxyConnect {
+			endpoint: "[::1]:1234",
+			bucket: "b",
+			region: "r",
+			prefix: "backups/2026",
+			repository_password: "rp",
+			server_id: "s",
+		};
+		let args = kopia_connect_args_proxy(&conn);
+		assert!(args.contains(&"--prefix=backups/2026".to_string()));
 	}
 }

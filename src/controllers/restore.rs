@@ -29,7 +29,7 @@ use crate::{
 	types::*,
 };
 
-mod builders;
+pub mod builders;
 
 pub(crate) use builders::{build_credential_reset_job, credential_reset_job_name};
 

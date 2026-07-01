@@ -773,6 +773,46 @@ echo -n "$VERSION" > /dev/termination-log
 	})
 }
 
+/// All the inputs `build_postgres_deployment_with` needs, factored out so
+/// both the CRD path and the canopy path can call the shared builder
+/// without pretending to be each other. The CRD path fills this from
+/// `PostgresPhysicalRestore` + `PostgresPhysicalReplica`; the canopy path
+/// fills it from a `WorklistEntry` + intent defaults.
+pub struct PostgresDeploymentInputs<'a> {
+	pub name: &'a str,
+	pub namespace: &'a str,
+	pub pvc_name: &'a str,
+	/// Postgres major version, e.g. `"16"`. Used as the image tag.
+	pub pg_version: &'a str,
+	pub shm_size: Quantity,
+	pub shared_buffers_mb: u64,
+	/// True when the replica is meant to serve read-only clients (verify /
+	/// analytics intents). Sets `default_transaction_read_only = on` and
+	/// swaps the analytics-user grant to `pg_read_all_data` on PG ≥ 14.
+	pub read_only: bool,
+	/// Extra postgresql.conf lines appended after the base config.
+	pub postgres_extra_config: Option<&'a str>,
+	/// Analytics role provisioned (or updated) by the setup-auth
+	/// initContainer. Its password comes from `analytics_password_secret`.
+	pub analytics_username: &'a str,
+	pub analytics_password_secret: &'a SecretReference,
+	pub analytics_password_key: &'a str,
+	pub snapshot_id: &'a str,
+	pub snapshot_time: &'a str,
+	pub labels: BTreeMap<String, String>,
+	pub match_labels: BTreeMap<String, String>,
+	pub pod_annotations: Option<BTreeMap<String, String>>,
+	pub owner_references:
+		Option<Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>>,
+	/// Resource requests/limits for the main postgres container.
+	pub postgres_resources: Option<ResourceRequirements>,
+	pub affinity: Option<k8s_openapi::api::core::v1::Affinity>,
+	pub tolerations: Vec<k8s_openapi::api::core::v1::Toleration>,
+}
+
+/// CRD-path Deployment builder. Fills the shared `PostgresDeploymentInputs`
+/// from the restore + replica CRs and delegates to
+/// [`build_postgres_deployment_with`].
 pub fn build_deployment(
 	restore: &PostgresPhysicalRestore,
 	name: &str,
@@ -792,6 +832,73 @@ pub fn build_deployment(
 		.and_then(|s| s.postgres_version.as_ref())
 		.cloned()
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
+
+	// persistent_schemas needs write access to receive the migrated data
+	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
+
+	let labels = BTreeMap::from([
+		(
+			"pgro.bes.au/replica".to_string(),
+			restore.spec.replica.name.clone(),
+		),
+		("pgro.bes.au/restore".to_string(), name.to_string()),
+	]);
+	let match_labels = BTreeMap::from([("pgro.bes.au/restore".to_string(), name.to_string())]);
+
+	build_postgres_deployment_with(&PostgresDeploymentInputs {
+		name,
+		namespace,
+		pvc_name: &pvc_name,
+		pg_version: &pg_version,
+		shm_size,
+		shared_buffers_mb,
+		read_only: effective_read_only,
+		postgres_extra_config: replica.spec.postgres_extra_config.as_deref(),
+		analytics_username: &replica.spec.analytics_username,
+		analytics_password_secret: &creds_secret,
+		analytics_password_key: "password",
+		snapshot_id: &restore.spec.snapshot,
+		snapshot_time: restore.spec.snapshot_time.as_deref().unwrap_or(""),
+		labels,
+		match_labels,
+		pod_annotations: replica.spec.pod_annotations.clone(),
+		owner_references: Some(vec![restore_owner_reference(restore)]),
+		postgres_resources: replica.spec.resources.clone(),
+		affinity: replica.spec.affinity.clone(),
+		tolerations: replica.spec.tolerations.clone(),
+	})
+}
+
+/// Shared postgres Deployment builder — no CR dependencies. Both the
+/// CRD path (`build_deployment`) and the canopy path
+/// (`controllers::canopy::builders::build_canopy_postgres_deployment`) go
+/// through this.
+pub fn build_postgres_deployment_with(cfg: &PostgresDeploymentInputs<'_>) -> Result<Deployment> {
+	let PostgresDeploymentInputs {
+		name,
+		namespace,
+		pvc_name,
+		pg_version,
+		shm_size,
+		shared_buffers_mb,
+		read_only,
+		postgres_extra_config,
+		analytics_username,
+		analytics_password_secret,
+		analytics_password_key,
+		snapshot_id,
+		snapshot_time,
+		labels,
+		match_labels,
+		pod_annotations,
+		owner_references,
+		postgres_resources,
+		affinity,
+		tolerations,
+	} = cfg;
+	let shm_size = shm_size.clone();
+	let shared_buffers_mb = *shared_buffers_mb;
+	let read_only = *read_only;
 
 	let pg_image = format!("postgres:{pg_version}");
 
@@ -817,11 +924,7 @@ cp -a /usr/lib/locale/* /locale-data/
 "#
 	.to_string();
 
-	// persistent_schemas needs write access to receive the migrated data
-	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
-	let read_only = effective_read_only.to_string();
-
-	let extra_config_block = if let Some(ref extra) = replica.spec.postgres_extra_config {
+	let extra_config_block = if let Some(extra) = postgres_extra_config {
 		format!(
 			r#"echo "Appending extra postgresql.conf settings..."
 cat >> "$PGDATA/postgresql.conf" << 'EXTRACONFEOF'
@@ -1114,21 +1217,17 @@ echo "Auth setup complete"
 "#
 	);
 
-	let labels = BTreeMap::from([
-		(
-			"pgro.bes.au/replica".to_string(),
-			restore.spec.replica.name.clone(),
-		),
-		("pgro.bes.au/restore".to_string(), name.to_string()),
-	]);
-
 	let init_env = vec![
 		EnvVar {
 			name: "ANALYTICS_USERNAME".to_string(),
-			value: Some(replica.spec.analytics_username.clone()),
+			value: Some((*analytics_username).to_string()),
 			..Default::default()
 		},
-		env_from_secret("ANALYTICS_PASSWORD", &creds_secret, "password"),
+		env_from_secret(
+			"ANALYTICS_PASSWORD",
+			analytics_password_secret,
+			analytics_password_key,
+		),
 		EnvVar {
 			name: "READ_ONLY".to_string(),
 			value: Some(read_only.to_string()),
@@ -1136,31 +1235,28 @@ echo "Auth setup complete"
 		},
 		EnvVar {
 			name: "PGRO_SNAPSHOT_ID".to_string(),
-			value: Some(restore.spec.snapshot.clone()),
+			value: Some((*snapshot_id).to_string()),
 			..Default::default()
 		},
 		EnvVar {
 			name: "PGRO_SNAPSHOT_TIME".to_string(),
-			value: Some(restore.spec.snapshot_time.clone().unwrap_or_default()),
+			value: Some((*snapshot_time).to_string()),
 			..Default::default()
 		},
 	];
 
 	Ok(Deployment {
 		metadata: ObjectMeta {
-			name: Some(name.to_string()),
-			namespace: Some(namespace.to_string()),
+			name: Some((*name).to_string()),
+			namespace: Some((*namespace).to_string()),
 			labels: Some(labels.clone()),
-			owner_references: Some(vec![restore_owner_reference(restore)]),
+			owner_references: owner_references.clone(),
 			..Default::default()
 		},
 		spec: Some(DeploymentSpec {
 			replicas: Some(1),
 			selector: LabelSelector {
-				match_labels: Some(BTreeMap::from([(
-					"pgro.bes.au/restore".to_string(),
-					name.to_string(),
-				)])),
+				match_labels: Some(match_labels.clone()),
 				..Default::default()
 			},
 			progress_deadline_seconds: Some(3600),
@@ -1170,8 +1266,8 @@ echo "Auth setup complete"
 			}),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
-					labels: Some(labels),
-					annotations: replica.spec.pod_annotations.clone(),
+					labels: Some(labels.clone()),
+					annotations: pod_annotations.clone(),
 					..Default::default()
 				}),
 				spec: Some(PodSpec {
@@ -1399,7 +1495,7 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							failure_threshold: Some(3),
 							..Default::default()
 						}),
-						resources: replica.spec.resources.clone(),
+						resources: postgres_resources.clone(),
 						..Default::default()
 					}],
 					volumes: Some(vec![
@@ -1407,7 +1503,7 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							name: "pgdata".to_string(),
 							persistent_volume_claim: Some(
 								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-									claim_name: pvc_name,
+									claim_name: (*pvc_name).to_string(),
 									read_only: Some(false),
 								},
 							),
@@ -1431,8 +1527,8 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 							..Default::default()
 						},
 					]),
-					affinity: replica.spec.affinity.clone(),
-					tolerations: Some(replica.spec.tolerations.clone()),
+					affinity: affinity.clone(),
+					tolerations: Some(tolerations.clone()),
 					..Default::default()
 				}),
 			},
