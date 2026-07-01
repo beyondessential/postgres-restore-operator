@@ -224,6 +224,7 @@ async fn fail_restore(
 	name: &str,
 	replica_name: &str,
 	status_patch: serde_json::Value,
+	error: &str,
 ) -> Result<Action> {
 	update_restore_status(&ctx.client, namespace, name, status_patch).await?;
 
@@ -294,6 +295,22 @@ async fn fail_restore(
 		.await
 	{
 		warn!(replica = replica_name, error = %e, "failed to publish RestoreFailed event");
+	}
+
+	// Canopy verification (signal 3, failure) — no-op unless the replica
+	// has spec.canopy_source. The caller passes a short reason so
+	// operators see it on canopy's UI without having to trawl k8s events.
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(ctx.client.clone(), namespace);
+	if let (Ok(restore), Ok(replica)) = (restores.get(name).await, replicas.get(replica_name).await)
+	{
+		crate::controllers::canopy::verification::report(
+			ctx,
+			&replica,
+			&restore,
+			bestool_canopy::Outcome::Failure,
+			Some(error),
+		)
+		.await;
 	}
 
 	Ok(Action::requeue(Duration::from_secs(300)))
@@ -446,6 +463,16 @@ async fn reconcile_restoring(
 			let replica = replicas.get(replica_name).await?;
 
 			let cache_pressure_url = ctx.cache_pressure_callback_url(namespace, name);
+			let stats_callback_url = ctx.canopy_stats_callback_url(namespace, &job_name);
+			let canopy_proxy = if replica.spec.canopy_source.is_some() {
+				Some(builders::CanopyProxyArgs {
+					image: &ctx.canopy_proxy_image,
+					broker_base_url: &ctx.canopy_broker_base_url,
+					stats_callback_url: &stats_callback_url,
+				})
+			} else {
+				None
+			};
 			let job = build_restore_job(
 				restore,
 				&job_name,
@@ -453,6 +480,7 @@ async fn reconcile_restoring(
 				&replica,
 				&ctx.kopia_image(),
 				&cache_pressure_url,
+				canopy_proxy.as_ref(),
 			)?;
 			jobs.create(&PostParams::default(), &job).await?
 		}
@@ -563,6 +591,7 @@ async fn reconcile_restoring(
 					"phase": "Failed",
 				},
 			}),
+			"kopia restore Job failed after backoff exhausted",
 		)
 		.await;
 	}
@@ -790,6 +819,7 @@ async fn reconcile_ready(
 						name,
 						replica_name,
 						serde_json::json!({ "phase": "Failed" }),
+						"version detection Job succeeded but did not report a postgres version",
 					)
 					.await;
 				}
@@ -809,6 +839,7 @@ async fn reconcile_ready(
 						name,
 						replica_name,
 						serde_json::json!({ "phase": "Failed" }),
+						"version detection Job failed after backoff exhausted",
 					)
 					.await;
 				}
@@ -877,6 +908,10 @@ async fn reconcile_ready(
 				name,
 				replica_name,
 				serde_json::json!({ "phase": "Failed" }),
+				&format!(
+					"postgres Deployment did not become Ready within {timeout_secs}s of \
+					 restore completion"
+				),
 			)
 			.await;
 		}

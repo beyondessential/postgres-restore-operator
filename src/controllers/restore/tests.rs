@@ -17,10 +17,11 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 */6 * * *".into(),
 			schedule_jitter: TimeSpan(Span::new().minutes(10)),
@@ -101,10 +102,11 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 */6 * * *".into(),
 			schedule_jitter: TimeSpan(Span::new().minutes(10)),
@@ -154,6 +156,7 @@ fn restore_job_has_ttl_seconds_after_finished() {
 		&replica,
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let ttl = job
@@ -180,6 +183,7 @@ fn restore_job_mounts_persistent_kopia_cache() {
 		&replica,
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -326,6 +330,7 @@ fn restore_job_passes_cache_caps_and_log_rotation() {
 		&replica,
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();

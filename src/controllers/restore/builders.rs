@@ -5,9 +5,9 @@ use k8s_openapi::{
 		apps::v1::{Deployment, DeploymentSpec},
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, ContainerPort, EnvVar, ExecAction, PersistentVolumeClaim,
-			PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe, ResourceRequirements,
-			SecretReference, Volume, VolumeMount, VolumeResourceRequirements,
+			Container, ContainerPort, EmptyDirVolumeSource, EnvVar, ExecAction,
+			PersistentVolumeClaim, PersistentVolumeClaimSpec, PodSpec, PodTemplateSpec, Probe,
+			ResourceRequirements, SecretReference, Volume, VolumeMount, VolumeResourceRequirements,
 		},
 	},
 	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::LabelSelector},
@@ -20,9 +20,26 @@ use super::restore_owner_reference;
 use crate::{
 	controllers::{env_from_secret, env_from_secret_optional, kopia_writable_env},
 	error::{Error, Result},
+	kopia::KopiaSource,
 	quantity::compute_shm_and_shared_buffers,
 	types::*,
 };
+
+/// Standard label used on Pods that carry a canopy-proxy sidecar so the
+/// operator's broker NetworkPolicy can admit their ingress.
+pub const PROXY_SIDECAR_POD_LABEL: (&str, &str) = ("pgro.bes.au/proxy-sidecar", "true");
+
+/// Extra inputs the canopy path needs on top of the legacy args.
+pub struct CanopyProxyArgs<'a> {
+	/// Image of the canopy-proxy sidecar (same image as the operator; the
+	/// container runs the `canopy-proxy` binary instead of `operator`).
+	pub image: &'a str,
+	/// Base URL the sidecar hits for STS creds
+	/// (e.g. `http://postgres-restore-operator.pgro-system.svc:9091`).
+	pub broker_base_url: &'a str,
+	/// Callback URL the sidecar POSTs its final TrafficStats to on shutdown.
+	pub stats_callback_url: &'a str,
+}
 
 /// Name of the credential-reset Job for a given restore.
 pub fn credential_reset_job_name(restore_name: &str) -> String {
@@ -512,12 +529,39 @@ pub fn build_restore_job(
 	replica: &PostgresPhysicalReplica,
 	kopia_image: &str,
 	cache_pressure_callback_url: &str,
+	canopy_proxy: Option<&CanopyProxyArgs<'_>>,
 ) -> Result<Job> {
-	let kopia_secret = &replica.spec.kopia_secret_ref;
+	let source = replica.kopia_source();
+	let kopia_secret = SecretReference {
+		name: Some(source.secret_name().to_string()),
+		namespace: None,
+	};
 	let pvc_name = format!("{}-data", restore.name_any());
 	let cache_pvc_name = kopia_cache_pvc_name(&restore.spec.replica.name);
 
-	let restore_script = r#"set -e
+	// Canopy prelude waits for the sidecar to bind, then exports the
+	// loopback endpoint/disable-tls so the main script's connect step
+	// picks them up via ENDPOINT_ARGS. No-op on the legacy path.
+	let canopy_prelude = if source.is_canopy_proxy() {
+		r#"PORT_FILE="/var/run/pgro/proxy-port"
+for _ in $(seq 1 30); do
+  [ -f "$PORT_FILE" ] && break
+  sleep 1
+done
+if [ ! -f "$PORT_FILE" ]; then
+  echo "ERROR: canopy-proxy sidecar did not write port file within 30s" >&2
+  exit 1
+fi
+export KOPIA_ENDPOINT="[::1]:$(cat "$PORT_FILE")"
+export KOPIA_DISABLE_TLS=true
+echo "kopia connecting via canopy proxy at ${KOPIA_ENDPOINT}"
+
+"#
+	} else {
+		""
+	};
+
+	let restore_script_body = r#"set -e
 
 mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
 
@@ -614,33 +658,232 @@ echo "$VERSION" > /pgdata/.postgres-version
 echo -n "$VERSION" > /dev/termination-log
 "#;
 
+	let restore_script = format!("{canopy_prelude}{restore_script_body}");
+
+	// Base env: shared between legacy and canopy. env_from_secret uses the
+	// same key names in both Secrets (bucket, region, accessKeyId,
+	// secretAccessKey, repositoryPassword); the canopy path just fills
+	// AWS creds with dummy values because the proxy re-signs upstream.
+	let mut env: Vec<EnvVar> = [
+		vec![
+			EnvVar {
+				name: "SNAPSHOT_ID".to_string(),
+				value: Some(restore.spec.snapshot.clone()),
+				..Default::default()
+			},
+			EnvVar {
+				name: "KOPIA_CONTENT_CACHE_MB".to_string(),
+				value: Some(kopia_content_cache_mb(&restore.spec.snapshot_size).to_string()),
+				..Default::default()
+			},
+			EnvVar {
+				name: "KOPIA_METADATA_CACHE_MB".to_string(),
+				value: Some(KOPIA_METADATA_CACHE_MB.to_string()),
+				..Default::default()
+			},
+			EnvVar {
+				name: "CACHE_PRESSURE_CALLBACK_URL".to_string(),
+				value: Some(cache_pressure_callback_url.to_string()),
+				..Default::default()
+			},
+		],
+		kopia_writable_env(),
+		vec![
+			env_from_secret("KOPIA_BUCKET", &kopia_secret, "bucket"),
+			env_from_secret("KOPIA_REGION", &kopia_secret, "region"),
+			env_from_secret("AWS_ACCESS_KEY_ID", &kopia_secret, "accessKeyId"),
+			env_from_secret("AWS_SECRET_ACCESS_KEY", &kopia_secret, "secretAccessKey"),
+			env_from_secret("KOPIA_PASSWORD", &kopia_secret, "repositoryPassword"),
+		],
+	]
+	.concat();
+
+	// Legacy Secrets may carry KOPIA_ENDPOINT / KOPIA_DISABLE_TLS as an
+	// escape hatch (e.g. for MinIO); canopy sets them via the shell prelude
+	// after the proxy binds, so we skip these optional keys on the canopy
+	// path to avoid a needless lookup.
+	if !source.is_canopy_proxy() {
+		env.push(env_from_secret_optional(
+			"KOPIA_ENDPOINT",
+			&kopia_secret,
+			"endpoint",
+		));
+		env.push(env_from_secret_optional(
+			"KOPIA_DISABLE_TLS",
+			&kopia_secret,
+			"disableTls",
+		));
+	}
+
+	let volume_mounts = vec![
+		VolumeMount {
+			name: "pgdata".to_string(),
+			mount_path: "/pgdata".to_string(),
+			..Default::default()
+		},
+		VolumeMount {
+			name: "kopia-cache".to_string(),
+			mount_path: "/tmp/kopia".to_string(),
+			..Default::default()
+		},
+	];
+	let mut volumes = vec![
+		Volume {
+			name: "pgdata".to_string(),
+			persistent_volume_claim: Some(
+				k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+					claim_name: pvc_name,
+					read_only: Some(false),
+				},
+			),
+			..Default::default()
+		},
+		Volume {
+			name: "kopia-cache".to_string(),
+			persistent_volume_claim: Some(
+				k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
+					claim_name: cache_pvc_name,
+					read_only: Some(false),
+				},
+			),
+			..Default::default()
+		},
+	];
+
+	let mut pod_labels = BTreeMap::from([
+		(
+			"pgro.bes.au/replica".to_string(),
+			restore.spec.replica.name.clone(),
+		),
+		("pgro.bes.au/restore".to_string(), restore.name_any()),
+	]);
+
+	let mut containers = Vec::with_capacity(2);
+	containers.push(Container {
+		name: "restore".to_string(),
+		image: Some(kopia_image.to_string()),
+		command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+		args: Some(vec![restore_script]),
+		env: Some(env),
+		volume_mounts: Some(volume_mounts),
+		resources: Some(ResourceRequirements {
+			requests: Some(BTreeMap::from([
+				("cpu".to_string(), Quantity("500m".to_string())),
+				("memory".to_string(), Quantity("1Gi".to_string())),
+			])),
+			limits: Some(BTreeMap::from([
+				("cpu".to_string(), Quantity("2".to_string())),
+				("memory".to_string(), Quantity("4Gi".to_string())),
+			])),
+			..Default::default()
+		}),
+		..Default::default()
+	});
+
+	if let KopiaSource::CanopyProxy {
+		group, backup_type, ..
+	} = &source
+	{
+		let proxy = canopy_proxy.expect(
+			"build_restore_job called with canopy_source but no CanopyProxyArgs; caller must \
+			 thread proxy config from Context when replica.spec.canopy_source is set",
+		);
+
+		containers[0]
+			.volume_mounts
+			.as_mut()
+			.unwrap()
+			.push(VolumeMount {
+				name: "proxy-shared".to_string(),
+				mount_path: "/var/run/pgro".to_string(),
+				..Default::default()
+			});
+
+		containers.push(Container {
+			name: "canopy-proxy".to_string(),
+			image: Some(proxy.image.to_string()),
+			// Same image as the operator; run the `canopy-proxy` binary
+			// instead of the default `operator` entrypoint.
+			command: Some(vec!["canopy-proxy".to_string()]),
+			env: Some(vec![
+				EnvVar {
+					name: "PGRO_BROKER_URL".to_string(),
+					value: Some(proxy.broker_base_url.to_string()),
+					..Default::default()
+				},
+				EnvVar {
+					name: "PGRO_GROUP".to_string(),
+					value: Some(group.clone()),
+					..Default::default()
+				},
+				EnvVar {
+					name: "PGRO_TYPE".to_string(),
+					value: Some(backup_type.clone()),
+					..Default::default()
+				},
+				EnvVar {
+					name: "PGRO_STATS_CALLBACK_URL".to_string(),
+					value: Some(proxy.stats_callback_url.to_string()),
+					..Default::default()
+				},
+			]),
+			volume_mounts: Some(vec![VolumeMount {
+				name: "proxy-shared".to_string(),
+				mount_path: "/var/run/pgro".to_string(),
+				..Default::default()
+			}]),
+			resources: Some(ResourceRequirements {
+				requests: Some(BTreeMap::from([
+					("cpu".to_string(), Quantity("50m".to_string())),
+					("memory".to_string(), Quantity("64Mi".to_string())),
+				])),
+				limits: Some(BTreeMap::from([
+					("cpu".to_string(), Quantity("500m".to_string())),
+					("memory".to_string(), Quantity("256Mi".to_string())),
+				])),
+				..Default::default()
+			}),
+			..Default::default()
+		});
+
+		volumes.push(Volume {
+			name: "proxy-shared".to_string(),
+			empty_dir: Some(EmptyDirVolumeSource {
+				medium: Some("Memory".to_string()),
+				..Default::default()
+			}),
+			..Default::default()
+		});
+
+		pod_labels.insert(
+			PROXY_SIDECAR_POD_LABEL.0.to_string(),
+			PROXY_SIDECAR_POD_LABEL.1.to_string(),
+		);
+	}
+
+	// Canopy's proxy refreshes creds so long restores aren't
+	// credential-bounded, only reachability-bounded — bump to 4 h.
+	let active_deadline_seconds = if source.is_canopy_proxy() {
+		14400
+	} else {
+		7200
+	};
+
 	Ok(Job {
 		metadata: ObjectMeta {
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
-			labels: Some(BTreeMap::from([
-				(
-					"pgro.bes.au/replica".to_string(),
-					restore.spec.replica.name.clone(),
-				),
-				("pgro.bes.au/restore".to_string(), restore.name_any()),
-			])),
+			labels: Some(pod_labels.clone()),
 			owner_references: Some(vec![restore_owner_reference(restore)]),
 			..Default::default()
 		},
 		spec: Some(JobSpec {
 			backoff_limit: Some(3),
-			active_deadline_seconds: Some(7200),   // 2 hours
-			ttl_seconds_after_finished: Some(120), // safety net if operator misses deletion
+			active_deadline_seconds: Some(active_deadline_seconds),
+			ttl_seconds_after_finished: Some(120),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
-					labels: Some(BTreeMap::from([
-						(
-							"pgro.bes.au/replica".to_string(),
-							restore.spec.replica.name.clone(),
-						),
-						("pgro.bes.au/restore".to_string(), restore.name_any()),
-					])),
+					labels: Some(pod_labels),
 					..Default::default()
 				}),
 				spec: Some(PodSpec {
@@ -651,119 +894,8 @@ echo -n "$VERSION" > /dev/termination-log
 						fs_group: Some(999),
 						..Default::default()
 					}),
-
-					containers: vec![Container {
-						name: "restore".to_string(),
-						image: Some(kopia_image.to_string()),
-						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![restore_script.to_string()]),
-						env: Some(
-							[
-								vec![
-									EnvVar {
-										name: "SNAPSHOT_ID".to_string(),
-										value: Some(restore.spec.snapshot.clone()),
-										..Default::default()
-									},
-									EnvVar {
-										name: "KOPIA_CONTENT_CACHE_MB".to_string(),
-										value: Some(
-											kopia_content_cache_mb(&restore.spec.snapshot_size)
-												.to_string(),
-										),
-										..Default::default()
-									},
-									EnvVar {
-										name: "KOPIA_METADATA_CACHE_MB".to_string(),
-										value: Some(KOPIA_METADATA_CACHE_MB.to_string()),
-										..Default::default()
-									},
-									EnvVar {
-										name: "CACHE_PRESSURE_CALLBACK_URL".to_string(),
-										value: Some(cache_pressure_callback_url.to_string()),
-										..Default::default()
-									},
-								],
-								kopia_writable_env(),
-								vec![
-									env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
-									env_from_secret("KOPIA_REGION", kopia_secret, "region"),
-									env_from_secret(
-										"AWS_ACCESS_KEY_ID",
-										kopia_secret,
-										"accessKeyId",
-									),
-									env_from_secret(
-										"AWS_SECRET_ACCESS_KEY",
-										kopia_secret,
-										"secretAccessKey",
-									),
-									env_from_secret(
-										"KOPIA_PASSWORD",
-										kopia_secret,
-										"repositoryPassword",
-									),
-									env_from_secret_optional(
-										"KOPIA_ENDPOINT",
-										kopia_secret,
-										"endpoint",
-									),
-									env_from_secret_optional(
-										"KOPIA_DISABLE_TLS",
-										kopia_secret,
-										"disableTls",
-									),
-								],
-							]
-							.concat(),
-						),
-						volume_mounts: Some(vec![
-							VolumeMount {
-								name: "pgdata".to_string(),
-								mount_path: "/pgdata".to_string(),
-								..Default::default()
-							},
-							k8s_openapi::api::core::v1::VolumeMount {
-								name: "kopia-cache".to_string(),
-								mount_path: "/tmp/kopia".to_string(),
-								..Default::default()
-							},
-						]),
-						resources: Some(ResourceRequirements {
-							requests: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("500m".to_string())),
-								("memory".to_string(), Quantity("1Gi".to_string())),
-							])),
-							limits: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("2".to_string())),
-								("memory".to_string(), Quantity("4Gi".to_string())),
-							])),
-							..Default::default()
-						}),
-						..Default::default()
-					}],
-					volumes: Some(vec![
-						Volume {
-							name: "pgdata".to_string(),
-							persistent_volume_claim: Some(
-								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-									claim_name: pvc_name,
-									read_only: Some(false),
-								},
-							),
-							..Default::default()
-						},
-						Volume {
-							name: "kopia-cache".to_string(),
-							persistent_volume_claim: Some(
-								k8s_openapi::api::core::v1::PersistentVolumeClaimVolumeSource {
-									claim_name: cache_pvc_name,
-									read_only: Some(false),
-								},
-							),
-							..Default::default()
-						},
-					]),
+					containers,
+					volumes: Some(volumes),
 					..Default::default()
 				}),
 			},

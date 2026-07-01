@@ -22,10 +22,10 @@ use tracing::{debug, info, warn};
 use postgres_restore_operator::{
 	canopy::{self, DEFAULT_SOCKS5_PROXY},
 	context::{
-		Context, DEFAULT_CANOPY_PGDATA_PVC_SIZE, DEFAULT_CANOPY_PROXY_IMAGE,
-		DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS, DEFAULT_KOPIA_IMAGE,
+		Context, DEFAULT_CANOPY_PROXY_IMAGE, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
+		DEFAULT_KOPIA_IMAGE,
 	},
-	controllers,
+	controllers::{self, canopy::intent::SUPPORTED as PGRO_SUPPORTED_INTENTS},
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
 
@@ -43,12 +43,6 @@ const DEFAULT_METRICS_PORT: u16 = 8080;
 const DEFAULT_BROKER_ADDR: &str = "[::]:9091";
 const DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS: u64 = 30;
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
-
-/// Intent set pgro registers with canopy on startup; only worklist entries
-/// with a matching intent will be dispatched. `disaster-recovery` is not
-/// yet supported — the code has no rehearsal lifecycle beyond "make it
-/// writable", which is not what DR actually needs.
-const PGRO_SUPPORTED_INTENTS: &[&str] = &["verify", "analytics"];
 
 /// Annotate the operator's own pod with the running version.
 async fn annotate_own_pod(client: &Client, namespace: &str) {
@@ -220,8 +214,6 @@ async fn main() -> anyhow::Result<()> {
 		});
 	ctx.canopy_proxy_image = std::env::var("CANOPY_PROXY_IMAGE")
 		.unwrap_or_else(|_| DEFAULT_CANOPY_PROXY_IMAGE.to_string());
-	ctx.canopy_pgdata_pvc_size = std::env::var("CANOPY_PGDATA_PVC_SIZE")
-		.unwrap_or_else(|_| DEFAULT_CANOPY_PGDATA_PVC_SIZE.to_string());
 	ctx.canopy_broker_base_url = if let Ok(url) = std::env::var("CANOPY_BROKER_BASE_URL") {
 		url
 	} else if let Ok(svc) = std::env::var("OPERATOR_SERVICE_NAME") {
@@ -564,8 +556,8 @@ async fn post_cache_pressure(
 }
 
 /// Accept the canopy-proxy sidecar's final TrafficStats POST on shutdown.
-/// The body is opaque JSON — the reporter deserializes it when building
-/// the RestoreVerification.
+/// The body is opaque JSON — the canopy notification target deserializes
+/// it when building the RestoreVerification.
 async fn post_canopy_stats(
 	State(state): State<ServerState>,
 	Path((namespace, job)): Path<(String, String)>,

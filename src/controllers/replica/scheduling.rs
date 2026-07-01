@@ -151,6 +151,28 @@ impl PostgresPhysicalReplica {
 		Some(next.into())
 	}
 
+	/// True when the replica's `minimum_ttl` is configured and the last
+	/// restore completed within that window relative to `now`. Used by both
+	/// the cron path (via [`Self::check_schedule`]) and the canopy path
+	/// where TTL gates the desired-snapshot trigger.
+	pub fn within_minimum_ttl(&self, now: Timestamp) -> bool {
+		let Some(ref minimum_ttl) = self.spec.minimum_ttl else {
+			return false;
+		};
+		let Some(last_completed) = self
+			.status
+			.as_ref()
+			.and_then(|s| s.last_restore_completed_at.as_ref())
+		else {
+			return false;
+		};
+		let not_before = last_completed
+			.0
+			.to_zoned(TimeZone::UTC)
+			.saturating_add(minimum_ttl.0);
+		now.to_zoned(TimeZone::UTC) < not_before
+	}
+
 	pub fn check_schedule(&self) -> ScheduleDecision {
 		let name = self.name_any();
 		let schedule = &self.spec.schedule;
@@ -231,10 +253,11 @@ mod tests {
 				..Default::default()
 			},
 			spec: PostgresPhysicalReplicaSpec {
-				kopia_secret_ref: SecretReference {
+				kopia_secret_ref: Some(SecretReference {
 					name: Some("test-secret".into()),
 					namespace: None,
-				},
+				}),
+				canopy_source: None,
 				snapshot_filter: None,
 				schedule: schedule.into(),
 				schedule_jitter: TimeSpan(Span::new().seconds(0)),

@@ -18,10 +18,11 @@ fn make_replica(
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 * * * *".into(),
 			schedule_jitter: TimeSpan(jiff::Span::new()),
@@ -176,10 +177,11 @@ fn snapshot_list_job_rotates_kopia_logs() {
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 * * * *".into(),
 			schedule_jitter: TimeSpan(jiff::Span::new()),
@@ -204,8 +206,15 @@ fn snapshot_list_job_rotates_kopia_logs() {
 		status: None,
 	};
 
-	let job = build_snapshot_list_job(&replica, "test-snap", "default", "kopia:latest", "http://x")
-		.expect("job builds");
+	let job = build_snapshot_list_job(
+		&replica,
+		"test-snap",
+		"default",
+		"kopia:latest",
+		"http://x",
+		None,
+	)
+	.expect("job builds");
 	let script = job.spec.unwrap().template.spec.unwrap().containers[0]
 		.args
 		.as_ref()

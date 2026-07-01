@@ -17,7 +17,6 @@ pub const DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS: u64 = 30 * 60;
 /// sidecar to a different tag from the operator itself.
 pub const DEFAULT_CANOPY_PROXY_IMAGE: &str =
 	"ghcr.io/beyondessential/postgres-restore-operator:latest";
-pub const DEFAULT_CANOPY_PGDATA_PVC_SIZE: &str = "20Gi";
 
 pub struct Context {
 	pub client: Client,
@@ -39,17 +38,14 @@ pub struct Context {
 	/// Image reference for the pgro-canopy-proxy sidecar container. Set
 	/// by the operator startup from `CANOPY_PROXY_IMAGE`.
 	pub canopy_proxy_image: String,
-	/// Default pgdata PVC size used when the operator provisions a
-	/// canopy-backed replica (per intent).
-	pub canopy_pgdata_pvc_size: String,
 	/// In-memory store for snapshot-list results POSTed by jobs.
 	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for schema migration results POSTed by jobs.
 	pub schema_migration_results: Arc<CallbackStore>,
 	/// In-memory store for canopy-proxy sidecar TrafficStats keyed by
 	/// `{namespace}/{job}`. Written on sidecar exit via the operator's
-	/// `/api/v1/canopy-stats/...` callback; read by the reporter when
-	/// building `RestoreVerification.s3_*_bytes`.
+	/// `/api/v1/canopy-stats/...` callback; read by the canopy
+	/// notification target when building `RestoreVerification.s3_*_bytes`.
 	pub canopy_stats: Arc<CallbackStore>,
 	/// Base URL the operator is reachable at from within the cluster,
 	/// e.g. `http://postgres-restore-operator.pgro-system.svc:8080`.
@@ -89,7 +85,6 @@ impl Context {
 			canopy: None,
 			canopy_broker_base_url: String::new(),
 			canopy_proxy_image: DEFAULT_CANOPY_PROXY_IMAGE.to_string(),
-			canopy_pgdata_pvc_size: DEFAULT_CANOPY_PGDATA_PVC_SIZE.to_string(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
 			canopy_stats: Arc::new(CallbackStore::default()),
