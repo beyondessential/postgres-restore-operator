@@ -37,6 +37,7 @@ use uuid::Uuid;
 use crate::{context::Context, error::Result};
 
 mod builders;
+mod reporter;
 pub use builders::{
 	CanopyRestoreJobConfig, KOPIA_JOB_NAME, PGDATA_PVC_NAME, PROXY_SIDECAR_POD_LABEL,
 	build_canopy_restore_job, build_pgdata_pvc,
@@ -370,6 +371,11 @@ impl CanopyController {
 				}
 			})
 			.await;
+
+		// Re-list namespaces so the reporter observes any state we just
+		// wrote. Cheap — one apiserver call for the pgro-canopy label.
+		let namespaces = ns_api.list(&params).await?.items;
+		reporter::observe_and_report(&self.ctx, &namespaces).await;
 
 		Ok(())
 	}
