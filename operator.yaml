@@ -98,6 +98,13 @@ rules:
       resources: ["configmaps"]
       resourceNames: ["postgres-restore-operator-config"]
       verbs: ["get", "list", "watch"]
+    # Tailscale sidecar persists tailnet state in this Secret so a restart
+    # rejoins as the same node identity — the sidecar writes to it under
+    # the operator's ServiceAccount.
+    - apiGroups: [""]
+      resources: ["secrets"]
+      resourceNames: ["pgro-operator-tailscale-state"]
+      verbs: ["get", "update", "patch", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -249,40 +256,46 @@ spec:
                       readOnlyRootFilesystem: true
                       capabilities:
                           drop: ["ALL"]
-            # --------------------------------------------------------------
-            # Tailscale sidecar for the canopy tailnet path.
-            #
-            # Uncomment the container below AND install the Tailscale
-            # Kubernetes operator (ops repo, one-time per cluster) to give
-            # the operator a tailnet identity. bestool-canopy's CanopyClient
-            # auto-probes canopy.tail53aef.ts.net; the SOCKS5 proxy on
-            # [::1]:1055 (below) is what makes that probe succeed from
-            # in-cluster.
-            #
-            # An OAuth-issued auth key with the pgro ACL tag must be
-            # provisioned by ops as the referenced Secret's `TS_AUTHKEY` key.
-            # ----------------------------------------------------------------
-            #   - name: tailscale
-            #     image: ghcr.io/tailscale/tailscale:v1.80
-            #     env:
-            #         - name: TS_USERSPACE
-            #           value: "true"
-            #         - name: TS_SOCKS5_SERVER
-            #           value: "[::]:1055"
-            #         - name: TS_HOSTNAME
-            #           value: pgro-operator
-            #         - name: TS_KUBE_SECRET
-            #           value: pgro-operator-tailscale-state
-            #         - name: TS_AUTHKEY
-            #           valueFrom:
-            #               secretKeyRef:
-            #                   name: pgro-operator-tailscale-authkey
-            #                   key: TS_AUTHKEY
-            #     securityContext:
-            #         allowPrivilegeEscalation: false
-            #         readOnlyRootFilesystem: false
-            #         capabilities:
-            #             drop: ["ALL"]
+                # Tailscale sidecar — the primary production network path
+                # to canopy. bestool-canopy's CanopyClient auto-probes
+                # canopy.tail53aef.ts.net; the SOCKS5 proxy on [::1]:1055
+                # is what makes that probe succeed from in-cluster.
+                #
+                # Ops (one-time per cluster) provisions:
+                # - the Tailscale k8s operator;
+                # - an OAuth-issued authkey carrying the pgro ACL tag,
+                #   stored in the pgro-operator-tailscale-authkey Secret
+                #   at the TS_AUTHKEY key;
+                # - the pgro-operator-tailscale-state Secret (empty,
+                #   writable by this pod for TS state persistence).
+                - name: tailscale
+                  image: ghcr.io/tailscale/tailscale:v1.80
+                  env:
+                      - name: TS_USERSPACE
+                        value: "true"
+                      - name: TS_SOCKS5_SERVER
+                        value: "[::]:1055"
+                      - name: TS_HOSTNAME
+                        value: pgro-operator
+                      - name: TS_KUBE_SECRET
+                        value: pgro-operator-tailscale-state
+                      - name: TS_AUTHKEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: pgro-operator-tailscale-authkey
+                                key: TS_AUTHKEY
+                  securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: false
+                      capabilities:
+                          drop: ["ALL"]
+                  resources:
+                      requests:
+                          cpu: 20m
+                          memory: 64Mi
+                      limits:
+                          cpu: 200m
+                          memory: 256Mi
 ---
 # NetworkPolicy restricting the credential-broker port (9091) to Pods
 # labelled `pgro.bes.au/proxy-sidecar=true` — the label the canopy Job
