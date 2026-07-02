@@ -1209,6 +1209,7 @@ HBAEOF
 if [ ! -d "$PGDATA/pg_wal" ]; then
   echo "pg_wal directory missing (snapshot may be from a Windows host with WAL on a separate path), creating empty pg_wal..."
   mkdir -p "$PGDATA/pg_wal"
+  touch /pgdata/fix-recreated-pg-wal
 fi
 
 # Run a postgres --single SQL command with a two-stage pg_resetwal -f
@@ -1252,6 +1253,7 @@ postgres_single_or_resetwal() {{
     rm -f "$logfile"
     pg_resetwal -f "$PGDATA"
     touch /pgdata/needs-reindex-all
+    touch /pgdata/fix-reset-wal
     echo "$sql_input" | postgres --single -D "$PGDATA" postgres
     return $?
   fi
@@ -1273,6 +1275,7 @@ postgres_single_or_resetwal() {{
   rm -f "$logfile"
   pg_resetwal -f "$PGDATA"
   touch /pgdata/needs-reindex-all
+  touch /pgdata/fix-reset-wal
   echo "$sql_input" | postgres --single -D "$PGDATA" postgres
 }}
 
@@ -1368,13 +1371,29 @@ ALTER ROLE ${{ANALYTICS_USERNAME}} WITH SUPERUSER;
 SQLEOF
 fi
 
+# Record which "fix" steps this restore had to apply, so the operator can
+# read them back (SELECT from _pgro.restore_info) and forward them to
+# canopy in the restore-verification health_details. Stored as a jsonb map
+# so adding a new fix is one shell line here plus recording its flag — no
+# schema change, no operator change (the operator forwards the map as-is).
+# Each fix is keyed by a flag file the fix step touches:
+#   locale  — the post-startup locale rewrite actually changed rows
+#   reindex — REINDEX ran (after pg_resetwal, or a locale rewrite)
+#   reset_wal — pg_resetwal -f ran (snapshot's trailing WAL was unusable)
+#   recreated_pg_wal — an empty pg_wal was created (Windows-host snapshot)
 if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
   PGRO_STAGE=restored
+  PGRO_REINDEX=true
 else
   PGRO_STAGE=ready
+  PGRO_REINDEX=false
 fi
+if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then PGRO_LOCALE=true; else PGRO_LOCALE=false; fi
+if [ -f /pgdata/fix-reset-wal ]; then PGRO_RESET_WAL=true; else PGRO_RESET_WAL=false; fi
+if [ -f /pgdata/fix-recreated-pg-wal ]; then PGRO_RECREATED_WAL=true; else PGRO_RECREATED_WAL=false; fi
+PGRO_FIXES="{{\"locale\": ${{PGRO_LOCALE}}, \"reindex\": ${{PGRO_REINDEX}}, \"reset_wal\": ${{PGRO_RESET_WAL}}, \"recreated_pg_wal\": ${{PGRO_RECREATED_WAL}}}}"
 
-echo "Writing restore metadata (stage=${{PGRO_STAGE}})..."
+echo "Writing restore metadata (stage=${{PGRO_STAGE}} fixes=${{PGRO_FIXES}})..."
 psql -U postgres -d postgres << SQLEOF
 CREATE SCHEMA IF NOT EXISTS _pgro;
 CREATE TABLE IF NOT EXISTS _pgro.restore_info (
@@ -1387,14 +1406,16 @@ CREATE TABLE IF NOT EXISTS _pgro.restore_info (
 );
 ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS stage text NOT NULL DEFAULT 'restored';
 ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS last_transition_time timestamptz NOT NULL DEFAULT now();
-INSERT INTO _pgro.restore_info (id, snapshot_id, snapshot_time, stage, last_transition_time)
-VALUES (1, '${{PGRO_SNAPSHOT_ID}}', CASE WHEN '${{PGRO_SNAPSHOT_TIME}}' = '' THEN NULL ELSE '${{PGRO_SNAPSHOT_TIME}}'::timestamptz END, '${{PGRO_STAGE}}', now())
+ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS fixes jsonb;
+INSERT INTO _pgro.restore_info (id, snapshot_id, snapshot_time, stage, last_transition_time, fixes)
+VALUES (1, '${{PGRO_SNAPSHOT_ID}}', CASE WHEN '${{PGRO_SNAPSHOT_TIME}}' = '' THEN NULL ELSE '${{PGRO_SNAPSHOT_TIME}}'::timestamptz END, '${{PGRO_STAGE}}', now(), '${{PGRO_FIXES}}'::jsonb)
 ON CONFLICT (id) DO UPDATE
   SET snapshot_id = EXCLUDED.snapshot_id,
       snapshot_time = EXCLUDED.snapshot_time,
       restored_at = now(),
       stage = EXCLUDED.stage,
-      last_transition_time = now();
+      last_transition_time = now(),
+      fixes = EXCLUDED.fixes;
 SQLEOF
 
 echo "Stopping temporary postgres..."

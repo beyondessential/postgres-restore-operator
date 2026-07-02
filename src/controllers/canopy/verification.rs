@@ -7,14 +7,16 @@
 
 use bestool_canopy::{Outcome, RestoreVerification};
 use jiff::Timestamp;
-use kube::ResourceExt;
+use k8s_openapi::api::core::v1::Secret;
+use kube::{Api, ResourceExt};
 use serde::Deserialize;
+use serde_json::{Value, json};
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::{
 	context::Context,
-	controllers::canopy::labels,
+	controllers::{canopy::labels, postgres},
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
 
@@ -125,11 +127,32 @@ pub async fn report(
 		s3_received_payload_bytes: Some(stats.received_payload_bytes as i64),
 	};
 
-	match canopy.restore_verification(&report).await {
+	// Serialize the typed report, then splice in `health_details` — the
+	// typed struct doesn't carry it, so we send via the arbitrary-JSON
+	// path. If serialization somehow fails, fall back to the typed call so
+	// the outcome still reaches canopy.
+	let mut body = match serde_json::to_value(&report) {
+		Ok(v) => v,
+		Err(err) => {
+			warn!(
+				restore = %restore.name_any(),
+				error = %err,
+				"canopy verification: failed to serialize report; sending without health_details"
+			);
+			if let Err(err) = canopy.restore_verification(&report).await {
+				warn!(restore = %restore.name_any(), error = %err, "canopy verification report failed");
+			}
+			return;
+		}
+	};
+	body["health_details"] = gather_health_details(ctx, replica, restore).await;
+
+	match canopy.restore_verification_json(&body).await {
 		Ok(()) => info!(
 			replica = %replica.name_any(),
 			restore = %restore.name_any(),
 			?outcome,
+			health_details = %body["health_details"],
 			"canopy verification reported"
 		),
 		Err(err) => warn!(
@@ -138,5 +161,142 @@ pub async fn report(
 			error = %err,
 			"canopy verification report failed"
 		),
+	}
+}
+
+/// Best-effort gather of the `health_details` map (snake_case keys):
+/// `{ sizes: {<db>: bytes}, fixes: {reindex, locale}, restore_duration_sec }`.
+///
+/// `sizes` and `fixes` come from a single read-only connection to the
+/// restore's postgres (`sizes` from `pg_database_size`, `fixes` from the
+/// `_pgro.restore_info` flags the init recorded). Any connection or query
+/// failure — expected on the failure path, where postgres may never have
+/// come up — just omits that piece; the verification still sends.
+/// `restore_duration_sec` is the wall-clock from the restore CR's
+/// `createdAt` to now (≈ activation), independent of postgres.
+async fn gather_health_details(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	restore: &PostgresPhysicalRestore,
+) -> Value {
+	let duration_sec = restore
+		.status
+		.as_ref()
+		.and_then(|s| s.created_at.as_ref())
+		.map(|created| Timestamp::now().duration_since(created.0).as_secs().max(0) as u64);
+
+	let pg = match gather_from_postgres(ctx, replica, restore).await {
+		Ok(parts) => Some(parts),
+		// Expected on the failure path (postgres may never have come up) and
+		// on ephemeral replicas racing teardown; the verification still sends.
+		Err(err) => {
+			warn!(
+				replica = %replica.name_any(),
+				restore = %restore.name_any(),
+				error = %err,
+				"canopy verification: could not gather sizes/fixes; reporting without them"
+			);
+			None
+		}
+	};
+
+	build_health_details(duration_sec, pg)
+}
+
+/// Postgres-derived pieces of the health details: per-database sizes and
+/// the `fixes` map the restore init recorded. `fixes` is an arbitrary JSON
+/// object (`{locale, reindex, reset_wal, ...}`) forwarded verbatim, so new
+/// fix flags flow through without operator changes.
+struct PostgresHealth {
+	sizes: Vec<(String, u64)>,
+	fixes: Value,
+}
+
+/// Assemble the `health_details` JSON from already-gathered parts. Pure, so
+/// the snake_case wire shape is unit-testable without a database. Omits any
+/// piece that wasn't gathered.
+fn build_health_details(duration_sec: Option<u64>, pg: Option<PostgresHealth>) -> Value {
+	let mut details = serde_json::Map::new();
+	if let Some(secs) = duration_sec {
+		details.insert("restore_duration_sec".into(), json!(secs));
+	}
+	if let Some(pg) = pg {
+		let sizes_obj: serde_json::Map<String, Value> = pg
+			.sizes
+			.into_iter()
+			.map(|(name, bytes)| (name, json!(bytes)))
+			.collect();
+		details.insert("sizes".into(), Value::Object(sizes_obj));
+		details.insert("fixes".into(), pg.fixes);
+	}
+	Value::Object(details)
+}
+
+/// Connect to the restore's postgres (as the replica's reader user) and
+/// read the per-database sizes + fix flags. Returns
+/// `(sizes, (locale_fixed, reindex_done))`.
+async fn gather_from_postgres(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	restore: &PostgresPhysicalRestore,
+) -> crate::error::Result<PostgresHealth> {
+	let namespace = replica.namespace().unwrap_or_default();
+	let restore_name = restore.name_any();
+
+	let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), &namespace);
+	let reader_secret = secrets.get(&replica.creds_secret_name()).await?;
+	let reader_user = postgres::read_secret_field(&reader_secret, "username")?;
+	let reader_password = postgres::read_secret_field(&reader_secret, "password")?;
+
+	let conn = postgres::connect_to_restore(
+		&ctx.client,
+		&namespace,
+		&restore_name,
+		"postgres",
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let sizes = postgres::list_database_sizes(&conn.client).await?;
+	let fixes = postgres::read_restore_fixes(&conn.client)
+		.await
+		.unwrap_or_else(|_| json!({}));
+	Ok(PostgresHealth { sizes, fixes })
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn health_details_shape_is_snake_case() {
+		let v = build_health_details(
+			Some(700),
+			Some(PostgresHealth {
+				sizes: vec![("tamanu".into(), 1_872_782), ("postgres".into(), 12_829)],
+				fixes: json!({ "locale": true, "reindex": false, "reset_wal": false }),
+			}),
+		);
+		assert_eq!(v["restore_duration_sec"], json!(700));
+		assert_eq!(v["sizes"]["tamanu"], json!(1_872_782u64));
+		assert_eq!(v["sizes"]["postgres"], json!(12_829u64));
+		// fixes is forwarded verbatim, so new flags pass through untouched.
+		assert_eq!(v["fixes"]["locale"], json!(true));
+		assert_eq!(v["fixes"]["reindex"], json!(false));
+		assert_eq!(v["fixes"]["reset_wal"], json!(false));
+	}
+
+	#[test]
+	fn health_details_omits_ungathered_parts() {
+		// Failure path: no postgres connection, no createdAt.
+		let v = build_health_details(None, None);
+		assert_eq!(v, json!({}));
+		// Duration known but postgres unreachable: sizes/fixes omitted.
+		let v = build_health_details(Some(42), None);
+		assert_eq!(v, json!({ "restore_duration_sec": 42 }));
+		assert!(v.get("sizes").is_none());
+		assert!(v.get("fixes").is_none());
 	}
 }
