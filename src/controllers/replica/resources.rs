@@ -213,6 +213,14 @@ fi
 					value: Some(backup_type.clone()),
 					..Default::default()
 				},
+				// Region comes from the canopy-creds Secret the syncer
+				// materialises alongside this Job; the sidecar signs S3
+				// requests for it before forwarding upstream.
+				crate::controllers::jobs::env_from_secret_name(
+					"PGRO_REGION",
+					source.secret_name(),
+					"region",
+				),
 				EnvVar {
 					name: "PGRO_STATS_CALLBACK_URL".to_string(),
 					value: Some(proxy.stats_callback_url.to_string()),
