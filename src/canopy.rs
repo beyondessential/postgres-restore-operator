@@ -7,9 +7,7 @@
 //! the integration seam tests inject a stub at, and as the place to hang
 //! pgro-specific logging / retry / cache concerns later.
 
-use bestool_canopy::{
-	CanopyClient, RestoreCredentials, RestoreVerification, WorklistEntry, client_builder,
-};
+use bestool_canopy::{CanopyClient, RestoreCredentials, WorklistEntry, client_builder};
 use reqwest::Url;
 use uuid::Uuid;
 
@@ -140,20 +138,16 @@ impl Client {
 	}
 
 	/// Report a restore outcome (signal 3, restore-verification).
-	pub async fn restore_verification(&self, report: &RestoreVerification<'_>) -> Result<()> {
-		self.inner
-			.restore_verification(&self.base_url, report)
-			.await
-			.map_err(|err| Error::Canopy(format!("restore_verification: {err:?}")))
-	}
-
-	/// Report a restore outcome with an arbitrary JSON body — used to include
-	/// the `health_details` field, which the typed [`RestoreVerification`]
-	/// struct doesn't carry. `body` should be the serialized verification
-	/// plus any extra fields. Goes to the same `POST /restore-verification`
-	/// endpoint via the generic request escape hatch; a non-2xx response is
-	/// an error carrying the status + body.
-	pub async fn restore_verification_json(&self, body: &serde_json::Value) -> Result<()> {
+	///
+	/// `body` is the typed [`bestool_canopy::schema::VerificationArgs`]
+	/// (generated from canopy's OpenAPI) — including the free-form
+	/// `health_details` the hand-written wire type doesn't carry. Sent to
+	/// `POST /restore-verification` via the generic request escape hatch; a
+	/// non-2xx response is an error carrying the status + body.
+	pub async fn restore_verification_typed(
+		&self,
+		body: &(impl serde::Serialize + ?Sized),
+	) -> Result<()> {
 		let resp = self
 			.inner
 			.request(
