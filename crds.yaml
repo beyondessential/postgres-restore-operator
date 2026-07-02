@@ -571,6 +571,17 @@ spec:
                 - group
                 - type
                 type: object
+              ephemeral:
+                default: false
+                description: |-
+                  Ephemeral replica: once a restore reaches `Active` (postgres came up
+                  healthy and, for canopy replicas, the verification was reported),
+                  tear the restore down instead of keeping it running. The replica CR
+                  stays; it only restores again when a new snapshot is offered (canopy
+                  path) or the schedule next fires (legacy path). Used by the `verify`
+                  intent, whose whole job is "prove the snapshot restores" — keeping
+                  the database idling afterward just wastes cluster resources.
+                type: boolean
               kopiaSecretRef:
                 description: |-
                   Reference to a Secret containing kopia repository credentials.
@@ -932,6 +943,15 @@ spec:
                 nullable: true
                 type: string
               serviceName:
+                nullable: true
+                type: string
+              verifiedSnapshotId:
+                description: |-
+                  Last snapshot id an ephemeral replica (`spec.ephemeral`) verified
+                  and then tore down. After teardown there is no `currentRestore` to
+                  compare against, so this marker is what stops the reconciler from
+                  immediately re-restoring the same snapshot; a restore is only
+                  re-triggered when the desired snapshot differs from this.
                 nullable: true
                 type: string
             type: object

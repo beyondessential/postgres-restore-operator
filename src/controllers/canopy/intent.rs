@@ -41,6 +41,11 @@ pub struct IntentConfig {
 	pub service_annotations: Option<BTreeMap<String, String>>,
 	pub switchover_grace_period: TimeSpan,
 	pub storage_size_override: Quantity,
+	/// Tear the restore down once it's verified healthy rather than keeping
+	/// it running. Materialised into `PostgresPhysicalReplicaSpec.ephemeral`.
+	/// True for `verify` (throwaway snapshot check), false for the
+	/// analytics intents (long-lived query replicas).
+	pub ephemeral: bool,
 	/// Floor on the postgres pod's `/dev/shm` sizing. Materialised into
 	/// `PostgresPhysicalReplicaSpec.shm_size_floor` so the shared
 	/// Deployment builder picks `max(computed_from_resources, floor)`.
@@ -79,6 +84,7 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			service_annotations: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 			storage_size_override: Quantity("20Gi".to_string()),
+			ephemeral: true,
 			shm_size_floor: Quantity("512Mi".to_string()),
 		}),
 		"analytics-dev" => Some(IntentConfig {
@@ -89,6 +95,7 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			service_annotations: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 			storage_size_override: Quantity("50Gi".to_string()),
+			ephemeral: false,
 			shm_size_floor: Quantity("2Gi".to_string()),
 		}),
 		"analytics-dbt" => Some(IntentConfig {
@@ -105,6 +112,7 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			])),
 			switchover_grace_period: TimeSpan(Span::new().minutes(2)),
 			storage_size_override: Quantity("50Gi".to_string()),
+			ephemeral: false,
 			shm_size_floor: Quantity("2Gi".to_string()),
 		}),
 		_ => None,
@@ -160,6 +168,7 @@ impl IntentConfig {
 			affinity: None,
 			tolerations: Vec::new(),
 			read_only: self.read_only,
+			ephemeral: self.ephemeral,
 			postgres_extra_config: None,
 			notifications,
 			persistent_schemas: self.persistent_schemas.clone(),
@@ -213,6 +222,38 @@ mod tests {
 		assert!(cfg.read_only);
 		assert!(cfg.minimum_ttl.is_none());
 		assert!(cfg.persistent_schemas.is_none());
+		assert!(cfg.ephemeral, "verify replicas are torn down after verify");
+	}
+
+	#[test]
+	fn only_verify_is_ephemeral() {
+		assert!(config_for("verify").unwrap().ephemeral);
+		assert!(
+			!config_for("analytics-dev").unwrap().ephemeral,
+			"analytics-dev is a long-lived query replica"
+		);
+		assert!(
+			!config_for("analytics-dbt").unwrap().ephemeral,
+			"analytics-dbt is a long-lived query replica"
+		);
+	}
+
+	#[test]
+	fn to_replica_spec_carries_ephemeral() {
+		let e = entry("verify", "test");
+		assert!(
+			config_for("verify")
+				.unwrap()
+				.to_replica_spec(&e, vec![])
+				.ephemeral
+		);
+		let e = entry("analytics-dev", "test");
+		assert!(
+			!config_for("analytics-dev")
+				.unwrap()
+				.to_replica_spec(&e, vec![])
+				.ephemeral
+		);
 	}
 
 	#[test]

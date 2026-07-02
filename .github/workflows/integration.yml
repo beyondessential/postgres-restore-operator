@@ -56,6 +56,11 @@ jobs:
               test-ps-all-missing
             needs_non_pg_snapshot: false
 
+          - name: ephemeral
+            namespaces: >-
+              test-ephemeral
+            needs_non_pg_snapshot: false
+
           # canopy_integration is a scaffold in tests/canopy_integration.rs
           # but no stub-canopy HTTP server exists yet, so the happy-path
           # test times out. Re-add this matrix entry when the stub lands:
