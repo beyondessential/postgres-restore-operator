@@ -357,6 +357,60 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
+	// Ephemeral teardown. For a `spec.ephemeral` replica (e.g. the `verify`
+	// intent) the point of the restore is to prove the snapshot comes up —
+	// once it's Active (the switchover block above ran and, for canopy
+	// replicas, reported the verification), keeping the database running
+	// just wastes resources. Record the verified snapshot and delete the
+	// restore. The replica CR stays; the should_restore logic below only
+	// re-triggers when a newer snapshot is offered (canopy) or the schedule
+	// fires (legacy), gated by `verifiedSnapshotId`.
+	if replica.spec.ephemeral
+		&& let Some(active) = active_restore
+		&& active.metadata.deletion_timestamp.is_none()
+	{
+		let active_name = active.name_any();
+		let verified_snapshot = active.spec.snapshot.clone();
+		info!(
+			replica = name,
+			restore = active_name,
+			snapshot = verified_snapshot,
+			"ephemeral replica: snapshot verified, tearing down restore"
+		);
+
+		// Record the marker BEFORE deleting so that even if the delete or a
+		// crash interleaves, the reconciler won't treat the vanished
+		// restore as an accidental deletion and immediately re-restore.
+		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), &namespace);
+		let patch = serde_json::json!({
+			"status": {
+				"verifiedSnapshotId": verified_snapshot,
+				"currentRestore": null,
+				"previousRestore": null,
+			}
+		});
+		replicas
+			.patch_status(
+				&name,
+				&PatchParams::apply("postgres-restore-operator"),
+				&Patch::Merge(&patch),
+			)
+			.await?;
+
+		if let Err(e) = restores.delete(&active_name, &Default::default()).await {
+			warn!(
+				replica = name,
+				restore = %active_name,
+				error = %e,
+				"failed to delete ephemeral restore; will retry"
+			);
+		}
+		if let Some(promoted) = ctx.release_restore_slot(&name).await {
+			info!(promoted = %promoted, "promoted queued restore after ephemeral teardown");
+		}
+		return Ok(Action::requeue(Duration::from_secs(30)));
+	}
+
 	// Sweep stale Active restores after grace period.
 	//
 	// Any Active restore for this replica that isn't the current one is a
@@ -909,17 +963,30 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	// On the canopy path, the worklist syncer updates
 	// `status.canopyDesiredSnapshotId` when canopy offers a newer snapshot.
 	// Trigger a restore whenever the desired snapshot differs from what the
-	// active restore already carries, in addition to the usual schedule /
+	// replica already carries, in addition to the usual schedule /
 	// never-restored / active-deleted triggers. minimum_ttl still gates:
 	// the intent may declare an explicit lower bound on restore frequency
 	// even in the face of a newer canopy snapshot.
+	//
+	// "What the replica already carries" is normally the active restore's
+	// snapshot, but an ephemeral replica has no active restore after it
+	// tears one down — there we fall back to `verifiedSnapshotId`, the
+	// marker recording the last snapshot we verified. Without that
+	// fallback the `(Some, None)` arm would re-fire forever.
+	let effective_current_snapshot =
+		active_restore.map(|r| r.spec.snapshot.clone()).or_else(|| {
+			replica
+				.status
+				.as_ref()
+				.and_then(|s| s.verified_snapshot_id.clone())
+		});
 	let canopy_desired_changed = is_canopy
 		&& match (
 			replica
 				.status
 				.as_ref()
 				.and_then(|s| s.canopy_desired_snapshot_id.as_ref()),
-			active_restore.map(|r| r.spec.snapshot.as_str()),
+			effective_current_snapshot.as_deref(),
 		) {
 			(Some(desired), Some(current)) => desired != current,
 			(Some(_), None) => true,

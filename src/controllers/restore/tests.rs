@@ -37,6 +37,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			affinity: None,
 			tolerations: vec![],
 			read_only: true,
+			ephemeral: false,
 			postgres_extra_config: None,
 			notifications: vec![],
 
@@ -123,6 +124,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			affinity: None,
 			tolerations: vec![],
 			read_only: true,
+			ephemeral: false,
 			postgres_extra_config: None,
 			notifications: vec![],
 

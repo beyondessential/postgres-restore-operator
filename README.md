@@ -103,6 +103,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `affinity` | `Affinity` | No | — | Pod scheduling affinity rules. |
 | `tolerations` | `[]Toleration` | No | `[]` | Pod tolerations. |
 | `readOnly` | `bool` | No | `true` | Set the restored database to read-only mode. |
+| `ephemeral` | `bool` | No | `false` | Tear the restore down once it reaches `Active` (postgres came up healthy) instead of keeping it running. The replica only restores again when a newer snapshot is offered (canopy path) or the schedule next fires (legacy path). Used by the `verify` intent, whose job is just to prove the snapshot restores. |
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. See [Persistent schemas](#persistent-schemas) below for the migration time budget and what happens on timeout. |
@@ -180,6 +181,7 @@ Additional fields for `target: graphQL`:
 | `nextScheduledRestore` | `Time` | When the next scheduled restore will occur. |
 | `latestAvailableSnapshot` | `string` | Snapshot ID of the latest available snapshot matching the filter. |
 | `canopyDesiredSnapshotId` | `string` | For canopy-sourced replicas: the snapshot the canopy worklist syncer wants restored. The reconciler triggers a new restore when this differs from the current one. |
+| `verifiedSnapshotId` | `string` | For `ephemeral` replicas: the last snapshot that was verified and then torn down. Gates re-restore — the reconciler only restores again when the desired snapshot differs from this. |
 | `connectionInfo` | `ConnectionInfo` | Connection details (host, port, database, username, password secret). |
 | `queuePosition` | `uint32` | Position in the global restore queue. |
 | `notifications` | `[]NotificationStatus` | Status of each configured notification target. |

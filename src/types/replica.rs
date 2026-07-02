@@ -118,6 +118,16 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default = "default_read_only")]
 	pub read_only: bool,
 
+	/// Ephemeral replica: once a restore reaches `Active` (postgres came up
+	/// healthy and, for canopy replicas, the verification was reported),
+	/// tear the restore down instead of keeping it running. The replica CR
+	/// stays; it only restores again when a new snapshot is offered (canopy
+	/// path) or the schedule next fires (legacy path). Used by the `verify`
+	/// intent, whose whole job is "prove the snapshot restores" — keeping
+	/// the database idling afterward just wastes cluster resources.
+	#[serde(default)]
+	pub ephemeral: bool,
+
 	/// Extra lines appended to postgresql.conf (e.g. shared_preload_libraries)
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub postgres_extra_config: Option<String>,
@@ -312,6 +322,14 @@ pub struct PostgresPhysicalReplicaStatus {
 	/// when this differs from the current one.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub canopy_desired_snapshot_id: Option<String>,
+
+	/// Last snapshot id an ephemeral replica (`spec.ephemeral`) verified
+	/// and then tore down. After teardown there is no `currentRestore` to
+	/// compare against, so this marker is what stops the reconciler from
+	/// immediately re-restoring the same snapshot; a restore is only
+	/// re-triggered when the desired snapshot differs from this.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub verified_snapshot_id: Option<String>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub connection_info: Option<ConnectionInfo>,

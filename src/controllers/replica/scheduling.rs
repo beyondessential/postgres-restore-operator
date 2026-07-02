@@ -273,6 +273,7 @@ mod tests {
 				affinity: None,
 				tolerations: Vec::new(),
 				read_only: true,
+				ephemeral: false,
 				postgres_extra_config: None,
 				notifications: Vec::new(),
 				storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(

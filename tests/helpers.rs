@@ -121,6 +121,7 @@ pub struct ReplicaOpts {
 	pub minimum_ttl: Option<TimeSpan>,
 	pub schedule_jitter: Option<TimeSpan>,
 	pub read_only: bool,
+	pub ephemeral: bool,
 }
 
 impl Default for ReplicaOpts {
@@ -130,6 +131,7 @@ impl Default for ReplicaOpts {
 			minimum_ttl: None,
 			schedule_jitter: None,
 			read_only: true,
+			ephemeral: false,
 		}
 	}
 }
@@ -158,6 +160,7 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 			affinity: None,
 			tolerations: vec![],
 			read_only: opts.read_only,
+			ephemeral: opts.ephemeral,
 			postgres_extra_config: None,
 			notifications: vec![],
 			persistent_schemas: None,
