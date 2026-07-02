@@ -5,7 +5,7 @@
 //! loop. This module owns signal 3 — one function called at each terminal
 //! transition (switchover success, restore failure).
 
-use bestool_canopy::{Outcome, RestoreVerification};
+use bestool_canopy::{Outcome, schema::VerificationArgs};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, ResourceExt};
@@ -105,54 +105,46 @@ pub async fn report(
 	let postgres_version = restore
 		.status
 		.as_ref()
-		.and_then(|s| s.postgres_version.as_deref());
+		.and_then(|s| s.postgres_version.clone());
 
 	let replica_healthy = matches!(outcome, Outcome::Success);
 
-	let report = RestoreVerification {
+	// Gather health details; send None rather than an empty object when
+	// nothing was gathered (e.g. failure path, postgres unreachable).
+	let health = gather_health_details(ctx, replica, restore).await;
+	let health_details = health
+		.as_object()
+		.is_some_and(|m| !m.is_empty())
+		.then_some(health);
+
+	// Typed request body generated from canopy's OpenAPI (bestool#628).
+	// Constructing it here means the field set is checked against canopy's
+	// spec at compile time; `health_details` stays free-form by design.
+	let args = VerificationArgs {
 		replica_id,
 		group,
 		server_id,
-		r#type: &backup_type,
-		intent: &intent,
-		snapshot_id: Some(restore.spec.snapshot.as_str()),
-		outcome,
-		error,
+		type_: backup_type.clone(),
+		intent: intent.clone(),
+		snapshot_id: Some(restore.spec.snapshot.clone()),
+		outcome: outcome_wire(outcome).to_string(),
+		error: error.map(str::to_string),
 		replica_healthy,
 		postgres_version,
-		observed_at: Timestamp::now(),
+		observed_at: Timestamp::now().to_string(),
 		s3_sent_raw_bytes: Some(stats.sent_raw_bytes as i64),
 		s3_sent_payload_bytes: Some(stats.sent_payload_bytes as i64),
 		s3_received_raw_bytes: Some(stats.received_raw_bytes as i64),
 		s3_received_payload_bytes: Some(stats.received_payload_bytes as i64),
+		health_details,
 	};
 
-	// Serialize the typed report, then splice in `health_details` — the
-	// typed struct doesn't carry it, so we send via the arbitrary-JSON
-	// path. If serialization somehow fails, fall back to the typed call so
-	// the outcome still reaches canopy.
-	let mut body = match serde_json::to_value(&report) {
-		Ok(v) => v,
-		Err(err) => {
-			warn!(
-				restore = %restore.name_any(),
-				error = %err,
-				"canopy verification: failed to serialize report; sending without health_details"
-			);
-			if let Err(err) = canopy.restore_verification(&report).await {
-				warn!(restore = %restore.name_any(), error = %err, "canopy verification report failed");
-			}
-			return;
-		}
-	};
-	body["health_details"] = gather_health_details(ctx, replica, restore).await;
-
-	match canopy.restore_verification_json(&body).await {
+	match canopy.restore_verification_typed(&args).await {
 		Ok(()) => info!(
 			replica = %replica.name_any(),
 			restore = %restore.name_any(),
 			?outcome,
-			health_details = %body["health_details"],
+			health_details = %args.health_details.as_ref().map(|v| v.to_string()).unwrap_or_default(),
 			"canopy verification reported"
 		),
 		Err(err) => warn!(
@@ -161,6 +153,15 @@ pub async fn report(
 			error = %err,
 			"canopy verification report failed"
 		),
+	}
+}
+
+/// Wire string canopy expects for the `outcome` field (matches the
+/// lowercase serialization of `bestool_canopy::Outcome`).
+fn outcome_wire(outcome: Outcome) -> &'static str {
+	match outcome {
+		Outcome::Success => "success",
+		Outcome::Failure => "failure",
 	}
 }
 
