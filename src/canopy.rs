@@ -147,6 +147,36 @@ impl Client {
 			.map_err(|err| Error::Canopy(format!("restore_verification: {err:?}")))
 	}
 
+	/// Report a restore outcome with an arbitrary JSON body — used to include
+	/// the `health_details` field, which the typed [`RestoreVerification`]
+	/// struct doesn't carry. `body` should be the serialized verification
+	/// plus any extra fields. Goes to the same `POST /restore-verification`
+	/// endpoint via the generic request escape hatch; a non-2xx response is
+	/// an error carrying the status + body.
+	pub async fn restore_verification_json(&self, body: &serde_json::Value) -> Result<()> {
+		let resp = self
+			.inner
+			.request(
+				bestool_canopy::reqwest::Method::POST,
+				&self.base_url,
+				"/restore-verification",
+			)
+			.await
+			.map_err(|err| Error::Canopy(format!("restore_verification request: {err:?}")))?
+			.json(body)
+			.send()
+			.await
+			.map_err(|err| Error::Canopy(format!("restore_verification send: {err:?}")))?;
+		let status = resp.status();
+		if !status.is_success() {
+			let text = resp.text().await.unwrap_or_default();
+			return Err(Error::Canopy(format!(
+				"restore_verification returned {status}: {text}"
+			)));
+		}
+		Ok(())
+	}
+
 	/// Direct access to the public-mTLS base URL the client is configured
 	/// against. The tailnet path uses its own hardcoded URL inside
 	/// `bestool-canopy`.

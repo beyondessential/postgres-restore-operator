@@ -464,9 +464,9 @@ checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
 
 [[package]]
 name = "bestool-canopy"
-version = "0.4.3"
+version = "0.4.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cb064d9c74aedc67f722d2bf7cac5a9214525ef6bf12b70c09d5428abe020e2"
+checksum = "322f836e08276d95b49e4b1188470f24af768e3e504b39a14661f9a882a42fcf"
 dependencies = [
  "algae-cli",
  "base64 0.22.1",

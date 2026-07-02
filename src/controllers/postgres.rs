@@ -258,6 +258,49 @@ pub async fn database_size_on(pg: &tokio_postgres::Client) -> Result<u64> {
 	Ok(size as u64)
 }
 
+/// Per-database on-disk sizes in bytes, keyed by database name, excluding
+/// the `template0`/`template1` templates. Runs on an already-open
+/// connection (typically to the `postgres` database). Used to build the
+/// `sizes` map in the canopy restore-verification `health_details`.
+pub async fn list_database_sizes(pg: &tokio_postgres::Client) -> Result<Vec<(String, u64)>> {
+	let rows = pg
+		.query(
+			"SELECT datname, pg_database_size(datname) FROM pg_database \
+			 WHERE datname NOT IN ('template0', 'template1') AND datallowconn \
+			 ORDER BY pg_database_size(datname) DESC",
+			&[],
+		)
+		.await?;
+	Ok(rows
+		.iter()
+		.map(|r| {
+			let name: String = r.get(0);
+			let size: i64 = r.get(1);
+			(name, size.max(0) as u64)
+		})
+		.collect())
+}
+
+/// Read the `fixes` map the restore's init recorded into
+/// `_pgro.restore_info` — an arbitrary JSON object like
+/// `{"locale": true, "reindex": false, "reset_wal": false, ...}`. Read as
+/// text and parsed here so we don't need tokio_postgres's serde_json
+/// feature. Absent row/column (older restores) reads as an empty object.
+/// Runs on an already-open connection to the `postgres` database.
+pub async fn read_restore_fixes(pg: &tokio_postgres::Client) -> Result<serde_json::Value> {
+	let row = pg
+		.query_opt(
+			"SELECT coalesce(fixes::text, '{}') FROM _pgro.restore_info WHERE id = 1",
+			&[],
+		)
+		.await?;
+	let text: String = match row {
+		Some(r) => r.get(0),
+		None => return Ok(serde_json::json!({})),
+	};
+	Ok(serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})))
+}
+
 /// Query the on-disk size of the given database (bytes) via `pg_database_size()`.
 pub async fn measure_database_size(
 	client: &Client,
