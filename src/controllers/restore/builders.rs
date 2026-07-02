@@ -758,7 +758,13 @@ echo -n "$VERSION" > /dev/termination-log
 		("pgro.bes.au/restore".to_string(), restore.name_any()),
 	]);
 
-	let mut containers = Vec::with_capacity(2);
+	let mut containers = Vec::with_capacity(1);
+	// The canopy-proxy runs as a native sidecar (an init container with
+	// restartPolicy: Always) so that when the main `restore` container
+	// exits the kubelet SIGTERMs the proxy and the Pod completes on the
+	// main container's exit code. A plain sidecar container would keep the
+	// Pod Running forever and the Job would never succeed.
+	let mut init_containers: Vec<Container> = Vec::new();
 	containers.push(Container {
 		name: "restore".to_string(),
 		image: Some(kopia_image.to_string()),
@@ -799,9 +805,14 @@ echo -n "$VERSION" > /dev/termination-log
 				..Default::default()
 			});
 
-		containers.push(Container {
+		init_containers.push(Container {
 			name: "canopy-proxy".to_string(),
 			image: Some(proxy.image.to_string()),
+			// Native sidecar: an init container that never exits on its
+			// own. `restartPolicy: Always` tells the kubelet to keep it
+			// running alongside the main containers and to SIGTERM it once
+			// they complete.
+			restart_policy: Some("Always".to_string()),
 			// Same image as the operator; run the `canopy-proxy` binary
 			// instead of the default `operator` entrypoint.
 			command: Some(vec!["canopy-proxy".to_string()]),
@@ -902,6 +913,14 @@ echo -n "$VERSION" > /dev/termination-log
 						fs_group: Some(999),
 						..Default::default()
 					}),
+					init_containers: if init_containers.is_empty() {
+						None
+					} else {
+						Some(init_containers)
+					},
+					// Give the native sidecar time to flush its final stats
+					// on SIGTERM before the kubelet SIGKILLs it.
+					termination_grace_period_seconds: Some(30),
 					containers,
 					volumes: Some(volumes),
 					..Default::default()
