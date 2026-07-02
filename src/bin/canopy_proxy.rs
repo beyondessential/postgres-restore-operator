@@ -154,6 +154,21 @@ struct StatsFile {
 	received_payload_bytes: u64,
 }
 
+/// Block until SIGTERM (kubelet, native-sidecar termination) or SIGINT
+/// (interactive ctrl-c) arrives, whichever comes first.
+async fn wait_for_shutdown() -> Result<(), String> {
+	use tokio::signal::unix::{SignalKind, signal};
+	let mut sigterm = signal(SignalKind::terminate())
+		.map_err(|err| format!("installing SIGTERM handler: {err}"))?;
+	let mut sigint = signal(SignalKind::interrupt())
+		.map_err(|err| format!("installing SIGINT handler: {err}"))?;
+	tokio::select! {
+		_ = sigterm.recv() => {}
+		_ = sigint.recv() => {}
+	}
+	Ok(())
+}
+
 /// Write `port` to `port_file` atomically (write `.tmp` then rename) so a
 /// partial read by the kopia container's wait-loop can't observe a torn value.
 fn write_port_atomic(port_file: &std::path::Path, port: u16) -> std::io::Result<()> {
@@ -208,10 +223,11 @@ async fn run(cfg: Config) -> Result<(), String> {
 	write_port_atomic(&cfg.port_file, port)
 		.map_err(|err| format!("writing port file {}: {err}", cfg.port_file.display()))?;
 
-	// Wait for SIGTERM (kopia container completion → pod termination).
-	tokio::signal::ctrl_c()
-		.await
-		.map_err(|err| format!("waiting for shutdown signal: {err}"))?;
+	// Wait for shutdown. As a native sidecar the kubelet sends SIGTERM once
+	// the main container exits; interactive runs get SIGINT. Handle both —
+	// ctrl_c() alone only catches SIGINT, so under k8s the proxy would hang
+	// until SIGKILL and lose its stats.
+	wait_for_shutdown().await?;
 	info!("shutdown signal received");
 
 	let traffic = proxy.traffic();

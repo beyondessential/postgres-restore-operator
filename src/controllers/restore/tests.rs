@@ -149,6 +149,61 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 }
 
 #[test]
+fn canopy_restore_job_proxy_is_native_sidecar() {
+	// Regression: the canopy-proxy must be an init container with
+	// restartPolicy=Always (a native sidecar), NOT a plain container. As a
+	// plain container it keeps the Pod Running after the main `restore`
+	// container exits, so the Job never succeeds and eventually hits
+	// activeDeadlineSeconds → DeadlineExceeded.
+	let (restore, mut replica) = test_restore_and_replica();
+	replica.spec.kopia_secret_ref = None;
+	replica.spec.canopy_source = Some(CanopySource {
+		group: "11111111-1111-1111-1111-111111111111".to_string(),
+		r#type: "tamanu-postgres".to_string(),
+	});
+	let proxy = super::builders::CanopyProxyArgs {
+		image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
+		broker_base_url: "http://operator.pgro-system.svc:9091",
+		stats_callback_url: "http://operator.pgro-system.svc:8080/api/v1/canopy-stats/ns/job",
+	};
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		Some(&proxy),
+	)
+	.unwrap();
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+
+	// The proxy is NOT a regular container.
+	assert!(
+		!pod_spec.containers.iter().any(|c| c.name == "canopy-proxy"),
+		"canopy-proxy must not be a plain container (Pod would never complete)"
+	);
+	// It IS an init container with restartPolicy=Always.
+	let init = pod_spec
+		.init_containers
+		.as_ref()
+		.expect("canopy path must declare init containers");
+	let sidecar = init
+		.iter()
+		.find(|c| c.name == "canopy-proxy")
+		.expect("canopy-proxy must be a native sidecar (init container)");
+	assert_eq!(
+		sidecar.restart_policy.as_deref(),
+		Some("Always"),
+		"native sidecar must set restartPolicy=Always"
+	);
+	assert!(
+		pod_spec.termination_grace_period_seconds.unwrap_or(0) > 0,
+		"canopy Pod must allow grace time for the sidecar to flush stats on SIGTERM"
+	);
+}
+
+#[test]
 fn restore_job_has_ttl_seconds_after_finished() {
 	let (restore, replica) = test_restore_and_replica();
 	let job = build_restore_job(

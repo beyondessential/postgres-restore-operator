@@ -176,6 +176,11 @@ fi
 		}),
 		..Default::default()
 	}];
+	// The canopy-proxy runs as a native sidecar (init container with
+	// restartPolicy: Always) so the Pod completes once the main
+	// snapshot-list container exits; a plain sidecar container would keep
+	// the Pod Running and the Job would never succeed.
+	let mut init_containers: Vec<Container> = Vec::new();
 
 	if let KopiaSource::CanopyProxy {
 		group, backup_type, ..
@@ -193,9 +198,10 @@ fi
 		});
 		containers[0].volume_mounts = Some(kopia_volume_mounts);
 
-		containers.push(Container {
+		init_containers.push(Container {
 			name: "canopy-proxy".to_string(),
 			image: Some(proxy.image.to_string()),
+			restart_policy: Some("Always".to_string()),
 			command: Some(vec!["canopy-proxy".to_string()]),
 			env: Some(vec![
 				EnvVar {
@@ -280,6 +286,12 @@ fi
 				}),
 				spec: Some(PodSpec {
 					restart_policy: Some("Never".to_string()),
+					init_containers: if init_containers.is_empty() {
+						None
+					} else {
+						Some(init_containers)
+					},
+					termination_grace_period_seconds: Some(30),
 					containers,
 					volumes: if volumes.is_empty() {
 						None
