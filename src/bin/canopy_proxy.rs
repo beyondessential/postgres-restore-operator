@@ -18,7 +18,7 @@
 
 use std::{path::PathBuf, pin::Pin, process::ExitCode, sync::Arc, time::Duration};
 
-use bestool_canopy::BackupCredentials;
+use bestool_canopy::schema::CredentialProcessOutput as BackupCredentials;
 use bestool_kopia::proxy::{self, BoxError, CredentialProvider, Credentials, S3ProxyConfig};
 use jiff::{Timestamp, ToSpan};
 use serde::Serialize;

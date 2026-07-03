@@ -5,7 +5,7 @@
 //! loop. This module owns signal 3 — one function called at each terminal
 //! transition (switchover success, restore failure).
 
-use bestool_canopy::{Outcome, schema::VerificationArgs};
+use bestool_canopy::schema::{RunOutcome, VerificationArgs};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, ResourceExt};
@@ -38,7 +38,7 @@ pub async fn report(
 	ctx: &Context,
 	replica: &PostgresPhysicalReplica,
 	restore: &PostgresPhysicalRestore,
-	outcome: Outcome,
+	outcome: RunOutcome,
 	error: Option<&str>,
 ) {
 	if replica.spec.canopy_source.is_none() {
@@ -107,11 +107,18 @@ pub async fn report(
 		.as_ref()
 		.and_then(|s| s.postgres_version.clone());
 
-	let replica_healthy = matches!(outcome, Outcome::Success);
+	let replica_healthy = matches!(outcome, RunOutcome::Success);
 
 	// Gather health details; send None rather than an empty object when
 	// nothing was gathered (e.g. failure path, postgres unreachable).
-	let health = gather_health_details(ctx, replica, restore).await;
+	let mut health = gather_health_details(ctx, replica, restore).await;
+	// `url` semantic: for a replica exposed on the tailnet, attach a link to
+	// it so canopy can surface it to operators alongside the report.
+	if let Some(url) = exposed_replica_url(ctx, replica).await
+		&& let Some(obj) = health.as_object_mut()
+	{
+		obj.insert("url".to_string(), json!(url));
+	}
 	let health_details = health
 		.as_object()
 		.is_some_and(|m| !m.is_empty())
@@ -158,11 +165,25 @@ pub async fn report(
 
 /// Wire string canopy expects for the `outcome` field (matches the
 /// lowercase serialization of `bestool_canopy::Outcome`).
-fn outcome_wire(outcome: Outcome) -> &'static str {
+fn outcome_wire(outcome: RunOutcome) -> &'static str {
 	match outcome {
-		Outcome::Success => "success",
-		Outcome::Failure => "failure",
+		RunOutcome::Success => "success",
+		RunOutcome::Failure => "failure",
 	}
+}
+
+/// The tailnet URL of a replica exposed via the `url` semantic, or `None` if
+/// it isn't exposed or the MagicDNS suffix can't be resolved. The hostname is
+/// read from the Service's `tailscale.com/hostname` annotation the intent set,
+/// so the reported URL matches exactly what tailscale publishes.
+async fn exposed_replica_url(ctx: &Context, replica: &PostgresPhysicalReplica) -> Option<String> {
+	let annotations = replica.spec.service_annotations.as_ref()?;
+	if annotations.get("tailscale.com/expose").map(String::as_str) != Some("true") {
+		return None;
+	}
+	let hostname = annotations.get("tailscale.com/hostname")?;
+	let suffix = ctx.magic_dns_suffix().await?;
+	Some(crate::tailscale::replica_url(hostname, &suffix))
 }
 
 /// Best-effort gather of the `health_details` map (snake_case keys):

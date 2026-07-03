@@ -17,7 +17,7 @@ use std::{
 	time::Duration,
 };
 
-use bestool_canopy::WorklistEntry;
+use bestool_canopy::schema::WorklistEntry;
 use futures::stream::{self, StreamExt};
 use k8s_openapi::{
 	ByteString,
@@ -260,7 +260,7 @@ async fn reconcile_entry(ctx: &Context, ns_name: &str, entry: &WorklistEntry) ->
 		return Ok(());
 	};
 	let creds = canopy
-		.restore_credentials(&entry.r#type.to_string(), entry.group_id)
+		.restore_credentials(&entry.type_, entry.group_id)
 		.await?;
 
 	ensure_canopy_creds_secret(ctx, ns_name, entry, &creds.repo_password.0).await?;
@@ -276,7 +276,7 @@ async fn ensure_namespace(ctx: &Context, ns_name: &str, entry: &WorklistEntry) -
 	labels_map.insert(labels::DECLARATION_ID.into(), entry.replica_id.to_string());
 	labels_map.insert(labels::GROUP.into(), entry.group_id.to_string());
 	labels_map.insert(labels::SERVER.into(), entry.server_id.to_string());
-	labels_map.insert(labels::TYPE.into(), entry.r#type.to_string());
+	labels_map.insert(labels::TYPE.into(), entry.type_.clone());
 	labels_map.insert(labels::INTENT.into(), entry.intent.to_string());
 
 	let ns = Namespace {
@@ -383,7 +383,7 @@ async fn ensure_replica_cr(
 	labels_map.insert(labels::DECLARATION_ID.into(), entry.replica_id.to_string());
 	labels_map.insert(labels::GROUP.into(), entry.group_id.to_string());
 	labels_map.insert(labels::SERVER.into(), entry.server_id.to_string());
-	labels_map.insert(labels::TYPE.into(), entry.r#type.to_string());
+	labels_map.insert(labels::TYPE.into(), entry.type_.clone());
 	labels_map.insert(labels::INTENT.into(), entry.intent.to_string());
 
 	let cr = replica_cr(CR_NAME, ns_name, labels_map, spec);
@@ -478,6 +478,7 @@ mod tests {
 			"type": "tamanu-postgres",
 			"intent": "verify",
 			"name": name,
+			"params": {},
 			"snapshot_id": null,
 			"snapshot_at": null,
 			"storage": "s3",

@@ -7,5 +7,6 @@ pub mod kopia;
 pub mod metrics;
 pub mod notifications;
 pub mod quantity;
+pub mod tailscale;
 pub mod types;
 pub mod util;

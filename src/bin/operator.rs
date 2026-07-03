@@ -25,7 +25,7 @@ use postgres_restore_operator::{
 		Context, DEFAULT_CANOPY_PROXY_IMAGE, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
 		DEFAULT_KOPIA_IMAGE,
 	},
-	controllers::{self, canopy::intent::SUPPORTED as PGRO_SUPPORTED_INTENTS},
+	controllers::{self, canopy::intent},
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
 };
 
@@ -216,6 +216,14 @@ async fn main() -> anyhow::Result<()> {
 		});
 	ctx.canopy_proxy_image = std::env::var("CANOPY_PROXY_IMAGE")
 		.unwrap_or_else(|_| DEFAULT_CANOPY_PROXY_IMAGE.to_string());
+	// Path to the tailscale sidecar's LocalAPI socket (shared via an emptyDir),
+	// used to resolve the tailnet MagicDNS suffix for the `url` semantic.
+	// Defaults to containerboot's fixed location; set empty to disable.
+	ctx.tailscaled_socket = match std::env::var("PGRO_TAILSCALED_SOCKET") {
+		Ok(s) if s.is_empty() => None,
+		Ok(s) => Some(s),
+		Err(_) => Some("/var/run/tailscale/tailscaled.sock".to_string()),
+	};
 	ctx.canopy_broker_base_url = if let Ok(url) = std::env::var("CANOPY_BROKER_BASE_URL") {
 		url
 	} else if let Ok(svc) = std::env::var("OPERATOR_SERVICE_NAME") {
@@ -660,13 +668,15 @@ async fn register_capabilities(ctx: Arc<Context>) {
 	let Some(canopy) = ctx.canopy.as_ref() else {
 		return;
 	};
+	let descriptors = intent::descriptors();
+	let intent_names: Vec<&str> = descriptors.iter().map(|d| d.intent.as_str()).collect();
 	let mut delay = Duration::from_secs(1);
 	let max_delay = Duration::from_secs(300);
 	for attempt in 1..=8u32 {
-		match canopy.restore_capabilities(PGRO_SUPPORTED_INTENTS).await {
+		match canopy.restore_capabilities(&descriptors).await {
 			Ok(_) => {
 				info!(
-					intents = ?PGRO_SUPPORTED_INTENTS,
+					intents = ?intent_names,
 					"registered supported intents with canopy"
 				);
 				return;
