@@ -67,6 +67,36 @@ pub fn persistent_schemas_migration_settled(replica: &PostgresPhysicalReplica) -
 		.is_none_or(SchemaMigrationPhase::is_settled)
 }
 
+/// True when a snapshot is already covered by an existing restore and must
+/// not be restored again.
+///
+/// A snapshot is covered when we've already recorded it as verified
+/// (`status.verifiedSnapshotId`, the ephemeral marker that outlives the torn
+/// down restore) or when any non-failed restore for this replica is already
+/// working on it (Pending/Restoring/Ready/Switching/Active). Failed restores
+/// don't count — the failure backoff path is allowed to retry the snapshot.
+///
+/// Without this an ephemeral `verify` replica whose restore has been torn
+/// down would re-create a restore for the same snapshot — the snapshot-list
+/// handler otherwise only checks the *active* restore, which is gone after
+/// teardown — and double-report the verification to canopy.
+fn snapshot_already_covered(
+	snapshot_id: &str,
+	verified_snapshot_id: Option<&str>,
+	restores: &[PostgresPhysicalRestore],
+) -> bool {
+	if verified_snapshot_id == Some(snapshot_id) {
+		return true;
+	}
+	restores.iter().any(|r| {
+		r.spec.snapshot == snapshot_id
+			&& !matches!(
+				r.status.as_ref().and_then(|s| s.phase.as_ref()),
+				Some(&RestorePhase::Failed)
+			)
+	})
+}
+
 /// Generate a random password for analytics credentials.
 pub(crate) fn generate_password() -> String {
 	let mut rng = rand::rng();
@@ -691,14 +721,20 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 								)
 								.await?;
 
-							let current_snapshot_id =
-								active_restore.map(|r| r.spec.snapshot.as_str());
+							let verified_snapshot_id = replica
+								.status
+								.as_ref()
+								.and_then(|s| s.verified_snapshot_id.as_deref());
 
-							if current_snapshot_id == Some(&snap.id) {
+							if snapshot_already_covered(
+								&snap.id,
+								verified_snapshot_id,
+								&restore_list.items,
+							) {
 								debug!(
 									replica = name,
 									snapshot = snap.id,
-									"latest snapshot already active, skipping"
+									"snapshot already covered by an existing or verified restore, skipping"
 								);
 							} else {
 								info!(
