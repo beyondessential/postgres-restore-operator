@@ -228,6 +228,13 @@ spec:
                       # operators can pin to a specific tag.
                       # - name: CANOPY_PROXY_IMAGE
                       #   value: ghcr.io/beyondessential/pgro-canopy-proxy:latest
+                      # Path to the tailscale sidecar's LocalAPI socket
+                      # (shared below via the tailscale-socket emptyDir),
+                      # used to resolve the tailnet MagicDNS suffix for the
+                      # `url` intent semantic. Defaults to the value below;
+                      # set empty to disable replica-URL reporting.
+                      # - name: PGRO_TAILSCALED_SOCKET
+                      #   value: /var/run/tailscale/tailscaled.sock
                   ports:
                       - name: http
                         containerPort: 8080
@@ -259,6 +266,13 @@ spec:
                       readOnlyRootFilesystem: true
                       capabilities:
                           drop: ["ALL"]
+                  volumeMounts:
+                      # Read the tailscale sidecar's LocalAPI socket to
+                      # resolve the tailnet MagicDNS suffix (see the `url`
+                      # intent semantic).
+                      - name: tailscale-socket
+                        mountPath: /var/run/tailscale
+                        readOnly: true
                 # Tailscale sidecar — the primary production network path
                 # to canopy. bestool-canopy's CanopyClient auto-probes
                 # canopy.tail53aef.ts.net; the SOCKS5 proxy on [::1]:1055
@@ -299,6 +313,17 @@ spec:
                       limits:
                           cpu: 200m
                           memory: 256Mi
+                  volumeMounts:
+                      # Expose the LocalAPI socket to the controller container.
+                      # containerboot symlinks the socket to this path.
+                      - name: tailscale-socket
+                        mountPath: /var/run/tailscale
+            volumes:
+                # Shares the tailscaled LocalAPI socket between the sidecar
+                # and the controller so the operator can query the tailnet
+                # MagicDNS suffix for the `url` semantic.
+                - name: tailscale-socket
+                  emptyDir: {}
 ---
 # NetworkPolicy restricting the credential-broker port (9091) to Pods
 # labelled `pgro.bes.au/proxy-sidecar=true` — the label the canopy Job

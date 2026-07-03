@@ -59,6 +59,13 @@ pub struct Context {
 	/// Unix timestamp of the last successful entry into a reconcile function.
 	/// Used by `/livez` to detect a stuck reconciliation loop.
 	pub last_reconcile: Arc<AtomicI64>,
+	/// Filesystem path to the tailscale sidecar's LocalAPI unix socket, used
+	/// to look up the tailnet MagicDNS suffix for the `url` semantic. `None`
+	/// disables URL reporting. Set at startup from `PGRO_TAILSCALED_SOCKET`.
+	pub tailscaled_socket: Option<String>,
+	/// Cached tailnet MagicDNS suffix. The suffix is constant per tailnet, so
+	/// it's fetched once from the LocalAPI and reused.
+	pub magic_dns_suffix: Arc<tokio::sync::RwLock<Option<String>>>,
 }
 
 impl Context {
@@ -91,7 +98,22 @@ impl Context {
 			callback_base_url,
 			deployment_ready_timeout_secs,
 			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
+			tailscaled_socket: None,
+			magic_dns_suffix: Arc::new(tokio::sync::RwLock::new(None)),
 		}
+	}
+
+	/// The tailnet MagicDNS suffix, fetched from the tailscale sidecar's
+	/// LocalAPI socket and cached. `None` when no socket is configured or the
+	/// lookup fails — callers then omit the replica URL.
+	pub async fn magic_dns_suffix(&self) -> Option<String> {
+		if let Some(cached) = self.magic_dns_suffix.read().await.clone() {
+			return Some(cached);
+		}
+		let socket = self.tailscaled_socket.as_deref()?;
+		let suffix = crate::tailscale::magic_dns_suffix(socket).await?;
+		*self.magic_dns_suffix.write().await = Some(suffix.clone());
+		Some(suffix)
 	}
 
 	pub fn max_concurrent_restores(&self) -> usize {

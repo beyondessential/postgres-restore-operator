@@ -7,7 +7,13 @@
 //! the integration seam tests inject a stub at, and as the place to hang
 //! pgro-specific logging / retry / cache concerns later.
 
-use bestool_canopy::{CanopyClient, RestoreCredentials, WorklistEntry, client_builder};
+use bestool_canopy::{
+	CanopyClient, TAILSCALE_URL,
+	schema::{
+		IntentDescriptor, RestoreCapabilitiesArgs, RestoreCredentials, RestoreCredentialsArgs,
+		VerificationArgs, WorklistEntry,
+	},
+};
 use reqwest::Url;
 use uuid::Uuid;
 
@@ -41,9 +47,8 @@ pub struct CanopyConfig {
 /// SOCKS proxy takes down both paths at once.
 async fn build_inner(cfg: &CanopyConfig) -> Result<CanopyClient> {
 	let socks5 = cfg.socks5_proxy.clone();
-	let version = env!("CARGO_PKG_VERSION").to_string();
 	let make_builder = move || {
-		let mut b = client_builder(&version);
+		let mut b = reqwest::Client::builder();
 		if !socks5.is_empty() {
 			let socks5 = socks5.clone();
 			let proxy = reqwest::Proxy::custom(move |url| {
@@ -58,8 +63,12 @@ async fn build_inner(cfg: &CanopyConfig) -> Result<CanopyClient> {
 		b
 	};
 
-	let inner = CanopyClient::new(
-		env!("CARGO_PKG_VERSION"),
+	let tailscale_url: Url = TAILSCALE_URL
+		.parse()
+		.expect("bestool-canopy TAILSCALE_URL is a valid URL");
+	let inner = CanopyClient::with_urls(
+		cfg.base_url.clone(),
+		tailscale_url,
 		cfg.device_key_pem.as_deref(),
 		make_builder,
 	)
@@ -73,51 +82,49 @@ async fn build_inner(cfg: &CanopyConfig) -> Result<CanopyClient> {
 	Ok(inner)
 }
 
-/// pgro's canopy client wrapper. Holds the live `bestool_canopy::CanopyClient`
-/// plus the public-mTLS base URL — the bestool client uses its own hardcoded
-/// tailnet URL on the tailnet path; the base URL is the mTLS-leg fallback.
+/// pgro's canopy client wrapper around the live `bestool_canopy::CanopyClient`
+/// (which bakes in the mTLS base URL and the tailnet endpoint at construction).
 pub struct Client {
 	inner: CanopyClient,
-	base_url: Url,
 }
 
 impl std::fmt::Debug for Client {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.debug_struct("canopy::Client")
-			.field("base_url", &self.base_url.as_str())
-			.finish_non_exhaustive()
+		f.debug_struct("canopy::Client").finish_non_exhaustive()
 	}
 }
 
 impl Client {
 	/// Build a client from operator-level config. Returns `Ok(None)` if no
-	/// canopy integration is configured (no base URL set) — the operator
+	/// canopy integration is configured (no config provided) — the operator
 	/// then runs in legacy-only mode.
 	pub async fn from_config(cfg: Option<CanopyConfig>) -> Result<Option<Self>> {
 		let Some(cfg) = cfg else { return Ok(None) };
 		let inner = build_inner(&cfg).await?;
-		Ok(Some(Self {
-			inner,
-			base_url: cfg.base_url,
-		}))
+		Ok(Some(Self { inner }))
 	}
 
-	/// Register the intents this consumer supports. Replaces the registered
-	/// set wholesale (per canopy's semantics).
-	pub async fn restore_capabilities(&self, intents: &[&str]) -> Result<()> {
+	/// Register the intent descriptors this consumer supports. Replaces the
+	/// registered set wholesale (per canopy's semantics). Each descriptor
+	/// carries the intent name, the canopy semantics it opts into, and its
+	/// typed parameter schema.
+	pub async fn restore_capabilities(&self, intents: &[IntentDescriptor]) -> Result<()> {
+		let body = RestoreCapabilitiesArgs {
+			intents: intents.to_vec(),
+		};
 		self.inner
-			.restore_capabilities(&self.base_url, intents)
+			.restore_capabilities(&body)
 			.await
-			.map_err(|err| Error::Canopy(format!("restore_capabilities: {err:?}")))
+			.map_err(|err| Error::Canopy(format!("restore_capabilities: {err}")))
 	}
 
 	/// Fetch the consumer's desired-state worklist. Each entry is one
 	/// concrete replica to maintain.
 	pub async fn worklist(&self) -> Result<Vec<WorklistEntry>> {
 		self.inner
-			.restore_worklist(&self.base_url)
+			.restore_worklist()
 			.await
-			.map_err(|err| Error::Canopy(format!("restore_worklist: {err:?}")))
+			.map_err(|err| Error::Canopy(format!("restore_worklist: {err}")))
 	}
 
 	/// Fetch short-lived read-only STS creds plus the repo password for a
@@ -127,63 +134,27 @@ impl Client {
 		backup_type: &str,
 		group: Uuid,
 	) -> Result<RestoreCredentials> {
+		let body = RestoreCredentialsArgs {
+			group,
+			type_: backup_type.to_string(),
+		};
+		self.inner.restore_credentials(&body).await.map_err(|err| {
+			Error::Canopy(format!(
+				"restore_credentials({backup_type}, {group}): {err}"
+			))
+		})
+	}
+
+	/// Report a restore outcome (signal 3, restore-verification). `args` is
+	/// the typed [`bestool_canopy::schema::VerificationArgs`], including the
+	/// free-form `health_details`.
+	pub async fn restore_verification_typed(&self, args: &VerificationArgs) -> Result<()> {
 		self.inner
-			.restore_credentials(&self.base_url, backup_type, group)
+			.restore_verification(args)
 			.await
-			.map_err(|err| {
-				Error::Canopy(format!(
-					"restore_credentials({backup_type}, {group}): {err:?}"
-				))
-			})
-	}
-
-	/// Report a restore outcome (signal 3, restore-verification).
-	///
-	/// `body` is the typed [`bestool_canopy::schema::VerificationArgs`]
-	/// (generated from canopy's OpenAPI) — including the free-form
-	/// `health_details` the hand-written wire type doesn't carry. Sent to
-	/// `POST /restore-verification` via the generic request escape hatch; a
-	/// non-2xx response is an error carrying the status + body.
-	pub async fn restore_verification_typed(
-		&self,
-		body: &(impl serde::Serialize + ?Sized),
-	) -> Result<()> {
-		let resp = self
-			.inner
-			.request(
-				bestool_canopy::reqwest::Method::POST,
-				&self.base_url,
-				"/restore-verification",
-			)
-			.await
-			.map_err(|err| Error::Canopy(format!("restore_verification request: {err:?}")))?
-			.json(body)
-			.send()
-			.await
-			.map_err(|err| Error::Canopy(format!("restore_verification send: {err:?}")))?;
-		let status = resp.status();
-		if !status.is_success() {
-			let text = resp.text().await.unwrap_or_default();
-			return Err(Error::Canopy(format!(
-				"restore_verification returned {status}: {text}"
-			)));
-		}
-		Ok(())
-	}
-
-	/// Direct access to the public-mTLS base URL the client is configured
-	/// against. The tailnet path uses its own hardcoded URL inside
-	/// `bestool-canopy`.
-	pub fn base_url(&self) -> &Url {
-		&self.base_url
+			.map_err(|err| Error::Canopy(format!("restore_verification: {err}")))
 	}
 }
-
-/// Re-export the wire types pgro consumes verbatim from `bestool-canopy`.
-pub use bestool_canopy::{
-	BackupCredentials as Credentials, Outcome, RestoreCredentials as CredsResponse,
-	RestoreVerification as Verification, WorklistEntry as Entry,
-};
 
 #[cfg(test)]
 mod tests {
