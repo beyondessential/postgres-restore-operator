@@ -5,6 +5,7 @@ use crate::{kopia::Snapshot, types::*, util::TimeSpan};
 
 use super::{
 	generate_password, persistent_schemas_migration_settled, resources::build_snapshot_list_job,
+	snapshot_already_covered,
 };
 
 fn make_replica(
@@ -232,4 +233,71 @@ fn snapshot_list_job_rotates_kopia_logs() {
 		script.contains("--log-dir-max-age=24h"),
 		"snapshot-list script must rotate kopia logs by age"
 	);
+}
+
+fn make_restore(snapshot: &str, phase: Option<RestorePhase>) -> PostgresPhysicalRestore {
+	PostgresPhysicalRestore {
+		metadata: ObjectMeta {
+			name: Some(format!("test-{snapshot}")),
+			namespace: Some("default".into()),
+			..Default::default()
+		},
+		spec: PostgresPhysicalRestoreSpec {
+			replica: k8s_openapi::api::core::v1::LocalObjectReference {
+				name: "test".into(),
+			},
+			snapshot: snapshot.into(),
+			snapshot_size: k8s_openapi::apimachinery::pkg::api::resource::Quantity("1Gi".into()),
+			snapshot_time: None,
+			storage_size: k8s_openapi::apimachinery::pkg::api::resource::Quantity("2Gi".into()),
+		},
+		status: phase.map(|p| PostgresPhysicalRestoreStatus {
+			phase: Some(p),
+			..Default::default()
+		}),
+	}
+}
+
+#[test]
+fn snapshot_covered_by_verified_marker() {
+	// Ephemeral `verify` replica: the restore has been torn down (no live
+	// restores) but the marker records that we already verified the
+	// snapshot, so we must not restore it again and double-report.
+	assert!(snapshot_already_covered("snapA", Some("snapA"), &[]));
+	assert!(!snapshot_already_covered("snapB", Some("snapA"), &[]));
+}
+
+#[test]
+fn snapshot_covered_by_live_restore() {
+	for phase in [
+		RestorePhase::Pending,
+		RestorePhase::Restoring,
+		RestorePhase::Ready,
+		RestorePhase::Switching,
+		RestorePhase::Active,
+	] {
+		let restores = [make_restore("snapA", Some(phase.clone()))];
+		assert!(
+			snapshot_already_covered("snapA", None, &restores),
+			"a {phase:?} restore on the snapshot must count as covered"
+		);
+	}
+}
+
+#[test]
+fn failed_restore_does_not_cover_snapshot() {
+	// A Failed restore is allowed to be retried via the failure backoff
+	// path, so it must not block a fresh restore of the same snapshot.
+	let restores = [make_restore("snapA", Some(RestorePhase::Failed))];
+	assert!(!snapshot_already_covered("snapA", None, &restores));
+}
+
+#[test]
+fn uncovered_snapshot_is_created() {
+	// No marker, and the only live restore is for a different snapshot.
+	let restores = [make_restore("snapOld", Some(RestorePhase::Active))];
+	assert!(!snapshot_already_covered("snapNew", None, &restores));
+	// A restore with no status yet (phase None) still counts as live.
+	let pending = [make_restore("snapNew", None)];
+	assert!(snapshot_already_covered("snapNew", None, &pending));
 }
