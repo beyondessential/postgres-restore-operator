@@ -1181,6 +1181,8 @@ sed -i \
   "$PGDATA/postgresql.conf"
 
 echo "Configuring stderr logging..."
+# prepend a newline so the first appended setting can't merge onto a last line that lacks a trailing newline
+echo >> "$PGDATA/postgresql.conf"
 echo "log_destination = 'stderr'" >> "$PGDATA/postgresql.conf"
 echo "password_encryption = 'scram-sha-256'" >> "$PGDATA/postgresql.conf"
 echo "logging_collector = off" >> "$PGDATA/postgresql.conf"
