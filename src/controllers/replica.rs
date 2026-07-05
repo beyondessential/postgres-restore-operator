@@ -1071,6 +1071,8 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				image: &ctx.canopy_proxy_image,
 				broker_base_url: &ctx.canopy_broker_base_url,
 				stats_callback_url: &stats_callback_url,
+				// Snapshot listing is discovery, not a restore run — no run_id.
+				run_id: None,
 			})
 		} else {
 			None

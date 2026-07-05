@@ -128,15 +128,20 @@ impl Client {
 	}
 
 	/// Fetch short-lived read-only STS creds plus the repo password for a
-	/// `(group, type)`. Authorized iff a declaration covers it.
+	/// `(group, type)`. Authorized iff a declaration covers it. `run_id` is the
+	/// canopy run-uuid when the fetch belongs to a restore run (the restore
+	/// job's sidecar); `None` for non-run fetches such as the reconcile-time
+	/// repo-password poll.
 	pub async fn restore_credentials(
 		&self,
 		backup_type: &str,
 		group: Uuid,
+		run_id: Option<Uuid>,
 	) -> Result<RestoreCredentials> {
 		let body = RestoreCredentialsArgs::builder()
 			.group(group)
 			.type_(backup_type.to_string())
+			.maybe_run_id(run_id)
 			.build();
 		self.inner.restore_credentials(&body).await.map_err(|err| {
 			Error::Canopy(format!(

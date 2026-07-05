@@ -698,10 +698,15 @@ async fn register_capabilities(ctx: Arc<Context>) {
 /// State passed to the credential-broker Router. Holds the operator's canopy
 /// client and a per-(group, type) cache so concurrent Job sidecars don't
 /// multiply upstream canopy calls.
+/// Broker creds cache key: `(group, type, run_id)`. Including the run_id keeps
+/// within-run STS refreshes on a cache hit while giving each restore run its
+/// own canopy-attributed credentials.
+type CredsCacheKey = (String, String, Option<uuid::Uuid>);
+
 #[derive(Clone)]
 struct BrokerState {
 	ctx: Arc<Context>,
-	cache: Arc<tokio::sync::Mutex<std::collections::HashMap<(String, String), CachedCreds>>>,
+	cache: Arc<tokio::sync::Mutex<std::collections::HashMap<CredsCacheKey, CachedCreds>>>,
 }
 
 #[derive(Clone)]
@@ -736,6 +741,11 @@ fn broker_router(state: BrokerState) -> Router {
 struct BrokerCredsRequest {
 	group: uuid::Uuid,
 	r#type: String,
+	/// Canopy run-uuid of the restore run this sidecar serves, forwarded to
+	/// canopy so its credential grant is attributed to the run. Optional to
+	/// tolerate an older sidecar (mid-rollout) that doesn't send one.
+	#[serde(default)]
+	run_id: Option<uuid::Uuid>,
 }
 
 /// Broker endpoint the proxy sidecar hits to refresh its STS creds. Forwards
@@ -756,7 +766,7 @@ async fn post_restore_creds(
 		);
 	};
 
-	let key = (req.group.to_string(), req.r#type.clone());
+	let key = (req.group.to_string(), req.r#type.clone(), req.run_id);
 	{
 		let cache = state.cache.lock().await;
 		if let Some(cached) = cache.get(&key)
@@ -766,7 +776,10 @@ async fn post_restore_creds(
 		}
 	}
 
-	match canopy.restore_credentials(&req.r#type, req.group).await {
+	match canopy
+		.restore_credentials(&req.r#type, req.group, req.run_id)
+		.await
+	{
 		Ok(resp) => {
 			let expires_at = resp
 				.credentials

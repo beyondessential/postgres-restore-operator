@@ -462,6 +462,32 @@ async fn reconcile_restoring(
 			let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 			let replica = replicas.get(replica_name).await?;
 
+			// Mint (or reuse) the canopy run-uuid for this restore run before
+			// creating the Job, so the sidecar's credential requests and the
+			// eventual verification report carry the same id and canopy can
+			// correlate them. Only canopy-backed restores are a "run"; the
+			// legacy kopia path has no canopy report. Persist it to status
+			// first so it survives a crash between here and Job creation.
+			let run_id = if replica.spec.canopy_source.is_some() {
+				let id = match restore.status.as_ref().and_then(|s| s.run_id.clone()) {
+					Some(existing) => existing,
+					None => {
+						let minted = uuid::Uuid::new_v4().to_string();
+						update_restore_status(
+							client,
+							namespace,
+							name,
+							serde_json::json!({ "runId": minted }),
+						)
+						.await?;
+						minted
+					}
+				};
+				Some(id)
+			} else {
+				None
+			};
+
 			let cache_pressure_url = ctx.cache_pressure_callback_url(namespace, name);
 			let stats_callback_url = ctx.canopy_stats_callback_url(namespace, &job_name);
 			let canopy_proxy = if replica.spec.canopy_source.is_some() {
@@ -469,6 +495,7 @@ async fn reconcile_restoring(
 					image: &ctx.canopy_proxy_image,
 					broker_base_url: &ctx.canopy_broker_base_url,
 					stats_callback_url: &stats_callback_url,
+					run_id: run_id.as_deref(),
 				})
 			} else {
 				None

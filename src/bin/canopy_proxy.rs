@@ -34,6 +34,10 @@ struct Config {
 	broker_url: String,
 	group: String,
 	backup_type: String,
+	/// Canopy run-uuid for this restore run (`PGRO_RUN_ID`), forwarded with
+	/// every creds request so canopy attributes the grant to the run. Optional
+	/// so a sidecar scheduled by an older operator (no env set) still works.
+	run_id: Option<String>,
 	region: String,
 	port_file: PathBuf,
 	/// URL the operator serves the stats-callback on; the sidecar POSTs
@@ -49,6 +53,7 @@ impl Config {
 			broker_url: env_required("PGRO_BROKER_URL")?,
 			group: env_required("PGRO_GROUP")?,
 			backup_type: env_required("PGRO_TYPE")?,
+			run_id: std::env::var("PGRO_RUN_ID").ok().filter(|s| !s.is_empty()),
 			region: env_required("PGRO_REGION")?,
 			port_file: env_or("PGRO_PROXY_PORT_FILE", "/var/run/pgro/proxy-port").into(),
 			stats_callback_url: env_required("PGRO_STATS_CALLBACK_URL")?,
@@ -71,11 +76,12 @@ struct BrokerCredentialProvider {
 	url: String,
 	group: String,
 	backup_type: String,
+	run_id: Option<String>,
 	cache: Mutex<Option<BackupCredentials>>,
 }
 
 impl BrokerCredentialProvider {
-	fn new(broker_url: &str, group: &str, backup_type: &str) -> Self {
+	fn new(broker_url: &str, group: &str, backup_type: &str, run_id: Option<&str>) -> Self {
 		Self {
 			http: reqwest::Client::builder()
 				.timeout(Duration::from_secs(10))
@@ -87,6 +93,7 @@ impl BrokerCredentialProvider {
 			),
 			group: group.to_string(),
 			backup_type: backup_type.to_string(),
+			run_id: run_id.map(str::to_string),
 			cache: Mutex::new(None),
 		}
 	}
@@ -96,6 +103,8 @@ impl BrokerCredentialProvider {
 		struct Req<'a> {
 			group: &'a str,
 			r#type: &'a str,
+			#[serde(skip_serializing_if = "Option::is_none")]
+			run_id: Option<&'a str>,
 		}
 		let resp = self
 			.http
@@ -103,6 +112,7 @@ impl BrokerCredentialProvider {
 			.json(&Req {
 				group: &self.group,
 				r#type: &self.backup_type,
+				run_id: self.run_id.as_deref(),
 			})
 			.send()
 			.await?
@@ -207,6 +217,7 @@ async fn run(cfg: Config) -> Result<(), String> {
 		&cfg.broker_url,
 		&group,
 		&backup_type,
+		cfg.run_id.as_deref(),
 	));
 	let s3_cfg = S3ProxyConfig {
 		upstream: format!("https://s3.{}.amazonaws.com", cfg.region),
