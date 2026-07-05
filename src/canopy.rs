@@ -109,9 +109,9 @@ impl Client {
 	/// carries the intent name, the canopy semantics it opts into, and its
 	/// typed parameter schema.
 	pub async fn restore_capabilities(&self, intents: &[IntentDescriptor]) -> Result<()> {
-		let body = RestoreCapabilitiesArgs {
-			intents: intents.to_vec(),
-		};
+		let body = RestoreCapabilitiesArgs::builder()
+			.intents(intents.to_vec())
+			.build();
 		self.inner
 			.restore_capabilities(&body)
 			.await
@@ -134,10 +134,10 @@ impl Client {
 		backup_type: &str,
 		group: Uuid,
 	) -> Result<RestoreCredentials> {
-		let body = RestoreCredentialsArgs {
-			group,
-			type_: backup_type.to_string(),
-		};
+		let body = RestoreCredentialsArgs::builder()
+			.group(group)
+			.type_(backup_type.to_string())
+			.build();
 		self.inner.restore_credentials(&body).await.map_err(|err| {
 			Error::Canopy(format!(
 				"restore_credentials({backup_type}, {group}): {err}"

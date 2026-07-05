@@ -127,24 +127,24 @@ pub async fn report(
 	// Typed request body generated from canopy's OpenAPI (bestool#628).
 	// Constructing it here means the field set is checked against canopy's
 	// spec at compile time; `health_details` stays free-form by design.
-	let args = VerificationArgs {
-		replica_id,
-		group,
-		server_id,
-		type_: backup_type.clone(),
-		intent: intent.clone(),
-		snapshot_id: Some(restore.spec.snapshot.clone()),
-		outcome: outcome_wire(outcome).to_string(),
-		error: error.map(str::to_string),
-		replica_healthy,
-		postgres_version,
-		observed_at: Timestamp::now().to_string(),
-		s3_sent_raw_bytes: Some(stats.sent_raw_bytes as i64),
-		s3_sent_payload_bytes: Some(stats.sent_payload_bytes as i64),
-		s3_received_raw_bytes: Some(stats.received_raw_bytes as i64),
-		s3_received_payload_bytes: Some(stats.received_payload_bytes as i64),
-		health_details,
-	};
+	let args = VerificationArgs::builder()
+		.maybe_replica_id(replica_id)
+		.group(group)
+		.server_id(server_id)
+		.type_(backup_type.clone())
+		.intent(intent.clone())
+		.snapshot_id(restore.spec.snapshot.clone())
+		.outcome(outcome_wire(outcome).to_string())
+		.maybe_error(error.map(str::to_string))
+		.replica_healthy(replica_healthy)
+		.maybe_postgres_version(postgres_version)
+		.observed_at(Timestamp::now().to_string())
+		.s3_sent_raw_bytes(stats.sent_raw_bytes as i64)
+		.s3_sent_payload_bytes(stats.sent_payload_bytes as i64)
+		.s3_received_raw_bytes(stats.received_raw_bytes as i64)
+		.s3_received_payload_bytes(stats.received_payload_bytes as i64)
+		.maybe_health_details(health_details)
+		.build();
 
 	match canopy.restore_verification_typed(&args).await {
 		Ok(()) => info!(
