@@ -107,6 +107,11 @@ pub async fn report(
 		.as_ref()
 		.and_then(|s| s.postgres_version.clone());
 
+	// The canopy run-uuid minted when this run's Job was created (persisted on
+	// the restore status). Reported so canopy can correlate the report with the
+	// run's credential requests.
+	let run_id = run_id_from_status(restore);
+
 	let replica_healthy = matches!(outcome, RunOutcome::Success);
 
 	// Gather health details; send None rather than an empty object when
@@ -127,24 +132,25 @@ pub async fn report(
 	// Typed request body generated from canopy's OpenAPI (bestool#628).
 	// Constructing it here means the field set is checked against canopy's
 	// spec at compile time; `health_details` stays free-form by design.
-	let args = VerificationArgs {
-		replica_id,
-		group,
-		server_id,
-		type_: backup_type.clone(),
-		intent: intent.clone(),
-		snapshot_id: Some(restore.spec.snapshot.clone()),
-		outcome: outcome_wire(outcome).to_string(),
-		error: error.map(str::to_string),
-		replica_healthy,
-		postgres_version,
-		observed_at: Timestamp::now().to_string(),
-		s3_sent_raw_bytes: Some(stats.sent_raw_bytes as i64),
-		s3_sent_payload_bytes: Some(stats.sent_payload_bytes as i64),
-		s3_received_raw_bytes: Some(stats.received_raw_bytes as i64),
-		s3_received_payload_bytes: Some(stats.received_payload_bytes as i64),
-		health_details,
-	};
+	let args = VerificationArgs::builder()
+		.maybe_replica_id(replica_id)
+		.maybe_run_id(run_id)
+		.group(group)
+		.server_id(server_id)
+		.type_(backup_type.clone())
+		.intent(intent.clone())
+		.snapshot_id(restore.spec.snapshot.clone())
+		.outcome(outcome_wire(outcome).to_string())
+		.maybe_error(error.map(str::to_string))
+		.replica_healthy(replica_healthy)
+		.maybe_postgres_version(postgres_version)
+		.observed_at(Timestamp::now().to_string())
+		.s3_sent_raw_bytes(stats.sent_raw_bytes as i64)
+		.s3_sent_payload_bytes(stats.sent_payload_bytes as i64)
+		.s3_received_raw_bytes(stats.received_raw_bytes as i64)
+		.s3_received_payload_bytes(stats.received_payload_bytes as i64)
+		.maybe_health_details(health_details)
+		.build();
 
 	match canopy.restore_verification_typed(&args).await {
 		Ok(()) => info!(
@@ -161,6 +167,17 @@ pub async fn report(
 			"canopy verification report failed"
 		),
 	}
+}
+
+/// The canopy run-uuid persisted on the restore status, parsed to a `Uuid`.
+/// A malformed value is treated as absent rather than failing the report —
+/// canopy still accepts a report without a run_id while the field is optional.
+fn run_id_from_status(restore: &PostgresPhysicalRestore) -> Option<Uuid> {
+	restore
+		.status
+		.as_ref()
+		.and_then(|s| s.run_id.as_deref())
+		.and_then(|s| Uuid::parse_str(s).ok())
 }
 
 /// Wire string canopy expects for the `outcome` field (matches the
@@ -320,5 +337,49 @@ mod tests {
 		assert_eq!(v, json!({ "restore_duration_sec": 42 }));
 		assert!(v.get("sizes").is_none());
 		assert!(v.get("fixes").is_none());
+	}
+
+	fn restore_with_run_id(run_id: Option<&str>) -> PostgresPhysicalRestore {
+		use k8s_openapi::api::core::v1::LocalObjectReference;
+		use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+		use crate::types::{PostgresPhysicalRestoreSpec, PostgresPhysicalRestoreStatus};
+
+		let mut restore = PostgresPhysicalRestore::new(
+			"r",
+			PostgresPhysicalRestoreSpec {
+				replica: LocalObjectReference {
+					name: "rep".to_string(),
+				},
+				snapshot: "snap".to_string(),
+				snapshot_size: Quantity("1Gi".to_string()),
+				snapshot_time: None,
+				storage_size: Quantity("2Gi".to_string()),
+			},
+		);
+		restore.status = Some(PostgresPhysicalRestoreStatus {
+			run_id: run_id.map(str::to_string),
+			..Default::default()
+		});
+		restore
+	}
+
+	#[test]
+	fn run_id_from_status_parses_valid_uuid() {
+		let id = "44444444-4444-4444-4444-444444444444";
+		assert_eq!(
+			run_id_from_status(&restore_with_run_id(Some(id))),
+			Some(Uuid::parse_str(id).unwrap())
+		);
+	}
+
+	#[test]
+	fn run_id_from_status_absent_or_malformed_is_none() {
+		assert_eq!(run_id_from_status(&restore_with_run_id(None)), None);
+		assert_eq!(
+			run_id_from_status(&restore_with_run_id(Some("not-a-uuid"))),
+			None,
+			"a malformed run_id is tolerated as absent, not a hard error"
+		);
 	}
 }

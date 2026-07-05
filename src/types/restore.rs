@@ -50,6 +50,14 @@ pub struct PostgresPhysicalRestoreStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub phase: Option<RestorePhase>,
 
+	/// Canopy run-uuid for this restore run, minted when the restore Job is
+	/// created and reused for the run's credential requests and its
+	/// verification report so canopy can correlate them. Stored as a string
+	/// (parsed to `Uuid` when sent) to avoid pulling a schemars uuid feature
+	/// into the CRD schema.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub run_id: Option<String>,
+
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub postgres_version: Option<String>,
 

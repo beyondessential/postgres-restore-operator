@@ -214,6 +214,7 @@ Deleting this resource will drop the restored database and prompt the Replica to
 | Field | Type | Description |
 |-------|------|-------------|
 | `phase` | `Pending` \| `Restoring` \| `Ready` \| `Switching` \| `Active` \| `Failed` | Current phase of the restore. |
+| `runId` | `string` | Canopy run-uuid minted when the restore Job is created, reused for the run's credential requests and verification report so canopy can correlate them. Canopy-backed restores only. |
 | `postgresVersion` | `string` | Detected PostgreSQL major version from the restored data. |
 | `createdAt` | `Time` | When the restore resource was created. |
 | `restoredAt` | `Time` | When the restore job completed. |

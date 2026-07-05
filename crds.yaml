@@ -1124,6 +1124,15 @@ spec:
                 format: date-time
                 nullable: true
                 type: string
+              runId:
+                description: |-
+                  Canopy run-uuid for this restore run, minted when the restore Job is
+                  created and reused for the run's credential requests and its
+                  verification report so canopy can correlate them. Stored as a string
+                  (parsed to `Uuid` when sent) to avoid pulling a schemars uuid feature
+                  into the CRD schema.
+                nullable: true
+                type: string
             type: object
         required:
         - spec

@@ -259,8 +259,10 @@ async fn reconcile_entry(ctx: &Context, ns_name: &str, entry: &WorklistEntry) ->
 	let Some(canopy) = ctx.canopy.as_ref() else {
 		return Ok(());
 	};
+	// This per-tick fetch exists only to read the repo password for the creds
+	// Secret; it is not a restore run, so it carries no run_id.
 	let creds = canopy
-		.restore_credentials(&entry.type_, entry.group_id)
+		.restore_credentials(&entry.type_, entry.group_id, None)
 		.await?;
 
 	ensure_canopy_creds_secret(ctx, ns_name, entry, &creds.repo_password.0).await?;

@@ -72,7 +72,10 @@ const DEFAULT_ANALYTICS_MINIMUM_TTL_SECS: i64 = 7200;
 const DEFAULT_ANALYTICS_SWITCHOVER_GRACE_SECS: i64 = 120;
 
 fn param(type_: ParamType, default: Option<Value>) -> ParamSpec {
-	ParamSpec { type_, default }
+	ParamSpec::builder()
+		.type_(type_)
+		.maybe_default(default)
+		.build()
 }
 
 /// The `analytics` intent's parameter schema (name → typed spec + default).
@@ -112,23 +115,28 @@ fn analytics_param_schema() -> ParamSchema {
 /// operators, dispatches only these, and applies the semantics' behaviours.
 pub fn descriptors() -> Vec<IntentDescriptor> {
 	vec![
-		IntentDescriptor {
-			intent: "verify".to_string(),
-			description: Some(
+		IntentDescriptor::builder()
+			.intent("verify".to_string())
+			.description(
 				"Restore the snapshot to prove it is restorable, then discard it.".to_string(),
-			),
-			semantics: vec![semantics::CHECK.to_string(), semantics::ONCE.to_string()],
-			params: None,
-		},
-		IntentDescriptor {
-			intent: "analytics".to_string(),
-			description: Some(
+			)
+			.semantics(vec![
+				semantics::CHECK.to_string(),
+				semantics::ONCE.to_string(),
+			])
+			.build(),
+		IntentDescriptor::builder()
+			.intent("analytics".to_string())
+			.description(
 				"Keep a long-lived read-only query replica restored from the latest snapshot."
 					.to_string(),
-			),
-			semantics: vec![semantics::CHECK.to_string(), semantics::URL.to_string()],
-			params: Some(analytics_param_schema()),
-		},
+			)
+			.semantics(vec![
+				semantics::CHECK.to_string(),
+				semantics::URL.to_string(),
+			])
+			.params(analytics_param_schema())
+			.build(),
 	]
 }
 
