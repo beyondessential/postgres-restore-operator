@@ -62,7 +62,7 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@v2.81.1
+      - uses: taiki-e/install-action@v2.82.2
         with:
           tool: just
 
@@ -127,9 +127,9 @@ jobs:
           ls -lh .github/build-context/arm64/
 
       - name: Setup buildkit
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@v4.1.0
 
-      - uses: docker/metadata-action@v6
+      - uses: docker/metadata-action@v6.1.0
         id: meta
         with:
           images: ghcr.io/beyondessential/postgres-restore-operator
