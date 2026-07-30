@@ -10,6 +10,9 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # See ci.yml: build bestool-canopy against its committed snapshot until
+  # canopy#422 deploys and the crate releases.
+  CANOPY_OPENAPI_OFFLINE: 1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}

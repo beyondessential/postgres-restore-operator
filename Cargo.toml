@@ -48,7 +48,9 @@ tower = "0.5.3"
 name = "canopy-proxy"
 path = "src/bin/canopy_proxy.rs"
 
-# Until bestool-canopy releases with the migration-testing schema (needs canopy
-# deployed to meta.tamanu.app, which the live-tracking build generates from).
+# Until bestool-canopy releases with the migration-testing schema. Its build
+# generates types from canopy's live spec, which does not carry them until
+# canopy#422 deploys, so CI sets CANOPY_OPENAPI_OFFLINE=1 to use the crate's
+# committed snapshot. Both this patch and that env go away on release.
 [patch.crates-io]
-bestool-canopy = { path = "../../bestool/crates/canopy" }
+bestool-canopy = { git = "https://github.com/beyondessential/bestool", branch = "feat/canopy-migration-testing" }

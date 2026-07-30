@@ -10,6 +10,11 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
+  # bestool-canopy generates its types from canopy's live OpenAPI, which does
+  # not carry the migration-testing fields until canopy#422 deploys. Build
+  # against the crate's committed snapshot until then; remove with the
+  # [patch.crates-io] in Cargo.toml.
+  CANOPY_OPENAPI_OFFLINE: 1
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref || github.run_id }}

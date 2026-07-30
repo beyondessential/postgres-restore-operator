@@ -141,6 +141,7 @@ dependencies = [
 [[package]]
 name = "algae-cli"
 version = "1.1.9"
+source = "git+https://github.com/beyondessential/bestool?branch=feat%2Fcanopy-migration-testing#f2ce4ac916b0d66fd8997cb2639fed2a84a30ce8"
 dependencies = [
  "age",
  "age-core",
@@ -496,6 +497,7 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "bestool-canopy"
 version = "0.7.8"
+source = "git+https://github.com/beyondessential/bestool?branch=feat%2Fcanopy-migration-testing#f2ce4ac916b0d66fd8997cb2639fed2a84a30ce8"
 dependencies = [
  "algae-cli",
  "async-trait",
