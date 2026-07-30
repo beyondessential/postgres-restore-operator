@@ -980,10 +980,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.await?;
 	}
 
+	// A replica that has never restored triggers immediately rather than
+	// idling until the first cron tick — but not while a failure backoff is
+	// in effect, or one that fails every attempt retries as fast as it can
+	// fail.
+	let backoff_pending = scheduling::backoff_pending(replica.status.as_ref(), now);
+	let never_restored = never_restored && !backoff_pending;
+
 	if never_restored {
 		info!(
 			replica = name,
 			"no successful restore yet, triggering immediately"
+		);
+	} else if backoff_pending {
+		debug!(
+			replica = name,
+			"restore failure backoff in effect, not triggering"
 		);
 	}
 
