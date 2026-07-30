@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -23,10 +24,10 @@ use postgres_restore_operator::{
 	canopy::{self, DEFAULT_SOCKS5_PROXY},
 	context::{
 		Context, DEFAULT_CANOPY_PROXY_IMAGE, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
-		DEFAULT_KOPIA_IMAGE,
+		DEFAULT_KOPIA_IMAGE, ReplicaKey,
 	},
 	controllers::{self, canopy::intent},
-	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
+	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase},
 };
 
 // Use mimalloc instead of the default glibc allocator. Long-running Rust
@@ -394,6 +395,70 @@ async fn main() -> anyhow::Result<()> {
 				}
 			}
 			Err(e) => tracing::error!(error = %e, addr = broker_addr, "broker bind failed"),
+		}
+	});
+
+	// Reconcile the in-memory restore queue against observed cluster state.
+	// Slots are released explicitly on failure, switchover and ephemeral
+	// teardown, but a restore deleted while Restoring bypasses all three and
+	// leaks its slot permanently — the queue only clears on restart, and at
+	// the default limit of 2 a pair of leaked slots stalls the whole fleet.
+	// Freeing a slot a little early is far cheaper than that, so this runs on
+	// a slow interval and lets transient races settle.
+	let queue_ctx = ctx.clone();
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(Duration::from_secs(60));
+		let restores: Api<PostgresPhysicalRestore> = Api::all(queue_ctx.client.clone());
+		loop {
+			interval.tick().await;
+			let Ok(list) = restores
+				.list(&Default::default())
+				.await
+				.inspect_err(|error| {
+					warn!(%error, "could not list restores to reconcile the queue");
+				})
+			else {
+				continue;
+			};
+			let live: HashSet<ReplicaKey> = list
+				.items
+				.iter()
+				.filter(|r| {
+					matches!(
+						r.status.as_ref().and_then(|s| s.phase.as_ref()),
+						Some(&RestorePhase::Restoring)
+					)
+				})
+				.filter_map(|r| {
+					Some(ReplicaKey::new(
+						r.metadata.namespace.as_deref()?,
+						&r.spec.replica.name,
+					))
+				})
+				.collect();
+
+			let mut queue = queue_ctx.restore_queue.write().await;
+			let dropped = queue.retain_active(&live);
+			if !dropped.is_empty() {
+				let freed: Vec<String> = dropped.iter().map(ToString::to_string).collect();
+				warn!(
+					?freed,
+					active = queue.active.len(),
+					"released restore queue slots with no live restore"
+				);
+			}
+			// Deliberately no try_promote here: `active` mirrors observed
+			// state, and promoting would put a key back with no restore
+			// behind it for the next tick to drop again. Freeing the slot is
+			// enough — each replica re-checks capacity on its own reconcile.
+			queue_ctx
+				.metrics
+				.active_restores
+				.set(queue.active.len() as i64);
+			queue_ctx
+				.metrics
+				.queue_depth
+				.set(queue.pending.len() as i64);
 		}
 	});
 

@@ -1,12 +1,81 @@
-use k8s_openapi::api::core::v1::SecretReference;
+use k8s_openapi::{api::core::v1::SecretReference, apimachinery::pkg::api::resource::Quantity};
 use kube::api::ObjectMeta;
+use kube_quantity::ParsedQuantity;
+use rust_decimal::Decimal;
 
 use crate::{kopia::Snapshot, types::*, util::TimeSpan};
 
 use super::{
-	generate_password, persistent_schemas_migration_settled, resources::build_snapshot_list_job,
+	generate_password, persistent_schemas_migration_settled,
+	resources::{build_snapshot_list_job, compute_storage_size},
 	snapshot_already_covered,
 };
+
+/// The canopy path always sets `storageSizeOverride` from its intent config
+/// (50Gi for `analytics`), which must not cap a replica whose snapshot is
+/// larger than that — doing so restores into a volume that fills partway
+/// through.
+#[test]
+fn storage_size_override_does_not_cap_a_larger_snapshot() {
+	const SNAPSHOT_BYTES: u64 = 120 * 1024 * 1024 * 1024;
+	let size = compute_storage_size(
+		ParsedQuantity::from(Decimal::from(SNAPSHOT_BYTES)),
+		Some(&Quantity("50Gi".into())),
+		&Quantity("2Ti".into()),
+		false,
+		None,
+	)
+	.expect("under the 2Ti maximum");
+
+	let bytes = ParsedQuantity::try_from(size).unwrap();
+	let snapshot_bytes = ParsedQuantity::from(Decimal::from(SNAPSHOT_BYTES));
+	assert!(
+		bytes > snapshot_bytes,
+		"PVC must be larger than the snapshot it holds, got {bytes:?}"
+	);
+}
+
+/// The floor is what keeps a small snapshot from getting a PVC too tight for
+/// postgres to run in — 1.1x of a 250MB snapshot is under 300MB. Guards
+/// against "fixing" the override by simply ignoring it.
+#[test]
+fn storage_size_override_is_a_floor_for_small_snapshots() {
+	let snapshot = ParsedQuantity::from(Decimal::from(250u64 * 1024 * 1024));
+	let size = compute_storage_size(
+		snapshot,
+		Some(&Quantity("50Gi".into())),
+		&Quantity("2Ti".into()),
+		false,
+		None,
+	)
+	.expect("under the 2Ti maximum");
+
+	assert_eq!(
+		ParsedQuantity::try_from(size).unwrap(),
+		ParsedQuantity::try_from("50Gi").unwrap()
+	);
+}
+
+/// With the override applied as a floor it now participates in the size
+/// selection, so `storageSizeMaximum` bounds it too — previously the override
+/// returned early and skipped the guardrail entirely.
+#[test]
+fn storage_size_maximum_is_enforced_against_the_override() {
+	let snapshot = ParsedQuantity::from(Decimal::from(1_000u64));
+	let err = compute_storage_size(
+		snapshot,
+		Some(&Quantity("50Gi".into())),
+		&Quantity("10Gi".into()),
+		false,
+		None,
+	)
+	.expect_err("50Gi floor exceeds the 10Gi maximum");
+
+	assert!(
+		matches!(err, crate::error::Error::StorageLimitExceeded { .. }),
+		"got {err:?}"
+	);
+}
 
 fn make_replica(
 	persistent_schemas: Option<Vec<String>>,

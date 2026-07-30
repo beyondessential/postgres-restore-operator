@@ -24,7 +24,7 @@ use tracing::{debug, info, warn};
 
 use super::read_job_termination_message;
 use crate::{
-	context::Context,
+	context::{Context, ReplicaKey},
 	error::{Error, Result},
 	types::*,
 };
@@ -228,8 +228,11 @@ async fn fail_restore(
 ) -> Result<Action> {
 	update_restore_status(&ctx.client, namespace, name, status_patch).await?;
 
-	if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
-		info!(promoted = %promoted_name, "promoted queued restore after failure");
+	if let Some(promoted) = ctx
+		.release_restore_slot(&ReplicaKey::new(namespace, replica_name))
+		.await
+	{
+		info!(promoted = %promoted, "promoted queued restore after failure");
 	}
 
 	// Increment consecutiveRestoreFailures on the parent replica and advance
@@ -428,9 +431,8 @@ async fn reconcile_pending(
 	)
 	.await?;
 
-	// Mark as active in the queue (keyed by replica name to match enqueue in replica controller)
 	let mut queue = ctx.restore_queue.write().await;
-	queue.mark_active(replica_name);
+	queue.mark_active(&ReplicaKey::new(namespace, replica_name));
 	ctx.metrics.active_restores.set(queue.active.len() as i64);
 	ctx.metrics.queue_depth.set(queue.pending.len() as i64);
 	drop(queue);
@@ -909,8 +911,11 @@ async fn reconcile_ready(
 		)
 		.await?;
 
-		if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
-			info!(promoted = %promoted_name, "promoted queued restore after switchover");
+		if let Some(promoted) = ctx
+			.release_restore_slot(&ReplicaKey::new(namespace, replica_name))
+			.await
+		{
+			info!(promoted = %promoted, "promoted queued restore after switchover");
 		}
 
 		return Ok(Action::requeue(Duration::from_secs(5)));

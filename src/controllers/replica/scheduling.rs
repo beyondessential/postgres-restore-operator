@@ -43,6 +43,25 @@ pub fn failure_backoff_delay(consecutive_failures: u32) -> Option<SignedDuration
 	Some(SignedDuration::from_secs(clamped as i64))
 }
 
+/// True when a failure backoff recorded by `fail_restore` is still in effect.
+///
+/// `fail_restore` advances `nextScheduledRestore` by [`failure_backoff_delay`]
+/// on every failure. Triggers that bypass the schedule (notably the
+/// never-restored immediate trigger) must consult this, or a replica that
+/// fails every attempt retries as fast as it can fail.
+pub fn backoff_pending(status: Option<&PostgresPhysicalReplicaStatus>, now: Timestamp) -> bool {
+	let Some(status) = status else {
+		return false;
+	};
+	if status.consecutive_restore_failures.unwrap_or(0) == 0 {
+		return false;
+	}
+	status
+		.next_scheduled_restore
+		.as_ref()
+		.is_some_and(|next| now < next.0)
+}
+
 impl PostgresPhysicalReplica {
 	/// Compute a stable hash of the schedule inputs (`schedule` + `scheduleJitter`)
 	/// so we can detect when the user changes either field without storing raw values.
@@ -288,6 +307,65 @@ mod tests {
 				..Default::default()
 			}),
 		}
+	}
+
+	/// A replica that has never restored successfully triggers immediately so
+	/// a freshly created one doesn't idle until the first cron tick. That must
+	/// not survive a failure: without this, a replica failing every attempt
+	/// retries as fast as it can fail, ignoring the backoff it just recorded.
+	#[test]
+	fn failure_backoff_applies_to_a_replica_that_never_restored() {
+		let now = Timestamp::now();
+		let mut replica = make_replica(
+			"H * * * *",
+			Some(now + SignedDuration::from_secs(600)),
+			None,
+			None,
+		);
+		replica
+			.status
+			.as_mut()
+			.unwrap()
+			.consecutive_restore_failures = Some(3);
+
+		assert!(
+			backoff_pending(replica.status.as_ref(), now),
+			"a pending backoff must suppress the never-restored immediate trigger"
+		);
+	}
+
+	/// The immediate trigger still has to work for a genuinely new replica,
+	/// which has no failures and a cron-derived nextScheduledRestore.
+	#[test]
+	fn no_backoff_pending_for_a_fresh_replica() {
+		let now = Timestamp::now();
+		let replica = make_replica(
+			"H * * * *",
+			Some(now + SignedDuration::from_secs(600)),
+			None,
+			None,
+		);
+
+		assert!(!backoff_pending(replica.status.as_ref(), now));
+	}
+
+	/// Once the backoff window elapses the replica is free to retry.
+	#[test]
+	fn no_backoff_pending_once_the_window_elapsed() {
+		let now = Timestamp::now();
+		let mut replica = make_replica(
+			"H * * * *",
+			Some(now - SignedDuration::from_secs(1)),
+			None,
+			None,
+		);
+		replica
+			.status
+			.as_mut()
+			.unwrap()
+			.consecutive_restore_failures = Some(3);
+
+		assert!(!backoff_pending(replica.status.as_ref(), now));
 	}
 
 	#[test]

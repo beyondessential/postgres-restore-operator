@@ -53,6 +53,54 @@ impl SnapshotInfo {
 	}
 }
 
+/// Size the restore PVC for a snapshot.
+///
+/// `override_size` (`spec.storageSizeOverride`) is a floor, not a replacement:
+/// the canopy path always sets it from the intent config, so treating it as an
+/// exact size would truncate any replica whose snapshot outgrew it. `maximum`
+/// still bounds the result, so an oversized replica fails loudly instead of
+/// restoring into a volume that fills partway through.
+pub fn compute_storage_size(
+	snapshot_bytes: ParsedQuantity,
+	override_size: Option<&Quantity>,
+	maximum: &Quantity,
+	persistent_schemas: bool,
+	measured_schema_delta: Option<ParsedQuantity>,
+) -> Result<Quantity> {
+	let max_pvc_size = ParsedQuantity::try_from(maximum.clone())
+		.unwrap_or_else(|_| ParsedQuantity::try_from("2Ti").unwrap());
+
+	let computed_size = if persistent_schemas {
+		// Persistent schemas are migrated into the restore PVC.
+		// Formula: snapshot + max(10% of snapshot, last measured delta) + 5Gi
+		let ten_percent = snapshot_bytes.clone() * Decimal::new(1, 1);
+		let measured = measured_schema_delta.unwrap_or_else(|| ParsedQuantity::from(Decimal::ZERO));
+		let overhead = if measured > ten_percent {
+			measured
+		} else {
+			ten_percent
+		};
+		snapshot_bytes + overhead + ParsedQuantity::try_from("5Gi").unwrap()
+	} else {
+		snapshot_bytes * Decimal::new(11, 1) // 1.1x
+	};
+
+	let floor = override_size.and_then(|q| ParsedQuantity::try_from(q.clone()).ok());
+	let chosen = match floor {
+		Some(floor) if floor > computed_size => floor,
+		_ => computed_size,
+	};
+
+	if chosen > max_pvc_size {
+		return Err(crate::error::Error::StorageLimitExceeded {
+			computed: chosen.into(),
+			maximum: max_pvc_size.into(),
+		});
+	}
+
+	Ok(chosen.into())
+}
+
 pub fn build_snapshot_list_job(
 	replica: &PostgresPhysicalReplica,
 	job_name: &str,
@@ -376,43 +424,18 @@ impl PostgresPhysicalReplica {
 		let timestamp = Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
 		let restore_name = format!("{replica_name}-{timestamp}");
 
-		let max_pvc_size = ParsedQuantity::try_from(self.spec.storage_size_maximum.clone())
-			.unwrap_or_else(|_| ParsedQuantity::try_from("2Ti").unwrap());
-
-		let snapshot_bytes = snapshot.bytes();
-		let storage_size = match &self.spec.storage_size_override {
-			Some(override_size) => override_size.clone(),
-			None => {
-				let computed_size = if self.spec.persistent_schemas.is_some() {
-					// Persistent schemas are migrated into the restore PVC.
-					// Formula: snapshot + max(10% of snapshot, last measured delta) + 5Gi
-					let ten_percent = snapshot_bytes.clone() * Decimal::new(1, 1);
-					let measured = self
-						.status
-						.as_ref()
-						.and_then(|s| s.persistent_schema_data_size.as_ref())
-						.and_then(|q| ParsedQuantity::try_from(q.clone()).ok())
-						.unwrap_or_else(|| ParsedQuantity::from(Decimal::ZERO));
-					let overhead = if measured > ten_percent {
-						measured
-					} else {
-						ten_percent
-					};
-					snapshot_bytes + overhead + ParsedQuantity::try_from("5Gi").unwrap()
-				} else {
-					snapshot_bytes * Decimal::new(11, 1) // 1.1x
-				};
-
-				if computed_size > max_pvc_size {
-					return Err(crate::error::Error::StorageLimitExceeded {
-						computed: computed_size.into(),
-						maximum: max_pvc_size.into(),
-					});
-				}
-
-				computed_size.into()
-			}
-		};
+		let measured_schema_delta = self
+			.status
+			.as_ref()
+			.and_then(|s| s.persistent_schema_data_size.as_ref())
+			.and_then(|q| ParsedQuantity::try_from(q.clone()).ok());
+		let storage_size = compute_storage_size(
+			snapshot.bytes(),
+			self.spec.storage_size_override.as_ref(),
+			&self.spec.storage_size_maximum,
+			self.spec.persistent_schemas.is_some(),
+			measured_schema_delta,
+		)?;
 
 		let mut restore = PostgresPhysicalRestore::new(
 			&restore_name,
