@@ -89,20 +89,43 @@ fn storage_size_override_is_a_floor_for_small_snapshots() {
 	);
 }
 
-/// With the override applied as a floor it now participates in the size
-/// selection, so `storageSizeMaximum` bounds it too — previously the override
-/// returned early and skipped the guardrail entirely.
+/// A floor above the maximum is contradictory configuration, not a replica
+/// that's too big — the maximum simply wins. Erroring here wedges a small
+/// replica whose operator capped it below the intent's floor: it can hold its
+/// snapshot many times over, but no restore can ever be created.
 #[test]
-fn storage_size_maximum_is_enforced_against_the_override() {
-	let snapshot = ParsedQuantity::from(Decimal::from(1_000u64));
-	let err = compute_storage_size(
+fn floor_above_the_maximum_clamps_rather_than_failing() {
+	let snapshot = ParsedQuantity::from(Decimal::from(250u64 * 1024 * 1024));
+	let size = compute_storage_size(
 		snapshot,
 		Some(&Quantity("50Gi".into())),
 		&Quantity("10Gi".into()),
 		false,
 		None,
 	)
-	.expect_err("50Gi floor exceeds the 10Gi maximum");
+	.expect("a floor over the cap clamps to the cap");
+
+	assert_eq!(
+		ParsedQuantity::try_from(size).unwrap(),
+		ParsedQuantity::try_from("10Gi").unwrap()
+	);
+}
+
+/// The guardrail still fires for what it's actually for: a snapshot too large
+/// to fit the configured maximum. Truncating there would restore into a volume
+/// that fills partway through, which is the failure the maximum exists to
+/// prevent.
+#[test]
+fn storage_size_maximum_still_rejects_an_oversized_snapshot() {
+	let snapshot = ParsedQuantity::from(Decimal::from(500u64 * 1024 * 1024 * 1024));
+	let err = compute_storage_size(
+		snapshot,
+		Some(&Quantity("50Gi".into())),
+		&Quantity("100Gi".into()),
+		false,
+		None,
+	)
+	.expect_err("a 500Gi snapshot cannot fit a 100Gi maximum");
 
 	assert!(
 		matches!(err, crate::error::Error::StorageLimitExceeded { .. }),
