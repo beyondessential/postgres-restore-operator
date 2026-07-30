@@ -57,9 +57,13 @@ impl SnapshotInfo {
 ///
 /// `override_size` (`spec.storageSizeOverride`) is a floor, not a replacement:
 /// the canopy path always sets it from the intent config, so treating it as an
-/// exact size would truncate any replica whose snapshot outgrew it. `maximum`
-/// still bounds the result, so an oversized replica fails loudly instead of
-/// restoring into a volume that fills partway through.
+/// exact size would truncate any replica whose snapshot outgrew it.
+///
+/// `maximum` bounds the result. It fails the restore only when the
+/// *snapshot-derived* size exceeds it — a replica genuinely too big for its
+/// configured cap, where truncating would restore into a volume that fills
+/// partway through. A floor above the maximum is merely contradictory config
+/// and clamps instead.
 pub fn compute_storage_size(
 	snapshot_bytes: ParsedQuantity,
 	override_size: Option<&Quantity>,
@@ -85,20 +89,29 @@ pub fn compute_storage_size(
 		snapshot_bytes * Decimal::new(11, 1) // 1.1x
 	};
 
+	// The maximum guards against a snapshot too large to fit — that's the case
+	// where truncating would restore into a volume that fills partway through.
+	if computed_size > max_pvc_size {
+		return Err(crate::error::Error::StorageLimitExceeded {
+			computed: computed_size.into(),
+			maximum: max_pvc_size.into(),
+		});
+	}
+
 	let floor = override_size.and_then(|q| ParsedQuantity::try_from(q.clone()).ok());
 	let chosen = match floor {
 		Some(floor) if floor > computed_size => floor,
 		_ => computed_size,
 	};
 
-	if chosen > max_pvc_size {
-		return Err(crate::error::Error::StorageLimitExceeded {
-			computed: chosen.into(),
-			maximum: max_pvc_size.into(),
-		});
-	}
-
-	Ok(chosen.into())
+	// A floor above the maximum is contradictory configuration rather than a
+	// too-big replica, so the maximum simply wins. Failing instead would wedge
+	// a small replica whose operator capped it below the intent's floor.
+	Ok(if chosen > max_pvc_size {
+		max_pvc_size.into()
+	} else {
+		chosen.into()
+	})
 }
 
 pub fn build_snapshot_list_job(
