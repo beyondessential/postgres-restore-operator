@@ -621,7 +621,7 @@ kopia $KOPIA_GLOBAL_FLAGS repository connect s3 \
   $ENDPOINT_ARGS
 
 echo "Starting restore..."
-kopia $KOPIA_GLOBAL_FLAGS snapshot restore "$SNAPSHOT_ID" /pgdata/postgres
+kopia $KOPIA_GLOBAL_FLAGS snapshot restore --parallel="$KOPIA_PARALLEL" "$SNAPSHOT_ID" /pgdata/postgres
 
 echo "Restore complete"
 ls -la /pgdata/
@@ -685,6 +685,11 @@ echo -n "$VERSION" > /dev/termination-log
 			EnvVar {
 				name: "KOPIA_METADATA_CACHE_MB".to_string(),
 				value: Some(KOPIA_METADATA_CACHE_MB.to_string()),
+				..Default::default()
+			},
+			EnvVar {
+				name: "KOPIA_PARALLEL".to_string(),
+				value: Some(RESTORE_JOB_CPU_LIMIT.to_string()),
 				..Default::default()
 			},
 			EnvVar {
@@ -778,17 +783,7 @@ echo -n "$VERSION" > /dev/termination-log
 		args: Some(vec![restore_script]),
 		env: Some(env),
 		volume_mounts: Some(volume_mounts),
-		resources: Some(ResourceRequirements {
-			requests: Some(BTreeMap::from([
-				("cpu".to_string(), Quantity("500m".to_string())),
-				("memory".to_string(), Quantity("1Gi".to_string())),
-			])),
-			limits: Some(BTreeMap::from([
-				("cpu".to_string(), Quantity("2".to_string())),
-				("memory".to_string(), Quantity("4Gi".to_string())),
-			])),
-			..Default::default()
-		}),
+		resources: Some(restore_job_resources(&restore.spec.snapshot_size)),
 		..Default::default()
 	});
 
@@ -1051,6 +1046,50 @@ pub fn build_deployment(
 		affinity: replica.spec.affinity.clone(),
 		tolerations: replica.spec.tolerations.clone(),
 	})
+}
+
+/// CPU the kopia restore container is allowed to use. Also the parallelism
+/// kopia is told to use: left to itself it sizes its worker pool from the CPUs
+/// visible on the *node*, so it spawns several times more workers than the
+/// cgroup will ever schedule.
+pub const RESTORE_JOB_CPU_LIMIT: &str = "2";
+const RESTORE_JOB_CPU_REQUEST: &str = "500m";
+/// Floor and cap on the kopia restore container's memory. kopia streams rather
+/// than buffering whole files, so its demand grows far more slowly than the
+/// snapshot does — hence a much lower ratio than postgres gets.
+const RESTORE_JOB_MEMORY_FLOOR: &str = "4Gi";
+const RESTORE_JOB_MEMORY_CAP: &str = "16Gi";
+
+/// Resources for the kopia restore container, with memory scaled to the
+/// snapshot being restored. Falls back to the floor if the size can't be
+/// parsed.
+fn restore_job_resources(snapshot_size: &Quantity) -> ResourceRequirements {
+	let floor = Quantity(RESTORE_JOB_MEMORY_FLOOR.to_string());
+	let memory = crate::quantity::scale_memory_for_snapshot(
+		snapshot_size,
+		&floor,
+		&Quantity(RESTORE_JOB_MEMORY_CAP.to_string()),
+	)
+	.and_then(|r| r.limits?.get("memory").cloned())
+	.unwrap_or(floor);
+
+	ResourceRequirements {
+		requests: Some(BTreeMap::from([
+			(
+				"cpu".to_string(),
+				Quantity(RESTORE_JOB_CPU_REQUEST.to_string()),
+			),
+			("memory".to_string(), Quantity("1Gi".to_string())),
+		])),
+		limits: Some(BTreeMap::from([
+			(
+				"cpu".to_string(),
+				Quantity(RESTORE_JOB_CPU_LIMIT.to_string()),
+			),
+			("memory".to_string(), memory),
+		])),
+		..Default::default()
+	}
 }
 
 /// Default cap on snapshot-derived postgres memory when the replica doesn't

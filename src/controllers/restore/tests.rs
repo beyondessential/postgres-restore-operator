@@ -536,6 +536,86 @@ fn parsed_bytes(q: &Quantity) -> u64 {
 		.unwrap_or(0)
 }
 
+fn restore_job_for(snapshot_size: &str) -> k8s_openapi::api::batch::v1::Job {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity(snapshot_size.to_string());
+	build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
+	)
+	.unwrap()
+}
+
+/// kopia sizes its worker pool from the CPUs it can see on the node, not from
+/// the container's cgroup limit, so it spawns far more workers than it has CPU
+/// to run them on. Pin the parallelism to what the container is actually
+/// allowed to use.
+#[test]
+fn restore_job_pins_kopia_parallelism_to_its_cpu_limit() {
+	let job = restore_job_for("10Gi");
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+	let container = &pod_spec.containers[0];
+	let cpu_limit = container
+		.resources
+		.as_ref()
+		.and_then(|r| r.limits.as_ref())
+		.and_then(|m| m.get("cpu"))
+		.expect("restore container must cap CPU")
+		.0
+		.clone();
+	let script = container.args.as_ref().unwrap().join(" ");
+	assert!(
+		script.contains("--parallel=\"$KOPIA_PARALLEL\""),
+		"restore must pass --parallel to kopia"
+	);
+
+	let parallel = container
+		.env
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|e| e.name == "KOPIA_PARALLEL")
+		.and_then(|e| e.value.clone())
+		.expect("KOPIA_PARALLEL must be set");
+	assert_eq!(
+		parallel, cpu_limit,
+		"parallelism must match the container's CPU limit"
+	);
+}
+
+/// A restore holding far more data gets more memory to work in, rather than
+/// every restore sharing whatever suited the first one.
+#[test]
+fn restore_job_memory_scales_with_snapshot_size() {
+	let mem_of = |job: k8s_openapi::api::batch::v1::Job| -> u64 {
+		let pod_spec = job.spec.unwrap().template.spec.unwrap();
+		let q = pod_spec.containers[0]
+			.resources
+			.as_ref()
+			.unwrap()
+			.limits
+			.as_ref()
+			.unwrap()
+			.get("memory")
+			.unwrap()
+			.clone();
+		parsed_bytes(&q)
+	};
+
+	let small = mem_of(restore_job_for("1Gi"));
+	let large = mem_of(restore_job_for("500Gi"));
+	assert!(
+		large > small,
+		"a much larger snapshot must get more memory, got {large} vs {small}"
+	);
+	assert_eq!(small, gib(4), "small restores keep today's 4Gi floor");
+}
+
 #[test]
 fn restore_job_passes_cache_caps_and_log_rotation() {
 	// The restore Job's pod spec must set KOPIA_CONTENT_CACHE_MB and
