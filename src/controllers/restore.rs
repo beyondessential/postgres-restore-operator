@@ -30,6 +30,7 @@ use crate::{
 };
 
 pub mod builders;
+mod migration;
 
 pub(crate) use builders::{build_credential_reset_job, credential_reset_job_name};
 
@@ -343,6 +344,9 @@ pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>)
 		}
 		Some(RestorePhase::Restoring) => {
 			reconcile_restoring(&restore, &ctx, &name, &namespace).await
+		}
+		Some(RestorePhase::Migrating) => {
+			migration::reconcile_migrating(&restore, &ctx, &name, &namespace).await
 		}
 		Some(RestorePhase::Ready) => reconcile_ready(&restore, &ctx, &name, &namespace).await,
 		Some(RestorePhase::Switching) => {

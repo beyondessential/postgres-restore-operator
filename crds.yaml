@@ -598,6 +598,26 @@ spec:
                     description: namespace defines the space within which the secret name must be unique.
                     type: string
                 type: object
+              migrateTo:
+                description: |-
+                  Tamanu version whose schema migrations each restore should apply once
+                  healthy, from canopy's worklist entry. Present only while canopy names a
+                  target; each restore snapshots it into its own spec at creation so a
+                  target that moves mid-restore doesn't change what that restore tested.
+                nullable: true
+                properties:
+                  version:
+                    description: Semver of the version, e.g. `2.63.2`. Selects the tamanu image tag.
+                    type: string
+                  versionId:
+                    description: |-
+                      Canopy's id for it, echoed back on the verification report so canopy can
+                      join the result to the version it asked about.
+                    type: string
+                required:
+                - version
+                - versionId
+                type: object
               minimumTtl:
                 description: Don't restore a new snapshot within this duration of the last restore completing
                 format: duration
@@ -1006,6 +1026,25 @@ spec:
         properties:
           spec:
             properties:
+              migrateTo:
+                description: |-
+                  Tamanu version whose schema migrations to apply once the replica is
+                  healthy, from canopy's worklist entry. Set only for `migrate` intents;
+                  without it the restore is verified and discarded as before.
+                nullable: true
+                properties:
+                  version:
+                    description: Semver of the version, e.g. `2.63.2`. Selects the tamanu image tag.
+                    type: string
+                  versionId:
+                    description: |-
+                      Canopy's id for it, echoed back on the verification report so canopy can
+                      join the result to the version it asked about.
+                    type: string
+                required:
+                - version
+                - versionId
+                type: object
               replica:
                 description: Reference to parent PostgresPhysicalReplica
                 properties:
@@ -1086,6 +1125,68 @@ spec:
               deployment:
                 nullable: true
                 type: string
+              migrationJob:
+                description: The migration job, once the replica is healthy and a `migrateTo` is set.
+                nullable: true
+                properties:
+                  completedAt:
+                    description: Time is a wrapper around time.Time which supports correct marshaling to YAML and JSON.  Wrappers are provided for many of the factory methods that the time package offers.
+                    format: date-time
+                    nullable: true
+                    type: string
+                  name:
+                    type: string
+                  phase:
+                    type: string
+                required:
+                - name
+                - phase
+                type: object
+              migrationResult:
+                description: What the migrations did, read back off the replica once the job ends.
+                nullable: true
+                properties:
+                  dataBytesAfter:
+                    format: int64
+                    type: integer
+                  dataBytesBefore:
+                    description: |-
+                      Database size before the migrations ran, and after. The growth between
+                      them is what shows a migration that backfills heavily.
+                    format: int64
+                    type: integer
+                  failedMigration:
+                    description: |-
+                      The migration that failed, when one did. Its absence is what makes the
+                      result a pass, so canopy reads it as the verdict rather than the job's
+                      exit code.
+                    nullable: true
+                    type: string
+                  timings:
+                    default: []
+                    description: One entry per migration that ran, in the order they ran.
+                    items:
+                      description: How long one migration took.
+                      properties:
+                        elapsedSeconds:
+                          format: int64
+                          type: integer
+                        name:
+                          type: string
+                      required:
+                      - elapsedSeconds
+                      - name
+                      type: object
+                    type: array
+                  totalElapsedSeconds:
+                    description: Whole seconds the migration job took, wall-clock.
+                    format: int64
+                    type: integer
+                required:
+                - dataBytesAfter
+                - dataBytesBefore
+                - totalElapsedSeconds
+                type: object
               phase:
                 enum:
                 - Pending
@@ -1094,7 +1195,7 @@ spec:
                 - Switching
                 - Active
                 - Failed
-                - null
+                - Migrating
                 nullable: true
                 type: string
               postgresVersion:

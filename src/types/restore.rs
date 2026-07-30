@@ -42,6 +42,12 @@ pub struct PostgresPhysicalRestoreSpec {
 
 	/// Calculated PVC size (snapshot_size * 1.1)
 	pub storage_size: Quantity,
+
+	/// Tamanu version whose schema migrations to apply once the replica is
+	/// healthy, from canopy's worklist entry. Set only for `migrate` intents;
+	/// without it the restore is verified and discarded as before.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub migrate_to: Option<MigrationTarget>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
@@ -75,6 +81,14 @@ pub struct PostgresPhysicalRestoreStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub restore_job: Option<JobStatus>,
 
+	/// The migration job, once the replica is healthy and a `migrateTo` is set.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub migration_job: Option<JobStatus>,
+
+	/// What the migrations did, read back off the replica once the job ends.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub migration_result: Option<MigrationResult>,
+
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub pvc: Option<String>,
 
@@ -93,10 +107,56 @@ pub struct PostgresPhysicalRestoreStatus {
 pub enum RestorePhase {
 	Pending,
 	Restoring,
+	/// Applying the `migrateTo` version's schema migrations. Only reached when a
+	/// migration target is set; otherwise Restoring goes straight to Ready.
+	Migrating,
 	Ready,
 	Switching,
 	Active,
 	Failed,
+}
+
+/// The version a migration test aims at, carried from canopy's worklist entry.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationTarget {
+	/// Semver of the version, e.g. `2.63.2`. Selects the tamanu image tag.
+	pub version: String,
+
+	/// Canopy's id for it, echoed back on the verification report so canopy can
+	/// join the result to the version it asked about.
+	pub version_id: String,
+}
+
+/// Outcome of applying a target version's migrations to a restored replica.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationResult {
+	/// Whole seconds the migration job took, wall-clock.
+	pub total_elapsed_seconds: i64,
+
+	/// The migration that failed, when one did. Its absence is what makes the
+	/// result a pass, so canopy reads it as the verdict rather than the job's
+	/// exit code.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub failed_migration: Option<String>,
+
+	/// Database size before the migrations ran, and after. The growth between
+	/// them is what shows a migration that backfills heavily.
+	pub data_bytes_before: i64,
+	pub data_bytes_after: i64,
+
+	/// One entry per migration that ran, in the order they ran.
+	#[serde(default)]
+	pub timings: Vec<MigrationTiming>,
+}
+
+/// How long one migration took.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MigrationTiming {
+	pub name: String,
+	pub elapsed_seconds: i64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

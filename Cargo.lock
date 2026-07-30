@@ -107,9 +107,7 @@ dependencies = [
 
 [[package]]
 name = "algae-cli"
-version = "1.1.6"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "904db2bebc10c4af40c21866dae385b008883ac57994896d8da815896ba3a63f"
+version = "1.1.7"
 dependencies = [
  "age",
  "age-core",
@@ -464,9 +462,7 @@ checksum = "d86b93f97252c47b41663388e6d155714a9d0c398b99f1005cbc5f978b29f445"
 
 [[package]]
 name = "bestool-canopy"
-version = "0.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32a31932e57eff5a5aa9cc2e01e78685b30acc083bf65b13decdeeed3cecde5f"
+version = "0.7.2"
 dependencies = [
  "algae-cli",
  "base64 0.22.1",
@@ -599,7 +595,7 @@ version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -5944,7 +5940,3 @@ name = "zmij"
 version = "1.0.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b8848ee67ecc8aedbaf3e4122217aff892639231befc6a1b58d29fff4c2cabaa"
-
-[[patch.unused]]
-name = "bestool-canopy"
-version = "0.7.2"

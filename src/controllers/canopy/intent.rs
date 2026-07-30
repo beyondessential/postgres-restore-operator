@@ -288,6 +288,17 @@ impl IntentConfig {
 			.filter(|schemas| !schemas.is_empty())
 			.or_else(|| self.persistent_schemas.clone());
 		let service_annotations = is_exposed(entry).then(|| expose_annotations(&entry.name));
+		// Canopy only names a target for a `migrate` intent, and withholds the
+		// entry entirely when the server has no candidate version, so the pair
+		// being present is the whole signal.
+		let migrate_to = entry
+			.target_version
+			.as_deref()
+			.zip(entry.target_version_id)
+			.map(|(version, version_id)| crate::types::MigrationTarget {
+				version: version.to_owned(),
+				version_id: version_id.to_string(),
+			});
 
 		PostgresPhysicalReplicaSpec {
 			kopia_secret_ref: None,
@@ -318,6 +329,7 @@ impl IntentConfig {
 			postgres_extra_config: None,
 			notifications,
 			persistent_schemas,
+			migrate_to,
 			storage_size_maximum,
 		}
 	}
