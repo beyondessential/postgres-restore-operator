@@ -1410,6 +1410,27 @@ fn migration_job_does_not_retry_and_is_owned_by_the_restore() {
 	// A failed migration is the finding; retrying spends the same hours to reach
 	// the same answer.
 	assert_eq!(job.spec.as_ref().unwrap().backoff_limit, Some(0));
+
+	let container = &job
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap()
+		.containers[0];
+	let limits = container
+		.resources
+		.as_ref()
+		.expect("the job must be capped")
+		.limits
+		.as_ref()
+		.expect("limits set");
+	// Too tight and an OOMKill reads as a failed migration, filing a known issue
+	// against a version that is fine.
+	assert_eq!(limits.get("memory").expect("memory limit").0, "4Gi");
+	assert!(container.resources.as_ref().unwrap().requests.is_some());
 	assert_eq!(
 		job.spec
 			.as_ref()

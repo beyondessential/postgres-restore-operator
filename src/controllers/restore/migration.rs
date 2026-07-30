@@ -9,9 +9,12 @@
 
 use std::{collections::BTreeMap, time::Duration};
 
-use k8s_openapi::api::{
-	batch::v1::{Job, JobSpec},
-	core::v1::{Container, PodSpec, PodTemplateSpec, Secret},
+use k8s_openapi::{
+	api::{
+		batch::v1::{Job, JobSpec},
+		core::v1::{Container, PodSpec, PodTemplateSpec, ResourceRequirements, Secret},
+	},
+	apimachinery::pkg::api::resource::Quantity,
 };
 use kube::{
 	Api, ResourceExt,
@@ -101,6 +104,21 @@ pub fn build_migration_job(
 							env_literal("CONFIG_SYNC_DB_NAME", dbname),
 							env_literal("NODE_ENV", "production"),
 						]),
+						// Generous, because an OOMKill here is indistinguishable
+						// from a migration that failed on its own and would file a
+						// known issue against a version that is actually fine. The
+						// job is short-lived and one per restore.
+						resources: Some(ResourceRequirements {
+							requests: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("100m".to_string())),
+								("memory".to_string(), Quantity("256Mi".to_string())),
+							])),
+							limits: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("2".to_string())),
+								("memory".to_string(), Quantity("4Gi".to_string())),
+							])),
+							..Default::default()
+						}),
 						..Default::default()
 					}],
 					..Default::default()
