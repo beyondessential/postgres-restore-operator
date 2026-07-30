@@ -96,7 +96,10 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `storageClass` | `string` | No | — | Kubernetes StorageClass for the restore PVCs. |
 | `storageSizeOverride` | `Quantity` | No | — | Lower bound on the PVC size. The size is still calculated from the snapshot, and this is used only when it is larger — so a replica whose snapshot outgrows it is sized from the snapshot rather than truncated. Still capped by `storageSizeMaximum`. |
 | `storageSizeMaximum` | `Quantity` | No | `2Ti` | Maximum allowed PVC size. The restore will fail if the computed size exceeds this limit. |
-| `resources` | `ResourceRequirements` | No | — | CPU/memory resource requirements for the PostgreSQL pods. |
+| `resources` | `ResourceRequirements` | No | — | Pin the PostgreSQL pods' CPU/memory. When set these are used verbatim; when unset, memory is derived from the snapshot size (bounded by `resourcesFloor` and `resourcesMaximum`) and CPU comes from `resourcesFloor`. |
+| `resourcesFloor` | `ResourceRequirements` | No | — | Lower bound on the snapshot-derived resources, and the source of CPU — CPU tracks query concurrency rather than data volume, so it isn't scaled. Ignored when `resources` is set. |
+| `resourcesMaximum` | `Quantity` | No | `64Gi` | Cap on the snapshot-derived memory, so an unexpectedly large snapshot can't request more than a node can offer and leave the pod unschedulable. |
+| `deploymentReadyTimeout` | `string` | No | derived | How long to wait for the restore's PostgreSQL Deployment to become Ready before failing the restore (friendly duration, e.g. `"45m"`). When unset, derived from the snapshot size — a larger data dir takes longer to open and replay WAL — floored at the operator-wide `DEPLOYMENT_READY_TIMEOUT_SECS`. |
 | `shmSizeFloor` | `Quantity` | No | — | Floor on the postgres pod's `/dev/shm` sizing. When set, the Deployment uses `max(computed, shmSizeFloor)` — the computed value is derived from `resources` by [`compute_shm_and_shared_buffers`]. Useful when a workload's `shared_buffers` needs more shm than the resource-derived value provides, without wanting to bump the container's memory request. |
 | `serviceAnnotations` | `map[string]string` | No | — | Annotations applied to the Service. |
 | `podAnnotations` | `map[string]string` | No | — | Annotations applied to the PostgreSQL pods. |

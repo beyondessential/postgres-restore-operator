@@ -5,11 +5,44 @@ use rust_decimal::Decimal;
 
 use crate::{kopia::Snapshot, types::*, util::TimeSpan};
 
+use jiff::SignedDuration;
+
 use super::{
 	generate_password, persistent_schemas_migration_settled,
 	resources::{build_snapshot_list_job, compute_storage_size},
+	scheduling::deployment_ready_timeout,
 	snapshot_already_covered,
 };
+
+/// A larger data dir takes longer to open and replay WAL. One cluster-wide
+/// timeout means either the large replicas fail spuriously or the small ones
+/// take far too long to be declared broken.
+#[test]
+fn ready_timeout_scales_with_snapshot_size() {
+	let small = deployment_ready_timeout(None, &Quantity("1Gi".into()), 1800);
+	let large = deployment_ready_timeout(None, &Quantity("200Gi".into()), 1800);
+	assert!(
+		large > small,
+		"a bigger snapshot must get a longer budget, got {large:?} vs {small:?}"
+	);
+}
+
+/// The operator-wide setting is a floor, so raising it still lifts everything.
+#[test]
+fn ready_timeout_never_drops_below_the_global_default() {
+	let derived = deployment_ready_timeout(None, &Quantity("1Mi".into()), 1800);
+	assert_eq!(derived, SignedDuration::from_secs(1800));
+}
+
+/// An explicit per-replica value wins outright, including below the default —
+/// it's the escape hatch for a replica that's slow for reasons unrelated to
+/// its size.
+#[test]
+fn explicit_ready_timeout_overrides_the_derived_value() {
+	let explicit = TimeSpan(jiff::Span::new().minutes(90));
+	let derived = deployment_ready_timeout(Some(&explicit), &Quantity("1Gi".into()), 1800);
+	assert_eq!(derived, SignedDuration::from_secs(90 * 60));
+}
 
 /// The canopy path always sets `storageSizeOverride` from its intent config
 /// (50Gi for `analytics`), which must not cap a replica whose snapshot is
@@ -56,20 +89,43 @@ fn storage_size_override_is_a_floor_for_small_snapshots() {
 	);
 }
 
-/// With the override applied as a floor it now participates in the size
-/// selection, so `storageSizeMaximum` bounds it too — previously the override
-/// returned early and skipped the guardrail entirely.
+/// A floor above the maximum is contradictory configuration, not a replica
+/// that's too big — the maximum simply wins. Erroring here wedges a small
+/// replica whose operator capped it below the intent's floor: it can hold its
+/// snapshot many times over, but no restore can ever be created.
 #[test]
-fn storage_size_maximum_is_enforced_against_the_override() {
-	let snapshot = ParsedQuantity::from(Decimal::from(1_000u64));
-	let err = compute_storage_size(
+fn floor_above_the_maximum_clamps_rather_than_failing() {
+	let snapshot = ParsedQuantity::from(Decimal::from(250u64 * 1024 * 1024));
+	let size = compute_storage_size(
 		snapshot,
 		Some(&Quantity("50Gi".into())),
 		&Quantity("10Gi".into()),
 		false,
 		None,
 	)
-	.expect_err("50Gi floor exceeds the 10Gi maximum");
+	.expect("a floor over the cap clamps to the cap");
+
+	assert_eq!(
+		ParsedQuantity::try_from(size).unwrap(),
+		ParsedQuantity::try_from("10Gi").unwrap()
+	);
+}
+
+/// The guardrail still fires for what it's actually for: a snapshot too large
+/// to fit the configured maximum. Truncating there would restore into a volume
+/// that fills partway through, which is the failure the maximum exists to
+/// prevent.
+#[test]
+fn storage_size_maximum_still_rejects_an_oversized_snapshot() {
+	let snapshot = ParsedQuantity::from(Decimal::from(500u64 * 1024 * 1024 * 1024));
+	let err = compute_storage_size(
+		snapshot,
+		Some(&Quantity("50Gi".into())),
+		&Quantity("100Gi".into()),
+		false,
+		None,
+	)
+	.expect_err("a 500Gi snapshot cannot fit a 100Gi maximum");
 
 	assert!(
 		matches!(err, crate::error::Error::StorageLimitExceeded { .. }),
@@ -103,6 +159,9 @@ fn make_replica(
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			resources_floor: None,
+			resources_maximum: None,
+			deployment_ready_timeout: None,
 			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,
@@ -265,6 +324,9 @@ fn snapshot_list_job_rotates_kopia_logs() {
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			resources_floor: None,
+			resources_maximum: None,
+			deployment_ready_timeout: None,
 			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,

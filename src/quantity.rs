@@ -72,6 +72,58 @@ impl ParsedQuantityExt for ParsedQuantity {
 	}
 }
 
+/// Fraction of the snapshot size used as the postgres memory limit.
+///
+/// Only memory scales with snapshot size — it tracks data volume (buffer
+/// cache, working set, WAL replay). CPU tracks query concurrency, which is a
+/// property of the workload rather than of how much data is on disk, so it
+/// stays on the per-intent constant.
+///
+/// This ratio is a heuristic, not a measurement: postgres memory demand is not
+/// linear in database size. It is picked to be directionally right and bounded
+/// at both ends. Revisit once there is real working-set data; until then the
+/// canopy parameter is the escape hatch for a replica it gets wrong.
+const SNAPSHOT_MEMORY_RATIO: f64 = 0.10;
+
+/// Memory request as a fraction of the limit — the ratio the per-intent
+/// constants already used (a 2Gi request against an 8Gi limit).
+const MEMORY_REQUEST_FRACTION: f64 = 0.25;
+
+/// Derive postgres memory requirements from the snapshot size, clamped to
+/// `[floor, cap]`. Returns `None` if any input fails to parse, so callers can
+/// fall back rather than silently sizing off a bogus value.
+///
+/// Sets only memory; CPU is left to the caller (see [`SNAPSHOT_MEMORY_RATIO`]).
+pub fn scale_memory_for_snapshot(
+	snapshot_size: &Quantity,
+	floor: &Quantity,
+	cap: &Quantity,
+) -> Option<ResourceRequirements> {
+	let bytes = |q: &Quantity| ParsedQuantity::try_from(q.clone()).ok()?.to_bytes_f64();
+	let (snapshot, floor, cap) = (bytes(snapshot_size)?, bytes(floor)?, bytes(cap)?);
+
+	let limit = (snapshot * SNAPSHOT_MEMORY_RATIO).clamp(floor.min(cap), cap);
+	let request = limit * MEMORY_REQUEST_FRACTION;
+
+	let to_quantity = |b: f64| -> Quantity {
+		ParsedQuantity::from(rust_decimal::Decimal::from(b.ceil() as u64))
+			.ceil_to(QuantityUnit::Mi)
+			.into()
+	};
+
+	Some(ResourceRequirements {
+		requests: Some(std::collections::BTreeMap::from([(
+			"memory".to_string(),
+			to_quantity(request),
+		)])),
+		limits: Some(std::collections::BTreeMap::from([(
+			"memory".to_string(),
+			to_quantity(limit),
+		)])),
+		..Default::default()
+	})
+}
+
 const DEFAULT_MEMORY_REQUEST: &str = "1Gi";
 
 fn default_memory_request() -> ParsedQuantity {
@@ -168,6 +220,56 @@ mod tests {
 	use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 	use super::*;
+
+	fn gib(n: u64) -> Quantity {
+		Quantity(format!("{n}Gi"))
+	}
+
+	fn limit_bytes(r: &ResourceRequirements) -> f64 {
+		let q = r.limits.as_ref().unwrap().get("memory").unwrap().clone();
+		ParsedQuantity::try_from(q).unwrap().to_bytes_f64().unwrap()
+	}
+
+	fn request_bytes(r: &ResourceRequirements) -> f64 {
+		let q = r.requests.as_ref().unwrap().get("memory").unwrap().clone();
+		ParsedQuantity::try_from(q).unwrap().to_bytes_f64().unwrap()
+	}
+
+	/// A replica holding a few hundred MB must not reserve what a
+	/// hundred-GB one does; the floor is what it lands on.
+	#[test]
+	fn small_snapshot_lands_on_the_floor() {
+		let scaled =
+			scale_memory_for_snapshot(&gib(1), &gib(2), &gib(64)).expect("quantities parse");
+		assert_eq!(limit_bytes(&scaled), 2.0 * (1u64 << 30) as f64);
+	}
+
+	/// Above the floor the limit tracks the snapshot, so a large replica is
+	/// not pinned to whatever constant happened to suit a small one.
+	#[test]
+	fn large_snapshot_scales_above_the_floor() {
+		let scaled =
+			scale_memory_for_snapshot(&gib(200), &gib(2), &gib(64)).expect("quantities parse");
+		assert_eq!(limit_bytes(&scaled), 20.0 * (1u64 << 30) as f64);
+	}
+
+	/// The cap keeps a pathological snapshot from requesting a node's worth
+	/// of memory and going unschedulable forever.
+	#[test]
+	fn cap_bounds_the_derived_limit() {
+		let scaled =
+			scale_memory_for_snapshot(&gib(2000), &gib(2), &gib(64)).expect("quantities parse");
+		assert_eq!(limit_bytes(&scaled), 64.0 * (1u64 << 30) as f64);
+	}
+
+	/// Request stays at a quarter of the limit — the ratio the per-intent
+	/// constants already used (2Gi request against an 8Gi limit).
+	#[test]
+	fn request_is_a_quarter_of_the_limit() {
+		let scaled =
+			scale_memory_for_snapshot(&gib(200), &gib(2), &gib(64)).expect("quantities parse");
+		assert_eq!(request_bytes(&scaled), limit_bytes(&scaled) / 4.0);
+	}
 
 	fn ceil(input: &str, unit: QuantityUnit) -> String {
 		let pq: ParsedQuantity = input.try_into().unwrap();

@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use k8s_openapi::{
 	api::{
 		apps::v1::Deployment,
@@ -954,15 +954,20 @@ async fn reconcile_ready(
 		return Ok(Action::requeue(Duration::from_secs(5)));
 	}
 
-	// Deployment readiness timeout. Replicas with larger data dirs need
-	// time for postgres to open the data dir and replay WAL after a
-	// fresh kopia restore. Default is 30 minutes; tunable per-cluster
-	// via the `DEPLOYMENT_READY_TIMEOUT_SECS` env var so larger replicas
-	// can raise it without a code release.
+	// Deployment readiness timeout. Replicas with larger data dirs need time
+	// for postgres to open the data dir and replay WAL after a fresh kopia
+	// restore, so the budget scales with the snapshot unless the replica pins
+	// `deploymentReadyTimeout`. The `DEPLOYMENT_READY_TIMEOUT_SECS` env var is
+	// the operator-wide floor.
 	if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref()) {
 		let elapsed = Timestamp::now().duration_since(created_at.0);
-		let timeout_secs = ctx.deployment_ready_timeout_secs;
-		if elapsed > SignedDuration::from_secs(timeout_secs as i64) {
+		let timeout = crate::controllers::replica::scheduling::deployment_ready_timeout(
+			replica.spec.deployment_ready_timeout.as_ref(),
+			&restore.spec.snapshot_size,
+			ctx.deployment_ready_timeout_secs,
+		);
+		let timeout_secs = timeout.as_secs();
+		if elapsed > timeout {
 			warn!(
 				restore = name,
 				timeout_secs, "deployment not ready within configured timeout, marking as Failed"

@@ -67,6 +67,20 @@ pub mod params {
 	pub const PERSISTENT_SCHEMAS: &str = "persistent_schemas";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
+	/// `bytes` — pin the postgres memory request, instead of deriving it from
+	/// the snapshot size.
+	pub const MEMORY_REQUEST: &str = "memory_request";
+	/// `bytes` — pin the postgres memory limit, instead of deriving it.
+	pub const MEMORY_LIMIT: &str = "memory_limit";
+	/// `text` — pin the postgres CPU request (a k8s quantity, e.g. `500m`).
+	pub const CPU_REQUEST: &str = "cpu_request";
+	/// `text` — pin the postgres CPU limit (a k8s quantity, e.g. `4`).
+	pub const CPU_LIMIT: &str = "cpu_limit";
+	/// `bytes` — cap on the snapshot-derived postgres memory.
+	pub const RESOURCES_MAXIMUM: &str = "resources_maximum";
+	/// `duration` — how long to wait for the restore's postgres Deployment to
+	/// become Ready before failing the restore.
+	pub const DEPLOYMENT_READY_TIMEOUT: &str = "deployment_ready_timeout";
 }
 
 /// Default minimum TTL for `analytics` replicas when the operator leaves the
@@ -111,7 +125,81 @@ fn analytics_param_schema() -> ParamSchema {
 			params::EXPOSE.to_string(),
 			param(ParamType::Boolean, Some(json!(false))),
 		),
+		(
+			params::MEMORY_REQUEST.to_string(),
+			param(ParamType::Bytes, None),
+		),
+		(
+			params::MEMORY_LIMIT.to_string(),
+			param(ParamType::Bytes, None),
+		),
+		(
+			params::CPU_REQUEST.to_string(),
+			param(ParamType::Text, None),
+		),
+		(params::CPU_LIMIT.to_string(), param(ParamType::Text, None)),
+		(
+			params::RESOURCES_MAXIMUM.to_string(),
+			param(ParamType::Bytes, None),
+		),
+		(
+			params::DEPLOYMENT_READY_TIMEOUT.to_string(),
+			param(ParamType::Duration, None),
+		),
 	]))
+}
+
+/// Build a pinned `resources` from the canopy params, or `None` when the
+/// operator declared none of them — in which case the deployment builder
+/// derives memory from the snapshot size instead.
+///
+/// A partially-specified pin falls back to `floor` for the fields the operator
+/// left out, so setting only `memory_limit` doesn't silently drop CPU.
+fn pinned_resources(
+	p: &Map<String, Value>,
+	floor: Option<&ResourceRequirements>,
+) -> Option<ResourceRequirements> {
+	let bytes = |name: &str| param_i64(p, name).map(|b| Quantity(b.to_string()));
+	let text = |name: &str| param_str(p, name).map(|s| Quantity(s.to_string()));
+
+	let memory_request = bytes(params::MEMORY_REQUEST);
+	let memory_limit = bytes(params::MEMORY_LIMIT);
+	let cpu_request = text(params::CPU_REQUEST);
+	let cpu_limit = text(params::CPU_LIMIT);
+	if memory_request.is_none()
+		&& memory_limit.is_none()
+		&& cpu_request.is_none()
+		&& cpu_limit.is_none()
+	{
+		return None;
+	}
+
+	let from_floor = |which: fn(&ResourceRequirements) -> &Option<BTreeMap<String, Quantity>>,
+	                  key: &str| {
+		floor
+			.and_then(|f| which(f).as_ref())
+			.and_then(|m| m.get(key))
+			.cloned()
+	};
+	let entries = |cpu: Option<Quantity>, memory: Option<Quantity>| {
+		let map: BTreeMap<String, Quantity> = [("cpu", cpu), ("memory", memory)]
+			.into_iter()
+			.filter_map(|(k, v)| v.map(|v| (k.to_string(), v)))
+			.collect();
+		(!map.is_empty()).then_some(map)
+	};
+
+	Some(ResourceRequirements {
+		requests: entries(
+			cpu_request.or_else(|| from_floor(|r| &r.requests, "cpu")),
+			memory_request.or_else(|| from_floor(|r| &r.requests, "memory")),
+		),
+		limits: entries(
+			cpu_limit.or_else(|| from_floor(|r| &r.limits, "cpu")),
+			memory_limit.or_else(|| from_floor(|r| &r.limits, "memory")),
+		),
+		..Default::default()
+	})
 }
 
 /// The intent descriptors pgro advertises to canopy at startup. Canopy stores
@@ -161,7 +249,16 @@ pub fn descriptors() -> Vec<IntentDescriptor> {
 /// defaults used when a parametrised field is left unset by the operator.
 #[derive(Debug, Clone)]
 pub struct IntentConfig {
-	pub resources: Option<ResourceRequirements>,
+	/// Lower bound on the snapshot-derived postgres resources, and the source
+	/// of CPU (which doesn't scale with data volume). Not an exact size — a
+	/// fixed value here would provision a replica holding a few hundred MB
+	/// identically to one holding a hundred GB.
+	pub resources_floor: Option<ResourceRequirements>,
+	/// Cap on the snapshot-derived postgres memory.
+	pub resources_maximum: Quantity,
+	/// Default when the `deployment_ready_timeout` param is unset. `None`
+	/// leaves the timeout to be derived from the snapshot size.
+	pub deployment_ready_timeout: Option<TimeSpan>,
 	pub read_only: bool,
 	/// Default when the `minimum_ttl` param is unset.
 	pub minimum_ttl: Option<TimeSpan>,
@@ -207,7 +304,7 @@ fn resources(cpu_req: &str, mem_req: &str, cpu_lim: &str, mem_lim: &str) -> Reso
 pub fn config_for(intent: &str) -> Option<IntentConfig> {
 	match intent {
 		"verify" | "upgrade" => Some(IntentConfig {
-			resources: Some(resources("250m", "512Mi", "2", "2Gi")),
+			resources_floor: Some(resources("250m", "512Mi", "2", "2Gi")),
 			read_only: true,
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
@@ -215,10 +312,12 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			storage_size_override: Quantity("20Gi".to_string()),
 			storage_size_maximum: Quantity("2Ti".to_string()),
 			ephemeral: true,
+			resources_maximum: Quantity("8Gi".to_string()),
+			deployment_ready_timeout: None,
 			shm_size_floor: Quantity("512Mi".to_string()),
 		}),
 		"analytics" => Some(IntentConfig {
-			resources: Some(resources("500m", "2Gi", "4", "8Gi")),
+			resources_floor: Some(resources("500m", "2Gi", "4", "8Gi")),
 			read_only: true,
 			minimum_ttl: Some(TimeSpan(
 				Span::new().seconds(DEFAULT_ANALYTICS_MINIMUM_TTL_SECS),
@@ -230,6 +329,8 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			storage_size_override: Quantity("50Gi".to_string()),
 			storage_size_maximum: Quantity("2Ti".to_string()),
 			ephemeral: false,
+			resources_maximum: Quantity("64Gi".to_string()),
+			deployment_ready_timeout: None,
 			shm_size_floor: Quantity("2Gi".to_string()),
 		}),
 		_ => None,
@@ -310,6 +411,17 @@ impl IntentConfig {
 				version_id: version_id.to_string(),
 			});
 
+		// Resources are pinned only when the operator declared at least one of
+		// them in canopy; otherwise they stay unset and the deployment builder
+		// derives memory from the snapshot size, floored by `resources_floor`.
+		let pinned_resources = pinned_resources(p, self.resources_floor.as_ref());
+		let resources_maximum = param_i64(p, params::RESOURCES_MAXIMUM)
+			.map(|bytes| Quantity(bytes.to_string()))
+			.unwrap_or_else(|| self.resources_maximum.clone());
+		let deployment_ready_timeout = param_i64(p, params::DEPLOYMENT_READY_TIMEOUT)
+			.map(|secs| TimeSpan(Span::new().seconds(secs)))
+			.or(self.deployment_ready_timeout);
+
 		PostgresPhysicalReplicaSpec {
 			kopia_secret_ref: None,
 			canopy_source: Some(CanopySource {
@@ -328,7 +440,10 @@ impl IntentConfig {
 			analytics_username: "analytics".to_string(),
 			storage_class: None,
 			storage_size_override: Some(self.storage_size_override.clone()),
-			resources: self.resources.clone(),
+			resources: pinned_resources,
+			resources_floor: self.resources_floor.clone(),
+			resources_maximum: Some(resources_maximum),
+			deployment_ready_timeout,
 			shm_size_floor: Some(self.shm_size_floor.clone()),
 			service_annotations,
 			pod_annotations: None,
@@ -471,8 +586,24 @@ mod tests {
 			params.get(params::EXPOSE).unwrap().type_,
 			ParamType::Boolean
 		);
+		assert_eq!(
+			params.get(params::MEMORY_LIMIT).unwrap().type_,
+			ParamType::Bytes
+		);
+		assert_eq!(
+			params.get(params::CPU_LIMIT).unwrap().type_,
+			ParamType::Text
+		);
+		assert_eq!(
+			params.get(params::DEPLOYMENT_READY_TIMEOUT).unwrap().type_,
+			ParamType::Duration
+		);
 		// Only the params pgro actually acts on are advertised.
-		assert_eq!(params.len(), 5);
+		assert_eq!(
+			params.len(),
+			11,
+			"advertising a param pgro doesn't read, or dropping one it does"
+		);
 		assert!(params.get("anonymise").is_none());
 		// Defaults the sketch specified.
 		assert_eq!(

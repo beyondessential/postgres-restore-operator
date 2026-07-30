@@ -9,7 +9,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use kube::ResourceExt;
 
-use super::builders::{build_deployment, build_restore_job, build_version_detect_job};
+use super::builders::{
+	build_deployment, build_restore_job, build_version_detect_job, resolve_postgres_resources,
+};
 use crate::{types::*, util::TimeSpan};
 
 #[test]
@@ -32,6 +34,9 @@ fn deployment_uses_affinity_not_node_selector() {
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			resources_floor: None,
+			resources_maximum: None,
+			deployment_ready_timeout: None,
 			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,
@@ -121,6 +126,9 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			resources_floor: None,
+			resources_maximum: None,
+			deployment_ready_timeout: None,
 			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,
@@ -152,6 +160,100 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	restore.metadata.uid = Some("uid-123".to_string());
 
 	(restore, replica)
+}
+
+/// Memory in bytes. Compared numerically because the derived value is ceiled
+/// to whole Mi, so `2Gi` legitimately comes back as `2048Mi`.
+fn mem(r: &ResourceRequirements, which: &str) -> u64 {
+	let map = match which {
+		"limits" => r.limits.as_ref(),
+		_ => r.requests.as_ref(),
+	};
+	let q = map.unwrap().get("memory").unwrap().clone();
+	parsed_bytes(&q)
+}
+
+fn gib(n: u64) -> u64 {
+	n * (1 << 30)
+}
+
+fn cpu(r: &ResourceRequirements, which: &str) -> Option<String> {
+	let map = match which {
+		"limits" => r.limits.as_ref(),
+		_ => r.requests.as_ref(),
+	};
+	map.and_then(|m| m.get("cpu")).map(|q| q.0.clone())
+}
+
+/// A pinned `resources` is the operator's explicit intent (or a canopy
+/// parameter) and must beat anything derived from the snapshot.
+#[test]
+fn pinned_resources_win_over_the_derived_value() {
+	let (restore, mut replica) = test_restore_and_replica();
+	replica.spec.resources = Some(ResourceRequirements {
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("3Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("8Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("pinned");
+	assert_eq!(mem(&resolved, "limits"), gib(3));
+}
+
+/// With nothing pinned the memory comes from the snapshot, while CPU is
+/// carried over from the floor — CPU tracks query concurrency, not data size.
+#[test]
+fn derived_memory_scales_but_cpu_comes_from_the_floor() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity("200Gi".to_string());
+	replica.spec.resources = None;
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		requests: Some(BTreeMap::from([
+			("cpu".to_string(), Quantity("500m".to_string())),
+			("memory".to_string(), Quantity("2Gi".to_string())),
+		])),
+		limits: Some(BTreeMap::from([
+			("cpu".to_string(), Quantity("4".to_string())),
+			("memory".to_string(), Quantity("8Gi".to_string())),
+		])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("derived");
+
+	assert_eq!(mem(&resolved, "limits"), gib(20), "10% of a 200Gi snapshot");
+	assert_eq!(cpu(&resolved, "limits").as_deref(), Some("4"));
+	assert_eq!(cpu(&resolved, "requests").as_deref(), Some("500m"));
+}
+
+/// A small replica must not inherit a large replica's reservation.
+#[test]
+fn derived_memory_falls_back_to_the_floor_for_a_small_snapshot() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity("300Mi".to_string());
+	replica.spec.resources = None;
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("2Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("derived");
+	assert_eq!(mem(&resolved, "limits"), gib(2));
 }
 
 #[test]
@@ -436,6 +538,86 @@ fn parsed_bytes(q: &Quantity) -> u64 {
 		.and_then(|p| p.to_bytes_f64())
 		.map(|b| b as u64)
 		.unwrap_or(0)
+}
+
+fn restore_job_for(snapshot_size: &str) -> k8s_openapi::api::batch::v1::Job {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity(snapshot_size.to_string());
+	build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
+	)
+	.unwrap()
+}
+
+/// kopia sizes its worker pool from the CPUs it can see on the node, not from
+/// the container's cgroup limit, so it spawns far more workers than it has CPU
+/// to run them on. Pin the parallelism to what the container is actually
+/// allowed to use.
+#[test]
+fn restore_job_pins_kopia_parallelism_to_its_cpu_limit() {
+	let job = restore_job_for("10Gi");
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+	let container = &pod_spec.containers[0];
+	let cpu_limit = container
+		.resources
+		.as_ref()
+		.and_then(|r| r.limits.as_ref())
+		.and_then(|m| m.get("cpu"))
+		.expect("restore container must cap CPU")
+		.0
+		.clone();
+	let script = container.args.as_ref().unwrap().join(" ");
+	assert!(
+		script.contains("--parallel=\"$KOPIA_PARALLEL\""),
+		"restore must pass --parallel to kopia"
+	);
+
+	let parallel = container
+		.env
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|e| e.name == "KOPIA_PARALLEL")
+		.and_then(|e| e.value.clone())
+		.expect("KOPIA_PARALLEL must be set");
+	assert_eq!(
+		parallel, cpu_limit,
+		"parallelism must match the container's CPU limit"
+	);
+}
+
+/// A restore holding far more data gets more memory to work in, rather than
+/// every restore sharing whatever suited the first one.
+#[test]
+fn restore_job_memory_scales_with_snapshot_size() {
+	let mem_of = |job: k8s_openapi::api::batch::v1::Job| -> u64 {
+		let pod_spec = job.spec.unwrap().template.spec.unwrap();
+		let q = pod_spec.containers[0]
+			.resources
+			.as_ref()
+			.unwrap()
+			.limits
+			.as_ref()
+			.unwrap()
+			.get("memory")
+			.unwrap()
+			.clone();
+		parsed_bytes(&q)
+	};
+
+	let small = mem_of(restore_job_for("1Gi"));
+	let large = mem_of(restore_job_for("500Gi"));
+	assert!(
+		large > small,
+		"a much larger snapshot must get more memory, got {large} vs {small}"
+	);
+	assert_eq!(small, gib(4), "small restores keep today's 4Gi floor");
 }
 
 #[test]

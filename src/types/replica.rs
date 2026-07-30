@@ -89,8 +89,29 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub storage_size_override: Option<Quantity>,
 
+	/// Pin the postgres pod's resources. When set these are used verbatim;
+	/// when unset, memory is derived from the snapshot size and floored by
+	/// [`resources_floor`].
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub resources: Option<ResourceRequirements>,
+
+	/// Lower bound on the snapshot-derived postgres resources, and the source
+	/// of CPU (which doesn't scale with data volume). Ignored when
+	/// [`resources`] pins the values outright.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resources_floor: Option<ResourceRequirements>,
+
+	/// Cap on the snapshot-derived postgres memory, so a pathological
+	/// snapshot can't request a node's worth of memory and sit unschedulable.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub resources_maximum: Option<Quantity>,
+
+	/// How long to wait for the restore's postgres Deployment to become Ready
+	/// before failing the restore. Unset derives a budget from the snapshot
+	/// size (a larger data dir needs longer to open and replay WAL), floored
+	/// at the operator-wide `DEPLOYMENT_READY_TIMEOUT_SECS`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub deployment_ready_timeout: Option<TimeSpan>,
 
 	/// Floor on the postgres pod's `/dev/shm` sizing. When set, the
 	/// Deployment builder uses `max(computed, shmSizeFloor)` — computed
