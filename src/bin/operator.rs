@@ -571,6 +571,10 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			axum::routing::post(post_cache_pressure),
 		)
 		.route(
+			"/api/v1/canopy-progress/{namespace}/{job}",
+			axum::routing::post(post_canopy_progress),
+		)
+		.route(
 			"/api/v1/canopy-stats/{namespace}/{job}",
 			axum::routing::post(post_canopy_stats),
 		)
@@ -627,6 +631,46 @@ async fn post_cache_pressure(
 	);
 	controllers::restore::grow_cache_pvc_after_pressure(&state.ctx.client, &namespace, &restore)
 		.await;
+	StatusCode::NO_CONTENT
+}
+
+/// Forward a canopy-proxy sidecar's in-flight progress sample to canopy.
+///
+/// The sidecar has the traffic counters but no canopy credentials — those live
+/// only here — so it posts to the operator and the operator relays. The sample
+/// is self-describing (it carries its own `run_id` and type), so this needs no
+/// Kubernetes lookup.
+///
+/// Best-effort telemetry: a rejected or failed relay is logged and the restore
+/// is unaffected. Always answers the sidecar with 204 so a canopy outage can't
+/// turn into sidecar retry pressure.
+async fn post_canopy_progress(
+	State(state): State<ServerState>,
+	Path((namespace, job)): Path<(String, String)>,
+	body: String,
+) -> StatusCode {
+	let sample: canopy::ProgressSample = match serde_json::from_str(&body) {
+		Ok(sample) => sample,
+		Err(error) => {
+			warn!(%namespace, %job, %error, "malformed canopy progress sample, dropping");
+			return StatusCode::NO_CONTENT;
+		}
+	};
+	let Some(client) = state.ctx.canopy.as_ref() else {
+		debug!(%namespace, %job, "canopy not configured, dropping progress sample");
+		return StatusCode::NO_CONTENT;
+	};
+
+	debug!(
+		%namespace,
+		%job,
+		run_id = %sample.run_id,
+		received_raw_bytes = sample.received_raw_bytes,
+		"relaying canopy progress sample"
+	);
+	if let Err(error) = client.backup_progress(&sample.to_args()).await {
+		debug!(%namespace, %job, %error, "posting progress to canopy failed (ignored)");
+	}
 	StatusCode::NO_CONTENT
 }
 

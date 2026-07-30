@@ -492,11 +492,13 @@ async fn reconcile_restoring(
 
 			let cache_pressure_url = ctx.cache_pressure_callback_url(namespace, name);
 			let stats_callback_url = ctx.canopy_stats_callback_url(namespace, &job_name);
+			let progress_callback_url = ctx.canopy_progress_callback_url(namespace, &job_name);
 			let canopy_proxy = if replica.spec.canopy_source.is_some() {
 				Some(builders::CanopyProxyArgs {
 					image: &ctx.canopy_proxy_image,
 					broker_base_url: &ctx.canopy_broker_base_url,
 					stats_callback_url: &stats_callback_url,
+					progress_callback_url: Some(&progress_callback_url),
 					run_id: run_id.as_deref(),
 				})
 			} else {
