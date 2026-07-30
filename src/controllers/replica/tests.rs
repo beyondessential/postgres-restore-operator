@@ -5,11 +5,44 @@ use rust_decimal::Decimal;
 
 use crate::{kopia::Snapshot, types::*, util::TimeSpan};
 
+use jiff::SignedDuration;
+
 use super::{
 	generate_password, persistent_schemas_migration_settled,
 	resources::{build_snapshot_list_job, compute_storage_size},
+	scheduling::deployment_ready_timeout,
 	snapshot_already_covered,
 };
+
+/// A larger data dir takes longer to open and replay WAL. One cluster-wide
+/// timeout means either the large replicas fail spuriously or the small ones
+/// take far too long to be declared broken.
+#[test]
+fn ready_timeout_scales_with_snapshot_size() {
+	let small = deployment_ready_timeout(None, &Quantity("1Gi".into()), 1800);
+	let large = deployment_ready_timeout(None, &Quantity("200Gi".into()), 1800);
+	assert!(
+		large > small,
+		"a bigger snapshot must get a longer budget, got {large:?} vs {small:?}"
+	);
+}
+
+/// The operator-wide setting is a floor, so raising it still lifts everything.
+#[test]
+fn ready_timeout_never_drops_below_the_global_default() {
+	let derived = deployment_ready_timeout(None, &Quantity("1Mi".into()), 1800);
+	assert_eq!(derived, SignedDuration::from_secs(1800));
+}
+
+/// An explicit per-replica value wins outright, including below the default —
+/// it's the escape hatch for a replica that's slow for reasons unrelated to
+/// its size.
+#[test]
+fn explicit_ready_timeout_overrides_the_derived_value() {
+	let explicit = TimeSpan(jiff::Span::new().minutes(90));
+	let derived = deployment_ready_timeout(Some(&explicit), &Quantity("1Gi".into()), 1800);
+	assert_eq!(derived, SignedDuration::from_secs(90 * 60));
+}
 
 /// The canopy path always sets `storageSizeOverride` from its intent config
 /// (50Gi for `analytics`), which must not cap a replica whose snapshot is
