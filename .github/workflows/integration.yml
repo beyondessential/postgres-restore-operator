@@ -10,8 +10,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   CARGO_REGISTRIES_CRATES_IO_PROTOCOL: sparse
-  # See ci.yml: build bestool-canopy against its committed snapshot until
-  # canopy#422 deploys and the crate releases.
+  # See ci.yml: build bestool-canopy against its committed snapshot until the
+  # deployed canopy carries the migration-testing fields.
   CANOPY_OPENAPI_OFFLINE: 1
 
 concurrency:
@@ -62,6 +62,11 @@ jobs:
           - name: ephemeral
             namespaces: >-
               test-ephemeral
+            needs_non_pg_snapshot: false
+
+          - name: migration
+            namespaces: >-
+              test-migration
             needs_non_pg_snapshot: false
 
           # canopy_integration is a scaffold in tests/canopy_integration.rs

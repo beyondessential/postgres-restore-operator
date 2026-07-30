@@ -32,7 +32,7 @@ use crate::{
 
 /// Where tamanu's server images are published. The tag is `v` + the semver
 /// canopy named, which is the same image an upgrading deployment runs.
-const TAMANU_IMAGE: &str = "ghcr.io/beyondessential/tamanu-central-server";
+const TAMANU_IMAGE: &str = "ghcr.io/beyondessential/tamanu-central";
 
 const MIGRATION_CONTAINER: &str = "migrate";
 
@@ -49,13 +49,13 @@ fn migration_image(target: &MigrationTarget) -> String {
 ///
 /// Points tamanu at the per-restore Service rather than the replica's, so a
 /// switchover mid-migration cannot repoint it at a different database. Runs as
-/// the app user from the replica's credentials Secret: the restore is read-only
-/// by config, which the job lifts for its own session only (see
-/// `MIGRATION_SCRIPT`).
+/// the credentials Secret's user, which holds superuser because a restore with a
+/// migration target is built read-write (see `apply_restore_deployment`).
 pub fn build_migration_job(
 	restore: &PostgresPhysicalRestore,
 	replica: &PostgresPhysicalReplica,
 	target: &MigrationTarget,
+	dbname: &str,
 	namespace: &str,
 ) -> Job {
 	let restore_name = restore.name_any();
@@ -84,13 +84,21 @@ pub fn build_migration_job(
 					containers: vec![Container {
 						name: MIGRATION_CONTAINER.to_string(),
 						image: Some(migration_image(target)),
-						command: Some(vec!["node".into()]),
-						args: Some(vec!["dist/index.js".into(), "migrate".into()]),
+						// The image's entrypoint takes the subcommand as its
+						// argument, the same way a deploy's migrator Job invokes
+						// it; overriding `command` would bypass it.
+						args: Some(vec!["migrate".into()]),
+						// tamanu maps its `db` config from `CONFIG_SYNC_DB_*`,
+						// which take precedence over anything under
+						// `NODE_CONFIG_DIR`, so the job needs no mounted config.
 						env: Some(vec![
-							env_literal("DB_HOST", &restore_name),
-							env_from_secret_name("DB_USERNAME", &creds, "username"),
-							env_from_secret_name("DB_PASSWORD", &creds, "password"),
-							env_from_secret_name("DB_NAME", &creds, "username"),
+							env_literal("CONFIG_SYNC_DB_HOST", &restore_name),
+							env_from_secret_name("CONFIG_SYNC_DB_USERNAME", &creds, "username"),
+							env_from_secret_name("CONFIG_SYNC_DB_PASSWORD", &creds, "password"),
+							// The restored database, not the credentials user:
+							// pgro's replicas do not follow the CNPG convention
+							// of naming the database after its owner.
+							env_literal("CONFIG_SYNC_DB_NAME", dbname),
 							env_literal("NODE_ENV", "production"),
 						]),
 						..Default::default()
@@ -132,6 +140,16 @@ pub async fn reconcile_migrating(
 
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
 	let replica = replicas.get(&restore.spec.replica.name).await?;
+	let creds = credentials(ctx, &replica, namespace).await?;
+	let dbname = crate::controllers::postgres::discover_restore_database(
+		&ctx.client,
+		namespace,
+		name,
+		&creds.0,
+		&creds.1,
+		ctx.use_port_forward(),
+	)
+	.await?;
 
 	let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
 	let job_name = migration_job_name(name);
@@ -142,9 +160,10 @@ pub async fn reconcile_migrating(
 			info!(
 				restore = name,
 				target = %target.version,
+				database = %dbname,
 				"starting migration test"
 			);
-			let job = build_migration_job(restore, &replica, &target, namespace);
+			let job = build_migration_job(restore, &replica, &target, &dbname, namespace);
 			jobs.create(&PostParams::default(), &job).await?
 		}
 	};
@@ -161,7 +180,7 @@ pub async fn reconcile_migrating(
 	// records every migration it applied, with per-migration durations, in
 	// `logs.migrations`. A failed job that got partway still has rows there,
 	// and its last applied migration names where it stopped.
-	let result = read_result(ctx, &replica, name, namespace, failed > 0).await?;
+	let result = read_result(ctx, name, namespace, &creds, &dbname, failed > 0).await?;
 
 	info!(
 		restore = name,
@@ -191,6 +210,20 @@ pub async fn reconcile_migrating(
 	Ok(Action::requeue(Duration::from_secs(1)))
 }
 
+/// The replica's app credentials, as (user, password).
+async fn credentials(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+) -> Result<(String, String)> {
+	let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
+	let secret = secrets.get(&replica.creds_secret_name()).await?;
+	Ok((
+		crate::controllers::postgres::read_secret_field(&secret, "username")?,
+		crate::controllers::postgres::read_secret_field(&secret, "password")?,
+	))
+}
+
 /// Read what the migrations did off the replica itself.
 ///
 /// `logs.migrations` is tamanu's own audit table: one row per batch, with a
@@ -199,32 +232,19 @@ pub async fn reconcile_migrating(
 /// inspect after a real upgrade.
 async fn read_result(
 	ctx: &Context,
-	replica: &PostgresPhysicalReplica,
 	restore_name: &str,
 	namespace: &str,
+	creds: &(String, String),
+	dbname: &str,
 	job_failed: bool,
 ) -> Result<MigrationResult> {
-	let secrets: Api<Secret> = Api::namespaced(ctx.client.clone(), namespace);
-	let creds = secrets.get(&replica.creds_secret_name()).await?;
-	let user = crate::controllers::postgres::read_secret_field(&creds, "username")?;
-	let password = crate::controllers::postgres::read_secret_field(&creds, "password")?;
-	let dbname = crate::controllers::postgres::discover_restore_database(
-		&ctx.client,
-		namespace,
-		restore_name,
-		&user,
-		&password,
-		ctx.use_port_forward(),
-	)
-	.await?;
-
 	let conn = crate::controllers::postgres::connect_to_restore(
 		&ctx.client,
 		namespace,
 		restore_name,
-		&dbname,
-		&user,
-		&password,
+		dbname,
+		&creds.0,
+		&creds.1,
 		ctx.use_port_forward(),
 	)
 	.await?;

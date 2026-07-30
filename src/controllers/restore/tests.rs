@@ -1114,3 +1114,179 @@ fn deployment_shared_buffers_with_custom_resources() {
 		"init script must set shared_buffers for 2Gi request"
 	);
 }
+
+fn migration_target() -> MigrationTarget {
+	MigrationTarget {
+		version: "2.62.0".to_string(),
+		version_id: "66666666-6666-6666-6666-666666666666".to_string(),
+	}
+}
+
+fn env_value(container: &k8s_openapi::api::core::v1::Container, name: &str) -> Option<String> {
+	container
+		.env
+		.as_ref()?
+		.iter()
+		.find(|e| e.name == name)?
+		.value
+		.clone()
+}
+
+fn env_secret_key(
+	container: &k8s_openapi::api::core::v1::Container,
+	name: &str,
+) -> Option<(String, String)> {
+	let e = container.env.as_ref()?.iter().find(|e| e.name == name)?;
+	let sel = e.value_from.as_ref()?.secret_key_ref.as_ref()?;
+	Some((sel.name.clone(), sel.key.clone()))
+}
+
+#[test]
+fn migration_job_lets_the_image_entrypoint_take_the_subcommand() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+
+	// The image's ENTRYPOINT dispatches the subcommand; overriding command would
+	// bypass it and run the app the wrong way.
+	assert_eq!(
+		container.command, None,
+		"command must be left to the image entrypoint"
+	);
+	assert_eq!(
+		container.args.as_deref(),
+		Some(["migrate".to_string()].as_slice())
+	);
+	assert_eq!(
+		container.image.as_deref(),
+		Some("ghcr.io/beyondessential/tamanu-central:v2.62.0"),
+		"the image must be the target version's own, since it owns the migrations"
+	);
+}
+
+#[test]
+fn migration_job_points_tamanu_at_the_restored_database() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+
+	// tamanu reads its db config from CONFIG_SYNC_DB_*; plain DB_* is ignored, so
+	// the job would silently target the packaged default instead.
+	assert_eq!(
+		env_value(container, "CONFIG_SYNC_DB_HOST").as_deref(),
+		Some("test-restore"),
+		"the per-restore Service, so a switchover cannot repoint it mid-migration"
+	);
+	// The restored database's own name: pgro replicas don't name the database
+	// after its owner, so the credentials username is the wrong answer.
+	assert_eq!(
+		env_value(container, "CONFIG_SYNC_DB_NAME").as_deref(),
+		Some("tamanu-fiji")
+	);
+	assert_eq!(
+		env_secret_key(container, "CONFIG_SYNC_DB_USERNAME"),
+		Some(("test-replica-creds".to_string(), "username".to_string()))
+	);
+	assert_eq!(
+		env_secret_key(container, "CONFIG_SYNC_DB_PASSWORD"),
+		Some(("test-replica-creds".to_string(), "password".to_string()))
+	);
+	assert!(
+		container
+			.env
+			.as_ref()
+			.unwrap()
+			.iter()
+			.all(|e| e.name != "DB_HOST"),
+		"no plain DB_* vars, which tamanu does not read"
+	);
+}
+
+#[test]
+fn migration_job_does_not_retry_and_is_owned_by_the_restore() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+
+	// A failed migration is the finding; retrying spends the same hours to reach
+	// the same answer.
+	assert_eq!(job.spec.as_ref().unwrap().backoff_limit, Some(0));
+	assert_eq!(
+		job.spec
+			.as_ref()
+			.unwrap()
+			.template
+			.spec
+			.as_ref()
+			.unwrap()
+			.restart_policy
+			.as_deref(),
+		Some("Never")
+	);
+
+	// Owned by the restore, so tearing the restore down takes the job with it.
+	let owners = job.metadata.owner_references.as_ref().unwrap();
+	assert_eq!(owners.len(), 1);
+	assert_eq!(owners[0].uid, "uid-123");
+	assert_eq!(owners[0].kind, "PostgresPhysicalRestore");
+}
+
+#[test]
+fn deployment_lifts_read_only_for_a_migration_target() {
+	// Migrations are DDL, so a read-only replica cannot host one: a restore
+	// carrying a target is built read-write for the same reason persistent_schemas
+	// restores are. On PG >= 14 read-only means `pg_read_all_data`, which holds no
+	// DDL whatever the transaction default says.
+	let (mut restore, mut replica) = test_restore_and_replica();
+	replica.spec.read_only = true;
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+
+	let script_for = |restore: &PostgresPhysicalRestore| {
+		let deploy = build_deployment(restore, "test-restore", "default", &replica).unwrap();
+		let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+		pod_spec
+			.init_containers
+			.as_ref()
+			.unwrap()
+			.iter()
+			.find(|c| c.name == "setup-auth")
+			.expect("setup-auth init container must exist")
+			.args
+			.as_ref()
+			.unwrap()[0]
+			.clone()
+	};
+
+	// Both grant branches are in the script; the flag the operator interpolates is
+	// what picks one.
+	assert!(
+		script_for(&restore).contains(r#"[ "true" = "true" ]"#),
+		"an ordinary restore of a read-only replica stays read-only"
+	);
+
+	restore.spec.migrate_to = Some(migration_target());
+	assert!(
+		script_for(&restore).contains(r#"[ "false" = "true" ]"#),
+		"a migrating restore must take the superuser branch"
+	);
+}
