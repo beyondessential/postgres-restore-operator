@@ -122,8 +122,18 @@ pub fn descriptors() -> Vec<IntentDescriptor> {
 		IntentDescriptor::builder()
 			.intent("verify".to_string())
 			.description(
-				"Restore the snapshot to prove it is restorable, apply the next version's \
-				 schema migrations to it, then discard it."
+				"Restore the snapshot to prove it is restorable, then discard it.".to_string(),
+			)
+			.semantics(vec![
+				semantics::CHECK.to_string(),
+				semantics::ONCE.to_string(),
+			])
+			.build(),
+		IntentDescriptor::builder()
+			.intent("upgrade".to_string())
+			.description(
+				"Restore the snapshot, apply the next version's schema migrations to it to \
+				 prove the upgrade survives this deployment's data, then discard it."
 					.to_string(),
 			)
 			.semantics(vec![
@@ -164,8 +174,8 @@ pub struct IntentConfig {
 	pub storage_size_maximum: Quantity,
 	/// Tear the restore down once it's verified healthy rather than keeping
 	/// it running. Materialised into `PostgresPhysicalReplicaSpec.ephemeral`.
-	/// True for `verify` (throwaway snapshot check), false for `analytics`
-	/// (long-lived query replica).
+	/// True for `verify` and `upgrade` (throwaway snapshot checks), false for
+	/// `analytics` (long-lived query replica).
 	pub ephemeral: bool,
 	/// Floor on the postgres pod's `/dev/shm` sizing. Materialised into
 	/// `PostgresPhysicalReplicaSpec.shm_size_floor` so the shared Deployment
@@ -196,7 +206,7 @@ fn resources(cpu_req: &str, mem_req: &str, cpu_lim: &str, mem_lim: &str) -> Reso
 /// downgrade).
 pub fn config_for(intent: &str) -> Option<IntentConfig> {
 	match intent {
-		"verify" => Some(IntentConfig {
+		"verify" | "upgrade" => Some(IntentConfig {
 			resources: Some(resources("250m", "512Mi", "2", "2Gi")),
 			read_only: true,
 			minimum_ttl: None,
@@ -385,18 +395,56 @@ mod tests {
 		.unwrap()
 	}
 
+	fn entry_with_target(intent: &str) -> WorklistEntry {
+		let mut v = serde_json::to_value(entry(intent, "site", json!({}))).unwrap();
+		v["target_version"] = json!("2.63.0");
+		v["target_version_id"] = json!("44444444-4444-4444-4444-444444444444");
+		serde_json::from_value(v).unwrap()
+	}
+
+	#[test]
+	fn only_a_named_target_migrates() {
+		// The target is the whole signal: canopy names one only for a `migrate`
+		// intent, so nothing here matches on the intent's name.
+		let spec = config_for("upgrade")
+			.unwrap()
+			.to_replica_spec(&entry_with_target("upgrade"), vec![]);
+		let target = spec.migrate_to.expect("a named target migrates");
+		assert_eq!(target.version, "2.63.0");
+		assert_eq!(target.version_id, "44444444-4444-4444-4444-444444444444");
+
+		for intent in ["verify", "analytics"] {
+			let spec = config_for(intent)
+				.unwrap()
+				.to_replica_spec(&entry(intent, "site", json!({})), vec![]);
+			assert!(
+				spec.migrate_to.is_none(),
+				"{intent} names no target, so it must not migrate"
+			);
+		}
+	}
+
 	#[test]
 	fn descriptors_advertise_expected_intents_and_semantics() {
 		let ds = descriptors();
 		let names: Vec<&str> = ds.iter().map(|d| d.intent.as_str()).collect();
-		assert_eq!(names, ["verify", "analytics"]);
+		assert_eq!(names, ["verify", "upgrade", "analytics"]);
 
 		let verify = &ds[0];
-		assert_eq!(verify.semantics, ["check", "once", "migrate"]);
+		// `migrate` withholds an entry from a server with no candidate version,
+		// which for a verifying intent would stop verifying the backups of every
+		// server that has none: a non-Tamanu product, or one already on the newest
+		// published version.
+		assert_eq!(verify.semantics, ["check", "once"]);
 		assert!(verify.params.is_none(), "verify takes no params");
 		assert!(verify.description.is_some());
 
-		let analytics = &ds[1];
+		let upgrade = &ds[1];
+		assert_eq!(upgrade.semantics, ["check", "once", "migrate"]);
+		assert!(upgrade.params.is_none(), "upgrade takes no params");
+		assert!(upgrade.description.is_some());
+
+		let analytics = &ds[2];
 		assert_eq!(analytics.semantics, ["check", "url"]);
 		let params = analytics
 			.params
@@ -454,20 +502,24 @@ mod tests {
 		let ds = descriptors();
 		let v = serde_json::to_value(&ds).unwrap();
 		assert_eq!(v[0]["intent"], "verify");
-		assert_eq!(v[0]["semantics"], json!(["check", "once", "migrate"]));
+		assert_eq!(v[0]["semantics"], json!(["check", "once"]));
 		assert!(v[0]["params"].is_null(), "verify has no params");
 
-		assert_eq!(v[1]["intent"], "analytics");
-		assert_eq!(v[1]["semantics"], json!(["check", "url"]));
+		assert_eq!(v[1]["intent"], "upgrade");
+		assert_eq!(v[1]["semantics"], json!(["check", "once", "migrate"]));
+		assert!(v[1]["params"].is_null(), "upgrade has no params");
+
+		assert_eq!(v[2]["intent"], "analytics");
+		assert_eq!(v[2]["semantics"], json!(["check", "url"]));
 		// params is a flat object of name -> { type, default? }.
-		assert_eq!(v[1]["params"]["minimum_ttl"]["type"], "duration");
-		assert_eq!(v[1]["params"]["minimum_ttl"]["default"], 7200);
-		assert_eq!(v[1]["params"]["storage_size_maximum"]["type"], "bytes");
-		assert_eq!(v[1]["params"]["persistent_schemas"]["type"], "text");
-		assert_eq!(v[1]["params"]["expose"]["type"], "boolean");
+		assert_eq!(v[2]["params"]["minimum_ttl"]["type"], "duration");
+		assert_eq!(v[2]["params"]["minimum_ttl"]["default"], 7200);
+		assert_eq!(v[2]["params"]["storage_size_maximum"]["type"], "bytes");
+		assert_eq!(v[2]["params"]["persistent_schemas"]["type"], "text");
+		assert_eq!(v[2]["params"]["expose"]["type"], "boolean");
 		// a `bytes` param with no default omits the key entirely.
 		assert!(
-			v[1]["params"]["storage_size_maximum"]
+			v[2]["params"]["storage_size_maximum"]
 				.get("default")
 				.is_none()
 		);
@@ -476,6 +528,7 @@ mod tests {
 	#[test]
 	fn config_for_known_and_unknown() {
 		assert!(config_for("verify").unwrap().ephemeral);
+		assert!(config_for("upgrade").unwrap().ephemeral);
 		assert!(!config_for("analytics").unwrap().ephemeral);
 		assert!(
 			config_for("analytics-dev").is_none(),
