@@ -94,7 +94,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `switchoverGracePeriod` | `string` | No | `"5m"` | How long to wait before deleting the old restore after a switchover. |
 | `analyticsUsername` | `string` | No | `"analytics"` | Username created for analytics connections. |
 | `storageClass` | `string` | No | — | Kubernetes StorageClass for the restore PVCs. |
-| `storageSizeOverride` | `Quantity` | No | — | Override dynamic sizing with a fixed PVC size. When absent, PVC size is calculated from snapshot size. |
+| `storageSizeOverride` | `Quantity` | No | — | Lower bound on the PVC size. The size is still calculated from the snapshot, and this is used only when it is larger — so a replica whose snapshot outgrows it is sized from the snapshot rather than truncated. Still capped by `storageSizeMaximum`. |
 | `storageSizeMaximum` | `Quantity` | No | `2Ti` | Maximum allowed PVC size. The restore will fail if the computed size exceeds this limit. |
 | `resources` | `ResourceRequirements` | No | — | CPU/memory resource requirements for the PostgreSQL pods. |
 | `shmSizeFloor` | `Quantity` | No | — | Floor on the postgres pod's `/dev/shm` sizing. When set, the Deployment uses `max(computed, shmSizeFloor)` — the computed value is derived from `resources` by [`compute_shm_and_shared_buffers`]. Useful when a workload's `shared_buffers` needs more shm than the resource-derived value provides, without wanting to bump the container's memory request. |
