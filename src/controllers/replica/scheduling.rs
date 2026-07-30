@@ -2,11 +2,13 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use cronexpr::{ParseOptions, parse_crontab_with};
 use jiff::{SignedDuration, SpanTotal, Timestamp, Unit, tz::TimeZone};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
+use kube_quantity::ParsedQuantity;
 use rand::distr::uniform::SampleRange;
 use tracing::{debug, info, warn};
 
-use crate::types::*;
+use crate::{types::*, util::TimeSpan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleDecision {
@@ -41,6 +43,50 @@ pub fn failure_backoff_delay(consecutive_failures: u32) -> Option<SignedDuration
 	let unclamped = BASE_SECS.saturating_mul(1u64 << exponent);
 	let clamped = unclamped.clamp(MIN_SECS, MAX_SECS);
 	Some(SignedDuration::from_secs(clamped as i64))
+}
+
+/// Extra readiness budget per 100 GiB of snapshot, on top of the
+/// operator-wide default.
+///
+/// Postgres has to open the restored data dir and replay WAL before it reports
+/// Ready, and both take longer the more data there is. A single cluster-wide
+/// timeout forces a choice between failing the large replicas spuriously and
+/// letting the small ones sit broken for far too long.
+///
+/// Like the memory ratio, this is a conservative guess rather than a
+/// measurement — `deploymentReadyTimeout` is the escape hatch when it is wrong.
+const READY_TIMEOUT_SECS_PER_100GIB: f64 = 900.0;
+const BYTES_PER_100GIB: f64 = (100u64 * (1 << 30)) as f64;
+
+/// How long to wait for a restore's postgres Deployment to become Ready.
+///
+/// An explicit `spec.deploymentReadyTimeout` wins outright. Otherwise the
+/// budget is derived from the snapshot size and floored at the operator-wide
+/// `DEPLOYMENT_READY_TIMEOUT_SECS`, so raising that still lifts every replica.
+pub fn deployment_ready_timeout(
+	explicit: Option<&TimeSpan>,
+	snapshot_size: &Quantity,
+	global_default_secs: u64,
+) -> SignedDuration {
+	if let Some(explicit) = explicit
+		&& let Ok(secs) = explicit
+			.0
+			.total(SpanTotal::from(Unit::Second).days_are_24_hours())
+	{
+		return SignedDuration::from_secs(secs as i64);
+	}
+
+	let global = SignedDuration::from_secs(global_default_secs as i64);
+	let Some(bytes) = ParsedQuantity::try_from(snapshot_size.clone())
+		.ok()
+		.and_then(|q| q.to_bytes_f64())
+	else {
+		return global;
+	};
+	let extra = (bytes / BYTES_PER_100GIB) * READY_TIMEOUT_SECS_PER_100GIB;
+	global.max(SignedDuration::from_secs(
+		global_default_secs as i64 + extra as i64,
+	))
 }
 
 /// True when a failure backoff recorded by `fail_restore` is still in effect.
@@ -286,6 +332,9 @@ mod tests {
 				storage_class: None,
 				storage_size_override: None,
 				resources: None,
+				resources_floor: None,
+				resources_maximum: None,
+				deployment_ready_timeout: None,
 				shm_size_floor: None,
 				service_annotations: None,
 				pod_annotations: None,
