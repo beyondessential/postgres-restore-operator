@@ -392,7 +392,7 @@ mod tests {
 		assert_eq!(names, ["verify", "analytics"]);
 
 		let verify = &ds[0];
-		assert_eq!(verify.semantics, ["check", "once"]);
+		assert_eq!(verify.semantics, ["check", "once", "migrate"]);
 		assert!(verify.params.is_none(), "verify takes no params");
 		assert!(verify.description.is_some());
 
@@ -454,7 +454,7 @@ mod tests {
 		let ds = descriptors();
 		let v = serde_json::to_value(&ds).unwrap();
 		assert_eq!(v[0]["intent"], "verify");
-		assert_eq!(v[0]["semantics"], json!(["check", "once"]));
+		assert_eq!(v[0]["semantics"], json!(["check", "once", "migrate"]));
 		assert!(v[0]["params"].is_null(), "verify has no params");
 
 		assert_eq!(v[1]["intent"], "analytics");

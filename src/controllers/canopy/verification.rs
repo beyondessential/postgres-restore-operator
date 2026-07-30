@@ -348,6 +348,7 @@ mod tests {
 		let mut restore = PostgresPhysicalRestore::new(
 			"r",
 			PostgresPhysicalRestoreSpec {
+				migrate_to: None,
 				replica: LocalObjectReference {
 					name: "rep".to_string(),
 				},

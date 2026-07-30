@@ -88,6 +88,7 @@ fn make_replica(
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
+			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
@@ -249,6 +250,7 @@ fn snapshot_list_job_rotates_kopia_logs() {
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
+			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
@@ -312,6 +314,7 @@ fn make_restore(snapshot: &str, phase: Option<RestorePhase>) -> PostgresPhysical
 			..Default::default()
 		},
 		spec: PostgresPhysicalRestoreSpec {
+			migrate_to: None,
 			replica: k8s_openapi::api::core::v1::LocalObjectReference {
 				name: "test".into(),
 			},

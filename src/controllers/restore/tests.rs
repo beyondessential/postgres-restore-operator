@@ -17,6 +17,7 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
+			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
@@ -66,6 +67,7 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut restore = PostgresPhysicalRestore::new(
 		"test-restore",
 		PostgresPhysicalRestoreSpec {
+			migrate_to: None,
 			replica: LocalObjectReference {
 				name: "test-replica".to_string(),
 			},
@@ -104,6 +106,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
+			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
@@ -136,6 +139,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let mut restore = PostgresPhysicalRestore::new(
 		"test-restore",
 		PostgresPhysicalRestoreSpec {
+			migrate_to: None,
 			replica: LocalObjectReference {
 				name: "test-replica".to_string(),
 			},
