@@ -5,7 +5,7 @@
 //! loop. This module owns signal 3 — one function called at each terminal
 //! transition (switchover success, restore failure).
 
-use bestool_canopy::schema::{RunOutcome, VerificationArgs};
+use bestool_canopy::schema::{MigrationArgs, MigrationTimingArgs, RunOutcome, VerificationArgs};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, ResourceExt};
@@ -132,7 +132,19 @@ pub async fn report(
 	// Typed request body generated from canopy's OpenAPI (bestool#628).
 	// Constructing it here means the field set is checked against canopy's
 	// spec at compile time; `health_details` stays free-form by design.
+	// A migration test's result, when this restore ran one. Canopy reads the
+	// named failing migration as the verdict rather than the report's outcome,
+	// which keeps backup health and version readiness as separate signals: the
+	// backup restored fine even when the version's migrations did not.
+	let migration = restore
+		.status
+		.as_ref()
+		.and_then(|s| s.migration_result.as_ref())
+		.zip(restore.spec.migrate_to.as_ref())
+		.and_then(|(result, target)| migration_args(result, target));
+
 	let args = VerificationArgs::builder()
+		.maybe_migration(migration)
 		.maybe_replica_id(replica_id)
 		.maybe_run_id(run_id)
 		.group(group)
@@ -303,6 +315,38 @@ async fn gather_from_postgres(
 		.await
 		.unwrap_or_else(|_| json!({}));
 	Ok(PostgresHealth { sizes, fixes })
+}
+
+/// Map the operator's recorded result onto canopy's wire shape.
+///
+/// Returns `None` when the target version's id isn't a uuid, which would mean
+/// canopy sent something it cannot itself join back to a version.
+fn migration_args(
+	result: &crate::types::MigrationResult,
+	target: &crate::types::MigrationTarget,
+) -> Option<MigrationArgs> {
+	let target_version_id = Uuid::parse_str(&target.version_id).ok()?;
+	Some(
+		MigrationArgs::builder()
+			.target_version_id(target_version_id)
+			.total_elapsed_seconds(result.total_elapsed_seconds)
+			.maybe_failed_migration(result.failed_migration.clone())
+			.data_bytes_before(result.data_bytes_before)
+			.data_bytes_after(result.data_bytes_after)
+			.timings(
+				result
+					.timings
+					.iter()
+					.map(|t| {
+						MigrationTimingArgs::builder()
+							.name(t.name.clone())
+							.elapsed_seconds(t.elapsed_seconds)
+							.build()
+					})
+					.collect::<Vec<_>>(),
+			)
+			.build(),
+	)
 }
 
 #[cfg(test)]

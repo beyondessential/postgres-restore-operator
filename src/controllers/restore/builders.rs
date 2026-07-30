@@ -1013,8 +1013,14 @@ pub fn build_deployment(
 		.cloned()
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
-	// persistent_schemas needs write access to receive the migrated data
-	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
+	// persistent_schemas needs write access to receive the migrated data, and a
+	// restore with a migration target exists to be written to: on PG >= 14
+	// read-only grants the app user `pg_read_all_data`, which has no DDL, so
+	// migrations cannot run under it whatever the transaction default says.
+	// These restores are ephemeral and discarded once verified.
+	let effective_read_only = replica.spec.read_only
+		&& replica.spec.persistent_schemas.is_none()
+		&& restore.spec.migrate_to.is_none();
 
 	let labels = BTreeMap::from([
 		(
