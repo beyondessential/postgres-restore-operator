@@ -29,7 +29,7 @@ use super::{
 	restore::{build_credential_reset_job, credential_reset_job_name},
 };
 use crate::{
-	context::Context,
+	context::{Context, ReplicaKey},
 	error::{Error, Result},
 	kopia,
 	types::*,
@@ -435,7 +435,10 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				"failed to delete ephemeral restore; will retry"
 			);
 		}
-		if let Some(promoted) = ctx.release_restore_slot(&name).await {
+		if let Some(promoted) = ctx
+			.release_restore_slot(&ReplicaKey::new(&namespace, &name))
+			.await
+		{
 			info!(promoted = %promoted, "promoted queued restore after ephemeral teardown");
 		}
 		return Ok(Action::requeue(Duration::from_secs(30)));
@@ -1050,10 +1053,24 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		// Check concurrent restore limit
 		let mut queue = ctx.restore_queue.write().await;
 		if !queue.can_start(ctx.max_concurrent_restores()) {
-			queue.enqueue(name.clone());
-			let position = queue.position(&name);
+			let key = ReplicaKey::new(&namespace, &name);
+			queue.enqueue(key.clone());
+			let position = queue.position(&key);
 			let pending_len = queue.pending.len();
+			let active: Vec<String> = queue.active.iter().map(ToString::to_string).collect();
 			drop(queue);
+
+			// Loud, because a queue that stops draining looks exactly like a
+			// replica that is simply never due: the reconcile requeues on a
+			// timer and nothing else is logged.
+			warn!(
+				replica = name,
+				position = ?position,
+				pending = pending_len,
+				active = ?active,
+				limit = ctx.max_concurrent_restores(),
+				"restore queue is full, waiting for a slot"
+			);
 
 			let replicas: Api<PostgresPhysicalReplica> =
 				Api::namespaced(client.clone(), &namespace);
