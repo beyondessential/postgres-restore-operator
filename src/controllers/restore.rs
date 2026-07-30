@@ -900,6 +900,35 @@ async fn reconcile_ready(
 		.unwrap_or(0);
 
 	if ready_replicas > 0 {
+		// A migration target means the database has to be migrated before it
+		// counts as verified: the point is to prove the version's migrations
+		// survive this data, and canopy reads the verdict off the report that
+		// switchover sends. Runs here because the database is only now up to
+		// migrate. `migrationResult` present means it already ran.
+		if restore.spec.migrate_to.is_some()
+			&& restore
+				.status
+				.as_ref()
+				.and_then(|s| s.migration_result.as_ref())
+				.is_none()
+		{
+			info!(
+				restore = name,
+				"deployment ready with a migration target, transitioning to Migrating"
+			);
+			update_restore_status(
+				client,
+				namespace,
+				name,
+				serde_json::json!({
+					"phase": "Migrating",
+					"deployment": name,
+				}),
+			)
+			.await?;
+			return Ok(Action::requeue(Duration::from_secs(1)));
+		}
+
 		info!(
 			restore = name,
 			"deployment ready, transitioning to Switching"
@@ -956,7 +985,7 @@ async fn reconcile_ready(
 	Ok(Action::requeue(Duration::from_secs(10)))
 }
 
-fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference {
+pub(crate) fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference {
 	OwnerReference {
 		api_version: "pgro.bes.au/v1alpha1".to_string(),
 		kind: "PostgresPhysicalRestore".to_string(),
@@ -967,7 +996,7 @@ fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference 
 	}
 }
 
-async fn update_restore_status(
+pub(crate) async fn update_restore_status(
 	client: &Client,
 	namespace: &str,
 	name: &str,
