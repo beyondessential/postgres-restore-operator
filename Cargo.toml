@@ -47,3 +47,8 @@ tower = "0.5.3"
 [[bin]]
 name = "canopy-proxy"
 path = "src/bin/canopy_proxy.rs"
+
+# Until bestool-canopy releases with the migration-testing schema (needs canopy
+# deployed to meta.tamanu.app, which the live-tracking build generates from).
+[patch.crates-io]
+bestool-canopy = { path = "../../bestool/crates/canopy" }

@@ -45,6 +45,10 @@ mod semantics {
 	/// The health report carries a link to the running replica, which canopy
 	/// surfaces to operators.
 	pub const URL: &str = "url";
+	/// Canopy names a target version on the worklist entry; the consumer applies
+	/// that version's schema migrations to the restored replica and reports how
+	/// they went alongside the replica's health.
+	pub const MIGRATE: &str = "migrate";
 }
 
 /// Names of the parameters the `analytics` intent advertises. Shared between
@@ -118,11 +122,14 @@ pub fn descriptors() -> Vec<IntentDescriptor> {
 		IntentDescriptor::builder()
 			.intent("verify".to_string())
 			.description(
-				"Restore the snapshot to prove it is restorable, then discard it.".to_string(),
+				"Restore the snapshot to prove it is restorable, apply the next version's \
+				 schema migrations to it, then discard it."
+					.to_string(),
 			)
 			.semantics(vec![
 				semantics::CHECK.to_string(),
 				semantics::ONCE.to_string(),
+				semantics::MIGRATE.to_string(),
 			])
 			.build(),
 		IntentDescriptor::builder()
