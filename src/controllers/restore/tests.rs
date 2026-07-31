@@ -1493,3 +1493,81 @@ fn deployment_lifts_read_only_for_a_migration_target() {
 		"a migrating restore must take the superuser branch"
 	);
 }
+
+/// Tamanu's own `logs.migrations.stats` payload, per
+/// `MigrationLogStats` + `PreMigrationDbSnapshot`.
+fn tamanu_stats(size_bytes: i64) -> serde_json::Value {
+	serde_json::json!({
+		"durationMsPerMigration": {
+			"1721000000-addFoo.ts": 400_000,
+			"1721000001-addBar.ts": 12_500,
+		},
+		"totalMigrationsDurationMs": 412_500,
+		"preSnapshot": {
+			"databaseSizeBytes": size_bytes,
+			"tableRowEstimates": [{ "table": "public.patients", "rows": 12_000 }],
+		},
+	})
+}
+
+fn applied() -> Vec<String> {
+	vec![
+		"1721000000-addFoo.ts".to_string(),
+		"1721000001-addBar.ts".to_string(),
+	]
+}
+
+#[test]
+fn batch_result_reads_tamanu_stats() {
+	let r = super::migration::result_from_batch(
+		applied(),
+		Some(415_000),
+		Some(tamanu_stats(1_000_000)),
+		1_200_000,
+		false,
+	);
+
+	assert_eq!(r.total_elapsed_seconds, 415);
+	assert_eq!(r.data_bytes_before, 1_000_000);
+	assert_eq!(r.data_bytes_after, 1_200_000);
+	assert_eq!(r.failed_migration, None);
+	// Order comes from the batch's file list, since a JSON object has none.
+	let names: Vec<_> = r.timings.iter().map(|t| t.name.as_str()).collect();
+	assert_eq!(names, ["1721000000-addFoo.ts", "1721000001-addBar.ts"]);
+	assert_eq!(r.timings[0].elapsed_seconds, 400);
+	assert_eq!(r.timings[1].elapsed_seconds, 12);
+}
+
+#[test]
+fn batch_result_treats_unreadable_size_as_unknown() {
+	// tamanu writes -1 when pg_database_size could not be read.
+	let r = super::migration::result_from_batch(
+		applied(),
+		Some(1_000),
+		Some(tamanu_stats(-1)),
+		1_200_000,
+		false,
+	);
+	assert_eq!(
+		r.data_bytes_before, 1_200_000,
+		"an unreadable before-size must not report negative growth"
+	);
+}
+
+#[test]
+fn batch_result_names_where_a_failed_run_stopped() {
+	let r = super::migration::result_from_batch(
+		applied(),
+		None,
+		Some(tamanu_stats(1_000)),
+		2_000,
+		true,
+	);
+	assert_eq!(
+		r.failed_migration.as_deref(),
+		Some("1721000001-addBar.ts"),
+		"the last migration in the batch is where it stopped"
+	);
+	// No batch duration recorded, so it falls back to the sum of the timings.
+	assert_eq!(r.total_elapsed_seconds, 412);
+}

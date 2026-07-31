@@ -270,16 +270,15 @@ async fn read_result(
 	let data_bytes_after =
 		crate::controllers::postgres::database_size_on(&conn.client).await? as i64;
 
-	// One row per batch: `migrations` is the ordered file list, `stats` holds
-	// `durationMsPerMigration` keyed by file and a `preSnapshot.sizeBytes` taken
-	// before the batch ran. Newest batch is this run's.
+	// One row per batch. `logged_at` is the only timestamp on the table; there is
+	// no `created_at`.
 	let row = conn
 		.client
 		.query_opt(
 			"SELECT migrations, batch_duration_ms, stats
 			 FROM logs.migrations
 			 WHERE direction = 'up'
-			 ORDER BY created_at DESC
+			 ORDER BY logged_at DESC
 			 LIMIT 1",
 			&[],
 		)
@@ -302,10 +301,27 @@ async fn read_result(
 		});
 	};
 
-	let applied: Vec<String> = row.get(0);
-	let batch_duration_ms: Option<i64> = row.get(1);
-	let stats: Option<serde_json::Value> = row.get(2);
+	Ok(result_from_batch(
+		row.get(0),
+		row.get(1),
+		row.get(2),
+		data_bytes_after,
+		job_failed,
+	))
+}
 
+/// Shape a `logs.migrations` batch row into the result canopy is sent.
+///
+/// `applied` is the batch's ordered file list, and `stats` is tamanu's payload:
+/// `durationMsPerMigration` keyed by those same file names, and a `preSnapshot`
+/// taken before the batch ran.
+pub(super) fn result_from_batch(
+	applied: Vec<String>,
+	batch_duration_ms: Option<i64>,
+	stats: Option<serde_json::Value>,
+	data_bytes_after: i64,
+	job_failed: bool,
+) -> MigrationResult {
 	let durations = stats
 		.as_ref()
 		.and_then(|s| s.get("durationMsPerMigration"))
@@ -331,12 +347,12 @@ async fn read_result(
 	// than reporting a negative size or a nonsense growth.
 	let data_bytes_before = stats
 		.as_ref()
-		.and_then(|s| s.pointer("/preSnapshot/sizeBytes"))
+		.and_then(|s| s.pointer("/preSnapshot/databaseSizeBytes"))
 		.and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
 		.filter(|bytes| *bytes >= 0)
 		.unwrap_or(data_bytes_after);
 
-	Ok(MigrationResult {
+	MigrationResult {
 		// The batch's own wall clock where tamanu recorded it, which includes the
 		// pre/post steps around the migrations themselves.
 		total_elapsed_seconds: batch_duration_ms
@@ -349,5 +365,5 @@ async fn read_result(
 		data_bytes_before,
 		data_bytes_after,
 		timings,
-	})
+	}
 }
