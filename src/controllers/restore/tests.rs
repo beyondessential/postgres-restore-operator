@@ -269,6 +269,7 @@ fn canopy_restore_job_proxy_is_native_sidecar() {
 		image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
 		broker_base_url: "http://operator.pgro-system.svc:9091",
 		stats_callback_url: "http://operator.pgro-system.svc:8080/api/v1/canopy-stats/ns/job",
+		progress_callback_url: None,
 		run_id: Some("44444444-4444-4444-4444-444444444444"),
 	};
 	let job = build_restore_job(
@@ -325,6 +326,7 @@ fn canopy_restore_job_sidecar_carries_run_id() {
 			image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
 			broker_base_url: "http://operator.pgro-system.svc:9091",
 			stats_callback_url: "http://operator.pgro-system.svc:8080/api/v1/canopy-stats/ns/job",
+			progress_callback_url: None,
 			run_id,
 		};
 		let job = build_restore_job(
@@ -534,6 +536,53 @@ fn parsed_bytes(q: &Quantity) -> u64 {
 		.and_then(|p| p.to_bytes_f64())
 		.map(|b| b as u64)
 		.unwrap_or(0)
+}
+
+/// The sidecar can only sample progress if the Job tells it where to post.
+#[test]
+fn canopy_restore_job_sidecar_carries_progress_callback_url() {
+	let (restore, mut replica) = test_restore_and_replica();
+	replica.spec.canopy_source = Some(CanopySource {
+		group: "11111111-1111-1111-1111-111111111111".to_string(),
+		r#type: "tamanu-postgres".to_string(),
+	});
+	let url = "http://operator.pgro-system.svc:8080/api/v1/canopy-progress/ns/job";
+	let proxy = super::builders::CanopyProxyArgs {
+		image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
+		broker_base_url: "http://operator.pgro-system.svc:9091",
+		stats_callback_url: "http://operator.pgro-system.svc:8080/api/v1/canopy-stats/ns/job",
+		progress_callback_url: Some(url),
+		run_id: Some("22222222-2222-2222-2222-222222222222"),
+	};
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		Some(&proxy),
+	)
+	.unwrap();
+	let sidecar = job
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "canopy-proxy")
+		.expect("canopy-proxy sidecar");
+
+	let got = sidecar
+		.env
+		.unwrap()
+		.into_iter()
+		.find(|e| e.name == "PGRO_PROGRESS_CALLBACK_URL")
+		.and_then(|e| e.value);
+	assert_eq!(got.as_deref(), Some(url));
 }
 
 fn restore_job_for(snapshot_size: &str) -> k8s_openapi::api::batch::v1::Job {

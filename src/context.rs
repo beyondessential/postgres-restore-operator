@@ -168,6 +168,16 @@ impl Context {
 		)
 	}
 
+	/// Callback URL the canopy-proxy sidecar POSTs periodic progress samples
+	/// to while a restore is in flight. Separate from the stats callback so
+	/// the once-per-run verification path is unaffected by the sampling.
+	pub fn canopy_progress_callback_url(&self, namespace: &str, job: &str) -> String {
+		format!(
+			"{}/api/v1/canopy-progress/{namespace}/{job}",
+			self.callback_base_url
+		)
+	}
+
 	/// Remove a restore from the queue, promote the next pending one if there
 	/// is capacity, and update the related gauges. Returns the promoted
 	/// replica, if any.

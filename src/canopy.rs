@@ -10,14 +10,58 @@
 use bestool_canopy::{
 	CanopyClient, TAILSCALE_URL,
 	schema::{
-		IntentDescriptor, RestoreCapabilitiesArgs, RestoreCredentials, RestoreCredentialsArgs,
-		VerificationArgs, WorklistEntry,
+		BackupPurpose, IntentDescriptor, ProgressArgs, RestoreCapabilitiesArgs, RestoreCredentials,
+		RestoreCredentialsArgs, VerificationArgs, WorklistEntry,
 	},
 };
 use reqwest::Url;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
+
+/// One cumulative progress sample from a restore run in flight, as the
+/// canopy-proxy sidecar POSTs it to the operator.
+///
+/// The sidecar measures S3 traffic and nothing else, so this carries only the
+/// four byte counters plus what canopy needs to identify the run. Shared with
+/// `bin/canopy_proxy` rather than duplicated, so the wire shape can't drift.
+///
+/// Counters are cumulative from the start of the run, never interval deltas:
+/// canopy's contract makes a dropped or repeated sample cost resolution rather
+/// than the accuracy of a total.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ProgressSample {
+	pub run_id: Uuid,
+	#[serde(rename = "type")]
+	pub type_: String,
+	pub sent_raw_bytes: u64,
+	pub sent_payload_bytes: u64,
+	pub received_raw_bytes: u64,
+	pub received_payload_bytes: u64,
+}
+
+impl ProgressSample {
+	/// Build the canopy request body.
+	///
+	/// Every counter pgro doesn't measure is left unset rather than sent as
+	/// zero — canopy stores what it's given, and a zero would read as "hashed
+	/// nothing" rather than "doesn't report hashing".
+	pub fn to_args(&self) -> ProgressArgs {
+		let to_i64 = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+		ProgressArgs::builder()
+			.run_id(self.run_id)
+			.type_(self.type_.clone())
+			.purpose(BackupPurpose::Restore)
+			.s3_sent_raw_bytes(to_i64(self.sent_raw_bytes))
+			.s3_sent_payload_bytes(to_i64(self.sent_payload_bytes))
+			.s3_received_raw_bytes(to_i64(self.received_raw_bytes))
+			.s3_received_payload_bytes(to_i64(self.received_payload_bytes))
+			// bestool rides the verbatim kopia status line along here; pgro's
+			// sidecar sees only S3 traffic, so there is nothing to add.
+			.extra(serde_json::Map::new())
+			.build()
+	}
+}
 
 /// Default SOCKS5 proxy the operator's Tailscale sidecar listens on (IPv6
 /// loopback). Override via `CANOPY_SOCKS5_PROXY` for tests / non-sidecar
@@ -150,6 +194,16 @@ impl Client {
 		})
 	}
 
+	/// Report a cumulative progress sample for a run still in flight, so canopy
+	/// can show a long restore advancing rather than a figureless in-progress
+	/// row. Best-effort telemetry: callers log failures and carry on.
+	pub async fn backup_progress(&self, args: &ProgressArgs) -> Result<()> {
+		self.inner
+			.backup_progress(args)
+			.await
+			.map_err(|err| Error::Canopy(format!("backup_progress: {err}")))
+	}
+
 	/// Report a restore outcome (signal 3, restore-verification). `args` is
 	/// the typed [`bestool_canopy::schema::VerificationArgs`], including the
 	/// free-form `health_details`.
@@ -164,6 +218,49 @@ impl Client {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn sample() -> ProgressSample {
+		ProgressSample {
+			run_id: "00000000-0000-0000-0000-000000000000".parse().unwrap(),
+			type_: "tamanu-postgres".to_string(),
+			sent_raw_bytes: 2_000_000,
+			sent_payload_bytes: 1_950_000,
+			received_raw_bytes: 500_000_000,
+			received_payload_bytes: 480_000_000,
+		}
+	}
+
+	#[test]
+	fn sample_maps_onto_progress_args() {
+		let args = sample().to_args();
+
+		assert_eq!(args.purpose, Some(BackupPurpose::Restore));
+		assert_eq!(args.type_, "tamanu-postgres");
+		assert_eq!(args.s3_sent_raw_bytes, Some(2_000_000));
+		assert_eq!(args.s3_sent_payload_bytes, Some(1_950_000));
+		assert_eq!(args.s3_received_raw_bytes, Some(500_000_000));
+		assert_eq!(args.s3_received_payload_bytes, Some(480_000_000));
+	}
+
+	/// Canopy's contract is explicit that an unmeasured counter must be left
+	/// out rather than sent as zero — a zero is a measurement, and would show
+	/// in canopy as a run that has hashed nothing rather than one that doesn't
+	/// report hashing at all. pgro measures none of the engine counters.
+	#[test]
+	fn unmeasured_counters_are_omitted_not_zeroed() {
+		let args = sample().to_args();
+
+		assert_eq!(args.bytes_hashed, None);
+		assert_eq!(args.bytes_uploaded, None);
+		assert_eq!(args.bytes_cached, None);
+		assert_eq!(args.bytes_estimated, None);
+		assert_eq!(args.bytes_read, None);
+		assert_eq!(args.files_done, None);
+		assert_eq!(args.files_estimated, None);
+		assert_eq!(args.errors, None);
+		// A restore has no freeze moment to report.
+		assert_eq!(args.snapshot_taken_at, None);
+	}
 
 	#[test]
 	fn default_socks5_proxy_is_v6_loopback() {
