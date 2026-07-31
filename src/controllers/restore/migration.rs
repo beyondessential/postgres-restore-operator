@@ -94,6 +94,9 @@ pub fn build_migration_job(
 						// tamanu maps its `db` config from `CONFIG_SYNC_DB_*`,
 						// which take precedence over anything under
 						// `NODE_CONFIG_DIR`, so the job needs no mounted config.
+						// Versions that understand `DATABASE_URL` prefer it over
+						// those, and the job runs whichever version canopy named,
+						// so both are set.
 						env: Some(vec![
 							env_literal("CONFIG_SYNC_DB_HOST", &restore_name),
 							env_from_secret_name("CONFIG_SYNC_DB_USERNAME", &creds, "username"),
@@ -102,6 +105,16 @@ pub fn build_migration_job(
 							// pgro's replicas do not follow the CNPG convention
 							// of naming the database after its owner.
 							env_literal("CONFIG_SYNC_DB_NAME", dbname),
+							// Must follow the vars it interpolates: kubelet expands
+							// `$(VAR)` only from entries defined above it. The
+							// generated password is ASCII alphanumeric, so it needs
+							// no percent-encoding.
+							env_literal(
+								"DATABASE_URL",
+								&format!(
+									"postgresql://$(CONFIG_SYNC_DB_USERNAME):$(CONFIG_SYNC_DB_PASSWORD)@{restore_name}:5432/{dbname}"
+								),
+							),
 							env_literal("NODE_ENV", "production"),
 						]),
 						// Generous, because an OOMKill here is indistinguishable

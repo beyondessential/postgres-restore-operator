@@ -1446,6 +1446,35 @@ fn migration_job_points_tamanu_at_the_restored_database() {
 }
 
 #[test]
+fn migration_job_supplies_a_connection_url_too() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+
+	assert_eq!(
+		env_value(container, "DATABASE_URL").as_deref(),
+		Some(
+			"postgresql://$(CONFIG_SYNC_DB_USERNAME):$(CONFIG_SYNC_DB_PASSWORD)@test-restore:5432/tamanu-fiji"
+		),
+		"a version that prefers DATABASE_URL must reach the same database as CONFIG_SYNC_DB_*"
+	);
+
+	let env = container.env.as_ref().unwrap();
+	let position = |name: &str| env.iter().position(|e| e.name == name).unwrap();
+	assert!(
+		position("DATABASE_URL") > position("CONFIG_SYNC_DB_USERNAME")
+			&& position("DATABASE_URL") > position("CONFIG_SYNC_DB_PASSWORD"),
+		"kubelet expands $(VAR) only from entries above it, so the URL would ship the literal placeholders"
+	);
+}
+
+#[test]
 fn migration_job_does_not_retry_and_is_owned_by_the_restore() {
 	let (restore, replica) = test_restore_and_replica();
 	let job = super::migration::build_migration_job(
