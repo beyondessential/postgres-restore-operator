@@ -1183,6 +1183,17 @@ spec:
               deployment:
                 nullable: true
                 type: string
+              migrationBaseline:
+                description: |-
+                  The newest `logs.migrations.logged_at` already in the snapshot when the
+                  migration Job was created: a restored production database carries batches
+                  from its own past upgrades, and only a batch newer than this is the
+                  Job's. Kept as the text postgres rendered and handed back for the
+                  comparison unparsed, since `logged_at` carries the source deployment's
+                  timesync offset and only the replica's own clock can order it. Absent
+                  when the snapshot had no batches, where any batch found is the Job's.
+                nullable: true
+                type: string
               migrationJob:
                 description: The migration job, once the replica is healthy and a `migrateTo` is set.
                 nullable: true

@@ -188,6 +188,19 @@ pub async fn reconcile_migrating(
 	let job = match jobs.get_opt(&job_name).await? {
 		Some(job) => job,
 		None => {
+			// Recorded before the Job exists so the result reader only
+			// attributes batches the Job wrote, and written to status before
+			// the Job is created so a crash between the two re-captures on the
+			// next pass, while the database is still untouched.
+			if let Some(at) = latest_batch_at(ctx, name, namespace, &creds, &dbname).await? {
+				super::update_restore_status(
+					&ctx.client,
+					namespace,
+					name,
+					serde_json::json!({ "migrationBaseline": at }),
+				)
+				.await?;
+			}
 			info!(
 				restore = name,
 				target = %target.version,
@@ -211,7 +224,11 @@ pub async fn reconcile_migrating(
 	// records every migration it applied, with per-migration durations, in
 	// `logs.migrations`. A failed job that got partway still has rows there,
 	// and its last applied migration names where it stopped.
-	let result = read_result(ctx, name, namespace, &creds, &dbname, failed > 0).await?;
+	let baseline = restore
+		.status
+		.as_ref()
+		.and_then(|status| status.migration_baseline.as_deref());
+	let result = read_result(ctx, name, namespace, &creds, &dbname, baseline, failed > 0).await?;
 
 	info!(
 		restore = name,
@@ -255,6 +272,48 @@ async fn credentials(
 	))
 }
 
+/// The newest batch `logs.migrations` already holds, as the text postgres
+/// renders it.
+///
+/// `logged_at` defaults to tamanu's `adjusted_timestamp()`, which carries the
+/// source deployment's timesync offset, so the value is never parsed here: it
+/// goes back to postgres unchanged and both sides of the comparison come from
+/// the replica's own clock. `None` when the table is absent (not a tamanu
+/// database, or a version predating it) or empty.
+async fn latest_batch_at(
+	ctx: &Context,
+	restore_name: &str,
+	namespace: &str,
+	creds: &(String, String),
+	dbname: &str,
+) -> Result<Option<String>> {
+	let conn = crate::controllers::postgres::connect_to_restore(
+		&ctx.client,
+		namespace,
+		restore_name,
+		dbname,
+		&creds.0,
+		&creds.1,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let table_exists: bool = conn
+		.client
+		.query_one("SELECT to_regclass('logs.migrations') IS NOT NULL", &[])
+		.await?
+		.get(0);
+	if !table_exists {
+		return Ok(None);
+	}
+
+	Ok(conn
+		.client
+		.query_one("SELECT max(logged_at)::text FROM logs.migrations", &[])
+		.await?
+		.get(0))
+}
+
 /// Read what the migrations did off the replica itself.
 ///
 /// `logs.migrations` is tamanu's own audit table: one row per batch, with a
@@ -267,6 +326,7 @@ async fn read_result(
 	namespace: &str,
 	creds: &(String, String),
 	dbname: &str,
+	baseline: Option<&str>,
 	job_failed: bool,
 ) -> Result<MigrationResult> {
 	let conn = crate::controllers::postgres::connect_to_restore(
@@ -284,26 +344,28 @@ async fn read_result(
 		crate::controllers::postgres::database_size_on(&conn.client).await? as i64;
 
 	// One row per batch. `logged_at` is the only timestamp on the table; there is
-	// no `created_at`.
+	// no `created_at`. Batches at or before the baseline are the source
+	// deployment's own upgrade history, restored along with the data.
 	let row = conn
 		.client
 		.query_opt(
 			"SELECT migrations, batch_duration_ms, stats
 			 FROM logs.migrations
 			 WHERE direction = 'up'
+			   AND ($1::text IS NULL OR logged_at > $1::text::timestamptz)
 			 ORDER BY logged_at DESC
 			 LIMIT 1",
-			&[],
+			&[&baseline],
 		)
 		.await?;
 
 	let Some(row) = row else {
-		// No batch recorded: the job died before applying anything (bad image,
+		// No batch the job wrote: it died before applying anything (bad image,
 		// unreachable database). Nothing to attribute, so report the shape
 		// without inventing timings.
 		warn!(
 			restore = restore_name,
-			"migration job ended with no batch in logs.migrations"
+			"migration job ended with no new batch in logs.migrations"
 		);
 		return Ok(MigrationResult {
 			total_elapsed_seconds: 0,

@@ -143,6 +143,23 @@ async fn migration_target_drives_a_migration_job() {
 		);
 	}
 
+	// myapp has no logs.migrations table, so the baseline capture must record
+	// nothing, and must not have errored, or the Job above would never have
+	// been created.
+	println!("--- checking no migration baseline was recorded");
+	let restore = restores
+		.get(&restore_name)
+		.await
+		.expect("failed to fetch restore");
+	assert!(
+		restore
+			.status
+			.as_ref()
+			.and_then(|status| status.migration_baseline.as_ref())
+			.is_none(),
+		"a database without logs.migrations must yield no baseline"
+	);
+
 	println!("--- cleaning up");
 	cleanup_namespace(&client, ns, &[replica_name]).await;
 }

@@ -85,6 +85,16 @@ pub struct PostgresPhysicalRestoreStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub migration_job: Option<JobStatus>,
 
+	/// The newest `logs.migrations.logged_at` already in the snapshot when the
+	/// migration Job was created: a restored production database carries batches
+	/// from its own past upgrades, and only a batch newer than this is the
+	/// Job's. Kept as the text postgres rendered and handed back for the
+	/// comparison unparsed, since `logged_at` carries the source deployment's
+	/// timesync offset and only the replica's own clock can order it. Absent
+	/// when the snapshot had no batches, where any batch found is the Job's.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub migration_baseline: Option<String>,
+
 	/// What the migrations did, read back off the replica once the job ends.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub migration_result: Option<MigrationResult>,
