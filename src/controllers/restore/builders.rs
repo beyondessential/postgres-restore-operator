@@ -40,6 +40,10 @@ pub struct CanopyProxyArgs<'a> {
 	pub broker_base_url: &'a str,
 	/// Callback URL the sidecar POSTs its final TrafficStats to on shutdown.
 	pub stats_callback_url: &'a str,
+	/// Callback URL the sidecar POSTs in-flight progress samples to, for the
+	/// operator to relay to canopy. `None` disables sampling — used for the
+	/// short snapshot-list job, where there is no download worth watching.
+	pub progress_callback_url: Option<&'a str>,
 	/// Canopy run-uuid for this restore run, passed to the sidecar as
 	/// `PGRO_RUN_ID` so its credential requests are attributed to the run.
 	/// `None` for non-run credential consumers (e.g. the snapshot-list job,
@@ -852,6 +856,13 @@ echo -n "$VERSION" > /dev/termination-log
 					env.push(EnvVar {
 						name: "PGRO_RUN_ID".to_string(),
 						value: Some(run_id.to_string()),
+						..Default::default()
+					});
+				}
+				if let Some(url) = proxy.progress_callback_url {
+					env.push(EnvVar {
+						name: "PGRO_PROGRESS_CALLBACK_URL".to_string(),
+						value: Some(url.to_string()),
 						..Default::default()
 					});
 				}
