@@ -1634,6 +1634,25 @@ fn batch_result_treats_unreadable_size_as_unknown() {
 
 #[test]
 fn batch_result_names_where_a_failed_run_stopped() {
+	let mut stats = tamanu_stats(1_000);
+	stats["failedMigration"] = serde_json::json!("1721000002-addBaz.ts");
+
+	let r = super::migration::result_from_batch(applied(), None, Some(stats), 2_000, true);
+
+	assert_eq!(
+		r.failed_migration.as_deref(),
+		Some("1721000002-addBaz.ts"),
+		"the migration tamanu stopped at, not the last one that applied"
+	);
+	// No batch duration recorded, so it falls back to the sum of the timings.
+	assert_eq!(r.total_elapsed_seconds, 412);
+}
+
+#[test]
+fn batch_result_reports_an_unattributed_failure() {
+	// A target version that records a batch only once all of it applied leaves no
+	// failedMigration to read, so the failure is reported without a name rather
+	// than pinned on the last migration that did apply.
 	let r = super::migration::result_from_batch(
 		applied(),
 		None,
@@ -1641,11 +1660,5 @@ fn batch_result_names_where_a_failed_run_stopped() {
 		2_000,
 		true,
 	);
-	assert_eq!(
-		r.failed_migration.as_deref(),
-		Some("1721000001-addBar.ts"),
-		"the last migration in the batch is where it stopped"
-	);
-	// No batch duration recorded, so it falls back to the sum of the timings.
-	assert_eq!(r.total_elapsed_seconds, 412);
+	assert_eq!(r.failed_migration.as_deref(), Some("unknown"));
 }

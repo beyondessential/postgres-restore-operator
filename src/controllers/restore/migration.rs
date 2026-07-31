@@ -388,8 +388,9 @@ async fn read_result(
 /// Shape a `logs.migrations` batch row into the result canopy is sent.
 ///
 /// `applied` is the batch's ordered file list, and `stats` is tamanu's payload:
-/// `durationMsPerMigration` keyed by those same file names, and a `preSnapshot`
-/// taken before the batch ran.
+/// `durationMsPerMigration` keyed by those same file names, a `preSnapshot`
+/// taken before the batch ran, and `failedMigration` when the batch stopped
+/// partway.
 pub(super) fn result_from_batch(
 	applied: Vec<String>,
 	batch_duration_ms: Option<i64>,
@@ -433,10 +434,17 @@ pub(super) fn result_from_batch(
 		total_elapsed_seconds: batch_duration_ms
 			.map(|ms| ms / 1000)
 			.unwrap_or_else(|| timings.iter().map(|t| t.elapsed_seconds).sum()),
-		// The last migration in the batch is where a failed run stopped.
-		failed_migration: job_failed
-			.then(|| timings.last().map(|t| t.name.clone()))
-			.flatten(),
+		// Tamanu names the migration it stopped at. Versions that record a batch
+		// only once all of it applied leave nothing to name, so a failed job with
+		// no such entry reports that it failed without attributing it.
+		failed_migration: job_failed.then(|| {
+			stats
+				.as_ref()
+				.and_then(|s| s.get("failedMigration"))
+				.and_then(serde_json::Value::as_str)
+				.map(str::to_owned)
+				.unwrap_or_else(|| "unknown".to_string())
+		}),
 		data_bytes_before,
 		data_bytes_after,
 		timings,
