@@ -141,7 +141,8 @@ dependencies = [
 [[package]]
 name = "algae-cli"
 version = "1.1.9"
-source = "git+https://github.com/beyondessential/bestool?branch=feat%2Fcanopy-migration-testing#f2ce4ac916b0d66fd8997cb2639fed2a84a30ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c1973b4431611cda14e2d1c587df37ff2e3593f0198d6154cf22e7f7bcff0b"
 dependencies = [
  "age",
  "age-core",
@@ -497,7 +498,8 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 [[package]]
 name = "bestool-canopy"
 version = "0.7.8"
-source = "git+https://github.com/beyondessential/bestool?branch=feat%2Fcanopy-migration-testing#f2ce4ac916b0d66fd8997cb2639fed2a84a30ce8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e76936cd06d70130e46c9cfac3c8e9db867c545ce59270f708c346c84cb6ab12"
 dependencies = [
  "algae-cli",
  "async-trait",
@@ -633,7 +635,7 @@ version = "3.9.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dee98b0db6a962de883bf5d20362dee4d7ca0d12fe39a7c6c73c844e1cd7c1f"
 dependencies = [
- "darling 0.23.0",
+ "darling 0.20.11",
  "ident_case",
  "prettyplease 0.2.37",
  "proc-macro2",
