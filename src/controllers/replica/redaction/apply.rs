@@ -38,12 +38,12 @@ pub async fn apply(conn: &PgConnection, manifest: &Manifest) -> Result<Outcome> 
 	conn.client
 		.simple_query("CREATE EXTENSION IF NOT EXISTS anon CASCADE")
 		.await
-		.map_err(|e| Error::Redaction(format!("CREATE EXTENSION anon failed: {e}")))?;
+		.map_err(|e| Error::Redaction(format!("CREATE EXTENSION anon failed: {}", pg_error(&e))))?;
 
 	conn.client
 		.simple_query("SELECT anon.init()")
 		.await
-		.map_err(|e| Error::Redaction(format!("anon.init() failed: {e}")))?;
+		.map_err(|e| Error::Redaction(format!("anon.init() failed: {}", pg_error(&e))))?;
 
 	for table in &manifest.tables {
 		outcome.tables_attempted += 1;
@@ -66,7 +66,7 @@ pub async fn apply(conn: &PgConnection, manifest: &Manifest) -> Result<Outcome> 
 			warn!(
 				schema = %table.schema,
 				table = %table.table,
-				error = %e,
+				error = %pg_error(&e),
 				"table truncate failed, continuing"
 			);
 			outcome.tables_failed += 1;
@@ -112,11 +112,16 @@ pub async fn apply(conn: &PgConnection, manifest: &Manifest) -> Result<Outcome> 
 			quote_sql_literal(&fragment.render()),
 		);
 		if let Err(e) = conn.client.simple_query(&label).await {
+			// Log the rule as well as the error: this path is tolerated,
+			// so the log is all an operator gets to work out why a column
+			// they expected to be masked came through in the clear.
 			warn!(
 				schema = %mask.schema,
 				table = %mask.table,
 				column = %mask.column,
-				error = %e,
+				kind = %mask.kind,
+				rule = %fragment.render(),
+				error = %pg_error(&e),
 				"SECURITY LABEL failed, continuing"
 			);
 			outcome.columns_failed += 1;
@@ -134,7 +139,12 @@ pub async fn apply(conn: &PgConnection, manifest: &Manifest) -> Result<Outcome> 
 	conn.client
 		.simple_query("SELECT anon.anonymize_database()")
 		.await
-		.map_err(|e| Error::Redaction(format!("anon.anonymize_database() failed: {e}")))?;
+		.map_err(|e| {
+			Error::Redaction(format!(
+				"anon.anonymize_database() failed: {}",
+				pg_error(&e)
+			))
+		})?;
 
 	Ok(outcome)
 }
@@ -256,6 +266,24 @@ async fn lookup_column_infos(
 	}
 
 	Ok(out)
+}
+
+/// Render a postgres error with the message the server actually sent.
+/// `tokio_postgres::Error`'s own Display flattens every server-side
+/// failure to "db error", which is useless in the tolerated-failure
+/// paths where the log is the only diagnostic.
+fn pg_error(e: &tokio_postgres::Error) -> String {
+	let Some(db) = e.as_db_error() else {
+		return e.to_string();
+	};
+	let mut out = format!("{} ({})", db.message(), db.code().code());
+	if let Some(detail) = db.detail() {
+		out.push_str(&format!("; detail: {detail}"));
+	}
+	if let Some(hint) = db.hint() {
+		out.push_str(&format!("; hint: {hint}"));
+	}
+	out
 }
 
 /// Quote a string for inclusion as a SQL literal (single-quoted).
