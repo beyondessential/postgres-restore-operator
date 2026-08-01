@@ -1415,12 +1415,29 @@ postgres_single_or_resetwal() {{
 }}
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
+# One definition of "non-conforming", shared by the probe and the rewrite. If
+# the two drifted, the probe would report a rewrite that never happened, or
+# miss one that did.
+LOCALE_MISMATCH_WHERE="datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST')"
 if [ "$PG_MAJOR" -ge 13 ]; then
-  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
+  LOCALE_REWRITE="UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE $LOCALE_MISMATCH_WHERE;"
 else
-  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
+  LOCALE_REWRITE="UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE $LOCALE_MISMATCH_WHERE;"
 fi
-LOCALE_CHANGED=1
+# This is the only point at which "did the locale need rewriting?" is
+# answerable: afterwards every database conforms and the question reads false
+# forever. postgres --single reports no row count, so the count is taken as a
+# labelled SELECT in the same session, immediately before the rewrite.
+# Single-user mode ends a statement at the newline, not the semicolon, so the
+# two statements must be on separate lines.
+LOCALE_PROBE=$(postgres_single_or_resetwal "SELECT count(*) AS pgro_locale_mismatch FROM pg_database WHERE $LOCALE_MISMATCH_WHERE;
+$LOCALE_REWRITE")
+echo "$LOCALE_PROBE"
+if echo "$LOCALE_PROBE" | grep -q 'pgro_locale_mismatch = "[1-9]'; then
+  echo "Locale was rewritten, flagging for reindex before this replica serves traffic"
+  touch /pgdata/fix-locale
+  touch /pgdata/needs-reindex
+fi
 
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
@@ -1466,7 +1483,8 @@ COLLEOF
 done
 
 if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then
-  echo "Locale was changed, flagging for background reindex after startup"
+  echo "Locale was changed by the post-startup fallback, flagging for reindex"
+  touch /pgdata/fix-locale
   touch /pgdata/needs-reindex
 fi
 
@@ -1512,7 +1530,7 @@ fi
 # so adding a new fix is one shell line here plus recording its flag — no
 # schema change, no operator change (the operator forwards the map as-is).
 # Each fix is keyed by a flag file the fix step touches:
-#   locale  — the post-startup locale rewrite actually changed rows
+#   locale  — a locale rewrite actually changed rows
 #   reindex — REINDEX ran (after pg_resetwal, or a locale rewrite)
 #   reset_wal — pg_resetwal -f ran (snapshot's trailing WAL was unusable)
 #   recreated_pg_wal — an empty pg_wal was created (Windows-host snapshot)
@@ -1523,7 +1541,7 @@ else
   PGRO_STAGE=ready
   PGRO_REINDEX=false
 fi
-if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then PGRO_LOCALE=true; else PGRO_LOCALE=false; fi
+if [ -f /pgdata/fix-locale ]; then PGRO_LOCALE=true; else PGRO_LOCALE=false; fi
 if [ -f /pgdata/fix-reset-wal ]; then PGRO_RESET_WAL=true; else PGRO_RESET_WAL=false; fi
 if [ -f /pgdata/fix-recreated-pg-wal ]; then PGRO_RECREATED_WAL=true; else PGRO_RECREATED_WAL=false; fi
 PGRO_FIXES="{{\"locale\": ${{PGRO_LOCALE}}, \"reindex\": ${{PGRO_REINDEX}}, \"reset_wal\": ${{PGRO_RESET_WAL}}, \"recreated_pg_wal\": ${{PGRO_RECREATED_WAL}}}}"
