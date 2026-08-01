@@ -22,7 +22,7 @@ use kube::{
 use postgres_restore_operator::{
 	types::{
 		PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore,
-		PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
+		PostgresPhysicalRestoreSpec, RedactionSpec, ReplicaPhase, RestorePhase,
 	},
 	util::TimeSpan,
 };
@@ -122,6 +122,7 @@ pub struct ReplicaOpts {
 	pub schedule_jitter: Option<TimeSpan>,
 	pub read_only: bool,
 	pub ephemeral: bool,
+	pub redaction: Option<RedactionSpec>,
 }
 
 impl Default for ReplicaOpts {
@@ -132,6 +133,7 @@ impl Default for ReplicaOpts {
 			schedule_jitter: None,
 			read_only: true,
 			ephemeral: false,
+			redaction: None,
 		}
 	}
 }
@@ -167,6 +169,7 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 			postgres_extra_config: None,
 			notifications: vec![],
 			persistent_schemas: None,
+			redaction: opts.redaction,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	)

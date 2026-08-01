@@ -44,6 +44,9 @@ pub enum Error {
 	#[error("Database connection error: {0}")]
 	Postgres(#[from] tokio_postgres::Error),
 
+	#[error("Redaction error: {0}")]
+	Redaction(String),
+
 	#[error("Canopy error: {0}")]
 	Canopy(String),
 }

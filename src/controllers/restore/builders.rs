@@ -989,6 +989,46 @@ pub struct PostgresDeploymentInputs<'a> {
 	pub postgres_resources: Option<ResourceRequirements>,
 	pub affinity: Option<k8s_openapi::api::core::v1::Affinity>,
 	pub tolerations: Vec<k8s_openapi::api::core::v1::Toleration>,
+	/// True when the replica redacts its data after restore. Makes the
+	/// postgres container install `postgresql_anonymizer` before starting
+	/// the server (see [`anon_install_prelude`]).
+	pub redaction_enabled: bool,
+}
+
+/// Shell prelude that makes the `anon` extension available to the postgres
+/// server, run as root before the container drops back to UID 999.
+///
+/// `postgresql_anonymizer` isn't in the postgres image and there's no
+/// upstream image that carries it, so the container apt-installs it from
+/// Dalibo Labs on first start. The download is cached on the restore PVC so
+/// later starts of the same restore skip the network; the copy into the
+/// container's (fresh each start) writable layer is a sub-second file copy.
+fn anon_install_prelude(pg_version: &str) -> String {
+	format!(
+		r#"
+if [ ! -f /pgdata/.anon-cache/anon.so ] || [ ! -f /pgdata/.anon-cache/anon.control ]; then
+  echo "Installing postgresql_anonymizer_{pg_version} from Dalibo Labs..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
+  curl -fsSL https://apt.dalibo.org/labs/debian-dalibo.gpg \
+      -o /etc/apt/trusted.gpg.d/dalibo-labs.gpg
+  echo "deb http://apt.dalibo.org/labs $(lsb_release -cs)-dalibo main" \
+      > /etc/apt/sources.list.d/dalibo-labs.list
+  apt-get update
+  apt-get install -y --no-install-recommends "postgresql_anonymizer_{pg_version}"
+  mkdir -p /pgdata/.anon-cache
+  cp -a "/usr/share/postgresql/{pg_version}/extension/anon"* /pgdata/.anon-cache/
+  cp -a "/usr/lib/postgresql/{pg_version}/lib/anon.so"       /pgdata/.anon-cache/
+  chown -R 999:999 /pgdata/.anon-cache
+else
+  echo "anon already cached on the restore PVC, skipping install"
+fi
+
+cp -a /pgdata/.anon-cache/anon*   "/usr/share/postgresql/{pg_version}/extension/"
+cp -a /pgdata/.anon-cache/anon.so "/usr/lib/postgresql/{pg_version}/lib/"
+"#
+	)
 }
 
 /// CRD-path Deployment builder. Fills the shared `PostgresDeploymentInputs`
@@ -1023,8 +1063,12 @@ pub fn build_deployment(
 		.cloned()
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
-	// persistent_schemas needs write access to receive the migrated data
-	let effective_read_only = replica.spec.read_only && replica.spec.persistent_schemas.is_none();
+	// persistent_schemas and redaction both need write access during their
+	// post-restore step. Redaction re-enables `default_transaction_read_only`
+	// at the database level itself once it's done.
+	let effective_read_only = replica.spec.read_only
+		&& replica.spec.persistent_schemas.is_none()
+		&& replica.spec.redaction.is_none();
 
 	let labels = BTreeMap::from([
 		(
@@ -1056,6 +1100,7 @@ pub fn build_deployment(
 		postgres_resources,
 		affinity: replica.spec.affinity.clone(),
 		tolerations: replica.spec.tolerations.clone(),
+		redaction_enabled: replica.spec.redaction.is_some(),
 	})
 }
 
@@ -1222,10 +1267,12 @@ pub fn build_postgres_deployment_with(cfg: &PostgresDeploymentInputs<'_>) -> Res
 		postgres_resources,
 		affinity,
 		tolerations,
+		redaction_enabled,
 	} = cfg;
 	let shm_size = shm_size.clone();
 	let shared_buffers_mb = *shared_buffers_mb;
 	let read_only = *read_only;
+	let redaction_enabled = *redaction_enabled;
 
 	let pg_image = format!("postgres:{pg_version}");
 
@@ -1250,6 +1297,20 @@ echo "Copying locale data to shared volume..."
 cp -a /usr/lib/locale/* /locale-data/
 "#
 	.to_string();
+
+	// With redaction the container starts as root to install `anon`, then
+	// hands off to UID 999 via gosu; without it postgres is PID 1's child
+	// under the pod's own UID and no privilege drop is needed.
+	let anon_prelude = if redaction_enabled {
+		anon_install_prelude(pg_version)
+	} else {
+		String::new()
+	};
+	let postgres_exec_line = if redaction_enabled {
+		"exec gosu postgres postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}\n"
+	} else {
+		"exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}\n"
+	};
 
 	let extra_config_block = if let Some(extra) = postgres_extra_config {
 		format!(
@@ -1651,13 +1712,11 @@ echo "Auth setup complete"
 							image: Some(pg_image.clone()),
 							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 							args: Some(vec![locale_script]),
-							security_context: Some(
-								k8s_openapi::api::core::v1::SecurityContext {
-									run_as_user: Some(0),
-									run_as_group: Some(0),
-									..Default::default()
-								},
-							),
+							security_context: Some(k8s_openapi::api::core::v1::SecurityContext {
+								run_as_user: Some(0),
+								run_as_group: Some(0),
+								..Default::default()
+							}),
 							volume_mounts: Some(vec![VolumeMount {
 								name: "locale-data".to_string(),
 								mount_path: "/locale-data".to_string(),
@@ -1708,7 +1767,10 @@ echo "Auth setup complete"
 						name: "postgres".to_string(),
 						image: Some(pg_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![r#"
+						args: Some(vec![
+							[
+								anon_prelude.as_str(),
+								r#"
 if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
   PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
   (
@@ -1800,8 +1862,10 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
     echo "Background reindex complete"
   ) &
 fi
-exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}
-"#.to_string()]),
+"#,
+							postgres_exec_line,
+						]
+						.concat()]),
 						env: Some(vec![
 							EnvVar {
 								name: "PGDATA".to_string(),
@@ -1814,6 +1878,17 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 								..Default::default()
 							},
 						]),
+						security_context: redaction_enabled.then(|| {
+							// The anon prelude apt-installs the extension and
+							// copies it into /usr/{share,lib}/postgresql/$N/ —
+							// both root-only operations. The script drops back
+							// to UID 999 with gosu before exec'ing postgres.
+							k8s_openapi::api::core::v1::SecurityContext {
+								run_as_user: Some(0),
+								run_as_group: Some(0),
+								..Default::default()
+							}
+						}),
 						ports: Some(vec![ContainerPort {
 							name: Some("postgres".to_string()),
 							container_port: 5432,
@@ -1898,12 +1973,10 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 						},
 						Volume {
 							name: "dshm".to_string(),
-							empty_dir: Some(
-								k8s_openapi::api::core::v1::EmptyDirVolumeSource {
-										medium: Some("Memory".to_string()),
-										size_limit: Some(shm_size),
-									},
-							),
+							empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+								medium: Some("Memory".to_string()),
+								size_limit: Some(shm_size),
+							}),
 							..Default::default()
 						},
 					]),

@@ -47,6 +47,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			notifications: vec![],
 
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);
@@ -137,6 +138,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			notifications: vec![],
 
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);
@@ -1501,4 +1503,178 @@ fn deployment_shared_buffers_with_custom_resources() {
 		script.contains("shared_buffers = 516MB"),
 		"init script must set shared_buffers for 2Gi request"
 	);
+}
+
+#[test]
+fn deployment_with_redaction_runs_postgres_as_root_and_installs_anon() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must be present");
+
+	let sec = postgres
+		.security_context
+		.as_ref()
+		.expect("postgres container must override securityContext when redaction is set");
+	assert_eq!(sec.run_as_user, Some(0), "postgres must run as root");
+
+	let script = &postgres.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("postgresql_anonymizer_18"),
+		"prelude must apt-install the anon package for the restore's PG major, got: {script}"
+	);
+	assert!(
+		script.contains("/usr/lib/postgresql/18/lib"),
+		"prelude must stage anon.so into the PG-major lib dir, got: {script}"
+	);
+	assert!(
+		script.contains("exec gosu postgres postgres"),
+		"prelude must drop privileges via gosu before exec'ing postgres"
+	);
+}
+
+#[test]
+fn deployment_without_redaction_keeps_default_securitycontext() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.unwrap();
+	assert!(
+		postgres.security_context.is_none(),
+		"postgres container must inherit the pod-level UID 999 when redaction is off"
+	);
+	let script = &postgres.args.as_ref().unwrap()[0];
+	assert!(
+		!script.contains("postgresql_anonymizer"),
+		"the anon install prelude must not be emitted when redaction is off"
+	);
+	assert!(
+		script.contains("exec postgres -D /pgdata/pgdata"),
+		"postgres must be exec'd directly when there's no privilege to drop"
+	);
+}
+
+#[test]
+fn deployment_with_redaction_builds_for_pg16() {
+	// Redaction used to be gated to PG 18+ when we relied on the
+	// extension_control_path GUC. Now the postgres container's prelude
+	// drops the files into /usr/share/postgresql/$N/extension and
+	// /usr/lib/postgresql/$N/lib of its own writable layer, so any PG
+	// major works.
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica)
+		.expect("redaction should build on PG 16");
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.unwrap();
+	let script = &postgres.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("postgresql_anonymizer_16"),
+		"prelude must use the restore's PG major (16), got: {script}"
+	);
+}
+
+#[test]
+fn deployment_with_redaction_forces_writable() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	replica.spec.read_only = true;
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let script = deploy_init_setup_auth_script(&deploy);
+	// The init script uses `if [ "<read_only>" = "true" ]` and we want
+	// that variable substituted to "false" when redaction is set so the
+	// conditional doesn't fire at runtime.
+	assert!(
+		script.contains("if [ \"false\" = \"true\" ]"),
+		"redaction must defer read-only by substituting read_only=false into the init script"
+	);
+}
+
+fn deploy_init_setup_auth_script(deploy: &k8s_openapi::api::apps::v1::Deployment) -> String {
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let setup_auth = pod
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.unwrap();
+	setup_auth.args.as_ref().unwrap()[0].clone()
 }

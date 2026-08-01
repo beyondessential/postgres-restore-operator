@@ -56,6 +56,12 @@ jobs:
               test-ps-all-missing
             needs_non_pg_snapshot: false
 
+          - name: redaction
+            namespaces: >-
+              test-redaction
+            needs_non_pg_snapshot: false
+            needs_pg18_snapshot: true
+
           - name: ephemeral
             namespaces: >-
               test-ephemeral
@@ -176,6 +182,10 @@ jobs:
           load_image postgres:16-alpine
           load_image alpine:latest
 
+          if [ "${{ matrix.needs_pg18_snapshot }}" = "true" ]; then
+            load_image postgres:18
+          fi
+
       - name: Deploy MinIO
         run: |
           kubectl apply -f tests/fixtures/minio.yaml
@@ -212,6 +222,34 @@ jobs:
           echo "--- Setup job logs ---"
           kubectl logs job/setup-kopia-repo --all-containers --prefix
           echo "--- Kopia repository ready ---"
+
+      - name: Set up PG-18 kopia snapshot
+        if: matrix.needs_pg18_snapshot
+        run: |
+          kubectl apply -f tests/fixtures/setup-kopia-repo-pg18.yaml
+          for i in $(seq 1 60); do
+            STATUS=$(kubectl get job/setup-kopia-repo-pg18 -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)
+            FAILED=$(kubectl get job/setup-kopia-repo-pg18 -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+            if [ "$STATUS" = "True" ]; then
+              echo "PG-18 setup job completed successfully"
+              break
+            fi
+            if [ "$FAILED" = "True" ]; then
+              echo "PG-18 setup job failed!"
+              kubectl describe job/setup-kopia-repo-pg18
+              kubectl logs job/setup-kopia-repo-pg18 --all-containers --prefix
+              exit 1
+            fi
+            if [ "$i" = "60" ]; then
+              echo "PG-18 setup job timed out after 300s"
+              kubectl describe job/setup-kopia-repo-pg18
+              kubectl logs job/setup-kopia-repo-pg18 --all-containers --prefix 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "--- PG-18 setup job logs ---"
+          kubectl logs job/setup-kopia-repo-pg18 --all-containers --prefix
 
       - name: Set up non-postgres kopia snapshot
         if: matrix.needs_non_pg_snapshot
@@ -268,6 +306,34 @@ jobs:
           done
           echo "--- Locale snapshot job logs ---"
           kubectl logs job/setup-locale-snapshot --all-containers --prefix
+
+      # Host-side, not in-cluster: the operator is what fetches the
+      # redaction manifest, and it runs out-of-cluster here, so a
+      # Service DNS name would not resolve for it. Served under v1.0.0/
+      # to match the currentVersion the PG-18 snapshot fixture seeds,
+      # which is what the replica's versionQuery resolves.
+      - name: Serve the redaction manifest
+        if: matrix.needs_pg18_snapshot
+        run: |
+          mkdir -p /tmp/manifest-server/v1.0.0
+          cp tests/fixtures/redaction-manifest.json \
+            /tmp/manifest-server/v1.0.0/manifest.json
+          python3 -m http.server 8099 --bind 127.0.0.1 \
+            --directory /tmp/manifest-server > /tmp/manifest-server.log 2>&1 &
+          echo $! > /tmp/manifest-server.pid
+
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8099/v1.0.0/manifest.json > /dev/null; then
+              echo "Manifest server is ready"
+              break
+            fi
+            if [ "$i" = "30" ]; then
+              echo "Manifest server failed to become ready"
+              cat /tmp/manifest-server.log
+              exit 1
+            fi
+            sleep 1
+          done
 
       - name: Start operator (out-of-cluster)
         run: |
@@ -350,6 +416,9 @@ jobs:
         run: |
           if [ -f /tmp/operator.pid ]; then
             kill "$(cat /tmp/operator.pid)" 2>/dev/null || true
+          fi
+          if [ -f /tmp/manifest-server.pid ]; then
+            kill "$(cat /tmp/manifest-server.pid)" 2>/dev/null || true
           fi
 
   all-green:

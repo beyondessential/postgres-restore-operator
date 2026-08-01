@@ -1,0 +1,328 @@
+//! Mask types parsed out of a Tamanu/dbt manifest, and the registry that
+//! turns them into the SQL expressions the apply layer assigns each
+//! masked column.
+//!
+//! The canonical contract for `meta.masking` is documented at
+//! <https://github.com/beyondessential/tamanu/tree/main/database#masking>.
+
+use crate::controllers::postgres::quote_ident;
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ColumnMask {
+	pub schema: String,
+	pub table: String,
+	pub column: String,
+	pub kind: String,
+	pub range: Option<(f64, f64)>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TableMask {
+	pub schema: String,
+	pub table: String,
+	pub kind: String,
+}
+
+/// Resolved column metadata used by the type-dispatched kinds
+/// (`zero`, `empty`, `default`, `nil`).
+#[derive(Debug, Clone)]
+pub struct ColumnInfo {
+	pub data_type: String,
+	pub is_nullable: bool,
+	pub column_default: Option<String>,
+}
+
+/// Parse `"L-H"` (e.g. `"20-50"`, `"1.001-1.03"`) into a pair of `f64`s,
+/// splitting on the **last** `-` so floats decompose correctly. Returns
+/// `None` on parse failure.
+pub fn parse_range(s: &str) -> Option<(f64, f64)> {
+	let (lo, hi) = s.rsplit_once('-')?;
+	let lo: f64 = lo.parse().ok()?;
+	let hi: f64 = hi.parse().ok()?;
+	Some((lo, hi))
+}
+
+/// Build the SQL expression a column mask assigns, i.e. the right-hand
+/// side of `SET <column> = <this>`.
+///
+/// `info` is only consulted for kinds that need column-type knowledge
+/// (`zero`, `empty`, `default`, `nil`); for other kinds it can be `None`
+/// (used by unit tests).
+///
+/// Returns `Err` with a short diagnostic when the kind is unsupported or
+/// when type-dependent kinds are missing required `info`.
+pub fn mask_expression(mask: &ColumnMask, info: Option<&ColumnInfo>) -> Result<String, String> {
+	let col = quote_ident(&mask.column);
+
+	match mask.kind.as_str() {
+		"date" => Ok(null_pres(&col, "anon.random_date()".into())),
+
+		"datetime" => Ok(null_pres(
+			&col,
+			format!("date_trunc('day', {col}) + (floor(random() * 86400) || ' seconds')::interval"),
+		)),
+
+		"text" => Ok(null_pres(
+			&col,
+			format!("anon.lorem_ipsum(characters := length({col}))"),
+		)),
+
+		"string" => Ok(null_pres(
+			&col,
+			format!("anon.random_string(length({col}))"),
+		)),
+
+		"email" => Ok(null_pres(&col, "anon.fake_email()".into())),
+
+		"name" => Ok(null_pres(
+			&col,
+			format!(
+				"CASE WHEN {col} LIKE '% %' \
+				 THEN anon.fake_first_name() || ' ' || anon.fake_last_name() \
+				 ELSE anon.fake_first_name() END"
+			),
+		)),
+
+		"phone" => Ok(null_pres(
+			&col,
+			format!("anon.partial({col}, 2, '****', 2)"),
+		)),
+
+		"place" => Ok(null_pres(&col, "anon.fake_city()".into())),
+
+		"url" => Ok(null_pres(
+			&col,
+			"'https://example.invalid/' || anon.random_string(8)".into(),
+		)),
+
+		"integer" => {
+			let (lo, hi) = mask.range.unwrap_or((i32::MIN as f64, i32::MAX as f64));
+			Ok(null_pres(
+				&col,
+				format!("(floor(random() * ({hi} - {lo} + 1)) + {lo})::int"),
+			))
+		}
+
+		"float" => {
+			let (lo, hi) = mask.range.unwrap_or((0.0, 1.0));
+			Ok(null_pres(
+				&col,
+				format!("(random() * ({hi} - {lo}) + {lo})::numeric"),
+			))
+		}
+
+		"money" => {
+			let (lo, hi) = mask.range.unwrap_or((0.0, 10_000.0));
+			Ok(null_pres(
+				&col,
+				format!("round((random() * ({hi} - {lo}) + {lo})::numeric, 2)"),
+			))
+		}
+
+		"zero" => {
+			let info = info.ok_or_else(|| "zero mask needs column type".to_string())?;
+			match data_type_family(&info.data_type) {
+				// There's no repeat() for bytea, so build the hex string
+				// and decode it back to length({col}) zero bytes.
+				DataTypeFamily::Bytea => Ok(format!("decode(repeat('00', length({col})), 'hex')")),
+				DataTypeFamily::Text => Ok(format!("repeat('0', length({col}))")),
+				DataTypeFamily::Numeric => Ok("0".into()),
+				DataTypeFamily::Other => {
+					Err(format!("zero mask unsupported for type {}", info.data_type))
+				}
+			}
+		}
+
+		"empty" => {
+			let info = info.ok_or_else(|| "empty mask needs column type".to_string())?;
+			match data_type_family(&info.data_type) {
+				DataTypeFamily::Numeric => Ok("0".into()),
+				DataTypeFamily::Text => Ok("''".into()),
+				DataTypeFamily::Bytea => Ok("E'\\\\x'::bytea".into()),
+				DataTypeFamily::Other => match info.data_type.as_str() {
+					"json" | "jsonb" => Ok(format!("'{{}}'::{}", info.data_type)),
+					"ARRAY" => Ok("'{}'".into()),
+					_ => Err(format!(
+						"empty mask unsupported for type {}",
+						info.data_type
+					)),
+				},
+			}
+		}
+
+		"nil" => {
+			let info = info.ok_or_else(|| "nil mask needs column type".to_string())?;
+			if !info.is_nullable {
+				return Err("nil mask on non-nullable column".into());
+			}
+			Ok("NULL".into())
+		}
+
+		"default" => {
+			let info = info.ok_or_else(|| "default mask needs column type".to_string())?;
+			match info.column_default.as_deref() {
+				Some(d) => Ok(d.into()),
+				None => Err("default mask on column without default".into()),
+			}
+		}
+
+		other => Err(format!("unknown mask kind: {other}")),
+	}
+}
+
+/// Wrap an expression in a null-preserving CASE.
+fn null_pres(col: &str, expr: String) -> String {
+	format!("CASE WHEN {col} IS NULL THEN NULL ELSE {expr} END")
+}
+
+enum DataTypeFamily {
+	Numeric,
+	Text,
+	Bytea,
+	Other,
+}
+
+/// Group `information_schema.columns.data_type` strings into the families
+/// that determine how `zero`/`empty` are realised.
+fn data_type_family(s: &str) -> DataTypeFamily {
+	match s {
+		"smallint" | "integer" | "bigint" | "real" | "double precision" | "numeric" | "decimal" => {
+			DataTypeFamily::Numeric
+		}
+		"character varying" | "character" | "text" | "citext" => DataTypeFamily::Text,
+		"bytea" => DataTypeFamily::Bytea,
+		_ => DataTypeFamily::Other,
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn cm(kind: &str, range: Option<(f64, f64)>) -> ColumnMask {
+		ColumnMask {
+			schema: "public".into(),
+			table: "t".into(),
+			column: "c".into(),
+			kind: kind.into(),
+			range,
+		}
+	}
+
+	fn info(data_type: &str, nullable: bool, default: Option<&str>) -> ColumnInfo {
+		ColumnInfo {
+			data_type: data_type.into(),
+			is_nullable: nullable,
+			column_default: default.map(str::to_string),
+		}
+	}
+
+	#[test]
+	fn range_splits_on_last_dash_for_floats() {
+		assert_eq!(parse_range("1.001-1.03"), Some((1.001, 1.03)));
+		assert_eq!(parse_range("20-50"), Some((20.0, 50.0)));
+		assert_eq!(parse_range("0-10.5"), Some((0.0, 10.5)));
+	}
+
+	#[test]
+	fn range_handles_negative_lo() {
+		assert_eq!(parse_range("-5-5"), Some((-5.0, 5.0)));
+	}
+
+	#[test]
+	fn range_returns_none_on_garbage() {
+		assert!(parse_range("nope").is_none());
+		assert!(parse_range("1-x").is_none());
+		assert!(parse_range("1.2").is_none());
+	}
+
+	#[test]
+	fn email_is_null_preserving() {
+		let e = mask_expression(&cm("email", None), None).unwrap();
+		assert_eq!(
+			e,
+			r#"CASE WHEN "c" IS NULL THEN NULL ELSE anon.fake_email() END"#
+		);
+	}
+
+	#[test]
+	fn name_composes_first_and_last_when_the_original_has_a_space() {
+		let e = mask_expression(&cm("name", None), None).unwrap();
+		assert!(e.contains("LIKE '% %'"));
+		// anon doesn't ship fake_name(); compose first + last for the
+		// with-space branch.
+		assert!(e.contains("fake_first_name() || ' ' || anon.fake_last_name()"));
+		assert!(e.contains("ELSE anon.fake_first_name()"));
+	}
+
+	#[test]
+	fn integer_uses_range() {
+		let e = mask_expression(&cm("integer", Some((20.0, 50.0))), None).unwrap();
+		assert!(e.contains("50 - 20"));
+		assert!(e.contains("::int"));
+	}
+
+	#[test]
+	fn money_rounds_to_two_decimals() {
+		let e = mask_expression(&cm("money", Some((0.0, 100.0))), None).unwrap();
+		assert!(e.contains("round("));
+	}
+
+	/// Postgres has no `repeat(bytea, int)`, so the bytea case has to go
+	/// the long way round.
+	#[test]
+	fn zero_for_bytea_decodes_a_hex_run() {
+		let e = mask_expression(&cm("zero", None), Some(&info("bytea", true, None))).unwrap();
+		assert_eq!(e, r#"decode(repeat('00', length("c")), 'hex')"#);
+	}
+
+	#[test]
+	fn zero_for_text_repeats_digit() {
+		let e = mask_expression(&cm("zero", None), Some(&info("text", true, None))).unwrap();
+		assert!(e.contains("repeat('0',"));
+	}
+
+	#[test]
+	fn zero_for_numeric_is_plain_zero() {
+		let e = mask_expression(&cm("zero", None), Some(&info("integer", true, None))).unwrap();
+		assert_eq!(e, "0");
+	}
+
+	#[test]
+	fn empty_dispatches_on_type() {
+		for (data_type, expected) in [("integer", "0"), ("text", "''"), ("jsonb", "'{}'::jsonb")] {
+			assert_eq!(
+				mask_expression(&cm("empty", None), Some(&info(data_type, true, None))).unwrap(),
+				expected,
+				"empty mask for {data_type}"
+			);
+		}
+	}
+
+	#[test]
+	fn nil_requires_nullable() {
+		assert!(mask_expression(&cm("nil", None), Some(&info("text", false, None))).is_err());
+		assert_eq!(
+			mask_expression(&cm("nil", None), Some(&info("text", true, None))).unwrap(),
+			"NULL"
+		);
+	}
+
+	#[test]
+	fn default_requires_default_expression() {
+		assert!(mask_expression(&cm("default", None), Some(&info("text", true, None))).is_err());
+		assert_eq!(
+			mask_expression(
+				&cm("default", None),
+				Some(&info("text", true, Some("'hello'::text"))),
+			)
+			.unwrap(),
+			"'hello'::text"
+		);
+	}
+
+	#[test]
+	fn unknown_kind_errors() {
+		assert!(mask_expression(&cm("brand_new_kind", None), None).is_err());
+	}
+}
