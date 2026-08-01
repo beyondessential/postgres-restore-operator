@@ -488,15 +488,14 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		// automatically.
 		let migration_complete = persistent_schemas_migration_settled(&replica);
 
-		let redaction_settled = if replica.spec.redaction.is_some() {
-			let phase = replica
-				.status
-				.as_ref()
-				.and_then(|s| s.redaction_phase.as_deref());
-			matches!(phase, None | Some("complete") | Some("partial"))
-		} else {
-			true
-		};
+		// Same gate as the migration one above, for the same reason: the
+		// only state that makes sweeping unsafe is a redaction currently
+		// running against a restore we might delete.
+		let redaction_settled = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.redaction_phase.as_ref())
+			.is_none_or(RedactionPhase::is_settled);
 
 		let grace_period =
 			SignedDuration::try_from(replica.spec.switchover_grace_period.0).unwrap_or_default();

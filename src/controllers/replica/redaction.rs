@@ -2,12 +2,15 @@
 //! a freshly-restored Postgres database using the `postgresql_anonymizer`
 //! extension.
 //!
-//! See `docs/plans/replica-redaction.md` for the full design.
+//! The manifest contract is documented at
+//! <https://github.com/beyondessential/tamanu/tree/main/database#masking>;
+//! the operator-facing behaviour is in the README under `RedactionSpec`.
 
 use k8s_openapi::api::core::v1::Secret;
 use kube::{
-	Api, ResourceExt as _,
+	Api, Resource as _, ResourceExt as _,
 	api::{Patch, PatchParams},
+	runtime::events::{Event, EventType},
 };
 use tracing::{debug, info, warn};
 
@@ -16,7 +19,9 @@ use crate::controllers::postgres::{
 	self, PgConnection, discover_restore_database, read_secret_field,
 };
 use crate::error::{Error, Result};
-use crate::types::{PostgresPhysicalReplica, PostgresPhysicalRestore, RedactionSpec};
+use crate::types::{
+	PostgresPhysicalReplica, PostgresPhysicalRestore, RedactionPhase, RedactionSpec,
+};
 
 use self::manifest::{Manifest, base_version, parse_manifest};
 
@@ -28,12 +33,19 @@ pub mod mask;
 
 const VERSION_PLACEHOLDER: &str = "{version}";
 
-/// Reconciler entry point: runs redaction against `switching` if the
-/// replica has a redaction spec and the current `redactionPhase` is not
-/// already `complete` / `partial` / `failed: …`. Returns `true` when the
-/// redaction is settled (complete, partial, or failed — anything that
-/// won't change on the next reconcile), `false` when more work is
-/// pending and the controller should requeue.
+/// Reconciler entry point: runs redaction against `switching` unless it
+/// has already finished for this restore. Returns `true` when the
+/// switchover may proceed (`complete` / `partial`), `false` while
+/// redaction is unhealthy — a replica whose redaction hasn't run must
+/// never be switched live.
+///
+/// A failed run is recorded as `failed: <reason>` and retried on the next
+/// reconcile: the common failures (manifest host unreachable, connection
+/// dropped mid-apply) are transient, and the individual steps are
+/// idempotent. A manifest that's broken for good therefore keeps the
+/// replica on its previous restore indefinitely, which is the intended
+/// trade — stale data beats unredacted data — and is surfaced as a
+/// `RedactionFailed` Warning event each time.
 pub async fn reconcile_redaction_step(
 	ctx: &Context,
 	replica: &PostgresPhysicalReplica,
@@ -44,36 +56,28 @@ pub async fn reconcile_redaction_step(
 	let phase = replica
 		.status
 		.as_ref()
-		.and_then(|s| s.redaction_phase.as_deref());
+		.and_then(|s| s.redaction_phase.as_ref());
 
-	match phase {
-		Some("complete") | Some("partial") => return Ok(true),
-		// `failed: …` is sticky: don't auto-retry. The user clears the
-		// phase by triggering a new restore (the sweep resets it) or
-		// editing status manually. Treat it as settled so the
-		// switchover branch can run if the operator decides to proceed
-		// without redaction — but `false` here means "redaction is not
-		// healthy, do not let the switchover proceed".
-		Some(p) if p.starts_with("failed:") => return Ok(false),
-		_ => {}
+	if phase.is_some_and(RedactionPhase::is_done) {
+		return Ok(true);
 	}
 
-	if phase != Some("active") {
-		patch_phase_only(ctx, &replica_name, &namespace, "active").await?;
+	if phase != Some(&RedactionPhase::Active) {
+		patch_phase(ctx, &replica_name, &namespace, &RedactionPhase::Active).await?;
 	}
 
 	let switching_name = switching.name_any();
 	match reconcile_redaction(ctx, replica, &switching_name).await {
 		Ok((version, outcome)) => {
 			let phase = if outcome.is_partial() {
-				"partial"
+				RedactionPhase::Partial
 			} else {
-				"complete"
+				RedactionPhase::Complete
 			};
 			info!(
 				replica = %replica_name,
 				restore = %switching_name,
-				phase,
+				%phase,
 				columns_attempted = outcome.columns_attempted,
 				columns_failed = outcome.columns_failed,
 				tables_attempted = outcome.tables_attempted,
@@ -84,7 +88,7 @@ pub async fn reconcile_redaction_step(
 				ctx,
 				&replica_name,
 				&namespace,
-				phase,
+				&phase,
 				version.as_deref(),
 				outcome.columns_attempted,
 			)
@@ -92,19 +96,42 @@ pub async fn reconcile_redaction_step(
 			Ok(true)
 		}
 		Err(e) => {
-			let msg = format!("failed: {e}");
-			warn!(replica = %replica_name, error = %e, "redaction failed");
-			patch_phase_only(ctx, &replica_name, &namespace, &msg).await?;
+			warn!(replica = %replica_name, error = %e, "redaction failed, holding the switchover");
+			patch_phase(
+				ctx,
+				&replica_name,
+				&namespace,
+				&RedactionPhase::Failed(e.to_string()),
+			)
+			.await?;
+			if let Err(e) = ctx
+				.recorder
+				.publish(
+					&Event {
+						type_: EventType::Warning,
+						reason: "RedactionFailed".into(),
+						note: Some(format!(
+							"redaction of {switching_name} failed, switchover held: {e}"
+						)),
+						action: "Redact".into(),
+						secondary: Some(switching.object_ref(&())),
+					},
+					&replica.object_ref(&()),
+				)
+				.await
+			{
+				warn!(replica = %replica_name, error = %e, "failed to publish RedactionFailed event");
+			}
 			Ok(false)
 		}
 	}
 }
 
-async fn patch_phase_only(
+async fn patch_phase(
 	ctx: &Context,
 	replica_name: &str,
 	namespace: &str,
-	phase: &str,
+	phase: &RedactionPhase,
 ) -> Result<()> {
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
 	let patch = serde_json::json!({ "status": { "redactionPhase": phase } });
@@ -122,7 +149,7 @@ async fn patch_settled(
 	ctx: &Context,
 	replica_name: &str,
 	namespace: &str,
-	phase: &str,
+	phase: &RedactionPhase,
 	version: Option<&str>,
 	columns_applied: u32,
 ) -> Result<()> {
@@ -212,7 +239,7 @@ pub async fn reconcile_redaction(
 
 	let outcome = apply::apply(&conn, &manifest).await?;
 
-	if replica.spec.read_only {
+	if should_enforce_read_only(replica) {
 		debug!(
 			replica = %replica.name_any(),
 			"re-enabling read-only on redacted database"
@@ -221,6 +248,19 @@ pub async fn reconcile_redaction(
 	}
 
 	Ok((version, outcome))
+}
+
+/// Whether redaction is the step that puts the restore back into
+/// read-only mode.
+///
+/// Redaction forces the restore up writable (see `effective_read_only` in
+/// the Deployment builder), so it owns putting read-only back — but only
+/// when nothing downstream still needs to write. A persistent_schemas
+/// migration runs after this step and loads the dbt schema into this same
+/// database as this same role, so those replicas stay writable exactly as
+/// they do without redaction.
+fn should_enforce_read_only(replica: &PostgresPhysicalReplica) -> bool {
+	replica.spec.read_only && replica.spec.persistent_schemas.is_none()
 }
 
 fn validate_spec(spec: &RedactionSpec) -> Result<()> {
@@ -373,5 +413,39 @@ mod tests {
 	fn resolve_url_passes_through_when_no_version() {
 		let s = spec("https://x/m.json", None, None);
 		assert_eq!(resolve_url(&s, None).unwrap(), "https://x/m.json");
+	}
+
+	fn replica_with(
+		read_only: bool,
+		persistent_schemas: Option<&[&str]>,
+	) -> PostgresPhysicalReplica {
+		let spec = serde_json::json!({
+			"schedule": "0 */6 * * *",
+			"readOnly": read_only,
+			"persistentSchemas": persistent_schemas,
+			"redaction": { "manifestUrl": "https://x/m.json" },
+		});
+		PostgresPhysicalReplica::new("r", serde_json::from_value(spec).expect("spec"))
+	}
+
+	#[test]
+	fn read_only_is_re_enabled_for_a_plain_redacted_replica() {
+		assert!(should_enforce_read_only(&replica_with(true, None)));
+	}
+
+	#[test]
+	fn read_only_is_left_alone_when_the_replica_is_writable() {
+		assert!(!should_enforce_read_only(&replica_with(false, None)));
+	}
+
+	/// The persistent_schemas migration runs after redaction and writes to
+	/// this same database as this same role; locking it down here would
+	/// break it.
+	#[test]
+	fn read_only_is_deferred_when_persistent_schemas_follow() {
+		assert!(!should_enforce_read_only(&replica_with(
+			true,
+			Some(&["dbt"])
+		)));
 	}
 }

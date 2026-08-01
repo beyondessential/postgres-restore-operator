@@ -13,7 +13,8 @@ use kube::{
 	api::{ObjectMeta, PostParams},
 };
 use postgres_restore_operator::types::{
-	PostgresPhysicalReplica, PostgresPhysicalRestore, RedactionSpec, ReplicaPhase, RestorePhase,
+	PostgresPhysicalReplica, PostgresPhysicalRestore, RedactionPhase, RedactionSpec, ReplicaPhase,
+	RestorePhase,
 };
 
 use helpers::*;
@@ -75,9 +76,9 @@ async fn redaction_applies_masks_to_restored_data() {
 	// the restore wouldn't transition Switching -> Active otherwise).
 	let final_replica = replicas.get(REPLICA_NAME).await.unwrap();
 	let status = final_replica.status.as_ref().expect("status set");
-	let phase = status.redaction_phase.as_deref();
+	let phase = status.redaction_phase.as_ref();
 	assert!(
-		matches!(phase, Some("complete") | Some("partial")),
+		phase.is_some_and(RedactionPhase::is_done),
 		"redactionPhase should be complete or partial, got {phase:?}"
 	);
 	let version = status.redaction_version.as_deref();

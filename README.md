@@ -167,7 +167,8 @@ Notes:
 - Works on any PostgreSQL major the operator otherwise supports. There's no PG-version gate because the prelude apt-installs `postgresql_anonymizer_$N` from [Dalibo Labs](https://apt.dalibo.org/labs/) per the running restore's PG version and copies the files into the standard system extension dirs (`/usr/share/postgresql/$N/extension`, `/usr/lib/postgresql/$N/lib`).
 - The download is cached on the restore PVC at `/pgdata/.anon-cache/`, so a pod restart doesn't re-fetch the package — it just re-copies the cached files into the (fresh) container writable layer.
 - The postgres container runs as root for the prelude (to apt-install and write to system paths) then drops back to UID 999 via `gosu` before exec'ing `postgres`. `gosu` is preinstalled in the official `postgres` image.
-- During redaction the database is writable; once anonymisation completes, the operator sets `default_transaction_read_only = on` at the database level and demotes the analytics user back to non-superuser when `spec.readOnly` is true.
+- During redaction the database is writable; once anonymisation completes, the operator sets `default_transaction_read_only = on` at the database level and demotes the analytics user back to non-superuser when `spec.readOnly` is true. Replicas that also set `persistentSchemas` stay writable, because the schema migration runs after redaction and writes to the same database — matching what those replicas do without redaction.
+- If a redaction run fails, the switchover is held: the replica keeps serving its previous restore, a `RedactionFailed` Warning event is recorded, and the next reconcile retries. An unredacted restore is never made live.
 
 #### SnapshotFilter
 
@@ -222,7 +223,7 @@ Additional fields for `target: graphQL`:
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
 | `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, `partial`, `timeout-skipped`, or `failed: <reason>`). See [Persistent schemas](#persistent-schemas). |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
-| `redactionPhase` | `string` | Phase of the current restore's redaction (`active`, `complete`, `partial`, or `failed: <reason>`). `partial` means anonymisation ran but some per-column SECURITY LABEL statements were tolerated as errors (e.g. column missing on this DB version). `failed:` is sticky — it doesn't auto-retry; the next scheduled restore clears it. |
+| `redactionPhase` | `string` | Phase of the current restore's redaction (`active`, `complete`, `partial`, or `failed: <reason>`). `partial` means anonymisation ran but some per-column SECURITY LABEL statements were tolerated as errors (e.g. column missing on this DB version). `failed:` holds the switchover — the replica keeps serving its previous restore rather than an unredacted one — and the next reconcile retries. |
 | `redactionVersion` | `string` | The manifest version resolved during the last redaction run (when `manifestUrl` is version-templated). |
 | `redactionColumnsApplied` | `uint32` | Number of columns the last redaction run attempted to mask. |
 | `consecutiveRestoreFailures` | `uint32` | Number of consecutive restore failures. Reset to 0 on success. After 3 consecutive failures the operator stops scheduling new restores until the counter is reset (automatically on next successful restore, or manually via `kubectl patch --subresource=status`). |

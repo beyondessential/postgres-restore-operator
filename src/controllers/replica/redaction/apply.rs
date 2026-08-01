@@ -141,9 +141,17 @@ pub async fn apply(conn: &PgConnection, manifest: &Manifest) -> Result<Outcome> 
 
 /// Lock the freshly-redacted database back to read-only by:
 /// - setting the DB-level `default_transaction_read_only` GUC, and
-/// - demoting the analytics user back to NOSUPERUSER + granting
-///   `pg_read_all_data` (matching the role posture the restore init
+/// - granting `pg_read_all_data` to the analytics user and demoting it
+///   back to NOSUPERUSER (matching the role posture the restore init
 ///   script applies when `effective_read_only` is true).
+///
+/// This connection *is* the analytics user — redaction needs the
+/// superuser it holds while the restore is writable — so the grant has to
+/// land before the demotion. `pg_read_all_data` has no admin option
+/// outside superuser, and postgres re-reads the session's superuser bit
+/// from the catalog on the very next statement, so demoting first makes
+/// the grant fail with "must have admin option on role pg_read_all_data"
+/// and leaves the replica with no read access at all.
 pub async fn enforce_read_only(
 	conn: &PgConnection,
 	dbname: &str,
@@ -158,15 +166,6 @@ pub async fn enforce_read_only(
 		.await
 		.map_err(|e| Error::Redaction(format!("ALTER DATABASE for read-only failed: {e}")))?;
 
-	let demote = format!(
-		"ALTER ROLE {user} WITH NOSUPERUSER",
-		user = quote_ident(analytics_user),
-	);
-	conn.client
-		.simple_query(&demote)
-		.await
-		.map_err(|e| Error::Redaction(format!("demoting analytics user failed: {e}")))?;
-
 	let grant = format!(
 		"GRANT pg_read_all_data TO {user}",
 		user = quote_ident(analytics_user),
@@ -175,6 +174,15 @@ pub async fn enforce_read_only(
 		.simple_query(&grant)
 		.await
 		.map_err(|e| Error::Redaction(format!("granting pg_read_all_data failed: {e}")))?;
+
+	let demote = format!(
+		"ALTER ROLE {user} WITH NOSUPERUSER",
+		user = quote_ident(analytics_user),
+	);
+	conn.client
+		.simple_query(&demote)
+		.await
+		.map_err(|e| Error::Redaction(format!("demoting analytics user failed: {e}")))?;
 
 	Ok(())
 }
