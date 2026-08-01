@@ -1713,7 +1713,12 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
   PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
   (
     while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
-    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
+    # A read-only replica runs with default_transaction_read_only = on, which
+    # rejects this bookkeeping ("cannot execute UPDATE in a read-only
+    # transaction") and leaves the stage stuck wherever the init container
+    # left it. Ask for a writable session per connection; the setting stays
+    # on for everyone else.
+    PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
     # needs-reindex-all (pg_resetwal aftermath) can leave torn pages in
     # ANY index, not just collation-dependent ones. We tried a "smart
     # pass" using the amcheck contrib extension (scan each btree, queue
@@ -1762,11 +1767,18 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
       rm -f /pgdata/needs-reindex
     elif [ -f /pgdata/needs-reindex ]; then
       for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+        # Only the database default collation (OID 100) is what the locale
+        # rewrite changed, so only indexes ordered by it are invalidated.
+        # `attcollation <> 0` also matches catalog indexes over `name`
+        # columns, which carry the C collation (950) and are unaffected —
+        # and REINDEX INDEX CONCURRENTLY cannot touch a system catalog, so
+        # including them produced dozens of swallowed errors per database
+        # that read like progress.
         INDEXES=$(psql -U postgres -d "$db" -At -c "
           SELECT DISTINCT indexrelid::regclass::text
           FROM pg_index i
           JOIN pg_attribute a ON a.attrelid = i.indexrelid
-          WHERE a.attcollation <> 0 AND i.indisvalid;
+          WHERE a.attcollation = 100 AND i.indisvalid;
         ")
         COUNT=$(echo "$INDEXES" | grep -c . || true)
         echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
@@ -1784,7 +1796,7 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
       done
       rm -f /pgdata/needs-reindex
     fi
-    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
+    PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
     echo "Background reindex complete"
   ) &
 fi

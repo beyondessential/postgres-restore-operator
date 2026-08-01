@@ -181,6 +181,28 @@ fn setup_auth_script() -> String {
 	setup_auth.args.unwrap().remove(0)
 }
 
+/// The `postgres` container's inline script, which carries the background
+/// reindex hook and its stage bookkeeping.
+fn postgres_container_script() -> String {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let postgres = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.containers
+		.into_iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	postgres.args.unwrap().remove(0)
+}
+
 /// Memory in bytes. Compared numerically because the derived value is ceiled
 /// to whole Mi, so `2Gi` legitimately comes back as `2048Mi`.
 fn mem(r: &ResourceRequirements, which: &str) -> u64 {
@@ -1398,6 +1420,52 @@ fn postgres_container_updates_stage_around_reindex() {
 	assert!(
 		script[..ready_pos].contains("rm -f /pgdata/needs-reindex"),
 		"ready update must happen after the needs-reindex flag is cleared"
+	);
+}
+
+#[test]
+fn postgres_container_stage_updates_override_read_only() {
+	// A read-only replica runs with default_transaction_read_only = on, which
+	// rejects the stage bookkeeping the reindex hook does about itself:
+	//   ERROR: cannot execute UPDATE in a read-only transaction
+	// The stage then sticks at whatever the init container wrote and never
+	// reaches 'ready', so `_pgro.restore_info` misreports a finished reindex as
+	// still pending. Each stage update must ask for a writable session.
+	let script = postgres_container_script();
+
+	let stage_updates = script
+		.matches("UPDATE _pgro.restore_info SET stage")
+		.count();
+	let overrides = script
+		.matches("PGOPTIONS='-c default_transaction_read_only=off'")
+		.count();
+	assert!(
+		stage_updates >= 2,
+		"expected the reindexing and ready stage updates; got {stage_updates}"
+	);
+	assert_eq!(
+		overrides, stage_updates,
+		"every stage update must run with default_transaction_read_only=off (got {overrides} overrides for {stage_updates} updates)"
+	);
+}
+
+#[test]
+fn locale_reindex_targets_only_default_collation_indexes() {
+	// A datcollate rewrite only invalidates indexes ordered by the database
+	// default collation (OID 100). Catalog indexes over `name` columns carry
+	// the C collation (950) and are unaffected — and REINDEX INDEX
+	// CONCURRENTLY cannot touch a system catalog at all, so selecting them
+	// yields dozens of swallowed "cannot reindex system catalogs
+	// concurrently" errors that look like work being done.
+	let script = postgres_container_script();
+
+	assert!(
+		script.contains("a.attcollation = 100"),
+		"the locale reindex must select only indexes ordered by the default collation"
+	);
+	assert!(
+		!script.contains("a.attcollation <> 0"),
+		"selecting every collation-bearing attribute pulls in system catalogs that cannot be reindexed concurrently"
 	);
 }
 
