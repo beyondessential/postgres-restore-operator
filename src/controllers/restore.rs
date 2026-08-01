@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
-use jiff::{SignedDuration, Timestamp};
+use jiff::Timestamp;
 use k8s_openapi::{
 	api::{
 		apps::v1::Deployment,
@@ -24,12 +24,12 @@ use tracing::{debug, info, warn};
 
 use super::read_job_termination_message;
 use crate::{
-	context::Context,
+	context::{Context, ReplicaKey},
 	error::{Error, Result},
 	types::*,
 };
 
-mod builders;
+pub mod builders;
 
 pub(crate) use builders::{build_credential_reset_job, credential_reset_job_name};
 
@@ -140,20 +140,105 @@ async fn ensure_kopia_cache_pvc(
 	Ok(())
 }
 
+/// Bump the kopia cache PVC's requested storage by
+/// [`builders::KOPIA_CACHE_PRESSURE_GROWTH_FACTOR`] in response to a
+/// `PGRO_CACHE_PRESSURE` HTTP callback from a restore Job. Best-effort:
+/// any failure to look up the restore or patch the PVC is logged but
+/// doesn't escalate, since the callback itself isn't the source of truth
+/// (the next pressure event will re-fire).
+pub async fn grow_cache_pvc_after_pressure(client: &Client, namespace: &str, restore_name: &str) {
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
+	let Ok(restore) = restores.get(restore_name).await else {
+		warn!(
+			restore = restore_name,
+			"cannot grow cache PVC after pressure: restore not found"
+		);
+		return;
+	};
+	let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client.clone(), namespace);
+	let cache_pvc_name = builders::kopia_cache_pvc_name(&restore.spec.replica.name);
+	let Ok(Some(existing)) = pvcs.get_opt(&cache_pvc_name).await else {
+		warn!(
+			pvc = cache_pvc_name,
+			"cannot grow cache PVC after pressure: PVC not found"
+		);
+		return;
+	};
+	let Some(current) = existing
+		.spec
+		.as_ref()
+		.and_then(|s| s.resources.as_ref())
+		.and_then(|r| r.requests.as_ref())
+		.and_then(|reqs| reqs.get("storage"))
+		.cloned()
+	else {
+		warn!(
+			pvc = cache_pvc_name,
+			"cannot grow cache PVC after pressure: no storage request set"
+		);
+		return;
+	};
+	let next = builders::next_cache_pvc_size_after_pressure(&current, &restore.spec.snapshot_size);
+	if !builders::cache_size_needs_grow(&current, &next) {
+		info!(
+			pvc = cache_pvc_name,
+			current = current.0,
+			"cache PVC already at growth cap; not growing further despite pressure"
+		);
+		return;
+	}
+	info!(
+		pvc = cache_pvc_name,
+		current = current.0,
+		next = next.0,
+		"PGRO_CACHE_PRESSURE observed; growing cache PVC"
+	);
+	let patch = serde_json::json!({
+		"spec": {
+			"resources": {
+				"requests": {
+					"storage": next,
+				}
+			}
+		}
+	});
+	if let Err(e) = pvcs
+		.patch(
+			&cache_pvc_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await
+	{
+		warn!(
+			pvc = cache_pvc_name,
+			error = %e,
+			"failed to grow cache PVC after pressure (storage class may not support volume expansion)"
+		);
+	}
+}
+
 async fn fail_restore(
 	ctx: &Context,
 	namespace: &str,
 	name: &str,
 	replica_name: &str,
 	status_patch: serde_json::Value,
+	error: &str,
 ) -> Result<Action> {
 	update_restore_status(&ctx.client, namespace, name, status_patch).await?;
 
-	if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
-		info!(promoted = %promoted_name, "promoted queued restore after failure");
+	if let Some(promoted) = ctx
+		.release_restore_slot(&ReplicaKey::new(namespace, replica_name))
+		.await
+	{
+		info!(promoted = %promoted, "promoted queued restore after failure");
 	}
 
-	// Increment consecutiveRestoreFailures on the parent replica
+	// Increment consecutiveRestoreFailures on the parent replica and advance
+	// nextScheduledRestore by the failure backoff, so the next reconcile
+	// retries on a bounded, sub-cron cadence instead of waiting until the
+	// next cron tick.
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
 	if let Ok(replica) = replicas.get(replica_name).await {
 		let current = replica
@@ -162,9 +247,12 @@ async fn fail_restore(
 			.and_then(|s| s.consecutive_restore_failures)
 			.unwrap_or(0);
 		let new_count = current + 1;
+		let backoff = super::replica::scheduling::failure_backoff_delay(new_count);
+		let next_scheduled = backoff.map(|d| Time(Timestamp::now() + d));
 		let patch = serde_json::json!({
 			"status": {
 				"consecutiveRestoreFailures": new_count,
+				"nextScheduledRestore": next_scheduled,
 			}
 		});
 		if let Err(e) = replicas
@@ -180,7 +268,8 @@ async fn fail_restore(
 			info!(
 				replica = replica_name,
 				consecutive_failures = new_count,
-				"incremented consecutive restore failure count"
+				next_scheduled = ?next_scheduled.map(|t| t.0),
+				"incremented consecutive restore failure count, scheduled retry via backoff"
 			);
 		}
 	}
@@ -209,6 +298,22 @@ async fn fail_restore(
 		.await
 	{
 		warn!(replica = replica_name, error = %e, "failed to publish RestoreFailed event");
+	}
+
+	// Canopy verification (signal 3, failure) — no-op unless the replica
+	// has spec.canopy_source. The caller passes a short reason so
+	// operators see it on canopy's UI without having to trawl k8s events.
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(ctx.client.clone(), namespace);
+	if let (Ok(restore), Ok(replica)) = (restores.get(name).await, replicas.get(replica_name).await)
+	{
+		crate::controllers::canopy::verification::report(
+			ctx,
+			&replica,
+			&restore,
+			bestool_canopy::schema::RunOutcome::Failure,
+			Some(error),
+		)
+		.await;
 	}
 
 	Ok(Action::requeue(Duration::from_secs(300)))
@@ -326,9 +431,8 @@ async fn reconcile_pending(
 	)
 	.await?;
 
-	// Mark as active in the queue (keyed by replica name to match enqueue in replica controller)
 	let mut queue = ctx.restore_queue.write().await;
-	queue.mark_active(replica_name);
+	queue.mark_active(&ReplicaKey::new(namespace, replica_name));
 	ctx.metrics.active_restores.set(queue.active.len() as i64);
 	ctx.metrics.queue_depth.set(queue.pending.len() as i64);
 	drop(queue);
@@ -360,8 +464,55 @@ async fn reconcile_restoring(
 			let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 			let replica = replicas.get(replica_name).await?;
 
-			let job =
-				build_restore_job(restore, &job_name, namespace, &replica, &ctx.kopia_image())?;
+			// Mint (or reuse) the canopy run-uuid for this restore run before
+			// creating the Job, so the sidecar's credential requests and the
+			// eventual verification report carry the same id and canopy can
+			// correlate them. Only canopy-backed restores are a "run"; the
+			// legacy kopia path has no canopy report. Persist it to status
+			// first so it survives a crash between here and Job creation.
+			let run_id = if replica.spec.canopy_source.is_some() {
+				let id = match restore.status.as_ref().and_then(|s| s.run_id.clone()) {
+					Some(existing) => existing,
+					None => {
+						let minted = uuid::Uuid::new_v4().to_string();
+						update_restore_status(
+							client,
+							namespace,
+							name,
+							serde_json::json!({ "runId": minted }),
+						)
+						.await?;
+						minted
+					}
+				};
+				Some(id)
+			} else {
+				None
+			};
+
+			let cache_pressure_url = ctx.cache_pressure_callback_url(namespace, name);
+			let stats_callback_url = ctx.canopy_stats_callback_url(namespace, &job_name);
+			let progress_callback_url = ctx.canopy_progress_callback_url(namespace, &job_name);
+			let canopy_proxy = if replica.spec.canopy_source.is_some() {
+				Some(builders::CanopyProxyArgs {
+					image: &ctx.canopy_proxy_image,
+					broker_base_url: &ctx.canopy_broker_base_url,
+					stats_callback_url: &stats_callback_url,
+					progress_callback_url: Some(&progress_callback_url),
+					run_id: run_id.as_deref(),
+				})
+			} else {
+				None
+			};
+			let job = build_restore_job(
+				restore,
+				&job_name,
+				namespace,
+				&replica,
+				&ctx.kopia_image(),
+				&cache_pressure_url,
+				canopy_proxy.as_ref(),
+			)?;
 			jobs.create(&PostParams::default(), &job).await?
 		}
 	};
@@ -471,6 +622,7 @@ async fn reconcile_restoring(
 					"phase": "Failed",
 				},
 			}),
+			"kopia restore Job failed after backoff exhausted",
 		)
 		.await;
 	}
@@ -610,6 +762,13 @@ async fn reconcile_active(
 		apply_restore_deployment(client, restore, &replica, name, namespace).await?;
 	}
 
+	// Defensively ensure the ready-for-traffic label is on the pod. If the
+	// pod restarted (OOM, eviction, node loss), the label is gone from the
+	// new pod and the Service stops routing to it; re-applying every pass
+	// closes that gap. Also handles the upgrade path where existing Active
+	// pods predate the label.
+	restore.mark_pod_ready_for_traffic(client).await?;
+
 	Ok(Action::requeue(Duration::from_secs(300)))
 }
 
@@ -691,6 +850,7 @@ async fn reconcile_ready(
 						name,
 						replica_name,
 						serde_json::json!({ "phase": "Failed" }),
+						"version detection Job succeeded but did not report a postgres version",
 					)
 					.await;
 				}
@@ -710,6 +870,7 @@ async fn reconcile_ready(
 						name,
 						replica_name,
 						serde_json::json!({ "phase": "Failed" }),
+						"version detection Job failed after backoff exhausted",
 					)
 					.await;
 				}
@@ -752,20 +913,33 @@ async fn reconcile_ready(
 		)
 		.await?;
 
-		if let Some(promoted_name) = ctx.release_restore_slot(replica_name).await {
-			info!(promoted = %promoted_name, "promoted queued restore after switchover");
+		if let Some(promoted) = ctx
+			.release_restore_slot(&ReplicaKey::new(namespace, replica_name))
+			.await
+		{
+			info!(promoted = %promoted, "promoted queued restore after switchover");
 		}
 
 		return Ok(Action::requeue(Duration::from_secs(5)));
 	}
 
-	// Check for timeout (10 minutes)
+	// Deployment readiness timeout. Replicas with larger data dirs need time
+	// for postgres to open the data dir and replay WAL after a fresh kopia
+	// restore, so the budget scales with the snapshot unless the replica pins
+	// `deploymentReadyTimeout`. The `DEPLOYMENT_READY_TIMEOUT_SECS` env var is
+	// the operator-wide floor.
 	if let Some(created_at) = restore.status.as_ref().and_then(|s| s.restored_at.as_ref()) {
 		let elapsed = Timestamp::now().duration_since(created_at.0);
-		if elapsed > SignedDuration::from_secs(10 * 60) {
+		let timeout = crate::controllers::replica::scheduling::deployment_ready_timeout(
+			replica.spec.deployment_ready_timeout.as_ref(),
+			&restore.spec.snapshot_size,
+			ctx.deployment_ready_timeout_secs,
+		);
+		let timeout_secs = timeout.as_secs();
+		if elapsed > timeout {
 			warn!(
 				restore = name,
-				"deployment not ready after 10 minutes, marking as Failed"
+				timeout_secs, "deployment not ready within configured timeout, marking as Failed"
 			);
 			return fail_restore(
 				ctx,
@@ -773,6 +947,10 @@ async fn reconcile_ready(
 				name,
 				replica_name,
 				serde_json::json!({ "phase": "Failed" }),
+				&format!(
+					"postgres Deployment did not become Ready within {timeout_secs}s of \
+					 restore completion"
+				),
 			)
 			.await;
 		}

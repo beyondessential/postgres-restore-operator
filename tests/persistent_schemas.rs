@@ -2,7 +2,7 @@ use k8s_openapi::api::core::v1::{LocalObjectReference, Secret};
 use kube::{Api, ResourceExt as _, api::PostParams};
 use postgres_restore_operator::types::{
 	PostgresPhysicalReplica, PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase,
-	RestorePhase,
+	RestorePhase, SchemaMigrationPhase,
 };
 use tokio::time::{sleep, timeout};
 
@@ -144,9 +144,9 @@ async fn persistent_schemas_migration() {
 				let phase = replica
 					.status
 					.as_ref()
-					.and_then(|s| s.schema_migration_phase.as_deref());
+					.and_then(|s| s.schema_migration_phase.as_ref());
 				println!("[{replica_name}] schemaMigrationPhase: {phase:?}");
-				if phase == Some("complete") {
+				if matches!(phase, Some(SchemaMigrationPhase::Complete)) {
 					return;
 				}
 			}
@@ -571,9 +571,9 @@ async fn persistent_schemas_skip_missing_on_source() {
 				let phase = replica
 					.status
 					.as_ref()
-					.and_then(|s| s.schema_migration_phase.as_deref());
+					.and_then(|s| s.schema_migration_phase.as_ref());
 				println!("[{replica_name}] schemaMigrationPhase: {phase:?}");
-				if phase == Some("complete") {
+				if matches!(phase, Some(SchemaMigrationPhase::Complete)) {
 					return;
 				}
 			}
@@ -767,8 +767,8 @@ async fn persistent_schemas_all_missing_prunes_previous_restore() {
 		post_switchover
 			.status
 			.as_ref()
-			.and_then(|s| s.schema_migration_phase.as_deref()),
-		Some("complete"),
+			.and_then(|s| s.schema_migration_phase.as_ref()),
+		Some(&SchemaMigrationPhase::Complete),
 		"schemaMigrationPhase must be set to complete even when all schemas are skipped"
 	);
 

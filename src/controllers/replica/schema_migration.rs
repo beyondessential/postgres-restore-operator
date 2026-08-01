@@ -65,6 +65,18 @@ done
 # Capture psql's stderr for visibility on partial failures.
 PSQL_STDERR=$(mktemp)
 
+# TCP keepalive options on the connection URI. Without keepalives a
+# silently-dropped pod-to-pod TCP connection (network policy change,
+# node disruption, etc.) leaves both ends waiting indefinitely — pg_dump
+# blocked on read, postgres marked "idle in transaction" with
+# wait_event=ClientRead. Observed in production: a migration sat
+# stuck for 39 hours after the connection died, with no detection.
+# 60s idle + 10s × 3 probes = dead connection killed within ~90s.
+KEEPALIVES="keepalives=1&keepalives_idle=60&keepalives_interval=10&keepalives_count=3"
+APPNAME="application_name=pgro-schema-migration"
+SOURCE_URI="postgresql://${SOURCE_USER}@${SOURCE_HOST}:5432/${SOURCE_DB}?${KEEPALIVES}&${APPNAME}"
+TARGET_URI="postgresql://${TARGET_USER}@${TARGET_HOST}:5432/${TARGET_DB}?${KEEPALIVES}&${APPNAME}"
+
 # ON_ERROR_STOP is deliberately NOT set: persistent_schemas like dbt
 # contain views derived from upstream tables, and across upstream schema
 # changes (renamed columns, dropped tables) some view DDL in the old
@@ -74,13 +86,13 @@ PSQL_STDERR=$(mktemp)
 # for replica availability — clients can regenerate the broken views
 # afterward, but the replica must be reachable.
 PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
-  -h "$SOURCE_HOST" -p 5432 -U "$SOURCE_USER" -d "$SOURCE_DB" \
+  -d "$SOURCE_URI" \
   "${SCHEMA_ARGS[@]}" \
   --no-owner --no-privileges \
   --no-publications --no-subscriptions \
   --verbose \
 | PGPASSWORD="$TARGET_PASSWORD" psql \
-  -h "$TARGET_HOST" -p 5432 -U "$TARGET_USER" -d "$TARGET_DB" \
+  -d "$TARGET_URI" \
   --quiet 2> >(tee "$PSQL_STDERR" >&2)
 
 PSQL_EXIT=$?
@@ -208,6 +220,16 @@ pub fn build_schema_migration_job(
 							env_literal("MIGRATION_CALLBACK_URL", callback_url),
 						]),
 						resources: Some(ResourceRequirements {
+							// pg_dump and psql each buffer some state per
+							// large object / row, and for non-trivial
+							// persistent schemas (dbt with many tables and
+							// indexes) the streaming pipe peaks well past
+							// the original 512Mi limit. Observed in
+							// production: the migration container was being
+							// OOMKilled dozens of times in succession.
+							// Bump to a generous limit so the migration
+							// completes; the Job is short-lived and only
+							// runs during switchover.
 							requests: Some(BTreeMap::from([
 								(
 									"cpu".to_string(),
@@ -218,7 +240,7 @@ pub fn build_schema_migration_job(
 								(
 									"memory".to_string(),
 									k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-										"128Mi".to_string(),
+										"256Mi".to_string(),
 									),
 								),
 							])),
@@ -226,13 +248,13 @@ pub fn build_schema_migration_job(
 								(
 									"cpu".to_string(),
 									k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-										"1".to_string(),
+										"2".to_string(),
 									),
 								),
 								(
 									"memory".to_string(),
 									k8s_openapi::apimachinery::pkg::api::resource::Quantity(
-										"512Mi".to_string(),
+										"4Gi".to_string(),
 									),
 								),
 							])),
@@ -263,7 +285,8 @@ mod tests {
 				..Default::default()
 			},
 			spec: crate::types::PostgresPhysicalReplicaSpec {
-				kopia_secret_ref: Default::default(),
+				kopia_secret_ref: Some(Default::default()),
+				canopy_source: None,
 				snapshot_filter: None,
 				schedule: "0 * * * *".into(),
 				schedule_jitter: crate::util::TimeSpan(jiff::Span::new()),
@@ -273,11 +296,16 @@ mod tests {
 				storage_class: None,
 				storage_size_override: None,
 				resources: None,
+				resources_floor: None,
+				resources_maximum: None,
+				deployment_ready_timeout: None,
+				shm_size_floor: None,
 				service_annotations: None,
 				pod_annotations: None,
 				affinity: None,
 				tolerations: vec![],
 				read_only: true,
+				ephemeral: false,
 				postgres_extra_config: None,
 				notifications: vec![],
 				storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
@@ -311,6 +339,80 @@ mod tests {
 		assert!(
 			MIGRATION_SCRIPT.contains("partial"),
 			"migration script must report partial migrations via the callback so the operator can surface them"
+		);
+	}
+
+	#[test]
+	fn migration_script_uses_tcp_keepalives() {
+		// Without TCP keepalives a silently-dropped pod-to-pod connection
+		// leaves pg_dump and psql blocked indefinitely on a dead socket,
+		// while postgres marks the session "idle in transaction" with
+		// wait_event=ClientRead. Observed in production: a migration sat
+		// stuck for 39 hours.
+		assert!(
+			MIGRATION_SCRIPT.contains("keepalives=1"),
+			"migration script must enable libpq TCP keepalives"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains("keepalives_idle="),
+			"migration script must set keepalives_idle"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains("keepalives_interval="),
+			"migration script must set keepalives_interval"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains("keepalives_count="),
+			"migration script must set keepalives_count"
+		);
+		// application_name shows up in pg_stat_activity, making the
+		// migration session identifiable for diagnosis.
+		assert!(
+			MIGRATION_SCRIPT.contains("application_name=pgro-schema-migration"),
+			"migration script must set application_name for visibility"
+		);
+	}
+
+	#[test]
+	fn migration_job_has_enough_memory_for_dbt_scale_schemas() {
+		// Default limits must be high enough for realistic
+		// persistent_schemas like dbt with many tables and indexes.
+		// pg_dump + psql peak well past the historic 512Mi default and
+		// OOMKill in production. Memory limit must be at least 2Gi.
+		let replica = make_replica(vec!["dbt"]);
+		let job = build_schema_migration_job(
+			&replica,
+			"test-ns",
+			"old",
+			"new",
+			"db",
+			"db",
+			&["dbt".to_string()],
+			"reader",
+			"super",
+			"http://op",
+			18,
+		);
+		let resources = job.spec.unwrap().template.spec.unwrap().containers[0]
+			.resources
+			.clone()
+			.expect("migration container must declare resources");
+		let limits = resources
+			.limits
+			.expect("migration container must declare limits");
+		let mem_limit = &limits.get("memory").expect("memory limit set").0;
+		// Accept anything ending with Gi where N >= 2, or Mi where N >= 2048.
+		let mem_ok = mem_limit
+			.strip_suffix("Gi")
+			.and_then(|n| n.parse::<u64>().ok())
+			.is_some_and(|n| n >= 2)
+			|| mem_limit
+				.strip_suffix("Mi")
+				.and_then(|n| n.parse::<u64>().ok())
+				.is_some_and(|n| n >= 2048);
+		assert!(
+			mem_ok,
+			"migration memory limit must be at least 2Gi (got {mem_limit})"
 		);
 	}
 

@@ -48,13 +48,6 @@ jobs:
               test-switchover
             needs_non_pg_snapshot: false
 
-          - name: consecutive_failures
-            namespaces: >-
-              test-consecutive-failures
-              test-phase-stuck
-              test-subresource-reset
-            needs_non_pg_snapshot: true
-
           - name: persistent_schemas
             namespaces: >-
               test-persistent-schemas
@@ -69,8 +62,21 @@ jobs:
             needs_non_pg_snapshot: false
             needs_pg18_snapshot: true
 
+          - name: ephemeral
+            namespaces: >-
+              test-ephemeral
+            needs_non_pg_snapshot: false
+
+          # canopy_integration is a scaffold in tests/canopy_integration.rs
+          # but no stub-canopy HTTP server exists yet, so the happy-path
+          # test times out. Re-add this matrix entry when the stub lands:
+          #   - name: canopy_integration
+          #     namespaces: >-
+          #       test-canopy-restore
+          #     needs_non_pg_snapshot: false
+
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
 
       - name: Configure toolchain
         run: |

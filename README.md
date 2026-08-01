@@ -1,24 +1,25 @@
-# pgro.bes.au — PostgreSQL Restore Operator
+# pgro — PostgreSQL Restore Operator
 
 Monitors a Kopia backup repository for "physical" backups of PostgreSQL databases and restores them regularly within a Kubernetes cluster.
 
 > [!WARNING]
-> This is an internal project of BES.au, used in our data and analytics infrastructure, as well as for backup operations and testing purposes.
-> As such no guarantees are made about stability beyond our internals.
+> This is an internal project of BES International, used in our data and analytics infrastructure, as well as for backup operations and testing purposes, and not supported outside that.
 
 ## Install
 
-Generate the CRDs:
+Apply the operator manifest:
+
+```
+kubectl apply -f operator.yaml
+```
+
+The operator applies its own CRDs on startup, so no separate `crds.yaml`
+step is needed. If you'd rather manage CRD lifecycle out-of-band (e.g.
+gating schema changes at install time), generate + apply them manually:
 
 ```
 cargo run --bin gen-crds > crds.yaml
-```
-
-Apply both the CRDs and the operator:
-
-```
 kubectl apply -f crds.yaml
-kubectl apply -f operator.yaml
 ```
 
 ## Quick start
@@ -84,7 +85,8 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `kopiaSecretRef` | `SecretReference` | Yes | — | Reference to a Secret containing Kopia repository credentials (`bucket`, `region`, `repositoryPassword`, `accessKeyId`, `secretAccessKey`). |
+| `kopiaSecretRef` | `SecretReference` | One of | — | Reference to a Secret containing Kopia repository credentials (`bucket`, `region`, `repositoryPassword`, `accessKeyId`, `secretAccessKey`). Mutually exclusive with `canopySource`. |
+| `canopySource` | `CanopySource` | One of | — | Route kopia through the canopy-mediated proxy sidecar instead of a static Secret. `{ group, type }`. Managed by the canopy worklist syncer; humans usually don't hand-author these. Mutually exclusive with `kopiaSecretRef`. |
 | `snapshotFilter` | `SnapshotFilter` | No | — | Filter criteria to select which Kopia snapshot to restore. |
 | `schedule` | `string` | Yes | — | Cron expression controlling how often new restores are triggered. |
 | `scheduleJitter` | `string` | No | `"10m"` | Random jitter added to scheduled restores (friendly duration, e.g. `"5m"`, `"1h"`). |
@@ -92,18 +94,23 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `switchoverGracePeriod` | `string` | No | `"5m"` | How long to wait before deleting the old restore after a switchover. |
 | `analyticsUsername` | `string` | No | `"analytics"` | Username created for analytics connections. |
 | `storageClass` | `string` | No | — | Kubernetes StorageClass for the restore PVCs. |
-| `storageSizeOverride` | `Quantity` | No | — | Override dynamic sizing with a fixed PVC size. When absent, PVC size is calculated from snapshot size. |
+| `storageSizeOverride` | `Quantity` | No | — | Lower bound on the PVC size. The size is still calculated from the snapshot, and this is used only when it is larger — so a replica whose snapshot outgrows it is sized from the snapshot rather than truncated. Still capped by `storageSizeMaximum`. |
 | `storageSizeMaximum` | `Quantity` | No | `2Ti` | Maximum allowed PVC size. The restore will fail if the computed size exceeds this limit. |
-| `resources` | `ResourceRequirements` | No | — | CPU/memory resource requirements for the PostgreSQL pods. |
+| `resources` | `ResourceRequirements` | No | — | Pin the PostgreSQL pods' CPU/memory. When set these are used verbatim; when unset, memory is derived from the snapshot size (bounded by `resourcesFloor` and `resourcesMaximum`) and CPU comes from `resourcesFloor`. |
+| `resourcesFloor` | `ResourceRequirements` | No | — | Lower bound on the snapshot-derived resources, and the source of CPU — CPU tracks query concurrency rather than data volume, so it isn't scaled. Ignored when `resources` is set. |
+| `resourcesMaximum` | `Quantity` | No | `64Gi` | Cap on the snapshot-derived memory, so an unexpectedly large snapshot can't request more than a node can offer and leave the pod unschedulable. |
+| `deploymentReadyTimeout` | `string` | No | derived | How long to wait for the restore's PostgreSQL Deployment to become Ready before failing the restore (friendly duration, e.g. `"45m"`). When unset, derived from the snapshot size — a larger data dir takes longer to open and replay WAL — floored at the operator-wide `DEPLOYMENT_READY_TIMEOUT_SECS`. |
+| `shmSizeFloor` | `Quantity` | No | — | Floor on the postgres pod's `/dev/shm` sizing. When set, the Deployment uses `max(computed, shmSizeFloor)` — the computed value is derived from `resources` by [`compute_shm_and_shared_buffers`]. Useful when a workload's `shared_buffers` needs more shm than the resource-derived value provides, without wanting to bump the container's memory request. |
 | `serviceAnnotations` | `map[string]string` | No | — | Annotations applied to the Service. |
 | `podAnnotations` | `map[string]string` | No | — | Annotations applied to the PostgreSQL pods. |
 | `affinity` | `Affinity` | No | — | Pod scheduling affinity rules. |
 | `tolerations` | `[]Toleration` | No | `[]` | Pod tolerations. |
 | `readOnly` | `bool` | No | `true` | Set the restored database to read-only mode. |
+| `ephemeral` | `bool` | No | `false` | Tear the restore down once it reaches `Active` (postgres came up healthy) instead of keeping it running. The replica only restores again when a newer snapshot is offered (canopy path) or the schedule next fires (legacy path). Used by the `verify` intent, whose job is just to prove the snapshot restores. |
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
-| `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. |
-| `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. Requires PostgreSQL 18+. |
+| `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. See [Persistent schemas](#persistent-schemas) below for the migration time budget and what happens on timeout. |
+| `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. See [RedactionSpec](#redactionspec) below. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -114,6 +121,24 @@ Jitter is applied to the scheduled time after the cron expression is evaluated.
 The jitter is a random duration between -time/2 and +time/2.
 For example, `10m` will result in a jitter between -5m and 5m.
 When using `H` in the cron expression, you might want to set the jitter to zero to properly take advantage of the spread-but-stable behaviour.
+
+#### Persistent schemas
+
+Each switchover normally drops the new restore (so it carries only what was in the snapshot) and is fast.
+The `persistentSchemas` field opts a schema (e.g. `dbt`) into being **carried across restores** via a `pg_dump | psql` migration Job that runs between the previous restore and the new one.
+A healthy migration takes seconds.
+
+The migration has a **hard time budget of 20% of the cron interval** (e.g. ~72 min on a 6-hourly schedule, ~5 h on a daily one).
+If the budget is exceeded — most realistically because some external upstream condition wedges postgres mid-migration — the operator:
+
+1. Cancels the migration Job.
+2. Runs `DROP SCHEMA <name> CASCADE` for each persistent schema on the new restore.
+3. Records a `SchemaMigrationTimedOut` Warning event on the replica.
+4. Sets `status.schemaMigrationPhase = "timeout-skipped"`.
+5. Proceeds with the switchover.
+
+The intent is that **a usable replica beats carrying the schema through**.
+The next restore cycle will re-attempt the migration if the schemas have been regenerated on the source in the meantime; until then the replica is up and serving the snapshot contents.
 
 #### RedactionSpec
 
@@ -188,12 +213,14 @@ Additional fields for `target: graphQL`:
 | `lastRestoreCompletedAt` | `Time` | When the last restore completed. |
 | `nextScheduledRestore` | `Time` | When the next scheduled restore will occur. |
 | `latestAvailableSnapshot` | `string` | Snapshot ID of the latest available snapshot matching the filter. |
+| `canopyDesiredSnapshotId` | `string` | For canopy-sourced replicas: the snapshot the canopy worklist syncer wants restored. The reconciler triggers a new restore when this differs from the current one. |
+| `verifiedSnapshotId` | `string` | For `ephemeral` replicas: the last snapshot that was verified and then torn down. Gates re-restore — the reconciler only restores again when the desired snapshot differs from this. |
 | `connectionInfo` | `ConnectionInfo` | Connection details (host, port, database, username, password secret). |
 | `queuePosition` | `uint32` | Position in the global restore queue. |
 | `notifications` | `[]NotificationStatus` | Status of each configured notification target. |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions. |
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
-| `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, or `failed: <reason>`). |
+| `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, `partial`, `timeout-skipped`, or `failed: <reason>`). See [Persistent schemas](#persistent-schemas). |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
 | `redactionPhase` | `string` | Phase of the current restore's redaction (`active`, `complete`, `partial`, or `failed: <reason>`). `partial` means anonymisation ran but some per-column SECURITY LABEL statements were tolerated as errors (e.g. column missing on this DB version). `failed:` is sticky — it doesn't auto-retry; the next scheduled restore clears it. |
 | `redactionVersion` | `string` | The manifest version resolved during the last redaction run (when `manifestUrl` is version-templated). |
@@ -223,6 +250,7 @@ Deleting this resource will drop the restored database and prompt the Replica to
 | Field | Type | Description |
 |-------|------|-------------|
 | `phase` | `Pending` \| `Restoring` \| `Ready` \| `Switching` \| `Active` \| `Failed` | Current phase of the restore. |
+| `runId` | `string` | Canopy run-uuid minted when the restore Job is created, reused for the run's credential requests and verification report so canopy can correlate them. Canopy-backed restores only. |
 | `postgresVersion` | `string` | Detected PostgreSQL major version from the restored data. |
 | `createdAt` | `Time` | When the restore resource was created. |
 | `restoredAt` | `Time` | When the restore job completed. |

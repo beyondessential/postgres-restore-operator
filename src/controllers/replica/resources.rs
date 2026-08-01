@@ -6,8 +6,9 @@ use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec},
 		core::v1::{
-			Container, EnvVar, LocalObjectReference, PodSpec, PodTemplateSpec,
-			ResourceRequirements, Secret, Service, ServicePort, ServiceSpec,
+			Container, EmptyDirVolumeSource, EnvVar, LocalObjectReference, Pod, PodSpec,
+			PodTemplateSpec, ResourceRequirements, Secret, SecretReference, Service, ServicePort,
+			ServiceSpec, Volume, VolumeMount,
 		},
 	},
 	apimachinery::pkg::{api::resource::Quantity, util::intstr::IntOrString},
@@ -22,8 +23,12 @@ use tracing::{info, warn};
 
 use super::generate_password;
 use crate::{
-	controllers::{env_from_secret, env_from_secret_optional},
+	controllers::{
+		env_from_secret, env_from_secret_optional,
+		restore::builders::{CanopyProxyArgs, PROXY_SIDECAR_POD_LABEL},
+	},
 	error::Result,
+	kopia::KopiaSource,
 	types::*,
 };
 
@@ -48,33 +53,127 @@ impl SnapshotInfo {
 	}
 }
 
+/// Size the restore PVC for a snapshot.
+///
+/// `override_size` (`spec.storageSizeOverride`) is a floor, not a replacement:
+/// the canopy path always sets it from the intent config, so treating it as an
+/// exact size would truncate any replica whose snapshot outgrew it.
+///
+/// `maximum` bounds the result. It fails the restore only when the
+/// *snapshot-derived* size exceeds it — a replica genuinely too big for its
+/// configured cap, where truncating would restore into a volume that fills
+/// partway through. A floor above the maximum is merely contradictory config
+/// and clamps instead.
+pub fn compute_storage_size(
+	snapshot_bytes: ParsedQuantity,
+	override_size: Option<&Quantity>,
+	maximum: &Quantity,
+	persistent_schemas: bool,
+	measured_schema_delta: Option<ParsedQuantity>,
+) -> Result<Quantity> {
+	let max_pvc_size = ParsedQuantity::try_from(maximum.clone())
+		.unwrap_or_else(|_| ParsedQuantity::try_from("2Ti").unwrap());
+
+	let computed_size = if persistent_schemas {
+		// Persistent schemas are migrated into the restore PVC.
+		// Formula: snapshot + max(10% of snapshot, last measured delta) + 5Gi
+		let ten_percent = snapshot_bytes.clone() * Decimal::new(1, 1);
+		let measured = measured_schema_delta.unwrap_or_else(|| ParsedQuantity::from(Decimal::ZERO));
+		let overhead = if measured > ten_percent {
+			measured
+		} else {
+			ten_percent
+		};
+		snapshot_bytes + overhead + ParsedQuantity::try_from("5Gi").unwrap()
+	} else {
+		snapshot_bytes * Decimal::new(11, 1) // 1.1x
+	};
+
+	// The maximum guards against a snapshot too large to fit — that's the case
+	// where truncating would restore into a volume that fills partway through.
+	if computed_size > max_pvc_size {
+		return Err(crate::error::Error::StorageLimitExceeded {
+			computed: computed_size.into(),
+			maximum: max_pvc_size.into(),
+		});
+	}
+
+	let floor = override_size.and_then(|q| ParsedQuantity::try_from(q.clone()).ok());
+	let chosen = match floor {
+		Some(floor) if floor > computed_size => floor,
+		_ => computed_size,
+	};
+
+	// A floor above the maximum is contradictory configuration rather than a
+	// too-big replica, so the maximum simply wins. Failing instead would wedge
+	// a small replica whose operator capped it below the intent's floor.
+	Ok(if chosen > max_pvc_size {
+		max_pvc_size.into()
+	} else {
+		chosen.into()
+	})
+}
+
 pub fn build_snapshot_list_job(
 	replica: &PostgresPhysicalReplica,
 	job_name: &str,
 	namespace: &str,
 	kopia_image: &str,
 	callback_url: &str,
+	canopy_proxy: Option<&CanopyProxyArgs<'_>>,
 ) -> Result<Job> {
-	let kopia_secret = &replica.spec.kopia_secret_ref;
+	let source = replica.kopia_source();
+	let kopia_secret = SecretReference {
+		name: Some(source.secret_name().to_string()),
+		namespace: None,
+	};
 	let replica_name = replica.name_any();
 
 	let mut env_vars = vec![
-		env_from_secret("KOPIA_BUCKET", kopia_secret, "bucket"),
-		env_from_secret("KOPIA_REGION", kopia_secret, "region"),
-		env_from_secret("AWS_ACCESS_KEY_ID", kopia_secret, "accessKeyId"),
-		env_from_secret("AWS_SECRET_ACCESS_KEY", kopia_secret, "secretAccessKey"),
-		env_from_secret("KOPIA_PASSWORD", kopia_secret, "repositoryPassword"),
-		env_from_secret_optional("KOPIA_ENDPOINT", kopia_secret, "endpoint"),
-		env_from_secret_optional("KOPIA_DISABLE_TLS", kopia_secret, "disableTls"),
+		env_from_secret("KOPIA_BUCKET", &kopia_secret, "bucket"),
+		env_from_secret("KOPIA_REGION", &kopia_secret, "region"),
+		env_from_secret("AWS_ACCESS_KEY_ID", &kopia_secret, "accessKeyId"),
+		env_from_secret("AWS_SECRET_ACCESS_KEY", &kopia_secret, "secretAccessKey"),
+		env_from_secret("KOPIA_PASSWORD", &kopia_secret, "repositoryPassword"),
 	];
-
+	if !source.is_canopy_proxy() {
+		env_vars.push(env_from_secret_optional(
+			"KOPIA_ENDPOINT",
+			&kopia_secret,
+			"endpoint",
+		));
+		env_vars.push(env_from_secret_optional(
+			"KOPIA_DISABLE_TLS",
+			&kopia_secret,
+			"disableTls",
+		));
+	}
 	env_vars.push(EnvVar {
 		name: "SNAPSHOT_CALLBACK_URL".to_string(),
 		value: Some(callback_url.to_string()),
 		..Default::default()
 	});
 
-	let script = r#"set -e
+	let canopy_prelude = if source.is_canopy_proxy() {
+		r#"PORT_FILE="/var/run/pgro/proxy-port"
+for _ in $(seq 1 30); do
+  [ -f "$PORT_FILE" ] && break
+  sleep 1
+done
+if [ ! -f "$PORT_FILE" ]; then
+  echo "ERROR: canopy-proxy sidecar did not write port file within 30s" >&2
+  exit 1
+fi
+export KOPIA_ENDPOINT="[::1]:$(cat "$PORT_FILE")"
+export KOPIA_DISABLE_TLS=true
+echo "kopia snapshot-list via canopy proxy at ${KOPIA_ENDPOINT}" >&2
+
+"#
+	} else {
+		""
+	};
+
+	let script_body = r#"set -e
 
 ENDPOINT_ARGS=""
 if [ -n "$KOPIA_ENDPOINT" ]; then
@@ -84,7 +183,11 @@ if [ "$KOPIA_DISABLE_TLS" = "true" ]; then
   ENDPOINT_ARGS="$ENDPOINT_ARGS --disable-tls --disable-tls-verification"
 fi
 
-kopia repository connect s3 \
+# Global kopia flags: rotate CLI logs so they don't accumulate over
+# many snapshot-list invocations.
+KOPIA_GLOBAL_FLAGS="--log-dir-max-files=20 --log-dir-max-age=24h"
+
+kopia $KOPIA_GLOBAL_FLAGS repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
   --region="$KOPIA_REGION" \
   --access-key="$AWS_ACCESS_KEY_ID" \
@@ -95,7 +198,7 @@ kopia repository connect s3 \
 
 SNAP_FILE=$(mktemp)
 trap 'rm -f "$SNAP_FILE"' EXIT
-kopia snapshot list --json --all > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
+kopia $KOPIA_GLOBAL_FLAGS snapshot list --json --all > "$SNAP_FILE" || echo "[]" > "$SNAP_FILE"
 cat "$SNAP_FILE"
 if [ -n "$SNAPSHOT_CALLBACK_URL" ]; then
   SNAP_SIZE=$(wc -c < "$SNAP_FILE")
@@ -107,18 +210,129 @@ if [ -n "$SNAPSHOT_CALLBACK_URL" ]; then
   echo "Callback response: HTTP $HTTP_CODE" >&2
 fi
 "#;
+	let script = format!("{canopy_prelude}{script_body}");
+
+	let mut kopia_volume_mounts: Vec<VolumeMount> = Vec::new();
+	let mut volumes: Vec<Volume> = Vec::new();
+	let mut pod_labels = BTreeMap::from([
+		("pgro.bes.au/replica".to_string(), replica_name.clone()),
+		(
+			"pgro.bes.au/job-type".to_string(),
+			"snapshot-list".to_string(),
+		),
+	]);
+	let mut containers = vec![Container {
+		name: "snapshot-list".to_string(),
+		image: Some(kopia_image.to_string()),
+		command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
+		args: Some(vec![script]),
+		env: Some(env_vars),
+		volume_mounts: Some(kopia_volume_mounts.clone()),
+		resources: Some(ResourceRequirements {
+			requests: Some(BTreeMap::from([
+				("cpu".to_string(), Quantity("50m".to_string())),
+				("memory".to_string(), Quantity("64Mi".to_string())),
+			])),
+			..Default::default()
+		}),
+		..Default::default()
+	}];
+	// The canopy-proxy runs as a native sidecar (init container with
+	// restartPolicy: Always) so the Pod completes once the main
+	// snapshot-list container exits; a plain sidecar container would keep
+	// the Pod Running and the Job would never succeed.
+	let mut init_containers: Vec<Container> = Vec::new();
+
+	if let KopiaSource::CanopyProxy {
+		group, backup_type, ..
+	} = &source
+	{
+		let proxy = canopy_proxy.expect(
+			"build_snapshot_list_job called with canopy_source but no CanopyProxyArgs; caller \
+			 must thread proxy config from Context when replica.spec.canopy_source is set",
+		);
+
+		kopia_volume_mounts.push(VolumeMount {
+			name: "proxy-shared".to_string(),
+			mount_path: "/var/run/pgro".to_string(),
+			..Default::default()
+		});
+		containers[0].volume_mounts = Some(kopia_volume_mounts);
+
+		init_containers.push(Container {
+			name: "canopy-proxy".to_string(),
+			image: Some(proxy.image.to_string()),
+			restart_policy: Some("Always".to_string()),
+			command: Some(vec!["canopy-proxy".to_string()]),
+			env: Some(vec![
+				EnvVar {
+					name: "PGRO_BROKER_URL".to_string(),
+					value: Some(proxy.broker_base_url.to_string()),
+					..Default::default()
+				},
+				EnvVar {
+					name: "PGRO_GROUP".to_string(),
+					value: Some(group.clone()),
+					..Default::default()
+				},
+				EnvVar {
+					name: "PGRO_TYPE".to_string(),
+					value: Some(backup_type.clone()),
+					..Default::default()
+				},
+				// Region comes from the canopy-creds Secret the syncer
+				// materialises alongside this Job; the sidecar signs S3
+				// requests for it before forwarding upstream.
+				crate::controllers::jobs::env_from_secret_name(
+					"PGRO_REGION",
+					source.secret_name(),
+					"region",
+				),
+				EnvVar {
+					name: "PGRO_STATS_CALLBACK_URL".to_string(),
+					value: Some(proxy.stats_callback_url.to_string()),
+					..Default::default()
+				},
+			]),
+			volume_mounts: Some(vec![VolumeMount {
+				name: "proxy-shared".to_string(),
+				mount_path: "/var/run/pgro".to_string(),
+				..Default::default()
+			}]),
+			resources: Some(ResourceRequirements {
+				requests: Some(BTreeMap::from([
+					("cpu".to_string(), Quantity("50m".to_string())),
+					("memory".to_string(), Quantity("64Mi".to_string())),
+				])),
+				limits: Some(BTreeMap::from([
+					("cpu".to_string(), Quantity("500m".to_string())),
+					("memory".to_string(), Quantity("256Mi".to_string())),
+				])),
+				..Default::default()
+			}),
+			..Default::default()
+		});
+
+		volumes.push(Volume {
+			name: "proxy-shared".to_string(),
+			empty_dir: Some(EmptyDirVolumeSource {
+				medium: Some("Memory".to_string()),
+				..Default::default()
+			}),
+			..Default::default()
+		});
+
+		pod_labels.insert(
+			PROXY_SIDECAR_POD_LABEL.0.to_string(),
+			PROXY_SIDECAR_POD_LABEL.1.to_string(),
+		);
+	}
 
 	Ok(Job {
 		metadata: ObjectMeta {
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
-			labels: Some(BTreeMap::from([
-				("pgro.bes.au/replica".to_string(), replica_name.clone()),
-				(
-					"pgro.bes.au/job-type".to_string(),
-					"snapshot-list".to_string(),
-				),
-			])),
+			labels: Some(pod_labels.clone()),
 			owner_references: Some(vec![replica.owner_reference()]),
 			..Default::default()
 		},
@@ -128,32 +342,23 @@ fi
 			ttl_seconds_after_finished: Some(120),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
-					labels: Some(BTreeMap::from([
-						("pgro.bes.au/replica".to_string(), replica_name),
-						(
-							"pgro.bes.au/job-type".to_string(),
-							"snapshot-list".to_string(),
-						),
-					])),
+					labels: Some(pod_labels),
 					..Default::default()
 				}),
 				spec: Some(PodSpec {
 					restart_policy: Some("Never".to_string()),
-					containers: vec![Container {
-						name: "snapshot-list".to_string(),
-						image: Some(kopia_image.to_string()),
-						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![script.to_string()]),
-						env: Some(env_vars),
-						resources: Some(ResourceRequirements {
-							requests: Some(BTreeMap::from([
-								("cpu".to_string(), Quantity("50m".to_string())),
-								("memory".to_string(), Quantity("64Mi".to_string())),
-							])),
-							..Default::default()
-						}),
-						..Default::default()
-					}],
+					init_containers: if init_containers.is_empty() {
+						None
+					} else {
+						Some(init_containers)
+					},
+					termination_grace_period_seconds: Some(30),
+					containers,
+					volumes: if volumes.is_empty() {
+						None
+					} else {
+						Some(volumes)
+					},
 					..Default::default()
 				}),
 			},
@@ -178,15 +383,33 @@ impl PostgresPhysicalReplica {
 		let replica_name = self.name_any();
 
 		// Guardrail: refuse to create another restore if we already have too
-		// many. Pruning normally keeps this at 1; if it doesn't, capping
-		// here prevents runaway PVC creation while the underlying issue is
-		// fixed.
+		// many *live* ones. Pruning normally keeps this at 1; if it
+		// doesn't, capping here prevents runaway PVC creation while the
+		// underlying issue is fixed.
+		//
+		// Failed restores are excluded from the count. They are
+		// operator-owned and cleaned up by the failed-restore sweep within
+		// minutes — counting them would cause the guardrail to spuriously
+		// trip during sustained-failure backoff (e.g. 1 active + 1 failed
+		// pending cleanup + 1 new attempt). The invariant we actually want
+		// to enforce is on live restores (Pending/Restoring/Ready/
+		// Switching/Active).
 		let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), &self.ns());
-		let existing = restores
+		let existing_all = restores
 			.list(&ListParams::default().labels(&format!("pgro.bes.au/replica={replica_name}")))
 			.await?;
-		if existing.items.len() >= MAX_RESTORES_PER_REPLICA {
-			let names: Vec<String> = existing.items.iter().map(|r| r.name_any()).collect();
+		let live: Vec<&PostgresPhysicalRestore> = existing_all
+			.items
+			.iter()
+			.filter(|r| {
+				!matches!(
+					r.status.as_ref().and_then(|s| s.phase.as_ref()),
+					Some(&RestorePhase::Failed)
+				)
+			})
+			.collect();
+		if live.len() >= MAX_RESTORES_PER_REPLICA {
+			let names: Vec<String> = live.iter().map(|r| r.name_any()).collect();
 			warn!(
 				replica = replica_name,
 				existing = ?names,
@@ -199,10 +422,10 @@ impl PostgresPhysicalReplica {
 				"True",
 				"TooManyRestores",
 				&format!(
-					"Refusing to create new restore: {} restores already exist for this \
+					"Refusing to create new restore: {} live restores already exist for this \
 					 replica (limit {}). Existing: [{}]. Reduce the count by deleting stale \
 					 restores or fix the pruning issue.",
-					existing.items.len(),
+					live.len(),
 					MAX_RESTORES_PER_REPLICA,
 					names.join(", "),
 				),
@@ -214,43 +437,18 @@ impl PostgresPhysicalReplica {
 		let timestamp = Timestamp::now().strftime("%Y%m%d-%H%M%S").to_string();
 		let restore_name = format!("{replica_name}-{timestamp}");
 
-		let max_pvc_size = ParsedQuantity::try_from(self.spec.storage_size_maximum.clone())
-			.unwrap_or_else(|_| ParsedQuantity::try_from("2Ti").unwrap());
-
-		let snapshot_bytes = snapshot.bytes();
-		let storage_size = match &self.spec.storage_size_override {
-			Some(override_size) => override_size.clone(),
-			None => {
-				let computed_size = if self.spec.persistent_schemas.is_some() {
-					// Persistent schemas are migrated into the restore PVC.
-					// Formula: snapshot + max(10% of snapshot, last measured delta) + 5Gi
-					let ten_percent = snapshot_bytes.clone() * Decimal::new(1, 1);
-					let measured = self
-						.status
-						.as_ref()
-						.and_then(|s| s.persistent_schema_data_size.as_ref())
-						.and_then(|q| ParsedQuantity::try_from(q.clone()).ok())
-						.unwrap_or_else(|| ParsedQuantity::from(Decimal::ZERO));
-					let overhead = if measured > ten_percent {
-						measured
-					} else {
-						ten_percent
-					};
-					snapshot_bytes + overhead + ParsedQuantity::try_from("5Gi").unwrap()
-				} else {
-					snapshot_bytes * Decimal::new(11, 1) // 1.1x
-				};
-
-				if computed_size > max_pvc_size {
-					return Err(crate::error::Error::StorageLimitExceeded {
-						computed: computed_size.into(),
-						maximum: max_pvc_size.into(),
-					});
-				}
-
-				computed_size.into()
-			}
-		};
+		let measured_schema_delta = self
+			.status
+			.as_ref()
+			.and_then(|s| s.persistent_schema_data_size.as_ref())
+			.and_then(|q| ParsedQuantity::try_from(q.clone()).ok());
+		let storage_size = compute_storage_size(
+			snapshot.bytes(),
+			self.spec.storage_size_override.as_ref(),
+			&self.spec.storage_size_maximum,
+			self.spec.persistent_schemas.is_some(),
+			measured_schema_delta,
+		)?;
 
 		let mut restore = PostgresPhysicalRestore::new(
 			&restore_name,
@@ -393,13 +591,60 @@ impl PostgresPhysicalReplica {
 	}
 }
 
+/// Label the operator sets on a restore's postgres pod once schema
+/// migration (and anything else that must run pre-handover) has completed
+/// and the pod is safe to receive external traffic. The per-replica
+/// Service selector requires this label, so a restore in `Switching`
+/// can't be reached via the Service — operator-side work (DROP SCHEMA,
+/// `pg_dump | psql` migration Job, etc.) runs without external clients
+/// racing to grab locks on the schemas being touched.
+pub const READY_FOR_TRAFFIC_LABEL: &str = "pgro.bes.au/ready-for-traffic";
+
 impl PostgresPhysicalRestore {
+	/// Patch this restore's postgres pod to add the [`READY_FOR_TRAFFIC_LABEL`].
+	/// Idempotent and resilient to the pod not existing yet (the restore's
+	/// deployment may be mid-rollout); callers that need the label to be
+	/// present should retry on the next reconcile pass.
+	pub async fn mark_pod_ready_for_traffic(&self, client: &Client) -> Result<()> {
+		let pods: Api<Pod> = Api::namespaced(client.clone(), &self.ns());
+		let selector = format!("pgro.bes.au/restore={}", self.name_any());
+		let list = pods.list(&ListParams::default().labels(&selector)).await?;
+		let pod = list
+			.items
+			.into_iter()
+			.find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"));
+		let Some(pod) = pod else {
+			warn!(
+				restore = self.name_any(),
+				"no running pod for restore yet; will retry next reconcile"
+			);
+			return Ok(());
+		};
+		let pod_name = pod.name_any();
+		let patch = serde_json::json!({
+			"metadata": {
+				"labels": {
+					READY_FOR_TRAFFIC_LABEL: "true",
+				}
+			}
+		});
+		pods.patch(&pod_name, &PatchParams::default(), &Patch::Merge(&patch))
+			.await?;
+		info!(
+			restore = self.name_any(),
+			pod = pod_name,
+			"marked restore pod ready for traffic"
+		);
+		Ok(())
+	}
+
 	pub async fn update_service_selector(&self, client: &Client, service_name: &str) -> Result<()> {
 		let services: Api<Service> = Api::namespaced(client.clone(), &self.ns());
 		let patch = serde_json::json!({
 			"spec": {
 				"selector": {
 					"pgro.bes.au/restore": self.name_any(),
+					READY_FOR_TRAFFIC_LABEL: "true",
 				}
 			}
 		});

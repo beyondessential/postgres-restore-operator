@@ -7,21 +7,13 @@
 
 use std::{collections::BTreeMap, time::Duration};
 
-use k8s_openapi::{
-	ByteString,
-	api::core::v1::{Secret, SecretReference},
-	apimachinery::pkg::api::resource::Quantity,
-};
+use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
 	Api,
 	api::{ObjectMeta, PostParams},
 };
-use postgres_restore_operator::{
-	types::{
-		PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore,
-		RedactionSpec, ReplicaPhase, RestorePhase,
-	},
-	util::TimeSpan,
+use postgres_restore_operator::types::{
+	PostgresPhysicalReplica, PostgresPhysicalRestore, RedactionSpec, ReplicaPhase, RestorePhase,
 };
 
 use helpers::*;
@@ -262,30 +254,10 @@ fn build_pg18_kopia_secret(ns: &str, name: &str) -> Secret {
 }
 
 fn build_redaction_replica(name: &str, secret_ref: &str) -> PostgresPhysicalReplica {
-	let mut replica = PostgresPhysicalReplica::new(
+	let mut replica = build_replica(
 		name,
-		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
-				name: Some(secret_ref.into()),
-				namespace: None,
-			},
-			snapshot_filter: None,
-			schedule: "0 */6 * * *".into(),
-			schedule_jitter: Default::default(),
-			minimum_ttl: None,
-			switchover_grace_period: TimeSpan(jiff::Span::new().seconds(10)),
-			analytics_username: "analytics".into(),
-			storage_class: None,
-			storage_size_override: None,
-			resources: None,
-			service_annotations: None,
-			pod_annotations: None,
-			affinity: None,
-			tolerations: vec![],
-			read_only: true,
-			postgres_extra_config: None,
-			notifications: vec![],
-			persistent_schemas: None,
+		secret_ref,
+		ReplicaOpts {
 			redaction: Some(RedactionSpec {
 				manifest_url: format!("http://manifest-server.{NS}.svc/manifest.json"),
 				version: None,
@@ -294,7 +266,7 @@ fn build_redaction_replica(name: &str, secret_ref: &str) -> PostgresPhysicalRepl
 				),
 				version_fallback_to_base: false,
 			}),
-			storage_size_maximum: Quantity("2Ti".into()),
+			..Default::default()
 		},
 	);
 	replica.metadata.namespace = Some(NS.into());

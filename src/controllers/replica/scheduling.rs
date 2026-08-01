@@ -2,17 +2,110 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use cronexpr::{ParseOptions, parse_crontab_with};
 use jiff::{SignedDuration, SpanTotal, Timestamp, Unit, tz::TimeZone};
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::ResourceExt;
+use kube_quantity::ParsedQuantity;
 use rand::distr::uniform::SampleRange;
 use tracing::{debug, info, warn};
 
-use crate::types::*;
+use crate::{types::*, util::TimeSpan};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScheduleDecision {
 	NotDue,
 	Trigger,
 	SkippedByTtl,
+}
+
+/// Geometric backoff to apply after consecutive restore failures, replacing
+/// the normal cron schedule until a restore succeeds.
+///
+/// Formula: `clamp(60s * 2^n, 2min, 1h)` where `n` is the consecutive
+/// failure count. Returns `None` for `n == 0` (no backoff needed; the cron
+/// schedule applies).
+///
+/// Hits the 1-hour ceiling at 6 consecutive failures, which means a
+/// sustained failure mode caps compute at ~1 retry/hour while a transient
+/// blip still gets a fast (2 min) retry. The operator never permanently
+/// suspends — failures are bounded by retry rate, not by a manual reset
+/// gate — because most failure modes in this system are *external*
+/// (Karpenter, AWS API, upstream snapshots) and resolve themselves; pgro
+/// must keep trying so it picks up the fix without human intervention.
+pub fn failure_backoff_delay(consecutive_failures: u32) -> Option<SignedDuration> {
+	if consecutive_failures == 0 {
+		return None;
+	}
+	const BASE_SECS: u64 = 60;
+	const MIN_SECS: u64 = 120;
+	const MAX_SECS: u64 = 3600;
+	// Saturate exponent so we don't overflow on absurd failure counts.
+	let exponent = consecutive_failures.min(20);
+	let unclamped = BASE_SECS.saturating_mul(1u64 << exponent);
+	let clamped = unclamped.clamp(MIN_SECS, MAX_SECS);
+	Some(SignedDuration::from_secs(clamped as i64))
+}
+
+/// Extra readiness budget per 100 GiB of snapshot, on top of the
+/// operator-wide default.
+///
+/// Postgres has to open the restored data dir and replay WAL before it reports
+/// Ready, and both take longer the more data there is. A single cluster-wide
+/// timeout forces a choice between failing the large replicas spuriously and
+/// letting the small ones sit broken for far too long.
+///
+/// Like the memory ratio, this is a conservative guess rather than a
+/// measurement — `deploymentReadyTimeout` is the escape hatch when it is wrong.
+const READY_TIMEOUT_SECS_PER_100GIB: f64 = 900.0;
+const BYTES_PER_100GIB: f64 = (100u64 * (1 << 30)) as f64;
+
+/// How long to wait for a restore's postgres Deployment to become Ready.
+///
+/// An explicit `spec.deploymentReadyTimeout` wins outright. Otherwise the
+/// budget is derived from the snapshot size and floored at the operator-wide
+/// `DEPLOYMENT_READY_TIMEOUT_SECS`, so raising that still lifts every replica.
+pub fn deployment_ready_timeout(
+	explicit: Option<&TimeSpan>,
+	snapshot_size: &Quantity,
+	global_default_secs: u64,
+) -> SignedDuration {
+	if let Some(explicit) = explicit
+		&& let Ok(secs) = explicit
+			.0
+			.total(SpanTotal::from(Unit::Second).days_are_24_hours())
+	{
+		return SignedDuration::from_secs(secs as i64);
+	}
+
+	let global = SignedDuration::from_secs(global_default_secs as i64);
+	let Some(bytes) = ParsedQuantity::try_from(snapshot_size.clone())
+		.ok()
+		.and_then(|q| q.to_bytes_f64())
+	else {
+		return global;
+	};
+	let extra = (bytes / BYTES_PER_100GIB) * READY_TIMEOUT_SECS_PER_100GIB;
+	global.max(SignedDuration::from_secs(
+		global_default_secs as i64 + extra as i64,
+	))
+}
+
+/// True when a failure backoff recorded by `fail_restore` is still in effect.
+///
+/// `fail_restore` advances `nextScheduledRestore` by [`failure_backoff_delay`]
+/// on every failure. Triggers that bypass the schedule (notably the
+/// never-restored immediate trigger) must consult this, or a replica that
+/// fails every attempt retries as fast as it can fail.
+pub fn backoff_pending(status: Option<&PostgresPhysicalReplicaStatus>, now: Timestamp) -> bool {
+	let Some(status) = status else {
+		return false;
+	};
+	if status.consecutive_restore_failures.unwrap_or(0) == 0 {
+		return false;
+	}
+	status
+		.next_scheduled_restore
+		.as_ref()
+		.is_some_and(|next| now < next.0)
 }
 
 impl PostgresPhysicalReplica {
@@ -23,6 +116,46 @@ impl PostgresPhysicalReplica {
 		self.spec.schedule.hash(&mut hasher);
 		self.spec.schedule_jitter.to_string().hash(&mut hasher);
 		format!("{:016x}", hasher.finish())
+	}
+
+	/// Wall-clock budget for the schema migration step inside a single
+	/// restore cycle. Returns 20% of the interval between consecutive
+	/// cron firings; e.g. a `0 */6 * * *` schedule (every 6h) gets a
+	/// ~72 min budget. A healthy migration completes in seconds, so this
+	/// is a generous backstop, not a tight SLA — the goal is to keep a
+	/// pathological migration (postgres backend stuck on a single DDL,
+	/// for example) from blocking the replica from coming up at all.
+	/// Falls back to 1h if the cron expression can't be parsed or there
+	/// is no schedule. When the timeout fires, the operator drops the
+	/// `persistent_schemas` on the new restore (DROP SCHEMA … CASCADE)
+	/// and proceeds to switchover. The next restore reattempts the
+	/// migration if the schemas were regenerated upstream in between.
+	pub fn schema_migration_timeout(&self) -> SignedDuration {
+		const FALLBACK: SignedDuration = SignedDuration::from_secs(3600);
+		const BUDGET_FRACTION_DENOMINATOR: i64 = 5; // 1/5 == 20%
+		let Some(interval) = self.cron_interval(Timestamp::now()) else {
+			return FALLBACK;
+		};
+		SignedDuration::from_secs(interval.as_secs() / BUDGET_FRACTION_DENOMINATOR)
+	}
+
+	/// Interval between two consecutive cron firings of this replica's
+	/// schedule, measured from `now`. Returns `None` when the schedule
+	/// can't be parsed or doesn't have a second next-fire.
+	fn cron_interval(&self, now: Timestamp) -> Option<SignedDuration> {
+		let schedule = &self.spec.schedule;
+		let cron = parse_crontab_with(schedule, {
+			let mut options = ParseOptions::default();
+			options.fallback_timezone_option = cronexpr::FallbackTimezoneOption::UTC;
+			options
+		})
+		.ok()?;
+		let next = cron.find_next(now).ok()?;
+		let next_ts = next.timestamp();
+		let after = cron
+			.find_next(next_ts + SignedDuration::from_secs(1))
+			.ok()?;
+		Some(after.timestamp().duration_since(next_ts))
 	}
 
 	pub fn compute_next_scheduled_restore(&self, now: Timestamp) -> Option<Timestamp> {
@@ -81,6 +214,28 @@ impl PostgresPhysicalReplica {
 		}
 
 		Some(next.into())
+	}
+
+	/// True when the replica's `minimum_ttl` is configured and the last
+	/// restore completed within that window relative to `now`. Used by both
+	/// the cron path (via [`Self::check_schedule`]) and the canopy path
+	/// where TTL gates the desired-snapshot trigger.
+	pub fn within_minimum_ttl(&self, now: Timestamp) -> bool {
+		let Some(ref minimum_ttl) = self.spec.minimum_ttl else {
+			return false;
+		};
+		let Some(last_completed) = self
+			.status
+			.as_ref()
+			.and_then(|s| s.last_restore_completed_at.as_ref())
+		else {
+			return false;
+		};
+		let not_before = last_completed
+			.0
+			.to_zoned(TimeZone::UTC)
+			.saturating_add(minimum_ttl.0);
+		now.to_zoned(TimeZone::UTC) < not_before
 	}
 
 	pub fn check_schedule(&self) -> ScheduleDecision {
@@ -163,10 +318,11 @@ mod tests {
 				..Default::default()
 			},
 			spec: PostgresPhysicalReplicaSpec {
-				kopia_secret_ref: SecretReference {
+				kopia_secret_ref: Some(SecretReference {
 					name: Some("test-secret".into()),
 					namespace: None,
-				},
+				}),
+				canopy_source: None,
 				snapshot_filter: None,
 				schedule: schedule.into(),
 				schedule_jitter: TimeSpan(Span::new().seconds(0)),
@@ -176,11 +332,16 @@ mod tests {
 				storage_class: None,
 				storage_size_override: None,
 				resources: None,
+				resources_floor: None,
+				resources_maximum: None,
+				deployment_ready_timeout: None,
+				shm_size_floor: None,
 				service_annotations: None,
 				pod_annotations: None,
 				affinity: None,
 				tolerations: Vec::new(),
 				read_only: true,
+				ephemeral: false,
 				postgres_extra_config: None,
 				notifications: Vec::new(),
 				storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
@@ -196,6 +357,106 @@ mod tests {
 				..Default::default()
 			}),
 		}
+	}
+
+	/// A replica that has never restored successfully triggers immediately so
+	/// a freshly created one doesn't idle until the first cron tick. That must
+	/// not survive a failure: without this, a replica failing every attempt
+	/// retries as fast as it can fail, ignoring the backoff it just recorded.
+	#[test]
+	fn failure_backoff_applies_to_a_replica_that_never_restored() {
+		let now = Timestamp::now();
+		let mut replica = make_replica(
+			"H * * * *",
+			Some(now + SignedDuration::from_secs(600)),
+			None,
+			None,
+		);
+		replica
+			.status
+			.as_mut()
+			.unwrap()
+			.consecutive_restore_failures = Some(3);
+
+		assert!(
+			backoff_pending(replica.status.as_ref(), now),
+			"a pending backoff must suppress the never-restored immediate trigger"
+		);
+	}
+
+	/// The immediate trigger still has to work for a genuinely new replica,
+	/// which has no failures and a cron-derived nextScheduledRestore.
+	#[test]
+	fn no_backoff_pending_for_a_fresh_replica() {
+		let now = Timestamp::now();
+		let replica = make_replica(
+			"H * * * *",
+			Some(now + SignedDuration::from_secs(600)),
+			None,
+			None,
+		);
+
+		assert!(!backoff_pending(replica.status.as_ref(), now));
+	}
+
+	/// Once the backoff window elapses the replica is free to retry.
+	#[test]
+	fn no_backoff_pending_once_the_window_elapsed() {
+		let now = Timestamp::now();
+		let mut replica = make_replica(
+			"H * * * *",
+			Some(now - SignedDuration::from_secs(1)),
+			None,
+			None,
+		);
+		replica
+			.status
+			.as_mut()
+			.unwrap()
+			.consecutive_restore_failures = Some(3);
+
+		assert!(!backoff_pending(replica.status.as_ref(), now));
+	}
+
+	#[test]
+	fn failure_backoff_progression() {
+		// No failures → no backoff (cron applies).
+		assert_eq!(failure_backoff_delay(0), None);
+		// Doubles each step until clamped at 1h (6+ failures).
+		assert_eq!(
+			failure_backoff_delay(1),
+			Some(SignedDuration::from_secs(120))
+		);
+		assert_eq!(
+			failure_backoff_delay(2),
+			Some(SignedDuration::from_secs(240))
+		);
+		assert_eq!(
+			failure_backoff_delay(3),
+			Some(SignedDuration::from_secs(480))
+		);
+		assert_eq!(
+			failure_backoff_delay(4),
+			Some(SignedDuration::from_secs(960))
+		);
+		assert_eq!(
+			failure_backoff_delay(5),
+			Some(SignedDuration::from_secs(1920))
+		);
+		// Capped at 1h from here on.
+		assert_eq!(
+			failure_backoff_delay(6),
+			Some(SignedDuration::from_secs(3600))
+		);
+		assert_eq!(
+			failure_backoff_delay(100),
+			Some(SignedDuration::from_secs(3600))
+		);
+		// Absurd values must not overflow.
+		assert_eq!(
+			failure_backoff_delay(u32::MAX),
+			Some(SignedDuration::from_secs(3600))
+		);
 	}
 
 	#[test]
@@ -278,6 +539,29 @@ mod tests {
 		let next = replica.compute_next_scheduled_restore(now);
 		assert!(next.is_some());
 		assert!(next.unwrap() > now);
+	}
+
+	#[test]
+	fn schema_migration_timeout_six_hourly_cron_is_twenty_percent() {
+		// `0 */6 * * *` fires every 6h → 21600s → 20% = 4320s = 72min.
+		let replica = make_replica("0 */6 * * *", None, None, None);
+		let timeout = replica.schema_migration_timeout();
+		assert_eq!(timeout, SignedDuration::from_secs(4320));
+	}
+
+	#[test]
+	fn schema_migration_timeout_daily_cron_is_twenty_percent() {
+		// Daily at midnight → 86400s → 20% = 17280s = 288min.
+		let replica = make_replica("0 0 * * *", None, None, None);
+		let timeout = replica.schema_migration_timeout();
+		assert_eq!(timeout, SignedDuration::from_secs(17280));
+	}
+
+	#[test]
+	fn schema_migration_timeout_falls_back_on_invalid_cron() {
+		let replica = make_replica("not a cron", None, None, None);
+		let timeout = replica.schema_migration_timeout();
+		assert_eq!(timeout, SignedDuration::from_secs(3600));
 	}
 
 	#[test]

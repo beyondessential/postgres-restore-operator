@@ -1,5 +1,7 @@
 # postgres-restore-operator install manifest
-# CRDs are not included — generate them with: cargo run --bin gen-crds
+# CRDs are installed by the operator at startup. Generate them
+# manually with `cargo run --bin gen-crds` if you want to apply them
+# out-of-band (e.g. install-time gating on schema changes).
 ---
 apiVersion: v1
 kind: Namespace
@@ -17,6 +19,10 @@ kind: ClusterRole
 metadata:
     name: postgres-restore-operator
 rules:
+    # CRD install (operator applies its own CRDs on startup).
+    - apiGroups: ["apiextensions.k8s.io"]
+      resources: ["customresourcedefinitions"]
+      verbs: ["get", "list", "create", "update", "patch"]
     # CRD access
     - apiGroups: ["pgro.bes.au"]
       resources:
@@ -49,6 +55,11 @@ rules:
     - apiGroups: [""]
       resources: ["pods"]
       verbs: ["get", "list", "patch", "delete"]
+    # Namespaces (canopy-path replica namespaces are labelled + annotated
+    # by the worklist syncer, and torn down when a declaration goes away)
+    - apiGroups: [""]
+      resources: ["namespaces"]
+      verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
     # Pod port-forward (overlay FDW reconciliation)
     - apiGroups: [""]
       resources: ["pods/portforward"]
@@ -93,6 +104,13 @@ rules:
       resources: ["configmaps"]
       resourceNames: ["postgres-restore-operator-config"]
       verbs: ["get", "list", "watch"]
+    # Tailscale sidecar persists tailnet state in this Secret so a restart
+    # rejoins as the same node identity — the sidecar writes to it under
+    # the operator's ServiceAccount.
+    - apiGroups: [""]
+      resources: ["secrets"]
+      resourceNames: ["pgro-operator-tailscale-state"]
+      verbs: ["get", "update", "patch", "create"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
@@ -132,6 +150,12 @@ spec:
         - name: http
           port: 8080
           targetPort: http
+        # Credential-broker port. Reached from canopy-backed Job pods'
+        # proxy sidecars in-cluster only; NetworkPolicy below gates
+        # ingress to Pods carrying pgro.bes.au/proxy-sidecar=true.
+        - name: broker
+          port: 9091
+          targetPort: broker
     selector:
         app.kubernetes.io/name: postgres-restore-operator
         app.kubernetes.io/component: controller
@@ -181,9 +205,42 @@ spec:
                                 fieldPath: metadata.namespace
                       - name: OPERATOR_SERVICE_NAME
                         value: postgres-restore-operator
+                      # ------------------------------------------------
+                      # Canopy integration — see docs/canopy-backup-integration.md
+                      # ------------------------------------------------
+                      # Uncomment CANOPY_BASE_URL to opt into the canopy path.
+                      # Leaving it unset keeps the operator in legacy-only mode
+                      # (existing PostgresPhysicalReplica CRDs continue to work).
+                      # - name: CANOPY_BASE_URL
+                      #   value: https://canopy.example.com
+                      # SOCKS5 proxy the operator's Tailscale sidecar exposes.
+                      # Default [::1]:1055 matches the sidecar's TS_SOCKS5_SERVER.
+                      # - name: CANOPY_SOCKS5_PROXY
+                      #   value: socks5://[::1]:1055
+                      # Optional mTLS fallback if the tailnet probe fails.
+                      # - name: CANOPY_DEVICE_CERT_SECRET
+                      #   value: pgro-canopy-device-cert
+                      # Worklist tick cadence (jittered ±20%). Default 30.
+                      # - name: CANOPY_RECONCILE_INTERVAL_SECS
+                      #   value: "30"
+                      # Sidecar image spawned into each canopy-backed
+                      # restore Job. Overrides the built-in default so
+                      # operators can pin to a specific tag.
+                      # - name: CANOPY_PROXY_IMAGE
+                      #   value: ghcr.io/beyondessential/pgro-canopy-proxy:latest
+                      # Path to the tailscale sidecar's LocalAPI socket
+                      # (shared below via the tailscale-socket emptyDir),
+                      # used to resolve the tailnet MagicDNS suffix for the
+                      # `url` intent semantic. Defaults to the value below;
+                      # set empty to disable replica-URL reporting.
+                      # - name: PGRO_TAILSCALED_SOCKET
+                      #   value: /var/run/tailscale/tailscaled.sock
                   ports:
                       - name: http
                         containerPort: 8080
+                        protocol: TCP
+                      - name: broker
+                        containerPort: 9091
                         protocol: TCP
                   readinessProbe:
                       httpGet:
@@ -200,12 +257,102 @@ spec:
                   resources:
                       requests:
                           cpu: 50m
-                          memory: 64Mi
+                          memory: 128Mi
                       limits:
                           cpu: 500m
-                          memory: 256Mi
+                          memory: 1Gi
                   securityContext:
                       allowPrivilegeEscalation: false
                       readOnlyRootFilesystem: true
                       capabilities:
                           drop: ["ALL"]
+                  volumeMounts:
+                      # Read the tailscale sidecar's LocalAPI socket to
+                      # resolve the tailnet MagicDNS suffix (see the `url`
+                      # intent semantic).
+                      - name: tailscale-socket
+                        mountPath: /var/run/tailscale
+                        readOnly: true
+                # Tailscale sidecar — the primary production network path
+                # to canopy. bestool-canopy's CanopyClient auto-probes
+                # canopy.tail53aef.ts.net; the SOCKS5 proxy on [::1]:1055
+                # is what makes that probe succeed from in-cluster.
+                #
+                # Ops (one-time per cluster) provisions:
+                # - the Tailscale k8s operator;
+                # - an OAuth-issued authkey carrying the pgro ACL tag,
+                #   stored in the pgro-operator-tailscale-authkey Secret
+                #   at the TS_AUTHKEY key;
+                # - the pgro-operator-tailscale-state Secret (empty,
+                #   writable by this pod for TS state persistence).
+                - name: tailscale
+                  image: ghcr.io/tailscale/tailscale:v1.98.8
+                  env:
+                      - name: TS_USERSPACE
+                        value: "true"
+                      - name: TS_SOCKS5_SERVER
+                        value: "[::]:1055"
+                      - name: TS_HOSTNAME
+                        value: pgro-operator
+                      - name: TS_KUBE_SECRET
+                        value: pgro-operator-tailscale-state
+                      - name: TS_AUTHKEY
+                        valueFrom:
+                            secretKeyRef:
+                                name: pgro-operator-tailscale-authkey
+                                key: TS_AUTHKEY
+                  securityContext:
+                      allowPrivilegeEscalation: false
+                      readOnlyRootFilesystem: false
+                      capabilities:
+                          drop: ["ALL"]
+                  resources:
+                      requests:
+                          cpu: 20m
+                          memory: 64Mi
+                      limits:
+                          cpu: 200m
+                          memory: 256Mi
+                  volumeMounts:
+                      # Expose the LocalAPI socket to the controller container.
+                      # containerboot symlinks the socket to this path.
+                      - name: tailscale-socket
+                        mountPath: /var/run/tailscale
+            volumes:
+                # Shares the tailscaled LocalAPI socket between the sidecar
+                # and the controller so the operator can query the tailnet
+                # MagicDNS suffix for the `url` semantic.
+                - name: tailscale-socket
+                  emptyDir: {}
+---
+# NetworkPolicy restricting the credential-broker port (9091) to Pods
+# labelled `pgro.bes.au/proxy-sidecar=true` — the label the canopy Job
+# builder puts on kopia-restore Pods so their sidecars can reach the
+# broker. Metrics port (8080) is left open per the existing Service +
+# Prometheus scrape convention.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+    name: postgres-restore-operator-broker
+    namespace: pgro-system
+spec:
+    podSelector:
+        matchLabels:
+            app.kubernetes.io/name: postgres-restore-operator
+            app.kubernetes.io/component: controller
+    policyTypes:
+        - Ingress
+    ingress:
+        # Allow the metrics port from anywhere in-cluster.
+        - ports:
+              - port: 8080
+                protocol: TCP
+        # Allow the broker port only from canopy Job proxy sidecars.
+        - from:
+              - namespaceSelector: {}
+                podSelector:
+                    matchLabels:
+                        pgro.bes.au/proxy-sidecar: "true"
+          ports:
+              - port: 9091
+                protocol: TCP

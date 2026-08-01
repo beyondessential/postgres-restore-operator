@@ -52,7 +52,7 @@ jobs:
     steps:
       - name: Free up space
         run: sudo rm -rf /opt/hostedtoolcache /usr/share/dotnet /usr/local/lib/android /opt/ghc /usr/local/.ghcup || true
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
         with:
           submodules: recursive
 
@@ -62,7 +62,7 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@v2.75.19
+      - uses: taiki-e/install-action@v2.81.1
         with:
           tool: just
 
@@ -71,7 +71,9 @@ jobs:
           key: ${{ matrix.arch }}-release
 
       - name: Build binaries
-        run: cargo build --locked --target ${{ matrix.target }} --release --bin operator
+        run: |
+          cargo build --locked --target ${{ matrix.target }} --release \
+            --bin operator --bin canopy-proxy
         env:
           RUSTFLAGS: "-C target-feature=+crt-static"
 
@@ -79,6 +81,7 @@ jobs:
         run: |
           mkdir -p artifacts/${{ matrix.arch }}
           cp target/${{ matrix.target }}/release/operator artifacts/${{ matrix.arch }}/
+          cp target/${{ matrix.target }}/release/canopy-proxy artifacts/${{ matrix.arch }}/
 
       - uses: actions/upload-artifact@v7
         with:
@@ -94,7 +97,7 @@ jobs:
       - name: Login to ghcr.io
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u $ --password-stdin
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v6.0.2
         with:
           submodules: recursive
 
@@ -135,7 +138,7 @@ jobs:
             type=semver,value=v${{ steps.version.outputs.version }},pattern={{major}}.{{minor}}
             type=semver,value=v${{ steps.version.outputs.version }},pattern={{major}}
           labels: |
-            org.opencontainers.image.vendor=BES
+            org.opencontainers.image.vendor=BES International
             org.opencontainers.image.title=Postgres Restore Operator
             org.opencontainers.image.url=https://github.com/beyondessential/postgres-restore-operator/
             org.opencontainers.image.source=https://github.com/beyondessential/postgres-restore-operator/
@@ -143,7 +146,7 @@ jobs:
             org.opencontainers.image.licenses=GPL-3.0-or-later
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@v7.2.0
         with:
           context: .github/build-context
           file: Containerfile

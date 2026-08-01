@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::Duration;
@@ -20,14 +21,28 @@ use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
-	context::{Context, DEFAULT_KOPIA_IMAGE},
-	controllers,
-	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
+	canopy::{self, DEFAULT_SOCKS5_PROXY},
+	context::{
+		Context, DEFAULT_CANOPY_PROXY_IMAGE, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
+		DEFAULT_KOPIA_IMAGE, ReplicaKey,
+	},
+	controllers::{self, canopy::intent},
+	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase},
 };
+
+// Use mimalloc instead of the default glibc allocator. Long-running Rust
+// services on glibc commonly hold significantly more RSS than their actual
+// live heap due to fragmentation and retained chunks; mimalloc keeps RSS
+// closer to working-set size, which matters for an operator that runs
+// indefinitely and was previously OOMKilled at a tight limit.
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const DEFAULT_MAX_CONCURRENT_RESTORES: usize = 2;
 const DEFAULT_METRICS_ADDR: &str = "[::]:8080";
 const DEFAULT_METRICS_PORT: u16 = 8080;
+const DEFAULT_BROKER_ADDR: &str = "[::]:9091";
+const DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS: u64 = 30;
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
 
 /// Annotate the operator's own pod with the running version.
@@ -137,6 +152,8 @@ async fn main() -> anyhow::Result<()> {
 
 	let client = Client::try_default().await?;
 
+	postgres_restore_operator::crd_install::ensure_crds(&client).await?;
+
 	let namespace = operator_namespace();
 	let (max_concurrent_restores, kopia_image, use_port_forward) =
 		read_config(&client, &namespace).await;
@@ -169,13 +186,61 @@ async fn main() -> anyhow::Result<()> {
 
 	annotate_own_pod(&client, &namespace).await;
 
-	let ctx = Arc::new(Context::new(
+	let deployment_ready_timeout_secs = std::env::var("DEPLOYMENT_READY_TIMEOUT_SECS")
+		.ok()
+		.and_then(|v| {
+			v.parse::<u64>()
+				.map_err(
+					|e| warn!(value = v, error = %e, "invalid DEPLOYMENT_READY_TIMEOUT_SECS, using default"),
+				)
+				.ok()
+		})
+		.unwrap_or(DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS);
+	info!(
+		deployment_ready_timeout_secs,
+		"deployment readiness timeout configured"
+	);
+
+	let mut ctx = Context::new(
 		client.clone(),
 		max_concurrent_restores,
 		kopia_image,
 		use_port_forward,
 		callback_base_url,
-	));
+		deployment_ready_timeout_secs,
+	);
+	ctx.canopy = load_canopy_client(&client, &namespace)
+		.await
+		.unwrap_or_else(|err| {
+			warn!(error = %err, "canopy client not configured; running in legacy-only mode");
+			None
+		});
+	ctx.canopy_proxy_image = std::env::var("CANOPY_PROXY_IMAGE")
+		.unwrap_or_else(|_| DEFAULT_CANOPY_PROXY_IMAGE.to_string());
+	// Path to the tailscale sidecar's LocalAPI socket (shared via an emptyDir),
+	// used to resolve the tailnet MagicDNS suffix for the `url` semantic.
+	// Defaults to containerboot's fixed location; set empty to disable.
+	ctx.tailscaled_socket = match std::env::var("PGRO_TAILSCALED_SOCKET") {
+		Ok(s) if s.is_empty() => None,
+		Ok(s) => Some(s),
+		Err(_) => Some("/var/run/tailscale/tailscaled.sock".to_string()),
+	};
+	ctx.canopy_broker_base_url = if let Ok(url) = std::env::var("CANOPY_BROKER_BASE_URL") {
+		url
+	} else if let Ok(svc) = std::env::var("OPERATOR_SERVICE_NAME") {
+		// Broker listens on its own port; parse from PGRO_BROKER_LISTEN_ADDR
+		// (default [::]:9091).
+		let broker_addr = std::env::var("PGRO_BROKER_LISTEN_ADDR")
+			.unwrap_or_else(|_| DEFAULT_BROKER_ADDR.to_string());
+		let broker_port: u16 = broker_addr
+			.rsplit_once(':')
+			.and_then(|(_, p)| p.parse().ok())
+			.unwrap_or(9091);
+		format!("http://{svc}.{namespace}.svc:{broker_port}")
+	} else {
+		String::new()
+	};
+	let ctx = Arc::new(ctx);
 
 	// Heartbeat: a background task updates this timestamp every 5s.
 	// If the runtime is deadlocked, the timestamp goes stale and /livez fails.
@@ -291,6 +356,112 @@ async fn main() -> anyhow::Result<()> {
 		}
 	});
 
+	// Register pgro's supported intents with canopy + start the worklist
+	// syncer. Only runs when a canopy client was successfully constructed.
+	if ctx.canopy.is_some() {
+		let register_ctx = ctx.clone();
+		tokio::spawn(async move {
+			register_capabilities(register_ctx).await;
+		});
+
+		let interval_secs = std::env::var("CANOPY_RECONCILE_INTERVAL_SECS")
+			.ok()
+			.and_then(|v| v.parse::<u64>().ok())
+			.unwrap_or(DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS);
+		let syncer_ctx = ctx.clone();
+		tokio::spawn(async move {
+			let syncer = controllers::canopy::CanopyController::new(
+				syncer_ctx,
+				Duration::from_secs(interval_secs),
+			);
+			syncer.run_forever().await;
+			warn!("canopy worklist syncer exited");
+		});
+	}
+
+	// Broker HTTP server on a separate listener/port, gated by NetworkPolicy
+	// to accept only the proxy sidecars in canopy-backed Job pods.
+	let broker_addr = std::env::var("PGRO_BROKER_LISTEN_ADDR")
+		.unwrap_or_else(|_| DEFAULT_BROKER_ADDR.to_string());
+	let broker_ctx = ctx.clone();
+	tokio::spawn(async move {
+		let state = BrokerState::new(broker_ctx);
+		let app = broker_router(state);
+		match tokio::net::TcpListener::bind(&broker_addr).await {
+			Ok(listener) => {
+				info!(addr = broker_addr, "credential broker listening");
+				if let Err(e) = axum::serve(listener, app).await {
+					tracing::error!(error = %e, "broker exited with error");
+				}
+			}
+			Err(e) => tracing::error!(error = %e, addr = broker_addr, "broker bind failed"),
+		}
+	});
+
+	// Reconcile the in-memory restore queue against observed cluster state.
+	// Slots are released explicitly on failure, switchover and ephemeral
+	// teardown, but a restore deleted while Restoring bypasses all three and
+	// leaks its slot permanently — the queue only clears on restart, and at
+	// the default limit of 2 a pair of leaked slots stalls the whole fleet.
+	// Freeing a slot a little early is far cheaper than that, so this runs on
+	// a slow interval and lets transient races settle.
+	let queue_ctx = ctx.clone();
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(Duration::from_secs(60));
+		let restores: Api<PostgresPhysicalRestore> = Api::all(queue_ctx.client.clone());
+		loop {
+			interval.tick().await;
+			let Ok(list) = restores
+				.list(&Default::default())
+				.await
+				.inspect_err(|error| {
+					warn!(%error, "could not list restores to reconcile the queue");
+				})
+			else {
+				continue;
+			};
+			let live: HashSet<ReplicaKey> = list
+				.items
+				.iter()
+				.filter(|r| {
+					matches!(
+						r.status.as_ref().and_then(|s| s.phase.as_ref()),
+						Some(&RestorePhase::Restoring)
+					)
+				})
+				.filter_map(|r| {
+					Some(ReplicaKey::new(
+						r.metadata.namespace.as_deref()?,
+						&r.spec.replica.name,
+					))
+				})
+				.collect();
+
+			let mut queue = queue_ctx.restore_queue.write().await;
+			let dropped = queue.retain_active(&live);
+			if !dropped.is_empty() {
+				let freed: Vec<String> = dropped.iter().map(ToString::to_string).collect();
+				warn!(
+					?freed,
+					active = queue.active.len(),
+					"released restore queue slots with no live restore"
+				);
+			}
+			// Deliberately no try_promote here: `active` mirrors observed
+			// state, and promoting would put a key back with no restore
+			// behind it for the next tick to drop again. Freeing the slot is
+			// enough — each replica re-checks capacity on its own reconcile.
+			queue_ctx
+				.metrics
+				.active_restores
+				.set(queue.active.len() as i64);
+			queue_ctx
+				.metrics
+				.queue_depth
+				.set(queue.pending.len() as i64);
+		}
+	});
+
 	// Start controllers
 	let replica_api: Api<PostgresPhysicalReplica> = Api::all(client.clone());
 	let restore_api: Api<PostgresPhysicalRestore> = Api::all(client.clone());
@@ -308,12 +479,23 @@ async fn main() -> anyhow::Result<()> {
 				namespace.map(|ns| ObjectRef::new(&replica_name).within(&ns))
 			},
 		)
-		.watches(Api::<Job>::all(client.clone()), Config::default(), |job| {
-			let labels = job.metadata.labels.as_ref()?;
-			let replica_name = labels.get("pgro.bes.au/replica")?;
-			let namespace = job.metadata.namespace.as_ref()?;
-			Some(ObjectRef::new(replica_name).within(namespace))
-		})
+		// Scope the Job watch to pgro-owned Jobs. Without a label selector
+		// kube-rs caches every Job in every namespace (CI runners, batch
+		// jobs, cert-manager, etc.) in the in-memory store, which scales
+		// with cluster activity rather than pgro's working set. Limiting
+		// to Jobs that carry the pgro.bes.au/replica label cuts that to
+		// only restore Jobs, snapshot-list Jobs, schema-migration Jobs,
+		// and credential-reset Jobs — all of which the operator builds.
+		.watches(
+			Api::<Job>::all(client.clone()),
+			Config::default().labels("pgro.bes.au/replica"),
+			|job| {
+				let labels = job.metadata.labels.as_ref()?;
+				let replica_name = labels.get("pgro.bes.au/replica")?;
+				let namespace = job.metadata.namespace.as_ref()?;
+				Some(ObjectRef::new(replica_name).within(namespace))
+			},
+		)
 		.run(
 			controllers::replica::reconcile,
 			controllers::replica::error_policy,
@@ -384,6 +566,18 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			"/api/v1/schema-migration-results/{namespace}/{replica}",
 			axum::routing::post(post_schema_migration_results),
 		)
+		.route(
+			"/api/v1/cache-pressure/{namespace}/{restore}",
+			axum::routing::post(post_cache_pressure),
+		)
+		.route(
+			"/api/v1/canopy-progress/{namespace}/{job}",
+			axum::routing::post(post_canopy_progress),
+		)
+		.route(
+			"/api/v1/canopy-stats/{namespace}/{job}",
+			axum::routing::post(post_canopy_stats),
+		)
 		.with_state(state)
 		.layer(TraceLayer::new_for_http())
 }
@@ -422,6 +616,82 @@ async fn post_schema_migration_results(
 	StatusCode::NO_CONTENT
 }
 
+/// Accept the cache-pressure callback a restore Job POSTs when its
+/// pre-flight check had to evict cache content. Bumps the replica's
+/// cache PVC requested storage so chronically-pressured replicas
+/// self-tune over a few restore cycles.
+async fn post_cache_pressure(
+	State(state): State<ServerState>,
+	Path((namespace, restore)): Path<(String, String)>,
+) -> StatusCode {
+	info!(
+		namespace = namespace,
+		restore = restore,
+		"received cache-pressure callback"
+	);
+	controllers::restore::grow_cache_pvc_after_pressure(&state.ctx.client, &namespace, &restore)
+		.await;
+	StatusCode::NO_CONTENT
+}
+
+/// Forward a canopy-proxy sidecar's in-flight progress sample to canopy.
+///
+/// The sidecar has the traffic counters but no canopy credentials — those live
+/// only here — so it posts to the operator and the operator relays. The sample
+/// is self-describing (it carries its own `run_id` and type), so this needs no
+/// Kubernetes lookup.
+///
+/// Best-effort telemetry: a rejected or failed relay is logged and the restore
+/// is unaffected. Always answers the sidecar with 204 so a canopy outage can't
+/// turn into sidecar retry pressure.
+async fn post_canopy_progress(
+	State(state): State<ServerState>,
+	Path((namespace, job)): Path<(String, String)>,
+	body: String,
+) -> StatusCode {
+	let sample: canopy::ProgressSample = match serde_json::from_str(&body) {
+		Ok(sample) => sample,
+		Err(error) => {
+			warn!(%namespace, %job, %error, "malformed canopy progress sample, dropping");
+			return StatusCode::NO_CONTENT;
+		}
+	};
+	let Some(client) = state.ctx.canopy.as_ref() else {
+		debug!(%namespace, %job, "canopy not configured, dropping progress sample");
+		return StatusCode::NO_CONTENT;
+	};
+
+	debug!(
+		%namespace,
+		%job,
+		run_id = %sample.run_id,
+		received_raw_bytes = sample.received_raw_bytes,
+		"relaying canopy progress sample"
+	);
+	if let Err(error) = client.backup_progress(&sample.to_args()).await {
+		debug!(%namespace, %job, %error, "posting progress to canopy failed (ignored)");
+	}
+	StatusCode::NO_CONTENT
+}
+
+/// Accept the canopy-proxy sidecar's final TrafficStats POST on shutdown.
+/// The body is opaque JSON — the canopy notification target deserializes
+/// it when building the RestoreVerification.
+async fn post_canopy_stats(
+	State(state): State<ServerState>,
+	Path((namespace, job)): Path<(String, String)>,
+	body: String,
+) -> StatusCode {
+	info!(
+		namespace = namespace,
+		job = job,
+		bytes = body.len(),
+		"received canopy-proxy stats callback"
+	);
+	state.ctx.canopy_stats.store(&namespace, &job, body);
+	StatusCode::NO_CONTENT
+}
+
 /// Liveness: checks that the async runtime isn't deadlocked by verifying
 /// a background heartbeat was updated within the last 30 seconds, and that
 /// the reconciliation loop has run at least once in the last 5 minutes.
@@ -454,6 +724,207 @@ async fn livez(State(state): State<ServerState>) -> (StatusCode, &'static str) {
 		"livez ok"
 	);
 	(StatusCode::OK, "ok")
+}
+
+/// Try to build the canopy client from env config. `Ok(None)` means the
+/// integration is intentionally not configured (no `CANOPY_BASE_URL`); pgro
+/// runs in legacy-only mode. `Err(_)` means configuration was attempted but
+/// failed — logged and downgraded to `None` at the call site.
+async fn load_canopy_client(
+	client: &Client,
+	operator_namespace: &str,
+) -> anyhow::Result<Option<Arc<canopy::Client>>> {
+	let Ok(base_url_str) = std::env::var("CANOPY_BASE_URL") else {
+		return Ok(None);
+	};
+	let base_url = reqwest::Url::parse(&base_url_str)
+		.map_err(|e| anyhow::anyhow!("CANOPY_BASE_URL is not a valid URL: {e}"))?;
+
+	let socks5_proxy =
+		std::env::var("CANOPY_SOCKS5_PROXY").unwrap_or_else(|_| DEFAULT_SOCKS5_PROXY.to_string());
+
+	let device_key_pem = if let Ok(secret_name) = std::env::var("CANOPY_DEVICE_CERT_SECRET") {
+		let secrets: Api<k8s_openapi::api::core::v1::Secret> =
+			Api::namespaced(client.clone(), operator_namespace);
+		let sec = secrets.get(&secret_name).await?;
+		let data = sec.data.and_then(|d| d.into_iter().next());
+		match data {
+			Some((_, v)) => Some(String::from_utf8(v.0).map_err(|e| {
+				anyhow::anyhow!("device cert secret {secret_name} not valid UTF-8: {e}")
+			})?),
+			None => {
+				warn!(secret = secret_name, "device cert secret has no data");
+				None
+			}
+		}
+	} else {
+		None
+	};
+
+	let cfg = canopy::CanopyConfig {
+		base_url,
+		socks5_proxy,
+		device_key_pem,
+	};
+	let cli = canopy::Client::from_config(Some(cfg)).await?;
+	Ok(cli.map(Arc::new))
+}
+
+/// POST `/restore-capabilities` to canopy with the intents pgro implements.
+/// Retries on transient failure with exponential-ish backoff up to ~5 min;
+/// past that, gives up and logs — the next operator restart will re-attempt.
+async fn register_capabilities(ctx: Arc<Context>) {
+	let Some(canopy) = ctx.canopy.as_ref() else {
+		return;
+	};
+	let descriptors = intent::descriptors();
+	let intent_names: Vec<&str> = descriptors.iter().map(|d| d.intent.as_str()).collect();
+	let mut delay = Duration::from_secs(1);
+	let max_delay = Duration::from_secs(300);
+	for attempt in 1..=8u32 {
+		match canopy.restore_capabilities(&descriptors).await {
+			Ok(_) => {
+				info!(
+					intents = ?intent_names,
+					"registered supported intents with canopy"
+				);
+				return;
+			}
+			Err(err) => {
+				warn!(
+					attempt,
+					error = %err,
+					"canopy restore_capabilities failed; retrying"
+				);
+				tokio::time::sleep(delay).await;
+				delay = std::cmp::min(delay * 2, max_delay);
+			}
+		}
+	}
+	warn!("gave up registering supported intents with canopy after 8 attempts");
+}
+
+/// State passed to the credential-broker Router. Holds the operator's canopy
+/// client and a per-(group, type) cache so concurrent Job sidecars don't
+/// multiply upstream canopy calls.
+/// Broker creds cache key: `(group, type, run_id)`. Including the run_id keeps
+/// within-run STS refreshes on a cache hit while giving each restore run its
+/// own canopy-attributed credentials.
+type CredsCacheKey = (String, String, Option<uuid::Uuid>);
+
+#[derive(Clone)]
+struct BrokerState {
+	ctx: Arc<Context>,
+	cache: Arc<tokio::sync::Mutex<std::collections::HashMap<CredsCacheKey, CachedCreds>>>,
+}
+
+#[derive(Clone)]
+struct CachedCreds {
+	body: serde_json::Value,
+	/// Cached response expires this long before the STS creds' own expiry
+	/// so the sidecar's next refresh call gets a fresh cache miss.
+	expires_at: jiff::Timestamp,
+}
+
+impl BrokerState {
+	fn new(ctx: Arc<Context>) -> Self {
+		Self {
+			ctx,
+			cache: Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new())),
+		}
+	}
+}
+
+fn broker_router(state: BrokerState) -> Router {
+	Router::new()
+		.route(
+			"/internal/restore-creds",
+			axum::routing::post(post_restore_creds),
+		)
+		.route("/healthz", get(|| async { StatusCode::OK }))
+		.with_state(state)
+		.layer(TraceLayer::new_for_http())
+}
+
+#[derive(serde::Deserialize)]
+struct BrokerCredsRequest {
+	group: uuid::Uuid,
+	r#type: String,
+	/// Canopy run-uuid of the restore run this sidecar serves, forwarded to
+	/// canopy so its credential grant is attributed to the run. Optional to
+	/// tolerate an older sidecar (mid-rollout) that doesn't send one.
+	#[serde(default)]
+	run_id: Option<uuid::Uuid>,
+}
+
+/// Broker endpoint the proxy sidecar hits to refresh its STS creds. Forwards
+/// to canopy's `POST /restore-credentials`, caches the response per-(group,
+/// type) up to 2 minutes before its expiry. 4xx failures propagate the
+/// upstream status verbatim so a missing external-restore grant surfaces
+/// clearly at the sidecar.
+async fn post_restore_creds(
+	State(state): State<BrokerState>,
+	axum::Json(req): axum::Json<BrokerCredsRequest>,
+) -> (StatusCode, axum::Json<serde_json::Value>) {
+	let Some(canopy) = state.ctx.canopy.as_ref() else {
+		return (
+			StatusCode::SERVICE_UNAVAILABLE,
+			axum::Json(serde_json::json!({
+				"error": "canopy client not configured on operator",
+			})),
+		);
+	};
+
+	let key = (req.group.to_string(), req.r#type.clone(), req.run_id);
+	{
+		let cache = state.cache.lock().await;
+		if let Some(cached) = cache.get(&key)
+			&& cached.expires_at > jiff::Timestamp::now()
+		{
+			return (StatusCode::OK, axum::Json(cached.body.clone()));
+		}
+	}
+
+	match canopy
+		.restore_credentials(&req.r#type, req.group, req.run_id)
+		.await
+	{
+		Ok(resp) => {
+			let expires_at = resp
+				.credentials
+				.expiration
+				.checked_sub(jiff::SignedDuration::from_secs(120))
+				.unwrap_or(resp.credentials.expiration);
+			// bestool-canopy's RestoreCredentials only derives Deserialize; build
+			// the response JSON manually with the same shape the sidecar expects.
+			let body = serde_json::json!({
+				"credentials": {
+					"Version": resp.credentials.version,
+					"AccessKeyId": resp.credentials.access_key_id,
+					"SecretAccessKey": resp.credentials.secret_access_key.0,
+					"SessionToken": resp.credentials.session_token.0,
+					"Expiration": resp.credentials.expiration.to_string(),
+				},
+				"repo_password": resp.repo_password.0,
+			});
+			let mut cache = state.cache.lock().await;
+			cache.insert(
+				key,
+				CachedCreds {
+					body: body.clone(),
+					expires_at,
+				},
+			);
+			(StatusCode::OK, axum::Json(body))
+		}
+		Err(err) => {
+			warn!(error = %err, group = %req.group, r#type = %req.r#type, "broker: canopy restore_credentials failed");
+			(
+				StatusCode::BAD_GATEWAY,
+				axum::Json(serde_json::json!({ "error": err.to_string() })),
+			)
+		}
+	}
 }
 
 /// Readiness: checks that the heartbeat is fresh (runtime is responsive).
@@ -494,6 +965,7 @@ mod tests {
 			DEFAULT_KOPIA_IMAGE.to_string(),
 			false,
 			"http://test.svc:8080".to_string(),
+			DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
 		));
 		let heartbeat = Arc::new(AtomicI64::new(Timestamp::now().as_second()));
 		let state = ServerState { heartbeat, ctx };

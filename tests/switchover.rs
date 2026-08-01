@@ -102,6 +102,13 @@ async fn second_restore_and_switchover() {
 		Some(first_restore_name.as_str()),
 		"service selector should point to first restore"
 	);
+	assert_eq!(
+		svc_selector
+			.get("pgro.bes.au/ready-for-traffic")
+			.map(|s| s.as_str()),
+		Some("true"),
+		"service selector should gate on ready-for-traffic label"
+	);
 
 	// Manually create a second PostgresPhysicalRestore to trigger switchover
 	let second_restore_name = "switchover-replica-manual-second";
@@ -212,6 +219,36 @@ async fn second_restore_and_switchover() {
 		svc_selector.get("pgro.bes.au/restore").map(|s| s.as_str()),
 		Some(second_restore_name),
 		"service selector should point to second restore after switchover"
+	);
+	assert_eq!(
+		svc_selector
+			.get("pgro.bes.au/ready-for-traffic")
+			.map(|s| s.as_str()),
+		Some("true"),
+		"service selector should still gate on ready-for-traffic label after switchover"
+	);
+
+	// The second restore's pod should be labeled ready-for-traffic.
+	let pods: kube::Api<k8s_openapi::api::core::v1::Pod> =
+		kube::Api::namespaced(client.clone(), ns);
+	let pod_list = pods
+		.list(
+			&kube::api::ListParams::default()
+				.labels(&format!("pgro.bes.au/restore={second_restore_name}")),
+		)
+		.await
+		.expect("failed to list second restore pods");
+	let labeled = pod_list.items.iter().any(|p| {
+		p.metadata
+			.labels
+			.as_ref()
+			.and_then(|l| l.get("pgro.bes.au/ready-for-traffic"))
+			.map(|v| v.as_str())
+			== Some("true")
+	});
+	assert!(
+		labeled,
+		"second restore's pod should carry pgro.bes.au/ready-for-traffic=true after switchover"
 	);
 
 	// Second restore should have activated_at set

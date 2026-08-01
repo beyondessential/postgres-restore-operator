@@ -22,3 +22,10 @@
 - Always work from a branch. If you're on `main`, create a new branch.
 - If you can at all do something from the operator, instead of in a script that runs in a job, do so. For example, if you need to query something in a database, you should be able to do so from the operator, instead of writing SQL code in bash logic.
 <!-- end rules -->
+
+## Lessons learned
+
+- Detect dead Postgres connections with **TCP keepalives** (`socket2::TcpKeepalive` on the raw `TcpStream` before handing it to `tokio_postgres::Config::connect_raw`), not with a wall-clock `tokio::time::timeout` around the query. Keepalives fire on the kernel's own timer regardless of in-flight queries, so a legitimately long-running statement (e.g. `DROP SCHEMA … CASCADE` on a populated dbt schema, which can run for tens of minutes) keeps working, while a NAT-evicted / silently-dead socket still errors within ~90s and the reconcile retries.
+- Wall-clock timeouts on a long-tail-distributed operation make a retry loop **never converge**: every attempt hits the cap, error policy retries, every retry hits the cap again. Don't add a timeout unless you have a real p99 number for the operation it wraps.
+- The operator's own libpq sockets are separate from the migration Job's libpq URI. Keepalive fixes in the Job (`keepalives=1&keepalives_idle=...`) do **not** cover the operator — set both.
+- The kube port-forward path is not a raw TCP socket; socket-level keepalives don't apply. That path keeps its own liveness via the API server WebSocket — only `connect_via_tcp` needs the socket2 setup.

@@ -22,7 +22,7 @@ use kube::{
 use postgres_restore_operator::{
 	types::{
 		PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore,
-		PostgresPhysicalRestoreSpec, ReplicaPhase, RestorePhase,
+		PostgresPhysicalRestoreSpec, RedactionSpec, ReplicaPhase, RestorePhase,
 	},
 	util::TimeSpan,
 };
@@ -121,6 +121,8 @@ pub struct ReplicaOpts {
 	pub minimum_ttl: Option<TimeSpan>,
 	pub schedule_jitter: Option<TimeSpan>,
 	pub read_only: bool,
+	pub ephemeral: bool,
+	pub redaction: Option<RedactionSpec>,
 }
 
 impl Default for ReplicaOpts {
@@ -130,6 +132,8 @@ impl Default for ReplicaOpts {
 			minimum_ttl: None,
 			schedule_jitter: None,
 			read_only: true,
+			ephemeral: false,
+			redaction: None,
 		}
 	}
 }
@@ -138,10 +142,11 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 	PostgresPhysicalReplica::new(
 		name,
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some(secret_ref.into()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: opts.schedule,
 			schedule_jitter: opts.schedule_jitter.unwrap_or_default(),
@@ -151,15 +156,20 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			resources_floor: None,
+			resources_maximum: None,
+			deployment_ready_timeout: None,
+			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,
 			affinity: None,
 			tolerations: vec![],
 			read_only: opts.read_only,
+			ephemeral: opts.ephemeral,
 			postgres_extra_config: None,
 			notifications: vec![],
 			persistent_schemas: None,
-			redaction: None,
+			redaction: opts.redaction,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	)

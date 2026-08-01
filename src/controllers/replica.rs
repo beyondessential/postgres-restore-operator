@@ -29,7 +29,7 @@ use super::{
 	restore::{build_credential_reset_job, credential_reset_job_name},
 };
 use crate::{
-	context::Context,
+	context::{Context, ReplicaKey},
 	error::{Error, Result},
 	kopia,
 	types::*,
@@ -38,7 +38,7 @@ use scheduling::ScheduleDecision;
 
 mod redaction;
 mod resources;
-mod scheduling;
+pub(super) mod scheduling;
 mod schema_migration;
 mod status;
 
@@ -46,6 +46,57 @@ mod status;
 mod tests;
 
 use resources::*;
+
+/// True when no schema migration is currently in flight for this replica
+/// — i.e. the sweep can safely delete the previous Active restore without
+/// pulling the rug out from under a running `pg_dump | psql`.
+///
+/// Returns `true` when `persistent_schemas` is unset (no migration ever
+/// runs) or when `schemaMigrationPhase` is anything other than `active`.
+/// Coded as "not in flight" rather than enumerating terminal phases so
+/// future additions (the operator's set of phase labels has grown over
+/// time: `complete`, `partial`, `failed: <reason>`, `timeout-skipped`)
+/// don't silently block the sweep.
+pub fn persistent_schemas_migration_settled(replica: &PostgresPhysicalReplica) -> bool {
+	if replica.spec.persistent_schemas.is_none() {
+		return true;
+	}
+	replica
+		.status
+		.as_ref()
+		.and_then(|s| s.schema_migration_phase.as_ref())
+		.is_none_or(SchemaMigrationPhase::is_settled)
+}
+
+/// True when a snapshot is already covered by an existing restore and must
+/// not be restored again.
+///
+/// A snapshot is covered when we've already recorded it as verified
+/// (`status.verifiedSnapshotId`, the ephemeral marker that outlives the torn
+/// down restore) or when any non-failed restore for this replica is already
+/// working on it (Pending/Restoring/Ready/Switching/Active). Failed restores
+/// don't count — the failure backoff path is allowed to retry the snapshot.
+///
+/// Without this an ephemeral `verify` replica whose restore has been torn
+/// down would re-create a restore for the same snapshot — the snapshot-list
+/// handler otherwise only checks the *active* restore, which is gone after
+/// teardown — and double-report the verification to canopy.
+fn snapshot_already_covered(
+	snapshot_id: &str,
+	verified_snapshot_id: Option<&str>,
+	restores: &[PostgresPhysicalRestore],
+) -> bool {
+	if verified_snapshot_id == Some(snapshot_id) {
+		return true;
+	}
+	restores.iter().any(|r| {
+		r.spec.snapshot == snapshot_id
+			&& !matches!(
+				r.status.as_ref().and_then(|s| s.phase.as_ref()),
+				Some(&RestorePhase::Failed)
+			)
+	})
+}
 
 /// Generate a random password for analytics credentials.
 pub(crate) fn generate_password() -> String {
@@ -74,63 +125,109 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	let client = &ctx.client;
 
-	// Validate kopia Secret
-	let secret_name = replica
-		.spec
-		.kopia_secret_ref
-		.name
-		.as_deref()
-		.unwrap_or_default();
-	let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
-	let secret = match secrets.get(secret_name).await {
-		Ok(s) => s,
-		Err(e) => {
+	// Validate the credential source: exactly one of kopiaSecretRef or
+	// canopySource must be set. Legacy replicas take the Secret path;
+	// canopy-managed ones take the proxy-sidecar path and get their
+	// creds via the operator's in-cluster broker at Job time.
+	match (&replica.spec.kopia_secret_ref, &replica.spec.canopy_source) {
+		(Some(_), Some(_)) => {
 			warn!(
 				replica = name,
-				secret = ?replica.spec.kopia_secret_ref,
-				error = %e,
-				"kopia secret not found"
+				"kopiaSecretRef and canopySource are mutually exclusive"
 			);
 			replica
 				.update_condition(
 					client,
 					"KopiaSecretValid",
 					"False",
-					"SecretNotFound",
-					&format!("Secret {secret_name} not found: {e}"),
+					"SecretRefAndCanopySource",
+					"kopiaSecretRef and canopySource are mutually exclusive; set exactly one",
 				)
 				.await?;
 			return Ok(Action::requeue(Duration::from_secs(60)));
 		}
-	};
-
-	let _creds = match kopia::validate_kopia_secret(&secret) {
-		Ok(c) => {
-			replica
-				.update_condition(
-					client,
-					"KopiaSecretValid",
-					"True",
-					"SecretValid",
-					"All required keys present",
-				)
-				.await?;
-			c
-		}
-		Err(e) => {
-			warn!(replica = name, error = %e, "kopia secret invalid");
+		(None, None) => {
+			warn!(
+				replica = name,
+				"neither kopiaSecretRef nor canopySource set"
+			);
 			replica
 				.update_condition(
 					client,
 					"KopiaSecretValid",
 					"False",
-					"SecretInvalid",
-					&e.to_string(),
+					"NoCredentialSource",
+					"one of kopiaSecretRef or canopySource must be set",
 				)
 				.await?;
 			return Ok(Action::requeue(Duration::from_secs(60)));
 		}
-	};
+		(Some(secret_ref), None) => {
+			let secret_name = secret_ref.name.as_deref().unwrap_or_default();
+			let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
+			let secret = match secrets.get(secret_name).await {
+				Ok(s) => s,
+				Err(e) => {
+					warn!(
+						replica = name,
+						secret = ?secret_ref,
+						error = %e,
+						"kopia secret not found"
+					);
+					replica
+						.update_condition(
+							client,
+							"KopiaSecretValid",
+							"False",
+							"SecretNotFound",
+							&format!("Secret {secret_name} not found: {e}"),
+						)
+						.await?;
+					return Ok(Action::requeue(Duration::from_secs(60)));
+				}
+			};
+			match kopia::validate_kopia_secret(&secret) {
+				Ok(_) => {
+					replica
+						.update_condition(
+							client,
+							"KopiaSecretValid",
+							"True",
+							"SecretValid",
+							"All required keys present",
+						)
+						.await?;
+				}
+				Err(e) => {
+					warn!(replica = name, error = %e, "kopia secret invalid");
+					replica
+						.update_condition(
+							client,
+							"KopiaSecretValid",
+							"False",
+							"SecretInvalid",
+							&e.to_string(),
+						)
+						.await?;
+					return Ok(Action::requeue(Duration::from_secs(60)));
+				}
+			}
+		}
+		(None, Some(_canopy_source)) => {
+			// Nothing to pre-validate at this stage — the proxy sidecar
+			// fetches short-lived creds at Job time via the operator's
+			// broker; any auth failure surfaces there.
+			replica
+				.update_condition(
+					client,
+					"KopiaSecretValid",
+					"True",
+					"CanopySourced",
+					"canopy-managed replica; credentials issued by canopy at Job time",
+				)
+				.await?;
+		}
+	}
 
 	replica.ensure_credentials_secret(client).await?;
 
@@ -203,6 +300,14 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			restore = switching_name,
 			"performing blue-green switchover"
 		);
+
+		// Mark the new restore's pod ready for traffic BEFORE pointing the
+		// Service at it. The Service selector requires the
+		// `ready-for-traffic=true` label (see [[READY_FOR_TRAFFIC_LABEL]]),
+		// so until the operator sets the label, no external client can
+		// reach the restore via the Service — operator-side prep work
+		// (DROP SCHEMA, migration Job) runs without external interference.
+		switching.mark_pod_ready_for_traffic(client).await?;
 
 		// Update Service selector to point to the new restore
 		switching.update_service_selector(client, &name).await?;
@@ -282,7 +387,75 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.send_notifications(client, &ctx.http_client, switching, &ctx.metrics)
 			.await;
 
+		// Canopy verification (signal 3) — no-op unless the replica has
+		// spec.canopy_source.
+		crate::controllers::canopy::verification::report(
+			&ctx,
+			&replica,
+			switching,
+			bestool_canopy::schema::RunOutcome::Success,
+			None,
+		)
+		.await;
+
 		return Ok(Action::requeue(Duration::from_secs(10)));
+	}
+
+	// Ephemeral teardown. For a `spec.ephemeral` replica (e.g. the `verify`
+	// intent) the point of the restore is to prove the snapshot comes up —
+	// once it's Active (the switchover block above ran and, for canopy
+	// replicas, reported the verification), keeping the database running
+	// just wastes resources. Record the verified snapshot and delete the
+	// restore. The replica CR stays; the should_restore logic below only
+	// re-triggers when a newer snapshot is offered (canopy) or the schedule
+	// fires (legacy), gated by `verifiedSnapshotId`.
+	if replica.spec.ephemeral
+		&& let Some(active) = active_restore
+		&& active.metadata.deletion_timestamp.is_none()
+	{
+		let active_name = active.name_any();
+		let verified_snapshot = active.spec.snapshot.clone();
+		info!(
+			replica = name,
+			restore = active_name,
+			snapshot = verified_snapshot,
+			"ephemeral replica: snapshot verified, tearing down restore"
+		);
+
+		// Record the marker BEFORE deleting so that even if the delete or a
+		// crash interleaves, the reconciler won't treat the vanished
+		// restore as an accidental deletion and immediately re-restore.
+		let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), &namespace);
+		let patch = serde_json::json!({
+			"status": {
+				"verifiedSnapshotId": verified_snapshot,
+				"currentRestore": null,
+				"previousRestore": null,
+			}
+		});
+		replicas
+			.patch_status(
+				&name,
+				&PatchParams::apply("postgres-restore-operator"),
+				&Patch::Merge(&patch),
+			)
+			.await?;
+
+		if let Err(e) = restores.delete(&active_name, &Default::default()).await {
+			warn!(
+				replica = name,
+				restore = %active_name,
+				error = %e,
+				"failed to delete ephemeral restore; will retry"
+			);
+		}
+		if let Some(promoted) = ctx
+			.release_restore_slot(&ReplicaKey::new(&namespace, &name))
+			.await
+		{
+			info!(promoted = %promoted, "promoted queued restore after ephemeral teardown");
+		}
+		return Ok(Action::requeue(Duration::from_secs(30)));
 	}
 
 	// Sweep stale Active restores after grace period.
@@ -298,27 +471,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.as_ref()
 		.and_then(|s| s.current_restore.as_deref());
 	if let Some(current) = current_restore_name {
-		// Allow the sweep when no migration is in flight: phase=None means
-		// either no migration has run since this replica was first
-		// reconciled, or a previous sweep cleared it. In both cases the
-		// gate's purpose (don't delete the source while a migration depends
-		// on it) is satisfied. Without this branch, a replica with
-		// persistent_schemas configured that hits the too-many-restores
-		// guardrail can't recover automatically: the guardrail blocks new
-		// restores, no switchover runs, no path sets phase=complete, and
-		// the sweep stays gated forever.
-		let migration_complete = if replica.spec.persistent_schemas.is_some() {
-			let phase = replica
-				.status
-				.as_ref()
-				.and_then(|s| s.schema_migration_phase.as_deref());
-			// "partial" counts as complete for sweep purposes: the
-			// migration Job ran and we accepted the result; we no longer
-			// depend on the previous restore being around.
-			matches!(phase, None | Some("complete") | Some("partial"))
-		} else {
-			true
-		};
+		// Gate the sweep on "migration isn't actively in flight": the
+		// gate's only purpose is to keep us from deleting the migration's
+		// source restore while pg_dump | psql still has it open. Any
+		// terminal phase (`complete`, `partial`, `timeout-skipped`,
+		// `failed: …`) — and `None` (no migration has run since this
+		// replica was first reconciled, or a previous sweep cleared the
+		// field) — all mean "no migration in flight, sweep is safe".
+		//
+		// Coded as "not in flight" rather than enumerating every terminal
+		// phase so future additions don't have to remember to update this
+		// gate. Previously this was an allow-list of `complete`/`partial`,
+		// which silently blocked the sweep when `timeout-skipped` was
+		// added — the replica then accumulated stale Active restores,
+		// hit the too-many-restores guardrail, and couldn't recover
+		// automatically.
+		let migration_complete = persistent_schemas_migration_settled(&replica);
 
 		let redaction_settled = if replica.spec.redaction.is_some() {
 			let phase = replica
@@ -504,9 +672,10 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// Process any existing snapshot-list job regardless of scheduling state.
-	// This runs before the in-progress / should_restore gates so that
-	// completed jobs are always cleaned up promptly.
+	// Snapshot-list runs on both paths. Canopy-sourced replicas fetch the
+	// same snapshot metadata but the result handler filters by
+	// `status.canopyDesiredSnapshotId` instead of the CR's snapshot_filter.
+	let is_canopy = replica.spec.canopy_source.is_some();
 	let snapshot_job_name = format!("{name}-snapshot-list");
 	let jobs: Api<Job> = Api::namespaced(client.clone(), &namespace);
 	let snapshot_job = jobs.get_opt(&snapshot_job_name).await?;
@@ -547,13 +716,28 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 				match kopia::parse_snapshot_list_output(raw) {
 					Ok(all_snapshots) => {
-						let filtered = kopia::filter_snapshots(
-							&all_snapshots,
-							replica.spec.snapshot_filter.as_ref(),
-						);
-						let latest = kopia::latest_snapshot(&filtered);
+						// Canopy path: canopy already picked a specific
+						// snapshot; select the metadata for that ID
+						// instead of applying snapshot_filter + "latest".
+						// Legacy path: filter by snapshot_filter, pick
+						// latest.
+						let picked = if is_canopy {
+							let desired = replica
+								.status
+								.as_ref()
+								.and_then(|s| s.canopy_desired_snapshot_id.as_deref());
+							desired
+								.and_then(|id| all_snapshots.iter().find(|s| s.id == id))
+								.cloned()
+						} else {
+							let filtered = kopia::filter_snapshots(
+								&all_snapshots,
+								replica.spec.snapshot_filter.as_ref(),
+							);
+							kopia::latest_snapshot(&filtered).cloned()
+						};
 
-						if let Some(snap) = latest {
+						if let Some(ref snap) = picked {
 							let size = snap.total_size_bytes();
 							replica
 								.update_status_field(client, "latestAvailableSnapshot", &snap.id)
@@ -568,14 +752,20 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 								)
 								.await?;
 
-							let current_snapshot_id =
-								active_restore.map(|r| r.spec.snapshot.as_str());
+							let verified_snapshot_id = replica
+								.status
+								.as_ref()
+								.and_then(|s| s.verified_snapshot_id.as_deref());
 
-							if current_snapshot_id == Some(&snap.id) {
+							if snapshot_already_covered(
+								&snap.id,
+								verified_snapshot_id,
+								&restore_list.items,
+							) {
 								debug!(
 									replica = name,
 									snapshot = snap.id,
-									"latest snapshot already active, skipping"
+									"snapshot already covered by an existing or verified restore, skipping"
 								);
 							} else {
 								info!(
@@ -634,6 +824,30 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 									warn!(replica = name, error = %e, "failed to publish RestoreCreationBlocked event");
 								}
 							}
+						} else if is_canopy {
+							let desired = replica
+								.status
+								.as_ref()
+								.and_then(|s| s.canopy_desired_snapshot_id.as_deref())
+								.unwrap_or("<none>");
+							warn!(
+								replica = name,
+								desired = desired,
+								"canopy: canopyDesiredSnapshotId not present in kopia snapshot list"
+							);
+							replica
+								.update_condition(
+									client,
+									"SnapshotAvailable",
+									"False",
+									"CanopyDesiredSnapshotMissing",
+									&format!(
+										"canopyDesiredSnapshotId {desired} was not found in the \
+										 kopia snapshot list — canopy may be pointing at a \
+										 snapshot that hasn't been indexed yet"
+									),
+								)
+								.await?;
 						} else {
 							warn!(
 								replica = name,
@@ -704,59 +918,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// Check consecutive failures before the in-progress restore early return,
-	// so that suspension takes priority and the phase doesn't get stuck at
-	// Restoring when all restores are failing.
-	let consecutive_failures = replica
-		.status
-		.as_ref()
-		.and_then(|s| s.consecutive_restore_failures)
-		.unwrap_or(0);
-
-	const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-	if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-		if active_restore.is_some() {
-			replica.update_phase(client, ReplicaPhase::Ready).await?;
-		} else {
-			replica.update_phase(client, ReplicaPhase::Pending).await?;
-		}
-
-		let already_suspended = replica
-			.status
-			.as_ref()
-			.and_then(|s| {
-				s.conditions
-					.iter()
-					.find(|c| c.type_ == "RestoreSchedulingSuspended")
-			})
-			.is_some_and(|c| c.status == "True");
-
-		if !already_suspended {
-			warn!(
-				replica = name,
-				consecutive_failures,
-				"restore scheduling suspended after {MAX_CONSECUTIVE_FAILURES} consecutive failures"
-			);
-			replica
-				.update_condition(
-					client,
-					"RestoreSchedulingSuspended",
-					"True",
-					"ConsecutiveFailures",
-					&format!(
-						"Scheduling suspended after {consecutive_failures} consecutive restore failures. \
-						 Fix the underlying issue and reset with: kubectl patch postgresphysicalreplica {name} \
-						 -n {namespace} --subresource=status --type=merge \
-						 -p '{{\"status\":{{\"consecutiveRestoreFailures\":0}}}}'"
-					),
-				)
-				.await?;
-		}
-		return Ok(Action::requeue(Duration::from_secs(300)));
-	}
-
-	// Clear RestoreSchedulingSuspended if it was previously set but the
-	// counter has since been reset below the threshold (e.g. manual patch).
+	// Clear the legacy RestoreSchedulingSuspended condition on existing
+	// replicas if still True (left over from the suspension behaviour we
+	// removed — see commit dropping MAX_CONSECUTIVE_FAILURES). The
+	// operator no longer suspends; bounded backoff via
+	// scheduling::failure_backoff_delay is the new rate limit, applied in
+	// fail_restore when each failure increments the counter.
 	if replica
 		.status
 		.as_ref()
@@ -769,16 +936,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	{
 		info!(
 			replica = name,
-			consecutive_failures,
-			"clearing RestoreSchedulingSuspended condition (counter below threshold)"
+			"clearing legacy RestoreSchedulingSuspended condition (suspension removed)"
 		);
 		replica
 			.update_condition(
 				client,
 				"RestoreSchedulingSuspended",
 				"False",
-				"CounterReset",
-				"Consecutive failure counter reset below threshold",
+				"SuspensionRemoved",
+				"Operator no longer suspends on consecutive failures; backoff is used instead",
 			)
 			.await?;
 	}
@@ -845,10 +1011,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			.await?;
 	}
 
+	// A replica that has never restored triggers immediately rather than
+	// idling until the first cron tick — but not while a failure backoff is
+	// in effect, or one that fails every attempt retries as fast as it can
+	// fail.
+	let backoff_pending = scheduling::backoff_pending(replica.status.as_ref(), now);
+	let never_restored = never_restored && !backoff_pending;
+
 	if never_restored {
 		info!(
 			replica = name,
 			"no successful restore yet, triggering immediately"
+		);
+	} else if backoff_pending {
+		debug!(
+			replica = name,
+			"restore failure backoff in effect, not triggering"
 		);
 	}
 
@@ -861,18 +1039,66 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	let schedule_decision = replica.check_schedule();
 
+	// On the canopy path, the worklist syncer updates
+	// `status.canopyDesiredSnapshotId` when canopy offers a newer snapshot.
+	// Trigger a restore whenever the desired snapshot differs from what the
+	// replica already carries, in addition to the usual schedule /
+	// never-restored / active-deleted triggers. minimum_ttl still gates:
+	// the intent may declare an explicit lower bound on restore frequency
+	// even in the face of a newer canopy snapshot.
+	//
+	// "What the replica already carries" is normally the active restore's
+	// snapshot, but an ephemeral replica has no active restore after it
+	// tears one down — there we fall back to `verifiedSnapshotId`, the
+	// marker recording the last snapshot we verified. Without that
+	// fallback the `(Some, None)` arm would re-fire forever.
+	let effective_current_snapshot =
+		active_restore.map(|r| r.spec.snapshot.clone()).or_else(|| {
+			replica
+				.status
+				.as_ref()
+				.and_then(|s| s.verified_snapshot_id.clone())
+		});
+	let canopy_desired_changed = is_canopy
+		&& match (
+			replica
+				.status
+				.as_ref()
+				.and_then(|s| s.canopy_desired_snapshot_id.as_ref()),
+			effective_current_snapshot.as_deref(),
+		) {
+			(Some(desired), Some(current)) => desired != current,
+			(Some(_), None) => true,
+			_ => false,
+		} && !replica.within_minimum_ttl(now);
+
 	let should_restore = never_restored
 		|| active_restore_deleted
+		|| canopy_desired_changed
 		|| matches!(schedule_decision, ScheduleDecision::Trigger);
 
 	if should_restore && snapshot_job.is_none() {
 		// Check concurrent restore limit
 		let mut queue = ctx.restore_queue.write().await;
 		if !queue.can_start(ctx.max_concurrent_restores()) {
-			queue.enqueue(name.clone());
-			let position = queue.position(&name);
+			let key = ReplicaKey::new(&namespace, &name);
+			queue.enqueue(key.clone());
+			let position = queue.position(&key);
 			let pending_len = queue.pending.len();
+			let active: Vec<String> = queue.active.iter().map(ToString::to_string).collect();
 			drop(queue);
+
+			// Loud, because a queue that stops draining looks exactly like a
+			// replica that is simply never due: the reconcile requeues on a
+			// timer and nothing else is logged.
+			warn!(
+				replica = name,
+				position = ?position,
+				pending = pending_len,
+				active = ?active,
+				limit = ctx.max_concurrent_restores(),
+				"restore queue is full, waiting for a slot"
+			);
 
 			let replicas: Api<PostgresPhysicalReplica> =
 				Api::namespaced(client.clone(), &namespace);
@@ -896,12 +1122,27 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 		info!(replica = name, "creating snapshot list job");
 		let callback_url = ctx.snapshot_callback_url(&namespace, &name);
+		let stats_callback_url = ctx.canopy_stats_callback_url(&namespace, &snapshot_job_name);
+		let canopy_proxy = if is_canopy {
+			Some(crate::controllers::restore::builders::CanopyProxyArgs {
+				image: &ctx.canopy_proxy_image,
+				broker_base_url: &ctx.canopy_broker_base_url,
+				stats_callback_url: &stats_callback_url,
+				// Snapshot listing is discovery, not a restore run — no run_id,
+				// and nothing long enough to be worth sampling.
+				progress_callback_url: None,
+				run_id: None,
+			})
+		} else {
+			None
+		};
 		let job = build_snapshot_list_job(
 			&replica,
 			&snapshot_job_name,
 			&namespace,
 			&ctx.kopia_image(),
 			&callback_url,
+			canopy_proxy.as_ref(),
 		)?;
 		jobs.create(&PostParams::default(), &job).await?;
 		return Ok(Action::requeue(Duration::from_secs(10)));
@@ -1129,7 +1370,7 @@ async fn mark_schema_migration_complete(
 	let patch = serde_json::json!({
 		"status": {
 			"schemaMigrationJob": null,
-			"schemaMigrationPhase": "complete",
+			"schemaMigrationPhase": SchemaMigrationPhase::Complete,
 		}
 	});
 	replicas
@@ -1139,6 +1380,174 @@ async fn mark_schema_migration_complete(
 			&Patch::Merge(&patch),
 		)
 		.await?;
+	Ok(())
+}
+
+/// True if the running schema-migration Job has been alive longer than the
+/// replica's per-cycle migration budget (see
+/// [`PostgresPhysicalReplica::schema_migration_timeout`]). Uses the Job's
+/// `creationTimestamp` as the start; falls back to "not exceeded" if the
+/// Job has no creation timestamp (which shouldn't happen in practice).
+fn migration_exceeded_budget(replica: &PostgresPhysicalReplica, job: &Job) -> bool {
+	let Some(created) = job.metadata.creation_timestamp.as_ref().map(|t| t.0) else {
+		return false;
+	};
+	let elapsed = Timestamp::now().duration_since(created);
+	elapsed > replica.schema_migration_timeout()
+}
+
+/// Abandon a stuck schema migration: drop the Job, DROP SCHEMA … CASCADE
+/// the configured `persistent_schemas` on the new restore, record a
+/// Warning event, and mark the migration phase as `timeout-skipped`.
+/// Lets switchover proceed so the replica gets a usable (if
+/// schema-less) database instead of being blocked indefinitely. The
+/// next restore cycle re-attempts migration if the schemas reappear on
+/// the source.
+/// Connect to the new restore and `DROP SCHEMA … CASCADE` each given
+/// schema. Separate function so the caller can wrap it in
+/// `tokio::time::timeout`; the operation has no internal deadline and
+/// can hang indefinitely if a backend on the target has a lock on the
+/// schema's namespace.
+async fn drop_persistent_schemas_on_target(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	new_restore_name: &str,
+	schemas: &[String],
+) -> Result<()> {
+	let reader_secret_name = replica.creds_secret_name();
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let reader_secret = secrets.get(&reader_secret_name).await?;
+	let reader_user = postgres::read_secret_field(&reader_secret, "username")?;
+	let reader_password = postgres::read_secret_field(&reader_secret, "password")?;
+	let target_dbname = postgres::discover_restore_database(
+		client,
+		namespace,
+		new_restore_name,
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+	let conn = postgres::connect_to_restore(
+		client,
+		namespace,
+		new_restore_name,
+		&target_dbname,
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+	postgres::drop_schemas_on(&conn.client, schemas).await
+}
+
+async fn timeout_schema_migration(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	new_restore: &PostgresPhysicalRestore,
+	job_name: &str,
+) -> Result<()> {
+	let replica_name = replica.name_any();
+	let new_restore_name = new_restore.name_any();
+	let schemas: Vec<String> = replica.spec.persistent_schemas.clone().unwrap_or_default();
+
+	warn!(
+		replica = %replica_name,
+		restore = %new_restore_name,
+		schemas = ?schemas,
+		timeout = ?replica.schema_migration_timeout(),
+		"schema migration exceeded budget; dropping persistent schemas on new restore and proceeding to switchover"
+	);
+
+	// Cancel the Job (background propagation so its pods are GC'd too).
+	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+	let dp = kube::api::DeleteParams::background();
+	if let Err(e) = jobs.delete(job_name, &dp).await {
+		warn!(job = %job_name, error = %e, "failed to delete timed-out migration Job");
+	}
+
+	// Opportunistically DROP SCHEMA … CASCADE the persistent_schemas on
+	// the new restore so the operator's "owned" schemas don't carry stale
+	// leftovers from the restored data. Bounded at 60 seconds: if a
+	// backend in the target restore is itself stuck (the exact failure
+	// mode that tripped the migration budget in the first place — e.g.
+	// CREATE TABLE spinning at 100% CPU and ignoring SIGTERM), our DROP
+	// queues on its lock and never completes. Better to leave leftover
+	// schemas than to wedge the switchover indefinitely on the cleanup.
+	const CLEANUP_TIMEOUT: Duration = Duration::from_secs(60);
+	if !schemas.is_empty() {
+		let cleanup = drop_persistent_schemas_on_target(
+			client,
+			ctx,
+			replica,
+			namespace,
+			&new_restore_name,
+			&schemas,
+		);
+		match tokio::time::timeout(CLEANUP_TIMEOUT, cleanup).await {
+			Ok(Ok(())) => {}
+			Ok(Err(e)) => {
+				warn!(
+					replica = %replica_name,
+					error = %e,
+					"DROP SCHEMA cleanup errored in timeout-skip path; proceeding to switchover with leftover schemas"
+				);
+			}
+			Err(_) => {
+				warn!(
+					replica = %replica_name,
+					timeout = ?CLEANUP_TIMEOUT,
+					"DROP SCHEMA cleanup itself timed out (target postgres backend likely stuck); proceeding to switchover with leftover schemas"
+				);
+			}
+		}
+	}
+
+	// Surface as a Warning event so this is visible on the replica CR.
+	let note = format!(
+		"Schema migration exceeded its time budget (20% of cron interval). \
+		 Persistent schemas [{}] were dropped on the new restore so it can come up. \
+		 The next restore cycle will reattempt migration if the schemas have been regenerated upstream.",
+		schemas.join(", ")
+	);
+	if let Err(e) = ctx
+		.recorder
+		.publish(
+			&Event {
+				type_: EventType::Warning,
+				reason: "SchemaMigrationTimedOut".into(),
+				note: Some(note),
+				action: "Restore".into(),
+				secondary: Some(new_restore.object_ref(&())),
+			},
+			&replica.object_ref(&()),
+		)
+		.await
+	{
+		warn!(replica = %replica_name, error = %e, "failed to publish SchemaMigrationTimedOut event");
+	}
+
+	// Status: phase = timeout-skipped so it's distinguishable from
+	// complete/partial/failed.
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let patch = serde_json::json!({
+		"status": {
+			"schemaMigrationJob": null,
+			"schemaMigrationPhase": SchemaMigrationPhase::TimeoutSkipped,
+		}
+	});
+	replicas
+		.patch_status(
+			&replica_name,
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+
 	Ok(())
 }
 
@@ -1186,7 +1595,7 @@ async fn reconcile_schema_migration(
 		.status
 		.as_ref()
 		.and_then(|s| s.schema_migration_phase.as_ref())
-		.is_some_and(|p| p == "complete")
+		.is_some_and(|p| matches!(p, SchemaMigrationPhase::Complete))
 	{
 		debug!(replica = %replica_name, "migration already complete in status");
 		return Ok(true);
@@ -1199,6 +1608,18 @@ async fn reconcile_schema_migration(
 	if let Some(job) = jobs.get_opt(&job_name).await? {
 		match classify_job(&job) {
 			JobStatus::Active => {
+				if migration_exceeded_budget(replica, &job) {
+					timeout_schema_migration(
+						client,
+						ctx,
+						replica,
+						namespace,
+						new_restore,
+						&job_name,
+					)
+					.await?;
+					return Ok(true);
+				}
 				debug!(replica = %replica_name, job = %job_name, "migration Job still running");
 				return Ok(false);
 			}
@@ -1240,7 +1661,11 @@ async fn reconcile_schema_migration(
 					info!(replica = %replica_name, "migration Job succeeded");
 				}
 
-				let phase = if is_partial { "partial" } else { "complete" };
+				let phase = if is_partial {
+					SchemaMigrationPhase::Partial
+				} else {
+					SchemaMigrationPhase::Complete
+				};
 				let replicas: Api<PostgresPhysicalReplica> =
 					Api::namespaced(client.clone(), namespace);
 				let patch = serde_json::json!({
@@ -1289,7 +1714,7 @@ async fn reconcile_schema_migration(
 				let patch = serde_json::json!({
 					"status": {
 						"schemaMigrationJob": null,
-						"schemaMigrationPhase": format!("failed: {}", last_error),
+						"schemaMigrationPhase": SchemaMigrationPhase::Failed(last_error.clone()),
 					}
 				});
 				replicas
@@ -1355,20 +1780,26 @@ async fn reconcile_schema_migration(
 		Err(e) => return Err(e),
 	};
 
-	// Filter out schemas that don't exist on the source. This happens when the
-	// user adds a schema to persistent_schemas before actually creating it.
+	// Source-side queries: schema existence + database size. Both run on
+	// (source restore, source_dbname), so we open one connection and
+	// reuse it across both queries to halve the connection count for
+	// this leg of the reconcile.
 	let all_schemas: &[String] = schemas;
-	let schemas = query_existing_schemas(
-		client,
-		namespace,
-		&old_restore_name,
-		&source_dbname,
-		&reader_user,
-		&reader_password,
-		all_schemas,
-		ctx.use_port_forward(),
-	)
-	.await?;
+	let (schemas, db_size_bytes) = {
+		let conn = postgres::connect_to_restore(
+			client,
+			namespace,
+			&old_restore_name,
+			&source_dbname,
+			&reader_user,
+			&reader_password,
+			ctx.use_port_forward(),
+		)
+		.await?;
+		let existing = postgres::existing_schemas_on(&conn.client, all_schemas).await?;
+		let size = postgres::database_size_on(&conn.client).await?;
+		(existing, size)
+	};
 	let existing_set: HashSet<&str> = schemas.iter().map(String::as_str).collect();
 	let skipped: Vec<&String> = all_schemas
 		.iter()
@@ -1390,21 +1821,6 @@ async fn reconcile_schema_migration(
 		mark_schema_migration_complete(client, &replica_name, namespace).await?;
 		return Ok(true);
 	}
-
-	// Measure the actual on-disk database size of the source restore and
-	// compute how much the persistent schemas have grown beyond the original
-	// snapshot.  This delta is stored in the replica status so the next
-	// restore PVC can be sized accordingly.
-	let db_size_bytes = postgres::measure_database_size(
-		client,
-		namespace,
-		&old_restore_name,
-		&source_dbname,
-		&reader_user,
-		&reader_password,
-		ctx.use_port_forward(),
-	)
-	.await?;
 
 	let snapshot_size_bytes: ParsedQuantity = old_restore
 		.spec
@@ -1470,42 +1886,36 @@ async fn reconcile_schema_migration(
 		Err(e) => return Err(e),
 	};
 
-	// Drop any persistent_schemas that are already present in the new
-	// restore. They are operator-owned: whatever was in the restored data
-	// is junk (typically because the schema has leaked back into the source
-	// DB), and the migration Job is about to write the canonical copy
-	// from the previous restore via pg_dump | psql, which would otherwise
-	// conflict on existing objects. Idempotent and no-op when the schemas
-	// are absent — safe to run unconditionally before every migration.
-	let preexisting = query_existing_schemas(
-		client,
-		namespace,
-		&new_restore_name,
-		&target_dbname,
-		&reader_user,
-		&reader_password,
-		&schemas,
-		ctx.use_port_forward(),
-	)
-	.await?;
-	if !preexisting.is_empty() {
-		info!(
-			replica = %replica_name,
-			restore = %new_restore_name,
-			schemas = ?preexisting,
-			"dropping pre-existing persistent schemas in target before migration"
-		);
-		postgres::drop_schemas_in_restore(
+	// Target-side: detect any persistent_schemas that are already present
+	// in the new restore and drop them. Both queries run on (new restore,
+	// target_dbname), so open one connection and reuse it for both. The
+	// schemas to drop are operator-owned — whatever was in the restored
+	// data is junk (typically because the schema has leaked back into
+	// the source DB) — and the migration Job is about to write the
+	// canonical copy from the previous restore via pg_dump | psql,
+	// which would otherwise conflict on existing objects. Idempotent
+	// and no-op when the schemas are absent.
+	{
+		let conn = postgres::connect_to_restore(
 			client,
 			namespace,
 			&new_restore_name,
 			&target_dbname,
 			&reader_user,
 			&reader_password,
-			&preexisting,
 			ctx.use_port_forward(),
 		)
 		.await?;
+		let preexisting = postgres::existing_schemas_on(&conn.client, &schemas).await?;
+		if !preexisting.is_empty() {
+			info!(
+				replica = %replica_name,
+				restore = %new_restore_name,
+				schemas = ?preexisting,
+				"dropping pre-existing persistent schemas in target before migration"
+			);
+			postgres::drop_schemas_on(&conn.client, &preexisting).await?;
+		}
 	}
 
 	// The analytics user is granted SUPERUSER on every read-write restore
@@ -1544,7 +1954,7 @@ async fn reconcile_schema_migration(
 	let patch = serde_json::json!({
 		"status": {
 			"schemaMigrationJob": job_name,
-			"schemaMigrationPhase": "active",
+			"schemaMigrationPhase": SchemaMigrationPhase::Active,
 		}
 	});
 	replicas
@@ -1556,51 +1966,6 @@ async fn reconcile_schema_migration(
 		.await?;
 
 	Ok(false) // Job created, not complete yet
-}
-
-/// Query which of the requested schemas actually exist in a restore's database.
-/// Returns schemas in the same order as the input slice, using the system
-/// catalog (`pg_catalog.pg_namespace`) which is always fully visible regardless
-/// of schema-level privileges.
-#[expect(
-	clippy::too_many_arguments,
-	reason = "internal helper with tightly-coupled params"
-)]
-async fn query_existing_schemas(
-	client: &Client,
-	namespace: &str,
-	restore_name: &str,
-	dbname: &str,
-	user: &str,
-	password: &str,
-	schemas: &[String],
-	use_port_forward: bool,
-) -> Result<Vec<String>> {
-	let conn = postgres::connect_to_restore(
-		client,
-		namespace,
-		restore_name,
-		dbname,
-		user,
-		password,
-		use_port_forward,
-	)
-	.await?;
-
-	let rows = conn
-		.client
-		.query(
-			"SELECT nspname FROM pg_catalog.pg_namespace WHERE nspname = ANY($1)",
-			&[&schemas],
-		)
-		.await?;
-
-	let found: HashSet<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
-	Ok(schemas
-		.iter()
-		.filter(|s| found.contains(s.as_str()))
-		.cloned()
-		.collect())
 }
 
 pub fn error_policy(

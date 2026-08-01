@@ -46,6 +46,9 @@ pub enum Error {
 
 	#[error("Redaction error: {0}")]
 	Redaction(String),
+
+	#[error("Canopy error: {0}")]
+	Canopy(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -1,0 +1,8 @@
+[default.extend-words]
+# BRIN: postgres "Block Range Index" type.
+BRIN = "BRIN"
+
+[files]
+# Generated from k8s-openapi schemas; upstream docstrings use
+# "ANDed" / "ORed" style jargon typos flags as misspellings.
+extend-exclude = ["crds.yaml"]

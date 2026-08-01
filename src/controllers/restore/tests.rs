@@ -9,7 +9,9 @@ use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
 use kube::ResourceExt;
 
-use super::builders::{build_deployment, build_restore_job, build_version_detect_job};
+use super::builders::{
+	build_deployment, build_restore_job, build_version_detect_job, resolve_postgres_resources,
+};
 use crate::{types::*, util::TimeSpan};
 
 #[test]
@@ -17,10 +19,11 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 */6 * * *".into(),
 			schedule_jitter: TimeSpan(Span::new().minutes(10)),
@@ -30,11 +33,16 @@ fn deployment_uses_affinity_not_node_selector() {
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			resources_floor: None,
+			resources_maximum: None,
+			deployment_ready_timeout: None,
+			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,
 			affinity: None,
 			tolerations: vec![],
 			read_only: true,
+			ephemeral: false,
 			postgres_extra_config: None,
 			notifications: vec![],
 
@@ -102,10 +110,11 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
-			kopia_secret_ref: SecretReference {
+			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
-			},
+			}),
+			canopy_source: None,
 			snapshot_filter: None,
 			schedule: "0 */6 * * *".into(),
 			schedule_jitter: TimeSpan(Span::new().minutes(10)),
@@ -115,11 +124,16 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
+			resources_floor: None,
+			resources_maximum: None,
+			deployment_ready_timeout: None,
+			shm_size_floor: None,
 			service_annotations: None,
 			pod_annotations: None,
 			affinity: None,
 			tolerations: vec![],
 			read_only: true,
+			ephemeral: false,
 			postgres_extra_config: None,
 			notifications: vec![],
 
@@ -146,6 +160,217 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	(restore, replica)
 }
 
+/// Memory in bytes. Compared numerically because the derived value is ceiled
+/// to whole Mi, so `2Gi` legitimately comes back as `2048Mi`.
+fn mem(r: &ResourceRequirements, which: &str) -> u64 {
+	let map = match which {
+		"limits" => r.limits.as_ref(),
+		_ => r.requests.as_ref(),
+	};
+	let q = map.unwrap().get("memory").unwrap().clone();
+	parsed_bytes(&q)
+}
+
+fn gib(n: u64) -> u64 {
+	n * (1 << 30)
+}
+
+fn cpu(r: &ResourceRequirements, which: &str) -> Option<String> {
+	let map = match which {
+		"limits" => r.limits.as_ref(),
+		_ => r.requests.as_ref(),
+	};
+	map.and_then(|m| m.get("cpu")).map(|q| q.0.clone())
+}
+
+/// A pinned `resources` is the operator's explicit intent (or a canopy
+/// parameter) and must beat anything derived from the snapshot.
+#[test]
+fn pinned_resources_win_over_the_derived_value() {
+	let (restore, mut replica) = test_restore_and_replica();
+	replica.spec.resources = Some(ResourceRequirements {
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("3Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("8Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("pinned");
+	assert_eq!(mem(&resolved, "limits"), gib(3));
+}
+
+/// With nothing pinned the memory comes from the snapshot, while CPU is
+/// carried over from the floor — CPU tracks query concurrency, not data size.
+#[test]
+fn derived_memory_scales_but_cpu_comes_from_the_floor() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity("200Gi".to_string());
+	replica.spec.resources = None;
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		requests: Some(BTreeMap::from([
+			("cpu".to_string(), Quantity("500m".to_string())),
+			("memory".to_string(), Quantity("2Gi".to_string())),
+		])),
+		limits: Some(BTreeMap::from([
+			("cpu".to_string(), Quantity("4".to_string())),
+			("memory".to_string(), Quantity("8Gi".to_string())),
+		])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("derived");
+
+	assert_eq!(mem(&resolved, "limits"), gib(20), "10% of a 200Gi snapshot");
+	assert_eq!(cpu(&resolved, "limits").as_deref(), Some("4"));
+	assert_eq!(cpu(&resolved, "requests").as_deref(), Some("500m"));
+}
+
+/// A small replica must not inherit a large replica's reservation.
+#[test]
+fn derived_memory_falls_back_to_the_floor_for_a_small_snapshot() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity("300Mi".to_string());
+	replica.spec.resources = None;
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("2Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("derived");
+	assert_eq!(mem(&resolved, "limits"), gib(2));
+}
+
+#[test]
+fn canopy_restore_job_proxy_is_native_sidecar() {
+	// Regression: the canopy-proxy must be an init container with
+	// restartPolicy=Always (a native sidecar), NOT a plain container. As a
+	// plain container it keeps the Pod Running after the main `restore`
+	// container exits, so the Job never succeeds and eventually hits
+	// activeDeadlineSeconds → DeadlineExceeded.
+	let (restore, mut replica) = test_restore_and_replica();
+	replica.spec.kopia_secret_ref = None;
+	replica.spec.canopy_source = Some(CanopySource {
+		group: "11111111-1111-1111-1111-111111111111".to_string(),
+		r#type: "tamanu-postgres".to_string(),
+	});
+	let proxy = super::builders::CanopyProxyArgs {
+		image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
+		broker_base_url: "http://operator.pgro-system.svc:9091",
+		stats_callback_url: "http://operator.pgro-system.svc:8080/api/v1/canopy-stats/ns/job",
+		progress_callback_url: None,
+		run_id: Some("44444444-4444-4444-4444-444444444444"),
+	};
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		Some(&proxy),
+	)
+	.unwrap();
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+
+	// The proxy is NOT a regular container.
+	assert!(
+		!pod_spec.containers.iter().any(|c| c.name == "canopy-proxy"),
+		"canopy-proxy must not be a plain container (Pod would never complete)"
+	);
+	// It IS an init container with restartPolicy=Always.
+	let init = pod_spec
+		.init_containers
+		.as_ref()
+		.expect("canopy path must declare init containers");
+	let sidecar = init
+		.iter()
+		.find(|c| c.name == "canopy-proxy")
+		.expect("canopy-proxy must be a native sidecar (init container)");
+	assert_eq!(
+		sidecar.restart_policy.as_deref(),
+		Some("Always"),
+		"native sidecar must set restartPolicy=Always"
+	);
+	assert!(
+		pod_spec.termination_grace_period_seconds.unwrap_or(0) > 0,
+		"canopy Pod must allow grace time for the sidecar to flush stats on SIGTERM"
+	);
+}
+
+#[test]
+fn canopy_restore_job_sidecar_carries_run_id() {
+	// The run_id passed in CanopyProxyArgs must reach the sidecar as
+	// PGRO_RUN_ID so its credential requests are attributed to the run; when
+	// no run_id is given (non-run credential consumers) the env is absent.
+	let (restore, mut replica) = test_restore_and_replica();
+	replica.spec.kopia_secret_ref = None;
+	replica.spec.canopy_source = Some(CanopySource {
+		group: "11111111-1111-1111-1111-111111111111".to_string(),
+		r#type: "tamanu-postgres".to_string(),
+	});
+
+	let run_id_env = |run_id: Option<&str>| {
+		let proxy = super::builders::CanopyProxyArgs {
+			image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
+			broker_base_url: "http://operator.pgro-system.svc:9091",
+			stats_callback_url: "http://operator.pgro-system.svc:8080/api/v1/canopy-stats/ns/job",
+			progress_callback_url: None,
+			run_id,
+		};
+		let job = build_restore_job(
+			&restore,
+			"test-restore-restore",
+			"default",
+			&replica,
+			"kopia:latest",
+			"http://operator/api/v1/cache-pressure/default/test-restore",
+			Some(&proxy),
+		)
+		.unwrap();
+		let sidecar = job
+			.spec
+			.unwrap()
+			.template
+			.spec
+			.unwrap()
+			.init_containers
+			.unwrap()
+			.into_iter()
+			.find(|c| c.name == "canopy-proxy")
+			.expect("canopy-proxy sidecar");
+		sidecar
+			.env
+			.unwrap_or_default()
+			.into_iter()
+			.find(|e| e.name == "PGRO_RUN_ID")
+			.and_then(|e| e.value)
+	};
+
+	assert_eq!(
+		run_id_env(Some("44444444-4444-4444-4444-444444444444")).as_deref(),
+		Some("44444444-4444-4444-4444-444444444444"),
+	);
+	assert_eq!(
+		run_id_env(None),
+		None,
+		"no run_id → no PGRO_RUN_ID env on the sidecar"
+	);
+}
+
 #[test]
 fn restore_job_has_ttl_seconds_after_finished() {
 	let (restore, replica) = test_restore_and_replica();
@@ -155,6 +380,8 @@ fn restore_job_has_ttl_seconds_after_finished() {
 		"default",
 		&replica,
 		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let ttl = job
@@ -180,6 +407,8 @@ fn restore_job_mounts_persistent_kopia_cache() {
 		"default",
 		&replica,
 		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -236,6 +465,268 @@ fn kopia_cache_pvc_owned_by_replica() {
 		.as_ref()
 		.expect("cache PVC must declare access modes");
 	assert_eq!(access_modes, &vec!["ReadWriteOnce".to_string()]);
+}
+
+#[test]
+fn kopia_content_cache_mb_floor_for_small_pvc() {
+	// 10Gi PVC (the floor for small snapshots): reserve = max(2Gi,
+	// 30% × 10Gi) = 3Gi → content cache = 7Gi.
+	let small = Quantity("1Gi".to_string());
+	let mb = super::builders::kopia_content_cache_mb(&small);
+	let pvc_mb = 10 * 1024;
+	let proportional = (pvc_mb as f64 * super::builders::KOPIA_CACHE_RESERVE_FRACTION) as u64;
+	let reserve = proportional.max(super::builders::KOPIA_CACHE_RESERVE_MIN_MB);
+	let expected = pvc_mb - reserve;
+	assert_eq!(mb, expected);
+	assert!(
+		mb >= super::builders::KOPIA_CONTENT_CACHE_FLOOR_MB,
+		"content cache must always be at least the floor"
+	);
+}
+
+#[test]
+fn kopia_content_cache_mb_scales_with_snapshot() {
+	// 100Gi snapshot → 20Gi PVC. Reserve = max(2Gi, 30% × 20Gi) = 6Gi
+	// → content cache = 14Gi.
+	let big = Quantity("100Gi".to_string());
+	let mb = super::builders::kopia_content_cache_mb(&big);
+	let pvc_mb = 20 * 1024;
+	let proportional = (pvc_mb as f64 * super::builders::KOPIA_CACHE_RESERVE_FRACTION) as u64;
+	let reserve = proportional.max(super::builders::KOPIA_CACHE_RESERVE_MIN_MB);
+	let expected = pvc_mb - reserve;
+	assert_eq!(mb, expected);
+}
+
+#[test]
+fn next_cache_pvc_size_after_pressure_bumps_and_caps() {
+	// 10Gi PVC → first bump → 11.5Gi. Eventually caps at 2×10Gi = 20Gi.
+	let snapshot = Quantity("1Gi".to_string());
+	let mut size = Quantity("10Gi".to_string());
+	let original_bytes = parsed_bytes(&size);
+	let max_bytes = parsed_bytes(&super::builders::kopia_cache_pvc_max(&snapshot));
+	assert_eq!(max_bytes, original_bytes * 2);
+
+	let first = super::builders::next_cache_pvc_size_after_pressure(&size, &snapshot);
+	let first_bytes = parsed_bytes(&first);
+	assert!(first_bytes > original_bytes, "first bump must grow");
+	assert!(first_bytes <= max_bytes, "first bump must not exceed cap");
+
+	// Loop until we hit the cap. Should take a bounded number of steps.
+	for _ in 0..50 {
+		size = super::builders::next_cache_pvc_size_after_pressure(&size, &snapshot);
+		if parsed_bytes(&size) >= max_bytes {
+			break;
+		}
+	}
+	assert!(
+		parsed_bytes(&size) >= max_bytes,
+		"repeated bumps must eventually reach the cap; got {}",
+		size.0
+	);
+
+	// Once at the cap, further bumps don't push past it.
+	let after_cap = super::builders::next_cache_pvc_size_after_pressure(&size, &snapshot);
+	assert!(
+		parsed_bytes(&after_cap) <= max_bytes,
+		"at-cap bump must not exceed cap"
+	);
+}
+
+fn parsed_bytes(q: &Quantity) -> u64 {
+	kube_quantity::ParsedQuantity::try_from(q.clone())
+		.ok()
+		.and_then(|p| p.to_bytes_f64())
+		.map(|b| b as u64)
+		.unwrap_or(0)
+}
+
+/// The sidecar can only sample progress if the Job tells it where to post.
+#[test]
+fn canopy_restore_job_sidecar_carries_progress_callback_url() {
+	let (restore, mut replica) = test_restore_and_replica();
+	replica.spec.canopy_source = Some(CanopySource {
+		group: "11111111-1111-1111-1111-111111111111".to_string(),
+		r#type: "tamanu-postgres".to_string(),
+	});
+	let url = "http://operator.pgro-system.svc:8080/api/v1/canopy-progress/ns/job";
+	let proxy = super::builders::CanopyProxyArgs {
+		image: "ghcr.io/beyondessential/postgres-restore-operator:latest",
+		broker_base_url: "http://operator.pgro-system.svc:9091",
+		stats_callback_url: "http://operator.pgro-system.svc:8080/api/v1/canopy-stats/ns/job",
+		progress_callback_url: Some(url),
+		run_id: Some("22222222-2222-2222-2222-222222222222"),
+	};
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		Some(&proxy),
+	)
+	.unwrap();
+	let sidecar = job
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "canopy-proxy")
+		.expect("canopy-proxy sidecar");
+
+	let got = sidecar
+		.env
+		.unwrap()
+		.into_iter()
+		.find(|e| e.name == "PGRO_PROGRESS_CALLBACK_URL")
+		.and_then(|e| e.value);
+	assert_eq!(got.as_deref(), Some(url));
+}
+
+fn restore_job_for(snapshot_size: &str) -> k8s_openapi::api::batch::v1::Job {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity(snapshot_size.to_string());
+	build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
+	)
+	.unwrap()
+}
+
+/// kopia sizes its worker pool from the CPUs it can see on the node, not from
+/// the container's cgroup limit, so it spawns far more workers than it has CPU
+/// to run them on. Pin the parallelism to what the container is actually
+/// allowed to use.
+#[test]
+fn restore_job_pins_kopia_parallelism_to_its_cpu_limit() {
+	let job = restore_job_for("10Gi");
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+	let container = &pod_spec.containers[0];
+	let cpu_limit = container
+		.resources
+		.as_ref()
+		.and_then(|r| r.limits.as_ref())
+		.and_then(|m| m.get("cpu"))
+		.expect("restore container must cap CPU")
+		.0
+		.clone();
+	let script = container.args.as_ref().unwrap().join(" ");
+	assert!(
+		script.contains("--parallel=\"$KOPIA_PARALLEL\""),
+		"restore must pass --parallel to kopia"
+	);
+
+	let parallel = container
+		.env
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|e| e.name == "KOPIA_PARALLEL")
+		.and_then(|e| e.value.clone())
+		.expect("KOPIA_PARALLEL must be set");
+	assert_eq!(
+		parallel, cpu_limit,
+		"parallelism must match the container's CPU limit"
+	);
+}
+
+/// A restore holding far more data gets more memory to work in, rather than
+/// every restore sharing whatever suited the first one.
+#[test]
+fn restore_job_memory_scales_with_snapshot_size() {
+	let mem_of = |job: k8s_openapi::api::batch::v1::Job| -> u64 {
+		let pod_spec = job.spec.unwrap().template.spec.unwrap();
+		let q = pod_spec.containers[0]
+			.resources
+			.as_ref()
+			.unwrap()
+			.limits
+			.as_ref()
+			.unwrap()
+			.get("memory")
+			.unwrap()
+			.clone();
+		parsed_bytes(&q)
+	};
+
+	let small = mem_of(restore_job_for("1Gi"));
+	let large = mem_of(restore_job_for("500Gi"));
+	assert!(
+		large > small,
+		"a much larger snapshot must get more memory, got {large} vs {small}"
+	);
+	assert_eq!(small, gib(4), "small restores keep today's 4Gi floor");
+}
+
+#[test]
+fn restore_job_passes_cache_caps_and_log_rotation() {
+	// The restore Job's pod spec must set KOPIA_CONTENT_CACHE_MB and
+	// KOPIA_METADATA_CACHE_MB so the embedded script can cap kopia's
+	// caches, and the script must rotate CLI logs. Without these the
+	// cache PVC fills up and every subsequent restore Job pod exits
+	// in 1–2 minutes ("no space left on device").
+	let (restore, replica) = test_restore_and_replica();
+	let job = build_restore_job(
+		&restore,
+		"test-restore-restore",
+		"default",
+		&replica,
+		"kopia:latest",
+		"http://operator/api/v1/cache-pressure/default/test-restore",
+		None,
+	)
+	.unwrap();
+	let pod_spec = job.spec.unwrap().template.spec.unwrap();
+	let container = &pod_spec.containers[0];
+	let env = container.env.as_ref().expect("container must declare env");
+	let names: Vec<&str> = env.iter().map(|e| e.name.as_str()).collect();
+	assert!(
+		names.contains(&"KOPIA_CONTENT_CACHE_MB"),
+		"restore Job env must include KOPIA_CONTENT_CACHE_MB"
+	);
+	assert!(
+		names.contains(&"KOPIA_METADATA_CACHE_MB"),
+		"restore Job env must include KOPIA_METADATA_CACHE_MB"
+	);
+
+	let script = &container.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("--content-cache-size-mb=\"$KOPIA_CONTENT_CACHE_MB\""),
+		"connect command must cap content cache via env var"
+	);
+	assert!(
+		script.contains("--metadata-cache-size-mb=\"$KOPIA_METADATA_CACHE_MB\""),
+		"connect command must cap metadata cache"
+	);
+	assert!(
+		script.contains("--log-dir-max-files=20"),
+		"kopia invocations must rotate CLI logs by file count"
+	);
+	assert!(
+		script.contains("--log-dir-max-age=24h"),
+		"kopia invocations must rotate CLI logs by age"
+	);
+	assert!(
+		names.contains(&"CACHE_PRESSURE_CALLBACK_URL"),
+		"restore Job env must include CACHE_PRESSURE_CALLBACK_URL"
+	);
+	assert!(
+		script.contains("PGRO_CACHE_PRESSURE"),
+		"restore script must emit pre-flight pressure marker"
+	);
+	assert!(
+		script.contains("$CACHE_PRESSURE_CALLBACK_URL"),
+		"restore script must POST to the cache-pressure callback URL on pressure"
+	);
 }
 
 #[test]
@@ -495,6 +986,212 @@ fn deployment_init_script_grants_read_only_on_pg14_plus() {
 }
 
 #[test]
+fn deployment_init_script_two_stage_pg_resetwal_fallback() {
+	// When a snapshot is taken mid-online-backup the trailing WAL isn't
+	// included, and postgres recovery fails with "WAL ends before end of
+	// online backup" (or a similar signature). For an analytics replica
+	// we prefer "comes up at the snapshotted state" over "permanently
+	// stuck", so the init script runs `pg_resetwal -f` as a fallback.
+	//
+	// Two stages:
+	//   - Detected WAL signature → short-circuit straight to pg_resetwal
+	//     (retrying the same command won't help when recovery itself is
+	//     blocking startup).
+	//   - Undetected failure → retry once with the same settings (could
+	//     be a transient I/O / catalog blip), then pg_resetwal as a
+	//     last resort.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let setup_auth = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = setup_auth.args.unwrap().remove(0);
+
+	// pg_resetwal appears multiple times — once in each fallback branch.
+	let resetwal_calls = script.matches("pg_resetwal -f").count();
+	assert!(
+		resetwal_calls >= 2,
+		"init script must reference pg_resetwal -f in both the detected and last-resort branches (saw {resetwal_calls})"
+	);
+	// Detection signatures.
+	for sig in [
+		"WAL ends before end of online backup",
+		"invalid record length at",
+		"database system was interrupted while in recovery",
+	] {
+		assert!(
+			script.contains(sig),
+			"fallback must detect WAL signature: {sig}"
+		);
+	}
+	// Stage-2 retry message — verifies the script attempts the same
+	// command once more before reset when no signature matched.
+	assert!(
+		script.contains("retrying once before falling back to pg_resetwal"),
+		"init script must do a same-settings retry before the last-resort reset"
+	);
+	assert!(
+		script.contains("last resort"),
+		"init script must label the second pg_resetwal as a last resort"
+	);
+}
+
+#[test]
+fn deployment_init_script_flags_full_reindex_after_resetwal() {
+	// pg_resetwal bypasses WAL replay, so any in-flight index write at
+	// snapshot time can leave torn pages (postgres later surfaces these
+	// as "unexpected zero page at block N" when queries hit the index).
+	// Every pg_resetwal call must therefore touch /pgdata/needs-reindex-all
+	// so the main container's startup hook runs REINDEX DATABASE on every
+	// user database before the readiness probe lets traffic in.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let setup_auth = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = setup_auth.args.unwrap().remove(0);
+
+	// The flag must be set every time pg_resetwal -f runs (currently
+	// twice — detected-signature branch and last-resort branch). The
+	// quick check: at least one `touch /pgdata/needs-reindex-all`
+	// follows each pg_resetwal invocation, and the count of the touch
+	// matches the count of resets.
+	// Count actual invocations (the literal command line) — using just
+	// "pg_resetwal -f" picks up comments and echo messages too.
+	let resetwal_calls = script.matches("pg_resetwal -f \"$PGDATA\"").count();
+	let touch_calls = script.matches("touch /pgdata/needs-reindex-all").count();
+	assert_eq!(
+		touch_calls, resetwal_calls,
+		"every pg_resetwal -f invocation must be paired with `touch /pgdata/needs-reindex-all` (got {touch_calls} touches for {resetwal_calls} resets)"
+	);
+	assert!(
+		resetwal_calls >= 2,
+		"expected at least two pg_resetwal invocation sites; got {resetwal_calls}"
+	);
+}
+
+#[test]
+fn deployment_runtime_reindex_handles_full_database_flag() {
+	// The main container's startup hook handles the broad flag
+	// (needs-reindex-all) via blind REINDEX DATABASE on every user DB.
+	// The earlier amcheck-driven smart pass turned out to hit the same
+	// postgres-internal pathology that wedges other vanilla DDL on
+	// the prod data — bt_index_check burned 100% CPU forever on
+	// individual indexes. REINDEX uses a different code path (reads
+	// the heap, rebuilds from scratch) and doesn't trip that wedge.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let postgres = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.containers
+		.into_iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	let script = postgres.args.unwrap().remove(0);
+
+	assert!(
+		script.contains("/pgdata/needs-reindex-all"),
+		"runtime startup hook must check the needs-reindex-all flag"
+	);
+	assert!(
+		script.contains("REINDEX DATABASE CONCURRENTLY"),
+		"needs-reindex-all branch must run REINDEX DATABASE CONCURRENTLY on PG ≥ 12 so clients can keep querying the old indexes during the rebuild"
+	);
+	// The PG < 12 fallback uses plain REINDEX DATABASE — verify the
+	// version gate exists in the script. (We can't string-match on the
+	// literal SQL because the shell-quoted `\"` form differs from a
+	// Rust string literal.)
+	assert!(
+		script.contains(r#""$PG_MAJOR" -ge 12"#),
+		"needs-reindex-all branch must gate CONCURRENTLY behind a PG ≥ 12 check"
+	);
+	assert!(
+		!script.contains("bt_index_check("),
+		"runtime hook must not call bt_index_check — amcheck wedges on the prod data"
+	);
+	assert!(
+		script.contains("rm -f /pgdata/needs-reindex-all"),
+		"runtime hook must clear the needs-reindex-all flag after the reindex"
+	);
+}
+
+#[test]
+fn deployment_readiness_probe_only_gates_on_locale_reindex() {
+	// The readiness probe waits for the locale-only `needs-reindex`
+	// flag to clear (small, fast, finishes in seconds) but NOT for
+	// `needs-reindex-all` (the post-pg_resetwal blind REINDEX DATABASE
+	// — takes hours on prod-sized indexes; gating here would trip the
+	// operator's deployment_ready_timeout and block restores
+	// indefinitely). The -all reindex runs in the background; clients
+	// hitting a not-yet-reindexed corrupt index see the explicit
+	// "unexpected zero page" error and can retry.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let postgres = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.containers
+		.into_iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	let probe_cmd = postgres
+		.readiness_probe
+		.expect("readiness probe must exist")
+		.exec
+		.expect("readiness probe must be an exec probe")
+		.command
+		.expect("exec probe must have a command");
+	let probe_script = probe_cmd.join(" ");
+	assert!(
+		probe_script.contains("[ ! -f /pgdata/needs-reindex ]"),
+		"readiness probe must still wait for the locale-only needs-reindex flag; got: {probe_script}"
+	);
+	assert!(
+		!probe_script.contains("needs-reindex-all"),
+		"readiness probe must NOT gate on needs-reindex-all (the long-running post-resetwal reindex); got: {probe_script}"
+	);
+}
+
+#[test]
 fn deployment_init_script_overrides_listen_addresses() {
 	// Some source backups carry `listen_addresses = 'localhost'` in
 	// postgresql.conf, which restricts the restored postgres to localhost
@@ -648,7 +1345,7 @@ fn deployment_shared_buffers_with_custom_resources() {
 }
 
 #[test]
-fn deployment_with_redaction_runs_postgres_as_root_and_sets_redaction_env() {
+fn deployment_with_redaction_runs_postgres_as_root_and_installs_anon() {
 	let (mut restore, mut replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
 		postgres_version: Some("18".to_string()),
@@ -683,21 +1380,14 @@ fn deployment_with_redaction_runs_postgres_as_root_and_sets_redaction_env() {
 		.expect("postgres container must override securityContext when redaction is set");
 	assert_eq!(sec.run_as_user, Some(0), "postgres must run as root");
 
-	let env = postgres.env.as_ref().unwrap();
-	assert!(
-		env.iter()
-			.any(|e| e.name == "REDACTION_ENABLED" && e.value.as_deref() == Some("1")),
-		"REDACTION_ENABLED=1 must be set so the prelude installs anon"
-	);
-
 	let script = &postgres.args.as_ref().unwrap()[0];
 	assert!(
-		script.contains("PG_MAJOR=18"),
-		"prelude must pin PG_MAJOR to the restore's PG version, got: {script}"
+		script.contains("postgresql_anonymizer_18"),
+		"prelude must apt-install the anon package for the restore's PG major, got: {script}"
 	);
 	assert!(
-		script.contains("postgresql_anonymizer_${PG_MAJOR}"),
-		"prelude must apt-install the PG-major-specific anon package"
+		script.contains("/usr/lib/postgresql/18/lib"),
+		"prelude must stage anon.so into the PG-major lib dir, got: {script}"
 	);
 	assert!(
 		script.contains("exec gosu postgres postgres"),
@@ -731,10 +1421,14 @@ fn deployment_without_redaction_keeps_default_securitycontext() {
 		postgres.security_context.is_none(),
 		"postgres container must inherit the pod-level UID 999 when redaction is off"
 	);
-	let env = postgres.env.as_ref().unwrap();
+	let script = &postgres.args.as_ref().unwrap()[0];
 	assert!(
-		!env.iter().any(|e| e.name == "REDACTION_ENABLED"),
-		"REDACTION_ENABLED must not be set when redaction is off"
+		!script.contains("postgresql_anonymizer"),
+		"the anon install prelude must not be emitted when redaction is off"
+	);
+	assert!(
+		script.contains("exec postgres -D /pgdata/pgdata"),
+		"postgres must be exec'd directly when there's no privilege to drop"
 	);
 }
 
@@ -774,7 +1468,7 @@ fn deployment_with_redaction_builds_for_pg16() {
 		.unwrap();
 	let script = &postgres.args.as_ref().unwrap()[0];
 	assert!(
-		script.contains("PG_MAJOR=16"),
+		script.contains("postgresql_anonymizer_16"),
 		"prelude must use the restore's PG major (16), got: {script}"
 	);
 }
