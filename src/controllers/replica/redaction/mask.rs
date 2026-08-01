@@ -1,5 +1,6 @@
 //! Mask types parsed out of a Tamanu/dbt manifest, and the registry that
-//! turns them into `SECURITY LABEL` fragments for postgresql_anonymizer.
+//! turns them into the SQL expressions the apply layer assigns each
+//! masked column.
 //!
 //! The canonical contract for `meta.masking` is documented at
 //! <https://github.com/beyondessential/tamanu/tree/main/database#masking>.
@@ -31,22 +32,6 @@ pub struct ColumnInfo {
 	pub column_default: Option<String>,
 }
 
-/// The SQL right-hand side of a `SECURITY LABEL … IS '<this>'`.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Fragment {
-	Function(String),
-	Value(String),
-}
-
-impl Fragment {
-	pub fn render(&self) -> String {
-		match self {
-			Self::Function(expr) => format!("MASKED WITH FUNCTION {expr}"),
-			Self::Value(expr) => format!("MASKED WITH VALUE {expr}"),
-		}
-	}
-}
-
 /// Parse `"L-H"` (e.g. `"20-50"`, `"1.001-1.03"`) into a pair of `f64`s,
 /// splitting on the **last** `-` so floats decompose correctly. Returns
 /// `None` on parse failure.
@@ -57,99 +42,91 @@ pub fn parse_range(s: &str) -> Option<(f64, f64)> {
 	Some((lo, hi))
 }
 
-/// Build the `Fragment` for a column mask. `info` is only consulted for
-/// kinds that need column-type knowledge (`zero`, `empty`, `default`,
-/// `nil`); for other kinds it can be `None` (used by unit tests).
+/// Build the SQL expression a column mask assigns, i.e. the right-hand
+/// side of `SET <column> = <this>`.
+///
+/// `info` is only consulted for kinds that need column-type knowledge
+/// (`zero`, `empty`, `default`, `nil`); for other kinds it can be `None`
+/// (used by unit tests).
 ///
 /// Returns `Err` with a short diagnostic when the kind is unsupported or
 /// when type-dependent kinds are missing required `info`.
-pub fn fragment_for(mask: &ColumnMask, info: Option<&ColumnInfo>) -> Result<Fragment, String> {
+pub fn mask_expression(mask: &ColumnMask, info: Option<&ColumnInfo>) -> Result<String, String> {
 	let col = quote_ident(&mask.column);
 
 	match mask.kind.as_str() {
-		"date" => Ok(Fragment::Function(null_pres(
-			&col,
-			"anon.random_date()".into(),
-		))),
+		"date" => Ok(null_pres(&col, "anon.random_date()".into())),
 
-		"datetime" => Ok(Fragment::Function(null_pres(
+		"datetime" => Ok(null_pres(
 			&col,
 			format!("date_trunc('day', {col}) + (floor(random() * 86400) || ' seconds')::interval"),
-		))),
+		)),
 
-		"text" => Ok(Fragment::Function(null_pres(
+		"text" => Ok(null_pres(
 			&col,
 			format!("anon.lorem_ipsum(characters := length({col}))"),
-		))),
+		)),
 
-		"string" => Ok(Fragment::Function(null_pres(
+		"string" => Ok(null_pres(
 			&col,
 			format!("anon.random_string(length({col}))"),
-		))),
+		)),
 
-		"email" => Ok(Fragment::Function(null_pres(
-			&col,
-			"anon.fake_email()".into(),
-		))),
+		"email" => Ok(null_pres(&col, "anon.fake_email()".into())),
 
-		"name" => Ok(Fragment::Function(null_pres(
+		"name" => Ok(null_pres(
 			&col,
 			format!(
 				"CASE WHEN {col} LIKE '% %' \
 				 THEN anon.fake_first_name() || ' ' || anon.fake_last_name() \
 				 ELSE anon.fake_first_name() END"
 			),
-		))),
+		)),
 
-		"phone" => Ok(Fragment::Function(null_pres(
+		"phone" => Ok(null_pres(
 			&col,
 			format!("anon.partial({col}, 2, '****', 2)"),
-		))),
+		)),
 
-		"place" => Ok(Fragment::Function(null_pres(
-			&col,
-			"anon.fake_city()".into(),
-		))),
+		"place" => Ok(null_pres(&col, "anon.fake_city()".into())),
 
-		"url" => Ok(Fragment::Function(null_pres(
+		"url" => Ok(null_pres(
 			&col,
 			"'https://example.invalid/' || anon.random_string(8)".into(),
-		))),
+		)),
 
 		"integer" => {
 			let (lo, hi) = mask.range.unwrap_or((i32::MIN as f64, i32::MAX as f64));
-			Ok(Fragment::Function(null_pres(
+			Ok(null_pres(
 				&col,
 				format!("(floor(random() * ({hi} - {lo} + 1)) + {lo})::int"),
-			)))
+			))
 		}
 
 		"float" => {
 			let (lo, hi) = mask.range.unwrap_or((0.0, 1.0));
-			Ok(Fragment::Function(null_pres(
+			Ok(null_pres(
 				&col,
 				format!("(random() * ({hi} - {lo}) + {lo})::numeric"),
-			)))
+			))
 		}
 
 		"money" => {
 			let (lo, hi) = mask.range.unwrap_or((0.0, 10_000.0));
-			Ok(Fragment::Function(null_pres(
+			Ok(null_pres(
 				&col,
 				format!("round((random() * ({hi} - {lo}) + {lo})::numeric, 2)"),
-			)))
+			))
 		}
 
 		"zero" => {
 			let info = info.ok_or_else(|| "zero mask needs column type".to_string())?;
 			match data_type_family(&info.data_type) {
-				DataTypeFamily::Bytea => Ok(Fragment::Function(format!(
-					"repeat(E'\\x00'::bytea, length({col}))"
-				))),
-				DataTypeFamily::Text => {
-					Ok(Fragment::Function(format!("repeat('0', length({col}))")))
-				}
-				DataTypeFamily::Numeric => Ok(Fragment::Value("0".into())),
+				// There's no repeat() for bytea, so build the hex string
+				// and decode it back to length({col}) zero bytes.
+				DataTypeFamily::Bytea => Ok(format!("decode(repeat('00', length({col})), 'hex')")),
+				DataTypeFamily::Text => Ok(format!("repeat('0', length({col}))")),
+				DataTypeFamily::Numeric => Ok("0".into()),
 				DataTypeFamily::Other => {
 					Err(format!("zero mask unsupported for type {}", info.data_type))
 				}
@@ -159,12 +136,12 @@ pub fn fragment_for(mask: &ColumnMask, info: Option<&ColumnInfo>) -> Result<Frag
 		"empty" => {
 			let info = info.ok_or_else(|| "empty mask needs column type".to_string())?;
 			match data_type_family(&info.data_type) {
-				DataTypeFamily::Numeric => Ok(Fragment::Value("0".into())),
-				DataTypeFamily::Text => Ok(Fragment::Value("''".into())),
-				DataTypeFamily::Bytea => Ok(Fragment::Value("E'\\\\x'::bytea".into())),
+				DataTypeFamily::Numeric => Ok("0".into()),
+				DataTypeFamily::Text => Ok("''".into()),
+				DataTypeFamily::Bytea => Ok("E'\\\\x'::bytea".into()),
 				DataTypeFamily::Other => match info.data_type.as_str() {
-					"json" | "jsonb" => Ok(Fragment::Value(format!("'{{}}'::{}", info.data_type))),
-					"ARRAY" => Ok(Fragment::Value("'{}'".into())),
+					"json" | "jsonb" => Ok(format!("'{{}}'::{}", info.data_type)),
+					"ARRAY" => Ok("'{}'".into()),
 					_ => Err(format!(
 						"empty mask unsupported for type {}",
 						info.data_type
@@ -178,13 +155,13 @@ pub fn fragment_for(mask: &ColumnMask, info: Option<&ColumnInfo>) -> Result<Frag
 			if !info.is_nullable {
 				return Err("nil mask on non-nullable column".into());
 			}
-			Ok(Fragment::Value("NULL".into()))
+			Ok("NULL".into())
 		}
 
 		"default" => {
 			let info = info.ok_or_else(|| "default mask needs column type".to_string())?;
 			match info.column_default.as_deref() {
-				Some(d) => Ok(Fragment::Value(d.into())),
+				Some(d) => Ok(d.into()),
 				None => Err("default mask on column without default".into()),
 			}
 		}
@@ -260,105 +237,92 @@ mod tests {
 	}
 
 	#[test]
-	fn fragment_email_is_null_preserving() {
-		let f = fragment_for(&cm("email", None), None).unwrap();
-		let rendered = f.render();
-		assert!(rendered.contains("MASKED WITH FUNCTION"));
-		assert!(rendered.contains("CASE WHEN"));
-		assert!(rendered.contains("anon.fake_email()"));
+	fn email_is_null_preserving() {
+		let e = mask_expression(&cm("email", None), None).unwrap();
+		assert_eq!(
+			e,
+			r#"CASE WHEN "c" IS NULL THEN NULL ELSE anon.fake_email() END"#
+		);
 	}
 
 	#[test]
-	fn fragment_name_detects_space() {
-		let f = fragment_for(&cm("name", None), None).unwrap();
-		let rendered = f.render();
-		assert!(rendered.contains("LIKE '% %'"));
+	fn name_composes_first_and_last_when_the_original_has_a_space() {
+		let e = mask_expression(&cm("name", None), None).unwrap();
+		assert!(e.contains("LIKE '% %'"));
 		// anon doesn't ship fake_name(); compose first + last for the
 		// with-space branch.
-		assert!(rendered.contains("fake_first_name() || ' ' || anon.fake_last_name()"));
-		assert!(rendered.contains("ELSE anon.fake_first_name()"));
+		assert!(e.contains("fake_first_name() || ' ' || anon.fake_last_name()"));
+		assert!(e.contains("ELSE anon.fake_first_name()"));
 	}
 
 	#[test]
-	fn fragment_integer_uses_range() {
-		let f = fragment_for(&cm("integer", Some((20.0, 50.0))), None).unwrap();
-		let rendered = f.render();
-		assert!(rendered.contains("50 - 20"));
-		assert!(rendered.contains("::int"));
+	fn integer_uses_range() {
+		let e = mask_expression(&cm("integer", Some((20.0, 50.0))), None).unwrap();
+		assert!(e.contains("50 - 20"));
+		assert!(e.contains("::int"));
 	}
 
 	#[test]
-	fn fragment_money_rounds_to_two_decimals() {
-		let f = fragment_for(&cm("money", Some((0.0, 100.0))), None).unwrap();
-		assert!(f.render().contains("round("));
+	fn money_rounds_to_two_decimals() {
+		let e = mask_expression(&cm("money", Some((0.0, 100.0))), None).unwrap();
+		assert!(e.contains("round("));
+	}
+
+	/// Postgres has no `repeat(bytea, int)`, so the bytea case has to go
+	/// the long way round.
+	#[test]
+	fn zero_for_bytea_decodes_a_hex_run() {
+		let e = mask_expression(&cm("zero", None), Some(&info("bytea", true, None))).unwrap();
+		assert_eq!(e, r#"decode(repeat('00', length("c")), 'hex')"#);
 	}
 
 	#[test]
-	fn fragment_zero_for_bytea_repeats() {
-		let f = fragment_for(&cm("zero", None), Some(&info("bytea", true, None))).unwrap();
-		assert!(matches!(f, Fragment::Function(ref s) if s.contains("repeat(E'\\x00'::bytea")));
+	fn zero_for_text_repeats_digit() {
+		let e = mask_expression(&cm("zero", None), Some(&info("text", true, None))).unwrap();
+		assert!(e.contains("repeat('0',"));
 	}
 
 	#[test]
-	fn fragment_zero_for_text_repeats_digit() {
-		let f = fragment_for(&cm("zero", None), Some(&info("text", true, None))).unwrap();
-		assert!(matches!(f, Fragment::Function(ref s) if s.contains("repeat('0',")));
+	fn zero_for_numeric_is_plain_zero() {
+		let e = mask_expression(&cm("zero", None), Some(&info("integer", true, None))).unwrap();
+		assert_eq!(e, "0");
 	}
 
 	#[test]
-	fn fragment_zero_for_numeric_is_value_zero() {
-		let f = fragment_for(&cm("zero", None), Some(&info("integer", true, None))).unwrap();
-		assert_eq!(f, Fragment::Value("0".into()));
+	fn empty_dispatches_on_type() {
+		for (data_type, expected) in [("integer", "0"), ("text", "''"), ("jsonb", "'{}'::jsonb")] {
+			assert_eq!(
+				mask_expression(&cm("empty", None), Some(&info(data_type, true, None))).unwrap(),
+				expected,
+				"empty mask for {data_type}"
+			);
+		}
 	}
 
 	#[test]
-	fn fragment_empty_dispatches_on_type() {
+	fn nil_requires_nullable() {
+		assert!(mask_expression(&cm("nil", None), Some(&info("text", false, None))).is_err());
 		assert_eq!(
-			fragment_for(&cm("empty", None), Some(&info("integer", true, None))).unwrap(),
-			Fragment::Value("0".into())
-		);
-		assert_eq!(
-			fragment_for(&cm("empty", None), Some(&info("text", true, None))).unwrap(),
-			Fragment::Value("''".into())
-		);
-		assert_eq!(
-			fragment_for(&cm("empty", None), Some(&info("jsonb", true, None))).unwrap(),
-			Fragment::Value("'{}'::jsonb".into())
-		);
-	}
-
-	#[test]
-	fn fragment_nil_requires_nullable() {
-		assert!(fragment_for(&cm("nil", None), Some(&info("text", false, None))).is_err());
-		assert_eq!(
-			fragment_for(&cm("nil", None), Some(&info("text", true, None))).unwrap(),
-			Fragment::Value("NULL".into())
+			mask_expression(&cm("nil", None), Some(&info("text", true, None))).unwrap(),
+			"NULL"
 		);
 	}
 
 	#[test]
-	fn fragment_default_requires_default_expression() {
-		assert!(fragment_for(&cm("default", None), Some(&info("text", true, None))).is_err());
+	fn default_requires_default_expression() {
+		assert!(mask_expression(&cm("default", None), Some(&info("text", true, None))).is_err());
 		assert_eq!(
-			fragment_for(
+			mask_expression(
 				&cm("default", None),
 				Some(&info("text", true, Some("'hello'::text"))),
 			)
 			.unwrap(),
-			Fragment::Value("'hello'::text".into())
+			"'hello'::text"
 		);
 	}
 
 	#[test]
-	fn fragment_unknown_kind_errors() {
-		assert!(fragment_for(&cm("brand_new_kind", None), None).is_err());
-	}
-
-	#[test]
-	fn rendered_value_keeps_null_marker() {
-		assert_eq!(
-			Fragment::Value("NULL".into()).render(),
-			"MASKED WITH VALUE NULL"
-		);
+	fn unknown_kind_errors() {
+		assert!(mask_expression(&cm("brand_new_kind", None), None).is_err());
 	}
 }
