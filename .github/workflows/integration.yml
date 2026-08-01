@@ -61,6 +61,12 @@ jobs:
               test-ephemeral
             needs_non_pg_snapshot: false
 
+          - name: locale_fix
+            namespaces: >-
+              test-locale-fix
+            needs_non_pg_snapshot: false
+            needs_locale_snapshot: true
+
           # canopy_integration is a scaffold in tests/canopy_integration.rs
           # but no stub-canopy HTTP server exists yet, so the happy-path
           # test times out. Re-add this matrix entry when the stub lands:
@@ -234,6 +240,34 @@ jobs:
           done
           echo "--- Non-postgres snapshot job logs ---"
           kubectl logs job/setup-non-postgres-snapshot --all-containers --prefix
+
+      - name: Set up non-C-locale kopia snapshot
+        if: matrix.needs_locale_snapshot
+        run: |
+          kubectl apply -f tests/fixtures/setup-locale-snapshot.yaml
+          for i in $(seq 1 60); do
+            STATUS=$(kubectl get job/setup-locale-snapshot -o jsonpath='{.status.conditions[?(@.type=="Complete")].status}' 2>/dev/null)
+            FAILED=$(kubectl get job/setup-locale-snapshot -o jsonpath='{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null)
+            if [ "$STATUS" = "True" ]; then
+              echo "Locale snapshot job completed successfully"
+              break
+            fi
+            if [ "$FAILED" = "True" ]; then
+              echo "Locale snapshot job failed!"
+              kubectl describe job/setup-locale-snapshot
+              kubectl logs job/setup-locale-snapshot --all-containers --prefix
+              exit 1
+            fi
+            if [ "$i" = "60" ]; then
+              echo "Locale snapshot job timed out after 300s"
+              kubectl describe job/setup-locale-snapshot
+              kubectl logs job/setup-locale-snapshot --all-containers --prefix 2>/dev/null || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "--- Locale snapshot job logs ---"
+          kubectl logs job/setup-locale-snapshot --all-containers --prefix
 
       - name: Start operator (out-of-cluster)
         run: |

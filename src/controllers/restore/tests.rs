@@ -158,6 +158,51 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	(restore, replica)
 }
 
+/// The `setup-auth` init container's inline script, which carries the locale,
+/// WAL and reindex fix steps.
+fn setup_auth_script() -> String {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let setup_auth = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	setup_auth.args.unwrap().remove(0)
+}
+
+/// The `postgres` container's inline script, which carries the background
+/// reindex hook and its stage bookkeeping.
+fn postgres_container_script() -> String {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let postgres = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.containers
+		.into_iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	postgres.args.unwrap().remove(0)
+}
+
 /// Memory in bytes. Compared numerically because the derived value is ceiled
 /// to whole Mi, so `2Gi` legitimately comes back as `2048Mi`.
 fn mem(r: &ResourceRequirements, which: &str) -> u64 {
@@ -1093,6 +1138,76 @@ fn deployment_init_script_flags_full_reindex_after_resetwal() {
 }
 
 #[test]
+fn deployment_init_script_detects_locale_mismatch_before_rewriting() {
+	// The single-user pass is where the locale rewrite actually happens, so
+	// it is the only place that can observe whether a rewrite was needed:
+	// once it runs, every database conforms and a later query can no longer
+	// tell. `postgres --single` reports no row count, so the rewrite must be
+	// preceded by a labelled count probe in the same session.
+	let script = setup_auth_script();
+
+	assert!(
+		script.contains("pgro_locale_mismatch"),
+		"single-user locale pass must probe for non-conforming databases under a distinctive label before rewriting them"
+	);
+	let probe_call = script
+		.find(r#"postgres_single_or_resetwal "SELECT count(*) AS pgro_locale_mismatch"#)
+		.expect("the probe must be submitted through the single-user helper");
+	assert!(
+		script[probe_call..].starts_with(
+			r#"postgres_single_or_resetwal "SELECT count(*) AS pgro_locale_mismatch FROM pg_database WHERE $LOCALE_MISMATCH_WHERE;
+$LOCALE_REWRITE""#
+		),
+		"the rewrite must be submitted in the same single-user session, on the line after the probe: single-user mode ends a statement at the newline, and a separate session would probe a database the rewrite had already fixed"
+	);
+}
+
+#[test]
+fn deployment_init_script_records_locale_fix_from_sticky_flag() {
+	// `fixes.locale` must be driven by a flag file the rewrite touches, the
+	// same way reset_wal and recreated_pg_wal are. The previous shell
+	// variable was set to 1 by the single-user pass and then unconditionally
+	// overwritten by the post-startup fallback's row count — always 0,
+	// because the single-user pass had already fixed every database — so the
+	// flag could never report true.
+	let script = setup_auth_script();
+
+	assert!(
+		script.contains("touch /pgdata/fix-locale"),
+		"a locale rewrite must record itself in a flag file"
+	);
+	assert!(
+		script.contains("if [ -f /pgdata/fix-locale ]; then PGRO_LOCALE=true"),
+		"PGRO_LOCALE must be read back from the flag file, not from a shell variable a later step can clobber"
+	);
+	assert!(
+		!script.contains("LOCALE_CHANGED=1\n"),
+		"the unconditional LOCALE_CHANGED=1 must be gone — it was overwritten by the post-startup fallback before it was ever read"
+	);
+}
+
+#[test]
+fn deployment_init_script_pairs_locale_rewrite_with_reindex_flag() {
+	// Rewriting datcollate changes collation semantics, so every text btree
+	// built under the old collation is potentially misordered. Each site
+	// that records a locale rewrite must also raise needs-reindex, which
+	// gates the readiness probe until the rebuild finishes.
+	let script = setup_auth_script();
+
+	let locale_flags = script.matches("touch /pgdata/fix-locale").count();
+	// Trailing newline: `needs-reindex-all` shares this prefix.
+	let reindex_flags = script.matches("touch /pgdata/needs-reindex\n").count();
+	assert!(
+		locale_flags >= 1,
+		"expected at least one locale-rewrite site; got {locale_flags}"
+	);
+	assert_eq!(
+		reindex_flags, locale_flags,
+		"every locale rewrite must be paired with `touch /pgdata/needs-reindex` (got {reindex_flags} reindex flags for {locale_flags} locale rewrites)"
+	);
+}
+
+#[test]
 fn deployment_runtime_reindex_handles_full_database_flag() {
 	// The main container's startup hook handles the broad flag
 	// (needs-reindex-all) via blind REINDEX DATABASE on every user DB.
@@ -1305,6 +1420,52 @@ fn postgres_container_updates_stage_around_reindex() {
 	assert!(
 		script[..ready_pos].contains("rm -f /pgdata/needs-reindex"),
 		"ready update must happen after the needs-reindex flag is cleared"
+	);
+}
+
+#[test]
+fn postgres_container_stage_updates_override_read_only() {
+	// A read-only replica runs with default_transaction_read_only = on, which
+	// rejects the stage bookkeeping the reindex hook does about itself:
+	//   ERROR: cannot execute UPDATE in a read-only transaction
+	// The stage then sticks at whatever the init container wrote and never
+	// reaches 'ready', so `_pgro.restore_info` misreports a finished reindex as
+	// still pending. Each stage update must ask for a writable session.
+	let script = postgres_container_script();
+
+	let stage_updates = script
+		.matches("UPDATE _pgro.restore_info SET stage")
+		.count();
+	let overrides = script
+		.matches("PGOPTIONS='-c default_transaction_read_only=off'")
+		.count();
+	assert!(
+		stage_updates >= 2,
+		"expected the reindexing and ready stage updates; got {stage_updates}"
+	);
+	assert_eq!(
+		overrides, stage_updates,
+		"every stage update must run with default_transaction_read_only=off (got {overrides} overrides for {stage_updates} updates)"
+	);
+}
+
+#[test]
+fn locale_reindex_targets_only_default_collation_indexes() {
+	// A datcollate rewrite only invalidates indexes ordered by the database
+	// default collation (OID 100). Catalog indexes over `name` columns carry
+	// the C collation (950) and are unaffected — and REINDEX INDEX
+	// CONCURRENTLY cannot touch a system catalog at all, so selecting them
+	// yields dozens of swallowed "cannot reindex system catalogs
+	// concurrently" errors that look like work being done.
+	let script = postgres_container_script();
+
+	assert!(
+		script.contains("a.attcollation = 100"),
+		"the locale reindex must select only indexes ordered by the default collation"
+	);
+	assert!(
+		!script.contains("a.attcollation <> 0"),
+		"selecting every collation-bearing attribute pulls in system catalogs that cannot be reindexed concurrently"
 	);
 }
 

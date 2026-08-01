@@ -1,0 +1,113 @@
+---
+# A source PGDATA whose databases carry a locale the restore container has to
+# rewrite. The default fixture uses `initdb --no-locale` (i.e. C), which the
+# locale fix step correctly leaves alone — so it can never exercise the fix.
+apiVersion: batch/v1
+kind: Job
+metadata:
+    name: setup-locale-snapshot
+    namespace: default
+spec:
+    backoffLimit: 3
+    template:
+        spec:
+            securityContext:
+                fsGroup: 999
+            initContainers:
+                - name: create-bucket
+                  image: minio/mc:latest
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+                          mc alias set minio http://minio.minio.svc:9000 minioadmin minioadmin
+                          mc mb minio/locale-bucket --ignore-existing
+                          echo "Bucket created"
+                - name: init-pgdata
+                  image: postgres:16
+                  imagePullPolicy: IfNotPresent
+                  securityContext:
+                      runAsUser: 0
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+                          echo "Initializing PostgreSQL data directory with a non-C locale..."
+                          mkdir -p /pgdata/16/main
+                          chown postgres:postgres /pgdata/16/main
+                          # en_US.UTF-8 is baked into the official postgres image.
+                          # It is not in ('C', 'C.UTF-8', 'PG_UNICODE_FAST'), so the
+                          # restore's locale step must rewrite every database.
+                          gosu postgres initdb -D /pgdata/16/main --locale=en_US.UTF-8 --encoding=UTF8 --auth=trust
+
+                          echo "Confirming the source locale is one the fix must rewrite..."
+                          grep -q "en_US.UTF-8" /pgdata/16/main/postgresql.conf || true
+
+                          echo "Starting temporary PostgreSQL to create application database..."
+                          gosu postgres pg_ctl -D /pgdata/16/main -l /tmp/pg.log start -w
+
+                          gosu postgres psql -d postgres -c "CREATE DATABASE myapp"
+                          # A text btree is what a collation change actually
+                          # endangers, so give the restore one to reindex.
+                          gosu postgres psql -d myapp -c "CREATE TABLE test_data (id serial PRIMARY KEY, data text)"
+                          gosu postgres psql -d myapp -c "INSERT INTO test_data (data) SELECT repeat('x', 1000) FROM generate_series(1, 1000)"
+                          gosu postgres psql -d myapp -c "CREATE INDEX test_data_data_idx ON test_data (data)"
+
+                          gosu postgres psql -d postgres -At \
+                            -c "SELECT datname, datcollate FROM pg_database ORDER BY datname"
+
+                          gosu postgres pg_ctl -D /pgdata/16/main stop -w
+
+                          echo "PostgreSQL data directory initialized"
+                          cat /pgdata/16/main/PG_VERSION
+                  volumeMounts:
+                      - name: pgdata
+                        mountPath: /pgdata
+            containers:
+                - name: create-snapshot
+                  image: kopia/kopia:0.22.3
+                  imagePullPolicy: IfNotPresent
+                  command: ["/bin/sh", "-c"]
+                  args:
+                      - |
+                          set -e
+
+                          mkdir -p /tmp/kopia/config /tmp/kopia/logs /tmp/kopia/cache
+
+                          echo "Creating kopia repository in locale-bucket..."
+                          kopia repository create s3 \
+                            --bucket=locale-bucket \
+                            --endpoint=minio.minio.svc:9000 \
+                            --region=us-east-1 \
+                            --access-key=minioadmin \
+                            --secret-access-key=minioadmin \
+                            --password=test-repo-password \
+                            --disable-tls \
+                            --disable-tls-verification
+
+                          echo "Creating snapshot..."
+                          kopia snapshot create /pgdata
+
+                          echo "Verifying snapshot..."
+                          kopia snapshot list --json --all
+
+                          echo "Done"
+                  env:
+                      - name: KOPIA_CONFIG_PATH
+                        value: /tmp/kopia/config/repository.config
+                      - name: KOPIA_LOG_DIR
+                        value: /tmp/kopia/logs
+                      - name: KOPIA_CACHE_DIRECTORY
+                        value: /tmp/kopia/cache
+                      - name: KOPIA_PASSWORD
+                        value: test-repo-password
+                      - name: USER
+                        value: kopia
+                  volumeMounts:
+                      - name: pgdata
+                        mountPath: /pgdata
+            volumes:
+                - name: pgdata
+                  emptyDir: {}
+            restartPolicy: Never
