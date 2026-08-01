@@ -260,7 +260,10 @@ fn build_redaction_replica(name: &str, secret_ref: &str) -> PostgresPhysicalRepl
 		secret_ref,
 		ReplicaOpts {
 			redaction: Some(RedactionSpec {
-				manifest_url: format!("http://manifest-server.{NS}.svc/manifest.json"),
+				// `{version}` is a literal placeholder the operator fills
+				// from version_query — the manifest server serves the
+				// document under /v1.0.0/.
+				manifest_url: format!("http://manifest-server.{NS}.svc/v{{version}}/manifest.json"),
 				version: None,
 				version_query: Some(
 					"SELECT value FROM local_system_facts WHERE key = 'currentVersion'".into(),

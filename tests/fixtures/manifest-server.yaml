@@ -3,7 +3,11 @@
 #
 # The harness `kubectl apply`s this into the test namespace; the redacted
 # replica's spec.redaction.manifestUrl points at
-# http://manifest-server.<ns>.svc/manifest.json
+# http://manifest-server.<ns>.svc/v{version}/manifest.json
+#
+# The manifest is served under a version directory so the test exercises
+# the versionQuery path: the operator reads currentVersion (1.0.0) out of
+# local_system_facts and substitutes it into the URL.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -62,6 +66,11 @@ spec:
                 - name: content
                   configMap:
                       name: manifest-server-content
+                      # A ConfigMap key can't hold a slash, but an item path
+                      # can, which is what puts the manifest under /v1.0.0/.
+                      items:
+                          - key: manifest.json
+                            path: v1.0.0/manifest.json
 ---
 apiVersion: v1
 kind: Service
