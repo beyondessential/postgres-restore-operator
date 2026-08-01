@@ -1476,12 +1476,29 @@ postgres_single_or_resetwal() {{
 }}
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
+# One definition of "non-conforming", shared by the probe and the rewrite. If
+# the two drifted, the probe would report a rewrite that never happened, or
+# miss one that did.
+LOCALE_MISMATCH_WHERE="datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST')"
 if [ "$PG_MAJOR" -ge 13 ]; then
-  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
+  LOCALE_REWRITE="UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE $LOCALE_MISMATCH_WHERE;"
 else
-  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
+  LOCALE_REWRITE="UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE $LOCALE_MISMATCH_WHERE;"
 fi
-LOCALE_CHANGED=1
+# This is the only point at which "did the locale need rewriting?" is
+# answerable: afterwards every database conforms and the question reads false
+# forever. postgres --single reports no row count, so the count is taken as a
+# labelled SELECT in the same session, immediately before the rewrite.
+# Single-user mode ends a statement at the newline, not the semicolon, so the
+# two statements must be on separate lines.
+LOCALE_PROBE=$(postgres_single_or_resetwal "SELECT count(*) AS pgro_locale_mismatch FROM pg_database WHERE $LOCALE_MISMATCH_WHERE;
+$LOCALE_REWRITE")
+echo "$LOCALE_PROBE"
+if echo "$LOCALE_PROBE" | grep -q 'pgro_locale_mismatch = "[1-9]'; then
+  echo "Locale was rewritten, flagging for reindex before this replica serves traffic"
+  touch /pgdata/fix-locale
+  touch /pgdata/needs-reindex
+fi
 
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
@@ -1527,7 +1544,8 @@ COLLEOF
 done
 
 if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then
-  echo "Locale was changed, flagging for background reindex after startup"
+  echo "Locale was changed by the post-startup fallback, flagging for reindex"
+  touch /pgdata/fix-locale
   touch /pgdata/needs-reindex
 fi
 
@@ -1573,7 +1591,7 @@ fi
 # so adding a new fix is one shell line here plus recording its flag — no
 # schema change, no operator change (the operator forwards the map as-is).
 # Each fix is keyed by a flag file the fix step touches:
-#   locale  — the post-startup locale rewrite actually changed rows
+#   locale  — a locale rewrite actually changed rows
 #   reindex — REINDEX ran (after pg_resetwal, or a locale rewrite)
 #   reset_wal — pg_resetwal -f ran (snapshot's trailing WAL was unusable)
 #   recreated_pg_wal — an empty pg_wal was created (Windows-host snapshot)
@@ -1584,7 +1602,7 @@ else
   PGRO_STAGE=ready
   PGRO_REINDEX=false
 fi
-if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then PGRO_LOCALE=true; else PGRO_LOCALE=false; fi
+if [ -f /pgdata/fix-locale ]; then PGRO_LOCALE=true; else PGRO_LOCALE=false; fi
 if [ -f /pgdata/fix-reset-wal ]; then PGRO_RESET_WAL=true; else PGRO_RESET_WAL=false; fi
 if [ -f /pgdata/fix-recreated-pg-wal ]; then PGRO_RECREATED_WAL=true; else PGRO_RECREATED_WAL=false; fi
 PGRO_FIXES="{{\"locale\": ${{PGRO_LOCALE}}, \"reindex\": ${{PGRO_REINDEX}}, \"reset_wal\": ${{PGRO_RESET_WAL}}, \"recreated_pg_wal\": ${{PGRO_RECREATED_WAL}}}}"
@@ -1757,7 +1775,12 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
   PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
   (
     while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
-    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
+    # A read-only replica runs with default_transaction_read_only = on, which
+    # rejects this bookkeeping ("cannot execute UPDATE in a read-only
+    # transaction") and leaves the stage stuck wherever the init container
+    # left it. Ask for a writable session per connection; the setting stays
+    # on for everyone else.
+    PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
     # needs-reindex-all (pg_resetwal aftermath) can leave torn pages in
     # ANY index, not just collation-dependent ones. We tried a "smart
     # pass" using the amcheck contrib extension (scan each btree, queue
@@ -1806,11 +1829,18 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
       rm -f /pgdata/needs-reindex
     elif [ -f /pgdata/needs-reindex ]; then
       for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+        # Only the database default collation (OID 100) is what the locale
+        # rewrite changed, so only indexes ordered by it are invalidated.
+        # `attcollation <> 0` also matches catalog indexes over `name`
+        # columns, which carry the C collation (950) and are unaffected —
+        # and REINDEX INDEX CONCURRENTLY cannot touch a system catalog, so
+        # including them produced dozens of swallowed errors per database
+        # that read like progress.
         INDEXES=$(psql -U postgres -d "$db" -At -c "
           SELECT DISTINCT indexrelid::regclass::text
           FROM pg_index i
           JOIN pg_attribute a ON a.attrelid = i.indexrelid
-          WHERE a.attcollation <> 0 AND i.indisvalid;
+          WHERE a.attcollation = 100 AND i.indisvalid;
         ")
         COUNT=$(echo "$INDEXES" | grep -c . || true)
         echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
@@ -1828,7 +1858,7 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
       done
       rm -f /pgdata/needs-reindex
     fi
-    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
+    PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
     echo "Background reindex complete"
   ) &
 fi
