@@ -1,11 +1,14 @@
 //! End-to-end redaction integration test.
 //!
-//! Requires a PG 18 kopia snapshot (see `setup-kopia-repo-pg18.yaml`)
-//! and the in-namespace static manifest server (see
-//! `manifest-server.yaml`). Both are deployed by the workflow before this
-//! test runs.
+//! Requires a PG 18 kopia snapshot (see `setup-kopia-repo-pg18.yaml`) and
+//! an HTTP server on the test host serving `redaction-manifest.json` at
+//! [`MANIFEST_URL`]. The workflow sets both up before this test runs.
+//!
+//! The manifest server is host-side rather than in-cluster because the
+//! operator is what fetches the manifest, and the integration harness runs
+//! it out-of-cluster — a `.svc` name would not resolve for it.
 
-use std::{collections::BTreeMap, time::Duration};
+use std::collections::BTreeMap;
 
 use k8s_openapi::{ByteString, api::core::v1::Secret};
 use kube::{
@@ -23,6 +26,11 @@ mod helpers;
 
 const NS: &str = "test-redaction";
 const REPLICA_NAME: &str = "redaction-replica";
+/// Where the harness serves `tests/fixtures/redaction-manifest.json`. The
+/// literal `{version}` is the placeholder the operator fills from
+/// `versionQuery`; the file is served under `v1.0.0/` to match the
+/// `currentVersion` the PG-18 snapshot fixture seeds.
+const MANIFEST_URL: &str = "http://127.0.0.1:8099/v{version}/manifest.json";
 
 #[tokio::test]
 #[ignore = "requires a running Kubernetes cluster with MinIO, PG-18 kopia snapshot and the manifest server"]
@@ -31,9 +39,6 @@ async fn redaction_applies_masks_to_restored_data() {
 
 	setup_namespace(&client, NS).await;
 	cleanup_namespace(&client, NS, &[REPLICA_NAME]).await;
-
-	println!("--- deploying in-namespace static manifest server");
-	deploy_manifest_server(NS).await;
 
 	let secrets: Api<Secret> = Api::namespaced(client.clone(), NS);
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), NS);
@@ -210,27 +215,6 @@ async fn redaction_applies_masks_to_restored_data() {
 	println!("--- all redaction assertions passed");
 }
 
-async fn deploy_manifest_server(ns: &str) {
-	let status = tokio::process::Command::new("kubectl")
-		.args([
-			"apply",
-			"-n",
-			ns,
-			"-f",
-			"tests/fixtures/manifest-server.yaml",
-		])
-		.status()
-		.await
-		.expect("failed to run kubectl apply");
-	assert!(status.success(), "kubectl apply for manifest server failed");
-
-	// Wait briefly for the Service endpoint to come up. Best-effort —
-	// the in-cluster DNS resolves the Service name even before the
-	// backing pod is Ready, and the operator's reqwest call retries
-	// on transient connection failures via the redaction failed:* path.
-	tokio::time::sleep(Duration::from_secs(5)).await;
-}
-
 fn build_pg18_kopia_secret(ns: &str, name: &str) -> Secret {
 	Secret {
 		metadata: ObjectMeta {
@@ -260,10 +244,7 @@ fn build_redaction_replica(name: &str, secret_ref: &str) -> PostgresPhysicalRepl
 		secret_ref,
 		ReplicaOpts {
 			redaction: Some(RedactionSpec {
-				// `{version}` is a literal placeholder the operator fills
-				// from version_query — the manifest server serves the
-				// document under /v1.0.0/.
-				manifest_url: format!("http://manifest-server.{NS}.svc/v{{version}}/manifest.json"),
+				manifest_url: MANIFEST_URL.to_string(),
 				version: None,
 				version_query: Some(
 					"SELECT value FROM local_system_facts WHERE key = 'currentVersion'".into(),
