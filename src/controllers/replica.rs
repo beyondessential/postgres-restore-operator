@@ -36,6 +36,7 @@ use crate::{
 };
 use scheduling::ScheduleDecision;
 
+mod redaction;
 mod resources;
 pub(super) mod scheduling;
 mod schema_migration;
@@ -259,6 +260,19 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		)
 	});
 
+	// Handle redaction before schema migration: if redaction is set,
+	// it rewrites the data in place, and any persistent_schemas migration
+	// pulls from the (already-redacted) source tables.
+	if replica.spec.redaction.is_some()
+		&& let Some(switching) = switching_restore
+	{
+		let redaction_settled =
+			redaction::reconcile_redaction_step(&ctx, &replica, switching).await?;
+		if !redaction_settled {
+			return Ok(Action::requeue(Duration::from_secs(30)));
+		}
+	}
+
 	// Handle schema migration for persistent_schemas configuration
 	if replica.spec.persistent_schemas.is_some()
 		&& let Some(switching) = switching_restore
@@ -474,6 +488,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		// automatically.
 		let migration_complete = persistent_schemas_migration_settled(&replica);
 
+		// Same gate as the migration one above, for the same reason: the
+		// only state that makes sweeping unsafe is a redaction currently
+		// running against a restore we might delete.
+		let redaction_settled = replica
+			.status
+			.as_ref()
+			.and_then(|s| s.redaction_phase.as_ref())
+			.is_none_or(RedactionPhase::is_settled);
+
 		let grace_period =
 			SignedDuration::try_from(replica.spec.switchover_grace_period.0).unwrap_or_default();
 		let last_completed = replica
@@ -493,6 +516,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		});
 
 		if migration_complete
+			&& redaction_settled
 			&& has_matching_current
 			&& let Some(completed_at) = last_completed
 			&& now.duration_since(completed_at.0) > grace_period
@@ -536,6 +560,9 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 							"previousRestore": null,
 							"schemaMigrationJob": null,
 							"schemaMigrationPhase": null,
+							"redactionPhase": null,
+							"redactionVersion": null,
+							"redactionColumnsApplied": null,
 						}
 					});
 					replicas

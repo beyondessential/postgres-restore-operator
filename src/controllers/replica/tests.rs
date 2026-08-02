@@ -172,6 +172,7 @@ fn make_replica(
 			postgres_extra_config: None,
 			notifications: vec![],
 			persistent_schemas,
+			redaction: None,
 			storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
 				"2Ti".to_string(),
 			),
@@ -337,6 +338,7 @@ fn snapshot_list_job_rotates_kopia_logs() {
 			postgres_extra_config: None,
 			notifications: vec![],
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
 				"2Ti".to_string(),
 			),

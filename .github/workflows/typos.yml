@@ -10,8 +10,8 @@ jobs:
     name: Spellcheck
     runs-on: ubuntu-slim
     steps:
-      - uses: actions/checkout@v6.0.2
+      - uses: actions/checkout@v7.0.0
       - name: Check spelling
-        uses: crate-ci/typos@v1.47.0
+        uses: crate-ci/typos@v1.48.0
         with:
           config: .typos.toml

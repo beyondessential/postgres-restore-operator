@@ -29,7 +29,7 @@ use k8s_openapi::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-	types::{CanopySource, PostgresPhysicalReplicaSpec},
+	types::{CanopySource, PostgresPhysicalReplicaSpec, RedactionSpec},
 	util::TimeSpan,
 };
 
@@ -49,6 +49,13 @@ mod semantics {
 	/// that version's schema migrations to the restored replica and reports how
 	/// they went alongside the replica's health.
 	pub const MIGRATE: &str = "migrate";
+	/// The intent can de-identify the restored data before serving it:
+	/// whether a given replica does is up to its `redaction_*` params, and
+	/// the replica's `redactionPhase` status says whether it took. Canopy
+	/// doesn't recognise this one yet — unrecognised semantics are stored
+	/// and have no effect — so declaring it now is how canopy learns the
+	/// capability exists when it grows support for it.
+	pub const REDACT: &str = "redact";
 }
 
 /// Names of the parameters the `analytics` intent advertises. Shared between
@@ -81,6 +88,19 @@ pub mod params {
 	/// `duration` — how long to wait for the restore's postgres Deployment to
 	/// become Ready before failing the restore.
 	pub const DEPLOYMENT_READY_TIMEOUT: &str = "deployment_ready_timeout";
+	/// `text` — URL of the dbt-shaped masking manifest to apply to the
+	/// restored data before it goes live. Setting it is what turns
+	/// redaction on; empty/unset leaves the data as restored. May carry a
+	/// `{version}` placeholder, which needs [`REDACTION_VERSION_QUERY`].
+	pub const REDACTION_MANIFEST_URL: &str = "redaction_manifest_url";
+	/// `text` — SQL returning one row, one column: the version to
+	/// substitute into the manifest URL's `{version}`. A replica that wants
+	/// a fixed version writes it into the URL instead.
+	pub const REDACTION_VERSION_QUERY: &str = "redaction_version_query";
+	/// `boolean` — when the versioned manifest URL 404s, retry at the
+	/// `major.minor.0` base version. For sources that publish a manifest
+	/// per minor rather than per patch.
+	pub const REDACTION_VERSION_FALLBACK_TO_BASE: &str = "redaction_version_fallback_to_base";
 }
 
 /// Default minimum TTL for `analytics` replicas when the operator leaves the
@@ -146,7 +166,42 @@ fn analytics_param_schema() -> ParamSchema {
 			params::DEPLOYMENT_READY_TIMEOUT.to_string(),
 			param(ParamType::Duration, None),
 		),
+		(
+			params::REDACTION_MANIFEST_URL.to_string(),
+			param(ParamType::Text, None),
+		),
+		(
+			params::REDACTION_VERSION_QUERY.to_string(),
+			param(ParamType::Text, None),
+		),
+		(
+			params::REDACTION_VERSION_FALLBACK_TO_BASE.to_string(),
+			param(ParamType::Boolean, Some(json!(false))),
+		),
 	]))
+}
+
+/// Build the replica's [`RedactionSpec`] from the canopy params, or `None`
+/// when the operator left the manifest URL unset — the common case, and the
+/// one that leaves the restore exactly as it came out of the snapshot.
+fn redaction_spec(p: &Map<String, Value>) -> Option<RedactionSpec> {
+	let non_empty = |name: &str| {
+		param_str(p, name)
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.map(str::to_string)
+	};
+
+	Some(RedactionSpec {
+		manifest_url: non_empty(params::REDACTION_MANIFEST_URL)?,
+		// Not a canopy param: a replica that wants a fixed version writes
+		// it into the manifest URL, which needs no placeholder and so no
+		// version resolution at all.
+		version: None,
+		version_query: non_empty(params::REDACTION_VERSION_QUERY),
+		version_fallback_to_base: param_bool(p, params::REDACTION_VERSION_FALLBACK_TO_BASE)
+			.unwrap_or(false),
+	})
 }
 
 /// Build a pinned `resources` from the canopy params, or `None` when the
@@ -239,6 +294,7 @@ pub fn descriptors() -> Vec<IntentDescriptor> {
 			.semantics(vec![
 				semantics::CHECK.to_string(),
 				semantics::URL.to_string(),
+				semantics::REDACT.to_string(),
 			])
 			.params(analytics_param_schema())
 			.build(),
@@ -455,6 +511,7 @@ impl IntentConfig {
 			notifications,
 			persistent_schemas,
 			migrate_to,
+			redaction: redaction_spec(p),
 			storage_size_maximum,
 		}
 	}
@@ -560,7 +617,7 @@ mod tests {
 		assert!(upgrade.description.is_some());
 
 		let analytics = &ds[2];
-		assert_eq!(analytics.semantics, ["check", "url"]);
+		assert_eq!(analytics.semantics, ["check", "url", "redact"]);
 		let params = analytics
 			.params
 			.as_ref()
@@ -598,10 +655,25 @@ mod tests {
 			params.get(params::DEPLOYMENT_READY_TIMEOUT).unwrap().type_,
 			ParamType::Duration
 		);
+		assert_eq!(
+			params.get(params::REDACTION_MANIFEST_URL).unwrap().type_,
+			ParamType::Text
+		);
+		assert_eq!(
+			params.get(params::REDACTION_VERSION_QUERY).unwrap().type_,
+			ParamType::Text
+		);
+		assert_eq!(
+			params
+				.get(params::REDACTION_VERSION_FALLBACK_TO_BASE)
+				.unwrap()
+				.type_,
+			ParamType::Boolean
+		);
 		// Only the params pgro actually acts on are advertised.
 		assert_eq!(
 			params.len(),
-			11,
+			14,
 			"advertising a param pgro doesn't read, or dropping one it does"
 		);
 		assert!(params.get("anonymise").is_none());
@@ -641,13 +713,21 @@ mod tests {
 		assert!(v[1]["params"].is_null(), "upgrade has no params");
 
 		assert_eq!(v[2]["intent"], "analytics");
-		assert_eq!(v[2]["semantics"], json!(["check", "url"]));
+		// `redact` is not a semantic canopy knows yet: it stores unrecognised
+		// ones untouched, so advertising it early is how the capability gets
+		// there ahead of canopy's support for it.
+		assert_eq!(v[2]["semantics"], json!(["check", "url", "redact"]));
 		// params is a flat object of name -> { type, default? }.
 		assert_eq!(v[2]["params"]["minimum_ttl"]["type"], "duration");
 		assert_eq!(v[2]["params"]["minimum_ttl"]["default"], 7200);
 		assert_eq!(v[2]["params"]["storage_size_maximum"]["type"], "bytes");
 		assert_eq!(v[2]["params"]["persistent_schemas"]["type"], "text");
 		assert_eq!(v[2]["params"]["expose"]["type"], "boolean");
+		assert_eq!(v[2]["params"]["redaction_manifest_url"]["type"], "text");
+		assert_eq!(
+			v[2]["params"]["redaction_version_fallback_to_base"]["default"],
+			false
+		);
 		// a `bytes` param with no default omits the key entirely.
 		assert!(
 			v[2]["params"]["storage_size_maximum"]
@@ -695,6 +775,79 @@ mod tests {
 			"unset expose = not exposed"
 		);
 		assert_eq!(spec.storage_size_maximum.0, "2Ti");
+		assert!(
+			spec.redaction.is_none(),
+			"no manifest URL = serve the snapshot's data as-is"
+		);
+	}
+
+	#[test]
+	fn redaction_params_build_the_spec() {
+		let spec = config_for("analytics").unwrap().to_replica_spec(
+			&entry(
+				"analytics",
+				"site",
+				json!({
+					"redaction_manifest_url": "https://docs.example.org/v{version}/manifest.json",
+					"redaction_version_query": "SELECT value FROM local_system_facts WHERE key = 'currentVersion'",
+					"redaction_version_fallback_to_base": true,
+				}),
+			),
+			vec![],
+		);
+		let redaction = spec.redaction.expect("manifest URL turns redaction on");
+		assert_eq!(
+			redaction.manifest_url,
+			"https://docs.example.org/v{version}/manifest.json"
+		);
+		assert_eq!(
+			redaction.version_query.as_deref(),
+			Some("SELECT value FROM local_system_facts WHERE key = 'currentVersion'")
+		);
+		assert!(redaction.version_fallback_to_base);
+		assert!(
+			redaction.version.is_none(),
+			"a pinned version goes in the URL, so canopy has no param for it"
+		);
+	}
+
+	/// A manifest URL with no placeholder needs no version resolution, and
+	/// canopy sends unset text params as null or "".
+	#[test]
+	fn redaction_spec_without_a_version_query() {
+		let spec = config_for("analytics").unwrap().to_replica_spec(
+			&entry(
+				"analytics",
+				"site",
+				json!({
+					"redaction_manifest_url": "https://docs.example.org/v2.41.0/manifest.json",
+					"redaction_version_query": "",
+					"redaction_version_fallback_to_base": false,
+				}),
+			),
+			vec![],
+		);
+		let redaction = spec.redaction.expect("manifest URL turns redaction on");
+		assert!(redaction.version_query.is_none());
+		assert!(!redaction.version_fallback_to_base);
+	}
+
+	#[test]
+	fn blank_redaction_manifest_url_leaves_redaction_off() {
+		for url in [json!(""), json!("   "), Value::Null] {
+			let spec = config_for("analytics").unwrap().to_replica_spec(
+				&entry(
+					"analytics",
+					"site",
+					json!({ "redaction_manifest_url": url }),
+				),
+				vec![],
+			);
+			assert!(
+				spec.redaction.is_none(),
+				"{url:?} must not enable redaction"
+			);
+		}
 	}
 
 	#[test]

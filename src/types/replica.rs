@@ -171,6 +171,41 @@ pub struct PostgresPhysicalReplicaSpec {
 	/// computed size exceeds this limit. Defaults to 2Ti.
 	#[serde(default = "default_storage_size_maximum")]
 	pub storage_size_maximum: Quantity,
+
+	/// If set, apply a redaction manifest to the restored data before the
+	/// replica becomes eligible for switchover. The restore Pod installs
+	/// the postgresql_anonymizer extension for its own Postgres major on
+	/// first start; no version gate applies.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction: Option<RedactionSpec>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct RedactionSpec {
+	/// HTTP(S) URL of the dbt-style masking manifest. May contain a
+	/// `{version}` placeholder, in which case `version` or `versionQuery`
+	/// must be set.
+	pub manifest_url: String,
+
+	/// Pinned version to substitute into `{version}`. Mutually exclusive
+	/// with `versionQuery`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub version: Option<String>,
+
+	/// SQL query that returns a single text column with the version string.
+	/// Run against the restore's main database as the operator's superuser.
+	/// Mutually exclusive with `version`.
+	///
+	/// Example (Tamanu):
+	/// `SELECT value FROM local_system_facts WHERE key = 'currentVersion'`
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub version_query: Option<String>,
+
+	/// If the manifest URL with the discovered/pinned version 404s, retry
+	/// with the major.minor.0 base version.
+	#[serde(default)]
+	pub version_fallback_to_base: bool,
 }
 
 fn default_storage_size_maximum() -> Quantity {
@@ -395,6 +430,18 @@ pub struct PostgresPhysicalReplicaStatus {
 	/// cleared (e.g. by a spec change or manual intervention).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub consecutive_restore_failures: Option<u32>,
+
+	/// Phase of the redaction step for the current restore.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction_phase: Option<RedactionPhase>,
+
+	/// Resolved manifest version used by the last redaction run.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction_version: Option<String>,
+
+	/// Number of columns redacted in the last run.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub redaction_columns_applied: Option<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -501,6 +548,99 @@ impl JsonSchema for SchemaMigrationPhase {
 		json_schema!({
 			"type": "string",
 			"description": "Schema migration phase: 'active' (Job running), 'complete' (succeeded), 'partial' (succeeded with statement errors), 'timeout-skipped' (budget exceeded; persistent schemas dropped and switchover proceeded), or 'failed: <reason>' (Job failed).",
+		})
+	}
+}
+
+/// Lifecycle phase of the operator's redaction step, which runs during a
+/// switchover when `redaction` is configured on the replica. Serialized as
+/// a flat string in the same shape as [`SchemaMigrationPhase`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedactionPhase {
+	/// Redaction is running against the switching restore. The switchover
+	/// must not proceed while we're in this state.
+	Active,
+	/// Every masked column and truncated table was applied cleanly.
+	Complete,
+	/// The manifest was applied but some entries were skipped (a column
+	/// the restore doesn't have, an unknown mask kind, a `nil` mask on a
+	/// non-nullable column). The data that did get masked is masked;
+	/// `redactionColumnsApplied` counts what was attempted.
+	Partial,
+	/// The redaction run errored out. The switchover stays blocked — an
+	/// unredacted replica must never be served — and the next reconcile
+	/// re-attempts, since most failures here (manifest host down, dropped
+	/// connection) are transient.
+	Failed(String),
+}
+
+impl RedactionPhase {
+	/// True for every phase except [`Self::Active`]. Used by the sweep
+	/// gate, which only needs to know that no redaction is in flight
+	/// against a restore it might delete.
+	pub fn is_settled(&self) -> bool {
+		!matches!(self, Self::Active)
+	}
+
+	/// True once redaction has done all it's going to do for this restore
+	/// and the switchover may proceed.
+	pub fn is_done(&self) -> bool {
+		matches!(self, Self::Complete | Self::Partial)
+	}
+}
+
+impl std::fmt::Display for RedactionPhase {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Active => f.write_str("active"),
+			Self::Complete => f.write_str("complete"),
+			Self::Partial => f.write_str("partial"),
+			Self::Failed(reason) => write!(f, "failed: {reason}"),
+		}
+	}
+}
+
+impl std::str::FromStr for RedactionPhase {
+	type Err = String;
+
+	fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+		match s {
+			"active" => Ok(Self::Active),
+			"complete" => Ok(Self::Complete),
+			"partial" => Ok(Self::Partial),
+			other => {
+				if let Some(reason) = other.strip_prefix("failed:") {
+					Ok(Self::Failed(reason.trim().to_string()))
+				} else {
+					Err(format!("unknown redaction phase: {other:?}"))
+				}
+			}
+		}
+	}
+}
+
+impl Serialize for RedactionPhase {
+	fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+		s.serialize_str(&self.to_string())
+	}
+}
+
+impl<'de> Deserialize<'de> for RedactionPhase {
+	fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+		let s = String::deserialize(d)?;
+		s.parse().map_err(serde::de::Error::custom)
+	}
+}
+
+impl JsonSchema for RedactionPhase {
+	fn schema_name() -> Cow<'static, str> {
+		"RedactionPhase".into()
+	}
+
+	fn json_schema(_: &mut SchemaGenerator) -> Schema {
+		json_schema!({
+			"type": "string",
+			"description": "Redaction phase: 'active' (running), 'complete' (all masks applied), 'partial' (applied, some entries skipped), or 'failed: <reason>' (errored; switchover stays blocked and the next reconcile retries).",
 		})
 	}
 }
@@ -637,5 +777,55 @@ mod tests {
 		assert!(SchemaMigrationPhase::Partial.is_settled());
 		assert!(SchemaMigrationPhase::TimeoutSkipped.is_settled());
 		assert!(SchemaMigrationPhase::Failed("x".into()).is_settled());
+	}
+
+	#[test]
+	fn redaction_phase_roundtrips() {
+		for phase in [
+			RedactionPhase::Active,
+			RedactionPhase::Complete,
+			RedactionPhase::Partial,
+			RedactionPhase::Failed("manifest 404".into()),
+		] {
+			let s = serde_json::to_string(&phase).expect("serialize");
+			let back: RedactionPhase = serde_json::from_str(&s).expect("deserialize");
+			assert_eq!(phase, back, "round-trip mismatch for {phase:?}");
+		}
+	}
+
+	#[test]
+	fn redaction_phase_wire_strings() {
+		assert_eq!(RedactionPhase::Active.to_string(), "active");
+		assert_eq!(RedactionPhase::Complete.to_string(), "complete");
+		assert_eq!(RedactionPhase::Partial.to_string(), "partial");
+		assert_eq!(
+			RedactionPhase::Failed("boom".into()).to_string(),
+			"failed: boom"
+		);
+	}
+
+	#[test]
+	fn redaction_phase_rejects_unknown_string() {
+		let r: Result<RedactionPhase, _> = "halfway".parse();
+		assert!(r.is_err());
+	}
+
+	/// The two gates differ: the sweep only needs redaction to not be
+	/// running, while the switchover needs it to have actually applied.
+	#[test]
+	fn redaction_phase_settled_is_wider_than_done() {
+		assert!(!RedactionPhase::Active.is_settled());
+		assert!(!RedactionPhase::Active.is_done());
+
+		assert!(RedactionPhase::Failed("x".into()).is_settled());
+		assert!(
+			!RedactionPhase::Failed("x".into()).is_done(),
+			"a failed redaction must never let the switchover through"
+		);
+
+		for phase in [RedactionPhase::Complete, RedactionPhase::Partial] {
+			assert!(phase.is_settled());
+			assert!(phase.is_done());
+		}
 	}
 }

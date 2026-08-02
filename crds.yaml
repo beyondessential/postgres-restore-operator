@@ -694,6 +694,45 @@ spec:
                 default: true
                 description: Set database to read-only mode
                 type: boolean
+              redaction:
+                description: |-
+                  If set, apply a redaction manifest to the restored data before the
+                  replica becomes eligible for switchover. The restore Pod installs
+                  the postgresql_anonymizer extension for its own Postgres major on
+                  first start; no version gate applies.
+                nullable: true
+                properties:
+                  manifestUrl:
+                    description: |-
+                      HTTP(S) URL of the dbt-style masking manifest. May contain a
+                      `{version}` placeholder, in which case `version` or `versionQuery`
+                      must be set.
+                    type: string
+                  version:
+                    description: |-
+                      Pinned version to substitute into `{version}`. Mutually exclusive
+                      with `versionQuery`.
+                    nullable: true
+                    type: string
+                  versionFallbackToBase:
+                    default: false
+                    description: |-
+                      If the manifest URL with the discovered/pinned version 404s, retry
+                      with the major.minor.0 base version.
+                    type: boolean
+                  versionQuery:
+                    description: |-
+                      SQL query that returns a single text column with the version string.
+                      Run against the restore's main database as the operator's superuser.
+                      Mutually exclusive with `version`.
+
+                      Example (Tamanu):
+                      `SELECT value FROM local_system_facts WHERE key = 'currentVersion'`
+                    nullable: true
+                    type: string
+                required:
+                - manifestUrl
+                type: object
               resources:
                 description: |-
                   Pin the postgres pod's resources. When set these are used verbatim;
@@ -1006,6 +1045,20 @@ spec:
                 minimum: 0.0
                 nullable: true
                 type: integer
+              redactionColumnsApplied:
+                description: Number of columns redacted in the last run.
+                format: uint32
+                minimum: 0.0
+                nullable: true
+                type: integer
+              redactionPhase:
+                description: Phase of the redaction step for the current restore.
+                nullable: true
+                type: string
+              redactionVersion:
+                description: Resolved manifest version used by the last redaction run.
+                nullable: true
+                type: string
               scheduleInputHash:
                 description: |-
                   Hash of the schedule inputs used to compute `nextScheduledRestore`,

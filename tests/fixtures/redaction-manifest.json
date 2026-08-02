@@ -1,0 +1,22 @@
+{
+  "sources": {
+    "source.tamanu.tamanu.users": {
+      "schema": "public",
+      "name": "users",
+      "columns": {
+        "email":       { "config": { "meta": { "masking": "email" } } },
+        "full_name":   { "config": { "meta": { "masking": "name" } } },
+        "single_name": { "config": { "meta": { "masking": "name" } } },
+        "dob":         { "config": { "meta": { "masking": "date" } } },
+        "phone":       { "config": { "meta": { "masking": "phone" } } },
+        "heart_rate":  { "config": { "meta": { "masking": { "kind": "integer", "range": "50-100" } } } }
+      }
+    },
+    "source.tamanu.tamanu.sync_lookup": {
+      "schema": "public",
+      "name": "sync_lookup",
+      "config": { "meta": { "masking": "truncate" } },
+      "columns": {}
+    }
+  }
+}

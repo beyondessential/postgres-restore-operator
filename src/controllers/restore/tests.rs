@@ -48,6 +48,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			notifications: vec![],
 
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);
@@ -140,6 +141,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			notifications: vec![],
 
 			persistent_schemas: None,
+			redaction: None,
 			storage_size_maximum: Quantity("2Ti".to_string()),
 		},
 	);
@@ -160,6 +162,51 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	restore.metadata.uid = Some("uid-123".to_string());
 
 	(restore, replica)
+}
+
+/// The `setup-auth` init container's inline script, which carries the locale,
+/// WAL and reindex fix steps.
+fn setup_auth_script() -> String {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let setup_auth = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	setup_auth.args.unwrap().remove(0)
+}
+
+/// The `postgres` container's inline script, which carries the background
+/// reindex hook and its stage bookkeeping.
+fn postgres_container_script() -> String {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let postgres = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.containers
+		.into_iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must exist");
+	postgres.args.unwrap().remove(0)
 }
 
 /// Memory in bytes. Compared numerically because the derived value is ceiled
@@ -1097,6 +1144,76 @@ fn deployment_init_script_flags_full_reindex_after_resetwal() {
 }
 
 #[test]
+fn deployment_init_script_detects_locale_mismatch_before_rewriting() {
+	// The single-user pass is where the locale rewrite actually happens, so
+	// it is the only place that can observe whether a rewrite was needed:
+	// once it runs, every database conforms and a later query can no longer
+	// tell. `postgres --single` reports no row count, so the rewrite must be
+	// preceded by a labelled count probe in the same session.
+	let script = setup_auth_script();
+
+	assert!(
+		script.contains("pgro_locale_mismatch"),
+		"single-user locale pass must probe for non-conforming databases under a distinctive label before rewriting them"
+	);
+	let probe_call = script
+		.find(r#"postgres_single_or_resetwal "SELECT count(*) AS pgro_locale_mismatch"#)
+		.expect("the probe must be submitted through the single-user helper");
+	assert!(
+		script[probe_call..].starts_with(
+			r#"postgres_single_or_resetwal "SELECT count(*) AS pgro_locale_mismatch FROM pg_database WHERE $LOCALE_MISMATCH_WHERE;
+$LOCALE_REWRITE""#
+		),
+		"the rewrite must be submitted in the same single-user session, on the line after the probe: single-user mode ends a statement at the newline, and a separate session would probe a database the rewrite had already fixed"
+	);
+}
+
+#[test]
+fn deployment_init_script_records_locale_fix_from_sticky_flag() {
+	// `fixes.locale` must be driven by a flag file the rewrite touches, the
+	// same way reset_wal and recreated_pg_wal are. The previous shell
+	// variable was set to 1 by the single-user pass and then unconditionally
+	// overwritten by the post-startup fallback's row count — always 0,
+	// because the single-user pass had already fixed every database — so the
+	// flag could never report true.
+	let script = setup_auth_script();
+
+	assert!(
+		script.contains("touch /pgdata/fix-locale"),
+		"a locale rewrite must record itself in a flag file"
+	);
+	assert!(
+		script.contains("if [ -f /pgdata/fix-locale ]; then PGRO_LOCALE=true"),
+		"PGRO_LOCALE must be read back from the flag file, not from a shell variable a later step can clobber"
+	);
+	assert!(
+		!script.contains("LOCALE_CHANGED=1\n"),
+		"the unconditional LOCALE_CHANGED=1 must be gone — it was overwritten by the post-startup fallback before it was ever read"
+	);
+}
+
+#[test]
+fn deployment_init_script_pairs_locale_rewrite_with_reindex_flag() {
+	// Rewriting datcollate changes collation semantics, so every text btree
+	// built under the old collation is potentially misordered. Each site
+	// that records a locale rewrite must also raise needs-reindex, which
+	// gates the readiness probe until the rebuild finishes.
+	let script = setup_auth_script();
+
+	let locale_flags = script.matches("touch /pgdata/fix-locale").count();
+	// Trailing newline: `needs-reindex-all` shares this prefix.
+	let reindex_flags = script.matches("touch /pgdata/needs-reindex\n").count();
+	assert!(
+		locale_flags >= 1,
+		"expected at least one locale-rewrite site; got {locale_flags}"
+	);
+	assert_eq!(
+		reindex_flags, locale_flags,
+		"every locale rewrite must be paired with `touch /pgdata/needs-reindex` (got {reindex_flags} reindex flags for {locale_flags} locale rewrites)"
+	);
+}
+
+#[test]
 fn deployment_runtime_reindex_handles_full_database_flag() {
 	// The main container's startup hook handles the broad flag
 	// (needs-reindex-all) via blind REINDEX DATABASE on every user DB.
@@ -1309,6 +1426,52 @@ fn postgres_container_updates_stage_around_reindex() {
 	assert!(
 		script[..ready_pos].contains("rm -f /pgdata/needs-reindex"),
 		"ready update must happen after the needs-reindex flag is cleared"
+	);
+}
+
+#[test]
+fn postgres_container_stage_updates_override_read_only() {
+	// A read-only replica runs with default_transaction_read_only = on, which
+	// rejects the stage bookkeeping the reindex hook does about itself:
+	//   ERROR: cannot execute UPDATE in a read-only transaction
+	// The stage then sticks at whatever the init container wrote and never
+	// reaches 'ready', so `_pgro.restore_info` misreports a finished reindex as
+	// still pending. Each stage update must ask for a writable session.
+	let script = postgres_container_script();
+
+	let stage_updates = script
+		.matches("UPDATE _pgro.restore_info SET stage")
+		.count();
+	let overrides = script
+		.matches("PGOPTIONS='-c default_transaction_read_only=off'")
+		.count();
+	assert!(
+		stage_updates >= 2,
+		"expected the reindexing and ready stage updates; got {stage_updates}"
+	);
+	assert_eq!(
+		overrides, stage_updates,
+		"every stage update must run with default_transaction_read_only=off (got {overrides} overrides for {stage_updates} updates)"
+	);
+}
+
+#[test]
+fn locale_reindex_targets_only_default_collation_indexes() {
+	// A datcollate rewrite only invalidates indexes ordered by the database
+	// default collation (OID 100). Catalog indexes over `name` columns carry
+	// the C collation (950) and are unaffected — and REINDEX INDEX
+	// CONCURRENTLY cannot touch a system catalog at all, so selecting them
+	// yields dozens of swallowed "cannot reindex system catalogs
+	// concurrently" errors that look like work being done.
+	let script = postgres_container_script();
+
+	assert!(
+		script.contains("a.attcollation = 100"),
+		"the locale reindex must select only indexes ordered by the default collation"
+	);
+	assert!(
+		!script.contains("a.attcollation <> 0"),
+		"selecting every collation-bearing attribute pulls in system catalogs that cannot be reindexed concurrently"
 	);
 }
 
@@ -1661,4 +1824,178 @@ fn batch_result_reports_an_unattributed_failure() {
 		true,
 	);
 	assert_eq!(r.failed_migration.as_deref(), Some("unknown"));
+}
+
+#[test]
+fn deployment_with_redaction_runs_postgres_as_root_and_installs_anon() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.expect("postgres container must be present");
+
+	let sec = postgres
+		.security_context
+		.as_ref()
+		.expect("postgres container must override securityContext when redaction is set");
+	assert_eq!(sec.run_as_user, Some(0), "postgres must run as root");
+
+	let script = &postgres.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("postgresql_anonymizer_18"),
+		"prelude must apt-install the anon package for the restore's PG major, got: {script}"
+	);
+	assert!(
+		script.contains("/usr/lib/postgresql/18/lib"),
+		"prelude must stage anon.so into the PG-major lib dir, got: {script}"
+	);
+	assert!(
+		script.contains("exec gosu postgres postgres"),
+		"prelude must drop privileges via gosu before exec'ing postgres"
+	);
+}
+
+#[test]
+fn deployment_without_redaction_keeps_default_securitycontext() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.unwrap();
+	assert!(
+		postgres.security_context.is_none(),
+		"postgres container must inherit the pod-level UID 999 when redaction is off"
+	);
+	let script = &postgres.args.as_ref().unwrap()[0];
+	assert!(
+		!script.contains("postgresql_anonymizer"),
+		"the anon install prelude must not be emitted when redaction is off"
+	);
+	assert!(
+		script.contains("exec postgres -D /pgdata/pgdata"),
+		"postgres must be exec'd directly when there's no privilege to drop"
+	);
+}
+
+#[test]
+fn deployment_with_redaction_builds_for_pg16() {
+	// Redaction used to be gated to PG 18+ when we relied on the
+	// extension_control_path GUC. Now the postgres container's prelude
+	// drops the files into /usr/share/postgresql/$N/extension and
+	// /usr/lib/postgresql/$N/lib of its own writable layer, so any PG
+	// major works.
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica)
+		.expect("redaction should build on PG 16");
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let postgres = pod
+		.containers
+		.iter()
+		.find(|c| c.name == "postgres")
+		.unwrap();
+	let script = &postgres.args.as_ref().unwrap()[0];
+	assert!(
+		script.contains("postgresql_anonymizer_16"),
+		"prelude must use the restore's PG major (16), got: {script}"
+	);
+}
+
+#[test]
+fn deployment_with_redaction_forces_writable() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	replica.spec.read_only = true;
+	replica.spec.redaction = Some(RedactionSpec {
+		manifest_url: "https://example.com/m.json".into(),
+		version: None,
+		version_query: None,
+		version_fallback_to_base: false,
+	});
+
+	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let script = deploy_init_setup_auth_script(&deploy);
+	// The init script uses `if [ "<read_only>" = "true" ]` and we want
+	// that variable substituted to "false" when redaction is set so the
+	// conditional doesn't fire at runtime.
+	assert!(
+		script.contains("if [ \"false\" = \"true\" ]"),
+		"redaction must defer read-only by substituting read_only=false into the init script"
+	);
+}
+
+fn deploy_init_setup_auth_script(deploy: &k8s_openapi::api::apps::v1::Deployment) -> String {
+	let pod = deploy
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap();
+	let setup_auth = pod
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.unwrap();
+	setup_auth.args.as_ref().unwrap()[0].clone()
 }

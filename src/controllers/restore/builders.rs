@@ -989,6 +989,46 @@ pub struct PostgresDeploymentInputs<'a> {
 	pub postgres_resources: Option<ResourceRequirements>,
 	pub affinity: Option<k8s_openapi::api::core::v1::Affinity>,
 	pub tolerations: Vec<k8s_openapi::api::core::v1::Toleration>,
+	/// True when the replica redacts its data after restore. Makes the
+	/// postgres container install `postgresql_anonymizer` before starting
+	/// the server (see [`anon_install_prelude`]).
+	pub redaction_enabled: bool,
+}
+
+/// Shell prelude that makes the `anon` extension available to the postgres
+/// server, run as root before the container drops back to UID 999.
+///
+/// `postgresql_anonymizer` isn't in the postgres image and there's no
+/// upstream image that carries it, so the container apt-installs it from
+/// Dalibo Labs on first start. The download is cached on the restore PVC so
+/// later starts of the same restore skip the network; the copy into the
+/// container's (fresh each start) writable layer is a sub-second file copy.
+fn anon_install_prelude(pg_version: &str) -> String {
+	format!(
+		r#"
+if [ ! -f /pgdata/.anon-cache/anon.so ] || [ ! -f /pgdata/.anon-cache/anon.control ]; then
+  echo "Installing postgresql_anonymizer_{pg_version} from Dalibo Labs..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get update
+  apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release
+  curl -fsSL https://apt.dalibo.org/labs/debian-dalibo.gpg \
+      -o /etc/apt/trusted.gpg.d/dalibo-labs.gpg
+  echo "deb http://apt.dalibo.org/labs $(lsb_release -cs)-dalibo main" \
+      > /etc/apt/sources.list.d/dalibo-labs.list
+  apt-get update
+  apt-get install -y --no-install-recommends "postgresql_anonymizer_{pg_version}"
+  mkdir -p /pgdata/.anon-cache
+  cp -a "/usr/share/postgresql/{pg_version}/extension/anon"* /pgdata/.anon-cache/
+  cp -a "/usr/lib/postgresql/{pg_version}/lib/anon.so"       /pgdata/.anon-cache/
+  chown -R 999:999 /pgdata/.anon-cache
+else
+  echo "anon already cached on the restore PVC, skipping install"
+fi
+
+cp -a /pgdata/.anon-cache/anon*   "/usr/share/postgresql/{pg_version}/extension/"
+cp -a /pgdata/.anon-cache/anon.so "/usr/lib/postgresql/{pg_version}/lib/"
+"#
+	)
 }
 
 /// CRD-path Deployment builder. Fills the shared `PostgresDeploymentInputs`
@@ -1023,13 +1063,14 @@ pub fn build_deployment(
 		.cloned()
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
-	// persistent_schemas needs write access to receive the migrated data, and a
-	// restore with a migration target exists to be written to: on PG >= 14
-	// read-only grants the app user `pg_read_all_data`, which has no DDL, so
-	// migrations cannot run under it whatever the transaction default says.
-	// These restores are ephemeral and discarded once verified.
+	// persistent_schemas, redaction and migrations all need write access during
+	// their post-restore step. On PG >= 14 read-only grants the app user
+	// `pg_read_all_data`, which has no DDL, so migrations cannot run under it
+	// whatever the transaction default says. Redaction re-enables
+	// `default_transaction_read_only` at the database level itself once it's done.
 	let effective_read_only = replica.spec.read_only
 		&& replica.spec.persistent_schemas.is_none()
+		&& replica.spec.redaction.is_none()
 		&& restore.spec.migrate_to.is_none();
 
 	let labels = BTreeMap::from([
@@ -1062,6 +1103,7 @@ pub fn build_deployment(
 		postgres_resources,
 		affinity: replica.spec.affinity.clone(),
 		tolerations: replica.spec.tolerations.clone(),
+		redaction_enabled: replica.spec.redaction.is_some(),
 	})
 }
 
@@ -1228,10 +1270,12 @@ pub fn build_postgres_deployment_with(cfg: &PostgresDeploymentInputs<'_>) -> Res
 		postgres_resources,
 		affinity,
 		tolerations,
+		redaction_enabled,
 	} = cfg;
 	let shm_size = shm_size.clone();
 	let shared_buffers_mb = *shared_buffers_mb;
 	let read_only = *read_only;
+	let redaction_enabled = *redaction_enabled;
 
 	let pg_image = format!("postgres:{pg_version}");
 
@@ -1256,6 +1300,20 @@ echo "Copying locale data to shared volume..."
 cp -a /usr/lib/locale/* /locale-data/
 "#
 	.to_string();
+
+	// With redaction the container starts as root to install `anon`, then
+	// hands off to UID 999 via gosu; without it postgres is PID 1's child
+	// under the pod's own UID and no privilege drop is needed.
+	let anon_prelude = if redaction_enabled {
+		anon_install_prelude(pg_version)
+	} else {
+		String::new()
+	};
+	let postgres_exec_line = if redaction_enabled {
+		"exec gosu postgres postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}\n"
+	} else {
+		"exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}\n"
+	};
 
 	let extra_config_block = if let Some(extra) = postgres_extra_config {
 		format!(
@@ -1421,12 +1479,29 @@ postgres_single_or_resetwal() {{
 }}
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."
+# One definition of "non-conforming", shared by the probe and the rewrite. If
+# the two drifted, the probe would report a rewrite that never happened, or
+# miss one that did.
+LOCALE_MISMATCH_WHERE="datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST')"
 if [ "$PG_MAJOR" -ge 13 ]; then
-  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
+  LOCALE_REWRITE="UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8', datcollversion = NULL WHERE $LOCALE_MISMATCH_WHERE;"
 else
-  postgres_single_or_resetwal "UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE datcollate NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST') OR datctype NOT IN ('C', 'C.UTF-8', 'PG_UNICODE_FAST');"
+  LOCALE_REWRITE="UPDATE pg_database SET datcollate = 'C.UTF-8', datctype = 'C.UTF-8' WHERE $LOCALE_MISMATCH_WHERE;"
 fi
-LOCALE_CHANGED=1
+# This is the only point at which "did the locale need rewriting?" is
+# answerable: afterwards every database conforms and the question reads false
+# forever. postgres --single reports no row count, so the count is taken as a
+# labelled SELECT in the same session, immediately before the rewrite.
+# Single-user mode ends a statement at the newline, not the semicolon, so the
+# two statements must be on separate lines.
+LOCALE_PROBE=$(postgres_single_or_resetwal "SELECT count(*) AS pgro_locale_mismatch FROM pg_database WHERE $LOCALE_MISMATCH_WHERE;
+$LOCALE_REWRITE")
+echo "$LOCALE_PROBE"
+if echo "$LOCALE_PROBE" | grep -q 'pgro_locale_mismatch = "[1-9]'; then
+  echo "Locale was rewritten, flagging for reindex before this replica serves traffic"
+  touch /pgdata/fix-locale
+  touch /pgdata/needs-reindex
+fi
 
 echo "Starting temporary postgres to configure analytics user..."
 pg_ctl -D "$PGDATA" -o "-c listen_addresses='' -c log_min_messages=WARNING" -w start
@@ -1472,7 +1547,8 @@ COLLEOF
 done
 
 if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then
-  echo "Locale was changed, flagging for background reindex after startup"
+  echo "Locale was changed by the post-startup fallback, flagging for reindex"
+  touch /pgdata/fix-locale
   touch /pgdata/needs-reindex
 fi
 
@@ -1518,7 +1594,7 @@ fi
 # so adding a new fix is one shell line here plus recording its flag — no
 # schema change, no operator change (the operator forwards the map as-is).
 # Each fix is keyed by a flag file the fix step touches:
-#   locale  — the post-startup locale rewrite actually changed rows
+#   locale  — a locale rewrite actually changed rows
 #   reindex — REINDEX ran (after pg_resetwal, or a locale rewrite)
 #   reset_wal — pg_resetwal -f ran (snapshot's trailing WAL was unusable)
 #   recreated_pg_wal — an empty pg_wal was created (Windows-host snapshot)
@@ -1529,7 +1605,7 @@ else
   PGRO_STAGE=ready
   PGRO_REINDEX=false
 fi
-if [ "${{LOCALE_CHANGED:-0}}" != "0" ]; then PGRO_LOCALE=true; else PGRO_LOCALE=false; fi
+if [ -f /pgdata/fix-locale ]; then PGRO_LOCALE=true; else PGRO_LOCALE=false; fi
 if [ -f /pgdata/fix-reset-wal ]; then PGRO_RESET_WAL=true; else PGRO_RESET_WAL=false; fi
 if [ -f /pgdata/fix-recreated-pg-wal ]; then PGRO_RECREATED_WAL=true; else PGRO_RECREATED_WAL=false; fi
 PGRO_FIXES="{{\"locale\": ${{PGRO_LOCALE}}, \"reindex\": ${{PGRO_REINDEX}}, \"reset_wal\": ${{PGRO_RESET_WAL}}, \"recreated_pg_wal\": ${{PGRO_RECREATED_WAL}}}}"
@@ -1639,13 +1715,11 @@ echo "Auth setup complete"
 							image: Some(pg_image.clone()),
 							command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
 							args: Some(vec![locale_script]),
-							security_context: Some(
-								k8s_openapi::api::core::v1::SecurityContext {
-									run_as_user: Some(0),
-									run_as_group: Some(0),
-									..Default::default()
-								},
-							),
+							security_context: Some(k8s_openapi::api::core::v1::SecurityContext {
+								run_as_user: Some(0),
+								run_as_group: Some(0),
+								..Default::default()
+							}),
 							volume_mounts: Some(vec![VolumeMount {
 								name: "locale-data".to_string(),
 								mount_path: "/locale-data".to_string(),
@@ -1696,12 +1770,20 @@ echo "Auth setup complete"
 						name: "postgres".to_string(),
 						image: Some(pg_image),
 						command: Some(vec!["/bin/sh".to_string(), "-c".to_string()]),
-						args: Some(vec![r#"
+						args: Some(vec![
+							[
+								anon_prelude.as_str(),
+								r#"
 if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
   PG_MAJOR=$(cat /pgdata/pgdata/PG_VERSION)
   (
     while ! pg_isready -q -U postgres -d postgres; do sleep 2; done
-    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
+    # A read-only replica runs with default_transaction_read_only = on, which
+    # rejects this bookkeeping ("cannot execute UPDATE in a read-only
+    # transaction") and leaves the stage stuck wherever the init container
+    # left it. Ask for a writable session per connection; the setting stays
+    # on for everyone else.
+    PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
     # needs-reindex-all (pg_resetwal aftermath) can leave torn pages in
     # ANY index, not just collation-dependent ones. We tried a "smart
     # pass" using the amcheck contrib extension (scan each btree, queue
@@ -1750,11 +1832,18 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
       rm -f /pgdata/needs-reindex
     elif [ -f /pgdata/needs-reindex ]; then
       for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+        # Only the database default collation (OID 100) is what the locale
+        # rewrite changed, so only indexes ordered by it are invalidated.
+        # `attcollation <> 0` also matches catalog indexes over `name`
+        # columns, which carry the C collation (950) and are unaffected —
+        # and REINDEX INDEX CONCURRENTLY cannot touch a system catalog, so
+        # including them produced dozens of swallowed errors per database
+        # that read like progress.
         INDEXES=$(psql -U postgres -d "$db" -At -c "
           SELECT DISTINCT indexrelid::regclass::text
           FROM pg_index i
           JOIN pg_attribute a ON a.attrelid = i.indexrelid
-          WHERE a.attcollation <> 0 AND i.indisvalid;
+          WHERE a.attcollation = 100 AND i.indisvalid;
         ")
         COUNT=$(echo "$INDEXES" | grep -c . || true)
         echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
@@ -1772,12 +1861,14 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ]; then
       done
       rm -f /pgdata/needs-reindex
     fi
-    psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
+    PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'ready', last_transition_time = now() WHERE id = 1;"
     echo "Background reindex complete"
   ) &
 fi
-exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_LEVEL}
-"#.to_string()]),
+"#,
+							postgres_exec_line,
+						]
+						.concat()]),
 						env: Some(vec![
 							EnvVar {
 								name: "PGDATA".to_string(),
@@ -1790,6 +1881,17 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 								..Default::default()
 							},
 						]),
+						security_context: redaction_enabled.then(|| {
+							// The anon prelude apt-installs the extension and
+							// copies it into /usr/{share,lib}/postgresql/$N/ —
+							// both root-only operations. The script drops back
+							// to UID 999 with gosu before exec'ing postgres.
+							k8s_openapi::api::core::v1::SecurityContext {
+								run_as_user: Some(0),
+								run_as_group: Some(0),
+								..Default::default()
+							}
+						}),
 						ports: Some(vec![ContainerPort {
 							name: Some("postgres".to_string()),
 							container_port: 5432,
@@ -1874,12 +1976,10 @@ exec postgres -D /pgdata/pgdata ${PGRO_LOG_LEVEL:+-c log_min_messages=$PGRO_LOG_
 						},
 						Volume {
 							name: "dshm".to_string(),
-							empty_dir: Some(
-								k8s_openapi::api::core::v1::EmptyDirVolumeSource {
-										medium: Some("Memory".to_string()),
-										size_limit: Some(shm_size),
-									},
-							),
+							empty_dir: Some(k8s_openapi::api::core::v1::EmptyDirVolumeSource {
+								medium: Some("Memory".to_string()),
+								size_limit: Some(shm_size),
+							}),
 							..Default::default()
 						},
 					]),

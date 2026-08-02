@@ -110,6 +110,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. See [Persistent schemas](#persistent-schemas) below for the migration time budget and what happens on timeout. |
+| `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. See [RedactionSpec](#redactionspec) below. |
 | `migrateTo` | `MigrationTarget` | No | — | Apply a Tamanu version's schema migrations to each restore of this replica and report how they went. `{ version, versionId }`. Set by the canopy worklist syncer for the `upgrade` intent, from the target version canopy names on the worklist entry. A restore carrying this is built read-write, since migrations are DDL, and is torn down once verified. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
@@ -139,6 +140,36 @@ If the budget is exceeded — most realistically because some external upstream 
 
 The intent is that **a usable replica beats carrying the schema through**.
 The next restore cycle will re-attempt the migration if the schemas have been regenerated on the source in the meantime; until then the replica is up and serving the snapshot contents.
+
+#### RedactionSpec
+
+Configures applying a column-masking manifest to the restored data using the [postgresql_anonymizer](https://gitlab.com/dalibo/postgresql_anonymizer) extension.
+The manifest follows the [Tamanu masking spec](https://github.com/beyondessential/tamanu/tree/main/database#masking) — any dbt project that publishes the same `meta.masking` annotation shape can be pointed at.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `manifestUrl` | `string` | Yes | — | HTTP(S) URL of the masking manifest. May contain a literal `{version}` placeholder. |
+| `version` | `string` | No | — | Pinned version substituted into `{version}`. Mutually exclusive with `versionQuery`. |
+| `versionQuery` | `string` | No | — | SQL query that returns one row, one text column with the version string. Run as the operator's superuser against the restore. Mutually exclusive with `version`. |
+| `versionFallbackToBase` | `bool` | No | `false` | If the manifest URL with the discovered/pinned version 404s, retry with the `major.minor.0` base version. |
+
+Example (Tamanu):
+
+```yaml
+spec:
+  redaction:
+    manifestUrl: "https://docs.data.bes.au/tamanu/v{version}/manifest.json"
+    versionQuery: "SELECT value FROM local_system_facts WHERE key = 'currentVersion'"
+    versionFallbackToBase: true
+```
+
+Notes:
+
+- Works on any PostgreSQL major the operator otherwise supports. There's no PG-version gate because the prelude apt-installs `postgresql_anonymizer_$N` from [Dalibo Labs](https://apt.dalibo.org/labs/) per the running restore's PG version and copies the files into the standard system extension dirs (`/usr/share/postgresql/$N/extension`, `/usr/lib/postgresql/$N/lib`).
+- The download is cached on the restore PVC at `/pgdata/.anon-cache/`, so a pod restart doesn't re-fetch the package — it just re-copies the cached files into the (fresh) container writable layer.
+- The postgres container runs as root for the prelude (to apt-install and write to system paths) then drops back to UID 999 via `gosu` before exec'ing `postgres`. `gosu` is preinstalled in the official `postgres` image.
+- During redaction the database is writable; once anonymisation completes, the operator sets `default_transaction_read_only = on` at the database level and demotes the analytics user back to non-superuser when `spec.readOnly` is true. Replicas that also set `persistentSchemas` stay writable, because the schema migration runs after redaction and writes to the same database — matching what those replicas do without redaction.
+- If a redaction run fails, the switchover is held: the replica keeps serving its previous restore, a `RedactionFailed` Warning event is recorded, and the next reconcile retries. An unredacted restore is never made live.
 
 #### SnapshotFilter
 
@@ -193,6 +224,9 @@ Additional fields for `target: graphQL`:
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
 | `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, `partial`, `timeout-skipped`, or `failed: <reason>`). See [Persistent schemas](#persistent-schemas). |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
+| `redactionPhase` | `string` | Phase of the current restore's redaction (`active`, `complete`, `partial`, or `failed: <reason>`). `partial` means masking ran but some columns were skipped and tolerated as errors (e.g. a column the manifest names that this database doesn't have). `failed:` holds the switchover — the replica keeps serving its previous restore rather than an unredacted one — and the next reconcile retries. |
+| `redactionVersion` | `string` | The manifest version resolved during the last redaction run (when `manifestUrl` is version-templated). |
+| `redactionColumnsApplied` | `uint32` | Number of columns the last redaction run attempted to mask. |
 | `consecutiveRestoreFailures` | `uint32` | Number of consecutive restore failures. Reset to 0 on success. After 3 consecutive failures the operator stops scheduling new restores until the counter is reset (automatically on next successful restore, or manually via `kubectl patch --subresource=status`). |
 
 ---
