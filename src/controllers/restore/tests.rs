@@ -19,6 +19,7 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
+			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
@@ -72,6 +73,7 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut restore = PostgresPhysicalRestore::new(
 		"test-restore",
 		PostgresPhysicalRestoreSpec {
+			migrate_to: None,
 			replica: LocalObjectReference {
 				name: "test-replica".to_string(),
 			},
@@ -110,6 +112,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
+			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
@@ -146,6 +149,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let mut restore = PostgresPhysicalRestore::new(
 		"test-restore",
 		PostgresPhysicalRestoreSpec {
+			migrate_to: None,
 			replica: LocalObjectReference {
 				name: "test-replica".to_string(),
 			},
@@ -1503,6 +1507,323 @@ fn deployment_shared_buffers_with_custom_resources() {
 		script.contains("shared_buffers = 516MB"),
 		"init script must set shared_buffers for 2Gi request"
 	);
+}
+
+fn migration_target() -> MigrationTarget {
+	MigrationTarget {
+		version: "2.62.0".to_string(),
+		version_id: "66666666-6666-6666-6666-666666666666".to_string(),
+	}
+}
+
+fn env_value(container: &k8s_openapi::api::core::v1::Container, name: &str) -> Option<String> {
+	container
+		.env
+		.as_ref()?
+		.iter()
+		.find(|e| e.name == name)?
+		.value
+		.clone()
+}
+
+fn env_secret_key(
+	container: &k8s_openapi::api::core::v1::Container,
+	name: &str,
+) -> Option<(String, String)> {
+	let e = container.env.as_ref()?.iter().find(|e| e.name == name)?;
+	let sel = e.value_from.as_ref()?.secret_key_ref.as_ref()?;
+	Some((sel.name.clone(), sel.key.clone()))
+}
+
+#[test]
+fn migration_job_lets_the_image_entrypoint_take_the_subcommand() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+
+	// The image's ENTRYPOINT dispatches the subcommand; overriding command would
+	// bypass it and run the app the wrong way.
+	assert_eq!(
+		container.command, None,
+		"command must be left to the image entrypoint"
+	);
+	assert_eq!(
+		container.args.as_deref(),
+		Some(["migrate".to_string()].as_slice())
+	);
+	assert_eq!(
+		container.image.as_deref(),
+		Some("ghcr.io/beyondessential/tamanu-central:v2.62.0"),
+		"the image must be the target version's own, since it owns the migrations"
+	);
+}
+
+#[test]
+fn migration_job_points_tamanu_at_the_restored_database() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+
+	// tamanu reads its db config from CONFIG_SYNC_DB_*; plain DB_* is ignored, so
+	// the job would silently target the packaged default instead.
+	assert_eq!(
+		env_value(container, "CONFIG_SYNC_DB_HOST").as_deref(),
+		Some("test-restore"),
+		"the per-restore Service, so a switchover cannot repoint it mid-migration"
+	);
+	// The restored database's own name: pgro replicas don't name the database
+	// after its owner, so the credentials username is the wrong answer.
+	assert_eq!(
+		env_value(container, "CONFIG_SYNC_DB_NAME").as_deref(),
+		Some("tamanu-fiji")
+	);
+	assert_eq!(
+		env_secret_key(container, "CONFIG_SYNC_DB_USERNAME"),
+		Some(("test-replica-creds".to_string(), "username".to_string()))
+	);
+	assert_eq!(
+		env_secret_key(container, "CONFIG_SYNC_DB_PASSWORD"),
+		Some(("test-replica-creds".to_string(), "password".to_string()))
+	);
+	assert!(
+		container
+			.env
+			.as_ref()
+			.unwrap()
+			.iter()
+			.all(|e| e.name != "DB_HOST"),
+		"no plain DB_* vars, which tamanu does not read"
+	);
+}
+
+#[test]
+fn migration_job_supplies_a_connection_url_too() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
+
+	assert_eq!(
+		env_value(container, "DATABASE_URL").as_deref(),
+		Some(
+			"postgresql://$(CONFIG_SYNC_DB_USERNAME):$(CONFIG_SYNC_DB_PASSWORD)@test-restore:5432/tamanu-fiji"
+		),
+		"a version that prefers DATABASE_URL must reach the same database as CONFIG_SYNC_DB_*"
+	);
+
+	let env = container.env.as_ref().unwrap();
+	let position = |name: &str| env.iter().position(|e| e.name == name).unwrap();
+	assert!(
+		position("DATABASE_URL") > position("CONFIG_SYNC_DB_USERNAME")
+			&& position("DATABASE_URL") > position("CONFIG_SYNC_DB_PASSWORD"),
+		"kubelet expands $(VAR) only from entries above it, so the URL would ship the literal placeholders"
+	);
+}
+
+#[test]
+fn migration_job_does_not_retry_and_is_owned_by_the_restore() {
+	let (restore, replica) = test_restore_and_replica();
+	let job = super::migration::build_migration_job(
+		&restore,
+		&replica,
+		&migration_target(),
+		"tamanu-fiji",
+		"default",
+	);
+
+	// A failed migration is the finding; retrying spends the same hours to reach
+	// the same answer.
+	assert_eq!(job.spec.as_ref().unwrap().backoff_limit, Some(0));
+
+	let container = &job
+		.spec
+		.as_ref()
+		.unwrap()
+		.template
+		.spec
+		.as_ref()
+		.unwrap()
+		.containers[0];
+	let limits = container
+		.resources
+		.as_ref()
+		.expect("the job must be capped")
+		.limits
+		.as_ref()
+		.expect("limits set");
+	// Too tight and an OOMKill reads as a failed migration, filing a known issue
+	// against a version that is fine.
+	assert_eq!(limits.get("memory").expect("memory limit").0, "4Gi");
+	assert!(container.resources.as_ref().unwrap().requests.is_some());
+	assert_eq!(
+		job.spec
+			.as_ref()
+			.unwrap()
+			.template
+			.spec
+			.as_ref()
+			.unwrap()
+			.restart_policy
+			.as_deref(),
+		Some("Never")
+	);
+
+	// Owned by the restore, so tearing the restore down takes the job with it.
+	let owners = job.metadata.owner_references.as_ref().unwrap();
+	assert_eq!(owners.len(), 1);
+	assert_eq!(owners[0].uid, "uid-123");
+	assert_eq!(owners[0].kind, "PostgresPhysicalRestore");
+}
+
+#[test]
+fn deployment_lifts_read_only_for_a_migration_target() {
+	// Migrations are DDL, so a read-only replica cannot host one: a restore
+	// carrying a target is built read-write for the same reason persistent_schemas
+	// restores are. On PG >= 14 read-only means `pg_read_all_data`, which holds no
+	// DDL whatever the transaction default says.
+	let (mut restore, mut replica) = test_restore_and_replica();
+	replica.spec.read_only = true;
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+
+	let script_for = |restore: &PostgresPhysicalRestore| {
+		let deploy = build_deployment(restore, "test-restore", "default", &replica).unwrap();
+		let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+		pod_spec
+			.init_containers
+			.as_ref()
+			.unwrap()
+			.iter()
+			.find(|c| c.name == "setup-auth")
+			.expect("setup-auth init container must exist")
+			.args
+			.as_ref()
+			.unwrap()[0]
+			.clone()
+	};
+
+	// Both grant branches are in the script; the flag the operator interpolates is
+	// what picks one.
+	assert!(
+		script_for(&restore).contains(r#"[ "true" = "true" ]"#),
+		"an ordinary restore of a read-only replica stays read-only"
+	);
+
+	restore.spec.migrate_to = Some(migration_target());
+	assert!(
+		script_for(&restore).contains(r#"[ "false" = "true" ]"#),
+		"a migrating restore must take the superuser branch"
+	);
+}
+
+/// Tamanu's own `logs.migrations.stats` payload, per
+/// `MigrationLogStats` + `PreMigrationDbSnapshot`.
+fn tamanu_stats(size_bytes: i64) -> serde_json::Value {
+	serde_json::json!({
+		"durationMsPerMigration": {
+			"1721000000-addFoo.ts": 400_000,
+			"1721000001-addBar.ts": 12_500,
+		},
+		"totalMigrationsDurationMs": 412_500,
+		"preSnapshot": {
+			"databaseSizeBytes": size_bytes,
+			"tableRowEstimates": [{ "table": "public.patients", "rows": 12_000 }],
+		},
+	})
+}
+
+fn applied() -> Vec<String> {
+	vec![
+		"1721000000-addFoo.ts".to_string(),
+		"1721000001-addBar.ts".to_string(),
+	]
+}
+
+#[test]
+fn batch_result_reads_tamanu_stats() {
+	let r = super::migration::result_from_batch(
+		applied(),
+		Some(415_000),
+		Some(tamanu_stats(1_000_000)),
+		1_200_000,
+		false,
+	);
+
+	assert_eq!(r.total_elapsed_seconds, 415);
+	assert_eq!(r.data_bytes_before, 1_000_000);
+	assert_eq!(r.data_bytes_after, 1_200_000);
+	assert_eq!(r.failed_migration, None);
+	// Order comes from the batch's file list, since a JSON object has none.
+	let names: Vec<_> = r.timings.iter().map(|t| t.name.as_str()).collect();
+	assert_eq!(names, ["1721000000-addFoo.ts", "1721000001-addBar.ts"]);
+	assert_eq!(r.timings[0].elapsed_seconds, 400);
+	assert_eq!(r.timings[1].elapsed_seconds, 12);
+}
+
+#[test]
+fn batch_result_treats_unreadable_size_as_unknown() {
+	// tamanu writes -1 when pg_database_size could not be read.
+	let r = super::migration::result_from_batch(
+		applied(),
+		Some(1_000),
+		Some(tamanu_stats(-1)),
+		1_200_000,
+		false,
+	);
+	assert_eq!(
+		r.data_bytes_before, 1_200_000,
+		"an unreadable before-size must not report negative growth"
+	);
+}
+
+#[test]
+fn batch_result_names_where_a_failed_run_stopped() {
+	let mut stats = tamanu_stats(1_000);
+	stats["failedMigration"] = serde_json::json!("1721000002-addBaz.ts");
+
+	let r = super::migration::result_from_batch(applied(), None, Some(stats), 2_000, true);
+
+	assert_eq!(
+		r.failed_migration.as_deref(),
+		Some("1721000002-addBaz.ts"),
+		"the migration tamanu stopped at, not the last one that applied"
+	);
+	// No batch duration recorded, so it falls back to the sum of the timings.
+	assert_eq!(r.total_elapsed_seconds, 412);
+}
+
+#[test]
+fn batch_result_reports_an_unattributed_failure() {
+	// A target version that records a batch only once all of it applied leaves no
+	// failedMigration to read, so the failure is reported without a name rather
+	// than pinned on the last migration that did apply.
+	let r = super::migration::result_from_batch(
+		applied(),
+		None,
+		Some(tamanu_stats(1_000)),
+		2_000,
+		true,
+	);
+	assert_eq!(r.failed_migration.as_deref(), Some("unknown"));
 }
 
 #[test]

@@ -67,6 +67,11 @@ jobs:
               test-ephemeral
             needs_non_pg_snapshot: false
 
+          - name: migration
+            namespaces: >-
+              test-migration
+            needs_non_pg_snapshot: false
+
           - name: locale_fix
             namespaces: >-
               test-locale-fix

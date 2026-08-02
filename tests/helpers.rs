@@ -142,6 +142,7 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 	PostgresPhysicalReplica::new(
 		name,
 		PostgresPhysicalReplicaSpec {
+			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some(secret_ref.into()),
 				namespace: None,
@@ -344,6 +345,7 @@ pub fn build_second_restore(
 	let mut restore = PostgresPhysicalRestore::new(
 		name,
 		PostgresPhysicalRestoreSpec {
+			migrate_to: None,
 			replica: LocalObjectReference {
 				name: replica.name_any(),
 			},

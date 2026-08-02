@@ -106,11 +106,12 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `affinity` | `Affinity` | No | — | Pod scheduling affinity rules. |
 | `tolerations` | `[]Toleration` | No | `[]` | Pod tolerations. |
 | `readOnly` | `bool` | No | `true` | Set the restored database to read-only mode. |
-| `ephemeral` | `bool` | No | `false` | Tear the restore down once it reaches `Active` (postgres came up healthy) instead of keeping it running. The replica only restores again when a newer snapshot is offered (canopy path) or the schedule next fires (legacy path). Used by the `verify` intent, whose job is just to prove the snapshot restores. |
+| `ephemeral` | `bool` | No | `false` | Tear the restore down once it reaches `Active` (postgres came up healthy) instead of keeping it running. The replica only restores again when a newer snapshot is offered (canopy path) or the schedule next fires (legacy path). Used by the `verify` intent, whose job is just to prove the snapshot restores, and by `upgrade`, which additionally migrates it. |
 | `postgresExtraConfig` | `string` | No | — | Extra lines appended to `postgresql.conf` (e.g. `shared_preload_libraries`). |
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. See [Persistent schemas](#persistent-schemas) below for the migration time budget and what happens on timeout. |
 | `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. See [RedactionSpec](#redactionspec) below. |
+| `migrateTo` | `MigrationTarget` | No | — | Apply a Tamanu version's schema migrations to each restore of this replica and report how they went. `{ version, versionId }`. Set by the canopy worklist syncer for the `upgrade` intent, from the target version canopy names on the worklist entry. A restore carrying this is built read-write, since migrations are DDL, and is torn down once verified. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -245,12 +246,13 @@ Deleting this resource will drop the restored database and prompt the Replica to
 | `snapshot` | `string` | Yes | Kopia snapshot ID to restore. |
 | `snapshotSize` | `Quantity` | Yes | Size of the snapshot from Kopia metadata. |
 | `storageSize` | `Quantity` | Yes | Calculated PVC size (snapshot size × 1.1). |
+| `migrateTo` | `MigrationTarget` | No | Copied from the parent replica: the Tamanu version whose schema migrations this restore should apply. Its presence is what sends the restore through `Migrating`. |
 
 #### Status
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `phase` | `Pending` \| `Restoring` \| `Ready` \| `Switching` \| `Active` \| `Failed` | Current phase of the restore. |
+| `phase` | `Pending` \| `Restoring` \| `Migrating` \| `Ready` \| `Switching` \| `Active` \| `Failed` | Current phase of the restore. `Migrating` is only reached when `migrateTo` is set. |
 | `runId` | `string` | Canopy run-uuid minted when the restore Job is created, reused for the run's credential requests and verification report so canopy can correlate them. Canopy-backed restores only. |
 | `postgresVersion` | `string` | Detected PostgreSQL major version from the restored data. |
 | `createdAt` | `Time` | When the restore resource was created. |
@@ -260,4 +262,7 @@ Deleting this resource will drop the restored database and prompt the Replica to
 | `pvc` | `string` | Name of the PVC holding the restored data. |
 | `deployment` | `string` | Name of the Deployment running PostgreSQL on the restored data. |
 | `credentialsSecret` | `string` | Shared credentials secret (owned by parent replica). |
+| `migrationJob` | `JobStatus` | Status of the Job that applied the target version's migrations (`name`, `phase`, `completedAt`). |
+| `migrationBaseline` | `string` | Newest `logs.migrations.logged_at` the snapshot already held when the migration Job was created, as postgres-rendered text. Only a batch newer than this is attributed to the Job, so a job that dies before migrating reports nothing rather than the source deployment's last real upgrade. Absent when the restored database had no batches. |
+| `migrationResult` | `MigrationResult` | What the migrations did: `totalElapsedSeconds`, `failedMigration` (absent on success; `unknown` when the target version does not record the migration it stopped at), `dataBytesBefore`/`dataBytesAfter`, and `timings` (one `{ name, elapsedSeconds }` per migration, in the order they ran). Read out of Tamanu's own `logs.migrations` audit table. |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions. |

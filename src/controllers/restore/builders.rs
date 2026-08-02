@@ -1063,12 +1063,15 @@ pub fn build_deployment(
 		.cloned()
 		.ok_or_else(|| Error::MissingField("status.postgresVersion".to_string()))?;
 
-	// persistent_schemas and redaction both need write access during their
-	// post-restore step. Redaction re-enables `default_transaction_read_only`
-	// at the database level itself once it's done.
+	// persistent_schemas, redaction and migrations all need write access during
+	// their post-restore step. On PG >= 14 read-only grants the app user
+	// `pg_read_all_data`, which has no DDL, so migrations cannot run under it
+	// whatever the transaction default says. Redaction re-enables
+	// `default_transaction_read_only` at the database level itself once it's done.
 	let effective_read_only = replica.spec.read_only
 		&& replica.spec.persistent_schemas.is_none()
-		&& replica.spec.redaction.is_none();
+		&& replica.spec.redaction.is_none()
+		&& restore.spec.migrate_to.is_none();
 
 	let labels = BTreeMap::from([
 		(

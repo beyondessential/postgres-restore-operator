@@ -464,6 +464,9 @@ impl PostgresPhysicalReplica {
 					Some(snapshot.start_time.clone())
 				},
 				storage_size,
+				// Snapshotted, not read live: the version this restore is proving
+				// must not change under it if canopy's plan moves mid-restore.
+				migrate_to: self.spec.migrate_to.clone(),
 			},
 		);
 

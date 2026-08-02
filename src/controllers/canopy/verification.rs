@@ -5,7 +5,7 @@
 //! loop. This module owns signal 3 — one function called at each terminal
 //! transition (switchover success, restore failure).
 
-use bestool_canopy::schema::{RunOutcome, VerificationArgs};
+use bestool_canopy::schema::{MigrationArgs, MigrationTimingArgs, RunOutcome, VerificationArgs};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, ResourceExt};
@@ -132,7 +132,19 @@ pub async fn report(
 	// Typed request body generated from canopy's OpenAPI (bestool#628).
 	// Constructing it here means the field set is checked against canopy's
 	// spec at compile time; `health_details` stays free-form by design.
+	// A migration test's result, when this restore ran one. Canopy reads the
+	// named failing migration as the verdict rather than the report's outcome,
+	// which keeps backup health and version readiness as separate signals: the
+	// backup restored fine even when the version's migrations did not.
+	let migration = restore
+		.status
+		.as_ref()
+		.and_then(|s| s.migration_result.as_ref())
+		.zip(restore.spec.migrate_to.as_ref())
+		.and_then(|(result, target)| migration_args(result, target));
+
 	let args = VerificationArgs::builder()
+		.maybe_migration(migration)
 		.maybe_replica_id(replica_id)
 		.maybe_run_id(run_id)
 		.group(group)
@@ -305,6 +317,38 @@ async fn gather_from_postgres(
 	Ok(PostgresHealth { sizes, fixes })
 }
 
+/// Map the operator's recorded result onto canopy's wire shape.
+///
+/// Returns `None` when the target version's id isn't a uuid, which would mean
+/// canopy sent something it cannot itself join back to a version.
+fn migration_args(
+	result: &crate::types::MigrationResult,
+	target: &crate::types::MigrationTarget,
+) -> Option<MigrationArgs> {
+	let target_version_id = Uuid::parse_str(&target.version_id).ok()?;
+	Some(
+		MigrationArgs::builder()
+			.target_version_id(target_version_id)
+			.total_elapsed_seconds(result.total_elapsed_seconds)
+			.maybe_failed_migration(result.failed_migration.clone())
+			.data_bytes_before(result.data_bytes_before)
+			.data_bytes_after(result.data_bytes_after)
+			.timings(
+				result
+					.timings
+					.iter()
+					.map(|t| {
+						MigrationTimingArgs::builder()
+							.name(t.name.clone())
+							.elapsed_seconds(t.elapsed_seconds)
+							.build()
+					})
+					.collect::<Vec<_>>(),
+			)
+			.build(),
+	)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -348,6 +392,7 @@ mod tests {
 		let mut restore = PostgresPhysicalRestore::new(
 			"r",
 			PostgresPhysicalRestoreSpec {
+				migrate_to: None,
 				replica: LocalObjectReference {
 					name: "rep".to_string(),
 				},
@@ -381,5 +426,69 @@ mod tests {
 			None,
 			"a malformed run_id is tolerated as absent, not a hard error"
 		);
+	}
+
+	fn migration_result() -> crate::types::MigrationResult {
+		use crate::types::MigrationTiming;
+
+		crate::types::MigrationResult {
+			total_elapsed_seconds: 412,
+			failed_migration: None,
+			data_bytes_before: 1_000,
+			data_bytes_after: 1_200,
+			timings: vec![
+				MigrationTiming {
+					name: "1721000000-addFoo.js".into(),
+					elapsed_seconds: 400,
+				},
+				MigrationTiming {
+					name: "1721000001-addBar.js".into(),
+					elapsed_seconds: 12,
+				},
+			],
+		}
+	}
+
+	fn target(version_id: &str) -> crate::types::MigrationTarget {
+		crate::types::MigrationTarget {
+			version: "2.62.0".into(),
+			version_id: version_id.into(),
+		}
+	}
+
+	#[test]
+	fn migration_args_carries_the_whole_result() {
+		let id = "55555555-5555-5555-5555-555555555555";
+		let args = migration_args(&migration_result(), &target(id)).expect("built");
+
+		assert_eq!(args.target_version_id, Uuid::parse_str(id).unwrap());
+		assert_eq!(args.total_elapsed_seconds, 412);
+		assert_eq!(args.failed_migration, None);
+		assert_eq!(args.data_bytes_before, 1_000);
+		assert_eq!(args.data_bytes_after, 1_200);
+		// Per-file timings are what canopy attributes a slow upgrade with, so all
+		// of them travel, in order.
+		let names: Vec<_> = args.timings.iter().map(|t| t.name.as_str()).collect();
+		assert_eq!(names, ["1721000000-addFoo.js", "1721000001-addBar.js"]);
+		assert_eq!(args.timings[0].elapsed_seconds, 400);
+	}
+
+	#[test]
+	fn migration_args_reports_the_migration_that_failed() {
+		let mut result = migration_result();
+		result.failed_migration = Some("1721000001-addBar.js".into());
+		let args = migration_args(&result, &target("55555555-5555-5555-5555-555555555555"))
+			.expect("built");
+		assert_eq!(
+			args.failed_migration.as_deref(),
+			Some("1721000001-addBar.js")
+		);
+	}
+
+	#[test]
+	fn migration_args_needs_a_parseable_version_id() {
+		// The id round-trips from canopy, so a malformed one means we would report
+		// against the wrong version; dropping the migration beats guessing.
+		assert!(migration_args(&migration_result(), &target("not-a-uuid")).is_none());
 	}
 }

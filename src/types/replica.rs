@@ -160,6 +160,13 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub persistent_schemas: Option<Vec<String>>,
 
+	/// Tamanu version whose schema migrations each restore should apply once
+	/// healthy, from canopy's worklist entry. Present only while canopy names a
+	/// target; each restore snapshots it into its own spec at creation so a
+	/// target that moves mid-restore doesn't change what that restore tested.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub migrate_to: Option<crate::types::MigrationTarget>,
+
 	/// Maximum allowed size for the restore PVC. The restore will fail if the
 	/// computed size exceeds this limit. Defaults to 2Ti.
 	#[serde(default = "default_storage_size_maximum")]
