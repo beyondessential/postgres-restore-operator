@@ -19,7 +19,9 @@ use tracing::warn;
 
 use super::restore_owner_reference;
 use crate::{
-	controllers::{env_from_secret, env_from_secret_optional, kopia_writable_env},
+	controllers::{
+		READY_FOR_TRAFFIC_LABEL, env_from_secret, env_from_secret_optional, kopia_writable_env,
+	},
 	error::{Error, Result},
 	kopia::KopiaSource,
 	placement::PodPlacement,
@@ -1718,7 +1720,16 @@ echo "Auth setup complete"
 			}),
 			template: PodTemplateSpec {
 				metadata: Some(ObjectMeta {
-					labels: Some(labels.clone()),
+					// Declared here rather than patched on after the pod is
+					// running, so a pod the ReplicaSet replaces rejoins the
+					// Service as soon as it is Ready. Safe to carry from
+					// creation: the Service selector also names a specific
+					// restore, and a switching restore's name isn't in it yet.
+					labels: Some({
+						let mut pod_labels = labels.clone();
+						pod_labels.insert(READY_FOR_TRAFFIC_LABEL.to_string(), "true".to_string());
+						pod_labels
+					}),
 					annotations: pod_annotations.clone(),
 					..Default::default()
 				}),

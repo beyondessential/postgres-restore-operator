@@ -2352,3 +2352,48 @@ fn empty_placement_adds_nothing() {
 	let template = deployment.spec.unwrap().template;
 	assert!(template.spec.unwrap().node_selector.is_none());
 }
+
+/// The Service selector requires this label, so a pod that comes up without it
+/// is invisible to clients until the operator notices and patches it. Declaring
+/// it in the pod template means a replacement pod — eviction, node loss, OOM —
+/// rejoins the Service the moment it is Ready.
+#[test]
+fn deployment_pod_template_carries_the_ready_for_traffic_label() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("17".to_string()),
+		..Default::default()
+	});
+
+	let deployment = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
+
+	let labels = deployment
+		.spec
+		.unwrap()
+		.template
+		.metadata
+		.expect("pod template has metadata")
+		.labels
+		.expect("pod template has labels");
+
+	assert_eq!(
+		labels
+			.get(crate::controllers::READY_FOR_TRAFFIC_LABEL)
+			.map(String::as_str),
+		Some("true"),
+		"a replacement pod must rejoin the Service without waiting for a reconcile"
+	);
+	// The restore label is what the Deployment's own selector matches on, so
+	// adding the traffic label must not have displaced it.
+	assert_eq!(
+		labels.get("pgro.bes.au/restore").map(String::as_str),
+		Some("test-restore")
+	);
+}

@@ -24,7 +24,7 @@ use tracing::{info, warn};
 use super::generate_password;
 use crate::{
 	controllers::{
-		env_from_secret, env_from_secret_optional,
+		READY_FOR_TRAFFIC_LABEL, env_from_secret, env_from_secret_optional,
 		restore::builders::{CanopyProxyArgs, PROXY_SIDECAR_POD_LABEL},
 	},
 	error::Result,
@@ -597,15 +597,6 @@ impl PostgresPhysicalReplica {
 		Ok(())
 	}
 }
-
-/// Label the operator sets on a restore's postgres pod once schema
-/// migration (and anything else that must run pre-handover) has completed
-/// and the pod is safe to receive external traffic. The per-replica
-/// Service selector requires this label, so a restore in `Switching`
-/// can't be reached via the Service — operator-side work (DROP SCHEMA,
-/// `pg_dump | psql` migration Job, etc.) runs without external clients
-/// racing to grab locks on the schemas being touched.
-pub const READY_FOR_TRAFFIC_LABEL: &str = "pgro.bes.au/ready-for-traffic";
 
 impl PostgresPhysicalRestore {
 	/// Patch this restore's postgres pod to add the [`READY_FOR_TRAFFIC_LABEL`].
