@@ -532,9 +532,9 @@ dependencies = [
 
 [[package]]
 name = "bestool-kopia"
-version = "0.4.0"
+version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "decbf63eebeda2982713bf322792c1a3d888ceb029579aae94087e6f48800875"
+checksum = "e481abe8ab718f3c8ad1462a52152dc4e8397147b6e199f9e68985059a963110"
 dependencies = [
  "bytes",
  "hex",
