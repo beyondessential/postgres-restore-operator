@@ -2618,3 +2618,25 @@ fn restore_info_is_writable_by_the_analytics_user() {
 		"the table has to exist before it can be granted on"
 	);
 }
+
+/// A restore with no snapshot time must still get a `_pgro.restore_info` row.
+///
+/// Postgres folds constant subexpressions at plan time, including ones in CASE
+/// arms that are never entered, so the previous
+/// `CASE WHEN '' = '' THEN NULL ELSE ''::timestamptz END` failed on the
+/// unreachable cast and took the whole INSERT down with it. The restore then
+/// had no row at all: no stage for a client to read, and an empty fixes map in
+/// the canopy health report.
+#[test]
+fn restore_info_insert_tolerates_an_absent_snapshot_time() {
+	let script = setup_auth_script();
+
+	assert!(
+		script.contains("NULLIF('${PGRO_SNAPSHOT_TIME}', '')::timestamptz"),
+		"an empty snapshot time must reach the cast as NULL, not as an empty string"
+	);
+	assert!(
+		!script.contains("ELSE '${PGRO_SNAPSHOT_TIME}'::timestamptz"),
+		"the CASE form is plan-time unsafe: postgres evaluates the unreachable arm"
+	);
+}

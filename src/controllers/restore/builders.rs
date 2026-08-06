@@ -1682,7 +1682,13 @@ ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS stage text NOT NULL DEFA
 ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS last_transition_time timestamptz NOT NULL DEFAULT now();
 ALTER TABLE _pgro.restore_info ADD COLUMN IF NOT EXISTS fixes jsonb;
 INSERT INTO _pgro.restore_info (id, snapshot_id, snapshot_time, stage, last_transition_time, fixes)
-VALUES (1, '${{PGRO_SNAPSHOT_ID}}', CASE WHEN '${{PGRO_SNAPSHOT_TIME}}' = '' THEN NULL ELSE '${{PGRO_SNAPSHOT_TIME}}'::timestamptz END, '${{PGRO_STAGE}}', now(), '${{PGRO_FIXES}}'::jsonb)
+-- NULLIF rather than CASE: postgres folds constant subexpressions at plan
+-- time, including ones in CASE arms that would never be entered, so
+-- `CASE WHEN '' = '' THEN NULL ELSE ''::timestamptz END` still fails on the
+-- unreachable cast. That took the whole INSERT with it, leaving restores
+-- without a snapshot time with no restore_info row at all — no stage, and an
+-- empty fixes map in the canopy health report.
+VALUES (1, '${{PGRO_SNAPSHOT_ID}}', NULLIF('${{PGRO_SNAPSHOT_TIME}}', '')::timestamptz, '${{PGRO_STAGE}}', now(), '${{PGRO_FIXES}}'::jsonb)
 ON CONFLICT (id) DO UPDATE
   SET snapshot_id = EXCLUDED.snapshot_id,
       snapshot_time = EXCLUDED.snapshot_time,
