@@ -2581,3 +2581,40 @@ fn generated_shell_scripts_are_valid_posix_sh() {
 		);
 	}
 }
+
+/// The operator marks the outgoing restore at switchover using the analytics
+/// credentials — the only ones it holds for a restore. On a read-only replica
+/// that role gets `pg_read_all_data` and nothing else, which reads the row but
+/// cannot update it, so the write needs an explicit grant. Without this the
+/// marking fails silently on exactly the replicas that need it most.
+#[test]
+fn restore_info_is_writable_by_the_analytics_user() {
+	let script = setup_auth_script();
+
+	assert!(
+		script.contains("GRANT USAGE ON SCHEMA _pgro TO"),
+		"the analytics user needs schema access to reach restore_info"
+	);
+	assert!(
+		script.contains("GRANT SELECT, UPDATE ON _pgro.restore_info TO"),
+		"the analytics user must be able to update the stage column"
+	);
+
+	// Scoped to the one table: a blanket grant over the schema would hand out
+	// write access to anything added to it later.
+	assert!(
+		!script.contains("GRANT ALL"),
+		"the grant must stay narrow — no blanket privileges on _pgro"
+	);
+
+	let table_created = script
+		.find("CREATE TABLE IF NOT EXISTS _pgro.restore_info")
+		.expect("restore_info is created");
+	let granted = script
+		.find("GRANT SELECT, UPDATE ON _pgro.restore_info")
+		.expect("restore_info is granted");
+	assert!(
+		table_created < granted,
+		"the table has to exist before it can be granted on"
+	);
+}

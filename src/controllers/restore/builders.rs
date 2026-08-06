@@ -1690,6 +1690,18 @@ ON CONFLICT (id) DO UPDATE
       stage = EXCLUDED.stage,
       last_transition_time = now(),
       fixes = EXCLUDED.fixes;
+
+-- The operator flips `stage` to 'outgoing' at switchover so clients still
+-- connected to the retiring instance can notice. It connects as the analytics
+-- user, which is the only credential it holds for a restore, and on a
+-- read-only replica that user has pg_read_all_data and nothing else — enough
+-- to read this row, not to update it.
+--
+-- Granted on this table alone. The row describes the restore's own lifecycle,
+-- so a client that writes it is misleading itself, not escalating: everything
+-- it could reach through this grant it can already read.
+GRANT USAGE ON SCHEMA _pgro TO ${{ANALYTICS_USERNAME}};
+GRANT SELECT, UPDATE ON _pgro.restore_info TO ${{ANALYTICS_USERNAME}};
 SQLEOF
 
 echo "Stopping temporary postgres..."

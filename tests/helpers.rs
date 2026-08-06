@@ -123,6 +123,10 @@ pub struct ReplicaOpts {
 	pub read_only: bool,
 	pub ephemeral: bool,
 	pub redaction: Option<RedactionSpec>,
+	/// How long the outgoing restore survives after a switchover. The default
+	/// is short so tests that don't care aren't slowed by it; raise it in tests
+	/// that need to inspect the outgoing instance before the sweep removes it.
+	pub switchover_grace_period: Option<TimeSpan>,
 }
 
 impl Default for ReplicaOpts {
@@ -134,6 +138,7 @@ impl Default for ReplicaOpts {
 			read_only: true,
 			ephemeral: false,
 			redaction: None,
+			switchover_grace_period: None,
 		}
 	}
 }
@@ -152,7 +157,9 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 			schedule: opts.schedule,
 			schedule_jitter: opts.schedule_jitter.unwrap_or_default(),
 			minimum_ttl: opts.minimum_ttl,
-			switchover_grace_period: TimeSpan(Span::new().seconds(10)),
+			switchover_grace_period: opts
+				.switchover_grace_period
+				.unwrap_or(TimeSpan(Span::new().seconds(10))),
 			analytics_username: "analytics".into(),
 			storage_class: None,
 			storage_size_override: None,

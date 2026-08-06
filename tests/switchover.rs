@@ -1,9 +1,11 @@
+use jiff::Span;
 use k8s_openapi::api::core::v1::{LocalObjectReference, Secret, Service};
 use kube::{Api, ResourceExt, api::PostParams};
 use postgres_restore_operator::types::{
 	PostgresPhysicalReplica, PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase,
 	RestorePhase,
 };
+use postgres_restore_operator::util::TimeSpan;
 use tokio::time::{sleep, timeout};
 
 use helpers::*;
@@ -34,10 +36,16 @@ async fn second_restore_and_switchover() {
 		.expect("failed to create kopia secret");
 
 	println!("--- creating PostgresPhysicalReplica (no schedule, manual trigger)");
+	// A long grace period keeps the outgoing restore alive after the
+	// switchover, so its post-switchover state can be inspected before the
+	// sweep removes it. Nothing here waits on the sweep, so this costs no time.
 	let mut replica = build_replica(
 		"switchover-replica",
 		"switchover-kopia-creds",
-		Default::default(),
+		ReplicaOpts {
+			switchover_grace_period: Some(TimeSpan(Span::new().seconds(120))),
+			..Default::default()
+		},
 	);
 	replica.metadata.namespace = Some(ns.into());
 	replicas
@@ -203,6 +211,56 @@ async fn second_restore_and_switchover() {
 		status.previous_restore.as_deref(),
 		Some(first_restore_name.as_str()),
 		"previousRestore should be the first restore"
+	);
+
+	// A client connected to the outgoing instance can't see the Kubernetes side
+	// of a switchover — its connection stays pinned there until the sweep. The
+	// recorded stage is the only channel that reaches it.
+	println!("--- checking the outgoing restore reports itself as outgoing");
+	let outgoing_stage = kubectl_exec(
+		ns,
+		&format!("deployment/{first_restore_name}"),
+		&[
+			"psql",
+			"-U",
+			"postgres",
+			"-d",
+			"postgres",
+			"-t",
+			"-A",
+			"-c",
+			"SELECT stage FROM _pgro.restore_info WHERE id = 1",
+		],
+	)
+	.await;
+	assert_eq!(
+		outgoing_stage.trim(),
+		"outgoing",
+		"the restore the Service stopped pointing at should report stage=outgoing, got {outgoing_stage:?}"
+	);
+
+	// The incoming one keeps saying ready, so the two are distinguishable from
+	// inside the database without knowing which is which beforehand.
+	let incoming_stage = kubectl_exec(
+		ns,
+		&format!("deployment/{second_restore_name}"),
+		&[
+			"psql",
+			"-U",
+			"postgres",
+			"-d",
+			"postgres",
+			"-t",
+			"-A",
+			"-c",
+			"SELECT stage FROM _pgro.restore_info WHERE id = 1",
+		],
+	)
+	.await;
+	assert_eq!(
+		incoming_stage.trim(),
+		"ready",
+		"the restore the Service now points at should still report stage=ready, got {incoming_stage:?}"
 	);
 
 	// Service selector should now point to the second restore

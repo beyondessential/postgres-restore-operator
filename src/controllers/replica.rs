@@ -302,16 +302,27 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			"performing blue-green switchover"
 		);
 
-		// Mark the new restore's pod ready for traffic BEFORE pointing the
-		// Service at it. The Service selector requires the
-		// `ready-for-traffic=true` label (see [[READY_FOR_TRAFFIC_LABEL]]),
-		// so until the operator sets the label, no external client can
-		// reach the restore via the Service — operator-side prep work
-		// (DROP SCHEMA, migration Job) runs without external interference.
+		// Pods carry [[READY_FOR_TRAFFIC_LABEL]] from creation, so this is only
+		// for restores whose pods predate that change. What actually keeps a
+		// switching restore unreachable is the other half of the Service
+		// selector: it names a specific restore, and until the line below runs
+		// that name is the outgoing one (or absent, on a replica's first
+		// restore). Operator-side prep — DROP SCHEMA, the migration Job — runs
+		// behind that, without external clients racing for locks.
 		switching.mark_pod_ready_for_traffic(client).await?;
 
 		// Update Service selector to point to the new restore
 		switching.update_service_selector(client, &name).await?;
+
+		// The Service has moved on, but clients already connected to the
+		// outgoing instance stay pinned to it until the sweep deletes it
+		// minutes from now — a postgres connection can't see the Kubernetes
+		// side of a switchover. Flip its recorded stage so a reader that
+		// checks `_pgro.restore_info` can tell it is talking to a database on
+		// its way out, and wrap up rather than starting new work.
+		if let Some(outgoing) = active_restore {
+			mark_restore_outgoing(client, &ctx, &replica, outgoing).await;
+		}
 
 		// Transition the switching restore to Active
 		switching.update_phase(client, RestorePhase::Active).await?;
@@ -1226,6 +1237,71 @@ fn is_auth_error(e: &Error) -> bool {
 ///      retried on the next reconcile once the job has been deleted.
 ///
 /// Idempotent: safe to call repeatedly while the job is in flight.
+/// Record on the outgoing restore that it is no longer the one the Service
+/// points at, for the benefit of clients still connected to it.
+///
+/// Every failure here is logged and swallowed. The instance is minutes from
+/// deletion and may already be unreachable; failing a switchover over a
+/// courtesy signal would be a far worse bug than the one this addresses.
+async fn mark_restore_outgoing(
+	client: &Client,
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	outgoing: &PostgresPhysicalRestore,
+) {
+	let namespace = replica.ns();
+	let restore_name = outgoing.name_any();
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), &namespace);
+	let creds = match secrets.get(&replica.creds_secret_name()).await {
+		Ok(secret) => secret,
+		Err(e) => {
+			warn!(restore = %restore_name, error = ?e, "could not read credentials to mark restore outgoing");
+			return;
+		}
+	};
+	let (user, password) = match (
+		postgres::read_secret_field(&creds, "username"),
+		postgres::read_secret_field(&creds, "password"),
+	) {
+		(Ok(user), Ok(password)) => (user, password),
+		_ => {
+			warn!(restore = %restore_name, "credentials secret missing username or password; not marking restore outgoing");
+			return;
+		}
+	};
+
+	// `_pgro.restore_info` lives in the `postgres` database, not the restored
+	// application one.
+	let conn = match postgres::connect_to_restore(
+		client,
+		&namespace,
+		&restore_name,
+		"postgres",
+		&user,
+		&password,
+		ctx.use_port_forward(),
+	)
+	.await
+	{
+		Ok(conn) => conn,
+		Err(e) => {
+			warn!(restore = %restore_name, error = ?e, "could not connect to mark restore outgoing");
+			return;
+		}
+	};
+
+	match postgres::mark_restore_outgoing(&conn.client).await {
+		Ok(()) => info!(restore = %restore_name, "marked outgoing restore for connected clients"),
+		// Debug, not Display: tokio_postgres renders a failed statement as the
+		// bare string "db error", and the useful part (severity, SQLSTATE,
+		// message) only shows through the wrapped DbError.
+		Err(e) => {
+			warn!(restore = %restore_name, error = ?e, "could not mark restore outgoing")
+		}
+	}
+}
+
 async fn ensure_credential_reset(
 	client: &Client,
 	namespace: &str,
