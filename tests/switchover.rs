@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use jiff::Span;
 use k8s_openapi::api::core::v1::{LocalObjectReference, Secret, Service};
 use kube::{Api, ResourceExt, api::PostParams};
@@ -217,44 +219,46 @@ async fn second_restore_and_switchover() {
 	// of a switchover — its connection stays pinned there until the sweep. The
 	// recorded stage is the only channel that reaches it.
 	println!("--- checking the outgoing restore reports itself as outgoing");
-	let outgoing_stage = kubectl_exec(
-		ns,
-		&format!("deployment/{first_restore_name}"),
-		&[
-			"psql",
-			"-U",
-			"postgres",
-			"-d",
-			"postgres",
-			"-t",
-			"-A",
-			"-c",
-			"SELECT stage FROM _pgro.restore_info WHERE id = 1",
-		],
-	)
-	.await;
-	assert_eq!(
-		outgoing_stage.trim(),
-		"outgoing",
-		"the restore the Service stopped pointing at should report stage=outgoing, got {outgoing_stage:?}"
-	);
+	// The operator writes this after patching the replica to Ready, so waiting
+	// on the phase is not enough to have observed it. It is also best-effort:
+	// if it never lands, the failure is a timeout here rather than a hang.
+	let stage_query = [
+		"psql",
+		"-U",
+		"postgres",
+		"-d",
+		"postgres",
+		"-t",
+		"-A",
+		"-c",
+		"SELECT stage FROM _pgro.restore_info WHERE id = 1",
+	];
+	let first_deploy = format!("deployment/{first_restore_name}");
+	let outgoing_stage = timeout(Duration::from_secs(60), async {
+		loop {
+			let stage = kubectl_exec(ns, &first_deploy, &stage_query).await;
+			if stage.trim() == "outgoing" {
+				return stage;
+			}
+			println!(
+				"[{first_restore_name}] stage: {:?}, waiting for outgoing",
+				stage.trim()
+			);
+			sleep(Duration::from_secs(2)).await;
+		}
+	})
+	.await
+	.unwrap_or_else(|_| {
+		panic!("the restore the Service stopped pointing at never reported stage=outgoing")
+	});
+	assert_eq!(outgoing_stage.trim(), "outgoing");
 
 	// The incoming one keeps saying ready, so the two are distinguishable from
 	// inside the database without knowing which is which beforehand.
 	let incoming_stage = kubectl_exec(
 		ns,
 		&format!("deployment/{second_restore_name}"),
-		&[
-			"psql",
-			"-U",
-			"postgres",
-			"-d",
-			"postgres",
-			"-t",
-			"-A",
-			"-c",
-			"SELECT stage FROM _pgro.restore_info WHERE id = 1",
-		],
+		&stage_query,
 	)
 	.await;
 	assert_eq!(

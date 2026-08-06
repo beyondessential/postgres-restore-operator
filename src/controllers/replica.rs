@@ -314,16 +314,6 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		// Update Service selector to point to the new restore
 		switching.update_service_selector(client, &name).await?;
 
-		// The Service has moved on, but clients already connected to the
-		// outgoing instance stay pinned to it until the sweep deletes it
-		// minutes from now — a postgres connection can't see the Kubernetes
-		// side of a switchover. Flip its recorded stage so a reader that
-		// checks `_pgro.restore_info` can tell it is talking to a database on
-		// its way out, and wrap up rather than starting new work.
-		if let Some(outgoing) = active_restore {
-			mark_restore_outgoing(client, &ctx, &replica, outgoing).await;
-		}
-
 		// Transition the switching restore to Active
 		switching.update_phase(client, RestorePhase::Active).await?;
 		let now = Timestamp::now();
@@ -351,6 +341,24 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 				&Patch::Merge(&patch),
 			)
 			.await?;
+
+		// The Service has moved on, but clients already connected to the
+		// outgoing instance stay pinned to it until the sweep deletes it
+		// minutes from now — a postgres connection can't see the Kubernetes
+		// side of a switchover. Flip its recorded stage so a reader that
+		// checks `_pgro.restore_info` can tell it is talking to a database on
+		// its way out, and wrap up rather than starting new work.
+		//
+		// After the status patch, not before: this is a courtesy write to a
+		// database that is about to be deleted, and everything that watches for
+		// a switchover to finish watches the replica phase. Putting a network
+		// round-trip to a dying instance ahead of that transition delays the
+		// observable end of the switchover for something optional. The outgoing
+		// instance survives the whole grace period, so arriving a moment later
+		// costs its readers nothing.
+		if let Some(outgoing) = active_restore {
+			mark_restore_outgoing(client, &ctx, &replica, outgoing).await;
+		}
 
 		// Clear the scheduling-suspended condition if it was set
 		if replica
