@@ -120,13 +120,31 @@ async fn redaction_applies_masks_to_restored_data() {
 		"SELECT string_agg(email, ',' ORDER BY id) FROM users",
 	)
 	.await;
-	assert!(
-		!emails.contains("a@example.com"),
-		"original email should be masked, got: {emails}"
+	// Compare whole values, not substrings. The fixture's local parts are a
+	// single letter, so a generated fake like `alexandragarcia@example.com`
+	// contains `a@example.com` and read as unmasked — the assertion failed
+	// whenever the faker happened to end a name in the right letter.
+	let masked_emails: Vec<&str> = emails.trim().split(',').collect();
+	assert_eq!(
+		masked_emails.len(),
+		5,
+		"expected one email per row, got: {emails}"
 	);
+	for original in [
+		"a@example.com",
+		"b@example.com",
+		"c@example.com",
+		"d@example.com",
+		"e@example.com",
+	] {
+		assert!(
+			!masked_emails.contains(&original),
+			"original email {original} survived masking, got: {emails}"
+		);
+	}
 	assert!(
-		emails.contains('@'),
-		"masked email should still look like an email, got: {emails}"
+		masked_emails.iter().all(|email| email.contains('@')),
+		"every masked email should still look like an email, got: {emails}"
 	);
 
 	println!("--- verifying name masks: full names (with space) and single names");
@@ -148,10 +166,15 @@ async fn redaction_applies_masks_to_restored_data() {
 		"SELECT string_agg(single_name, '|' ORDER BY id) FROM users",
 	)
 	.await;
-	assert!(
-		!single_names.contains("Alice"),
-		"single_name should be masked, got: {single_names}"
-	);
+	// Same hazard as the emails: "Alice" is short enough to turn up inside a
+	// longer generated first name.
+	let masked_single: Vec<&str> = single_names.trim().split('|').collect();
+	for original in ["Alice", "Bob", "Carol", "Dave", "Eve"] {
+		assert!(
+			!masked_single.contains(&original),
+			"original single_name {original} survived masking, got: {single_names}"
+		);
+	}
 
 	println!("--- verifying date mask changed dob");
 	let dobs = query_one_value(
