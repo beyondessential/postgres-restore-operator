@@ -303,6 +303,62 @@ fn derived_memory_falls_back_to_the_floor_for_a_small_snapshot() {
 	assert_eq!(mem(&resolved, "limits"), gib(2));
 }
 
+/// The derived memory request must equal the limit. Requests are the only
+/// figure the cluster acts on — instance selection, bin-packing, consolidation,
+/// eviction order — so understating one puts the pod on a node that cannot
+/// satisfy its own limit and marks the node as spare capacity.
+#[test]
+fn derived_memory_request_equals_limit() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity("200Gi".to_string());
+	replica.spec.resources = None;
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("8Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("derived");
+	assert_eq!(mem(&resolved, "limits"), gib(20));
+	assert_eq!(mem(&resolved, "requests"), gib(20));
+}
+
+/// A floor that omits the CPU limit must produce resources with no CPU limit.
+/// `resolve_postgres_resources` copies CPU from the floor's requests and limits
+/// independently, so this holds without special-casing — but it's load-bearing
+/// for the analytics intent and implicit in the merge, so pin it.
+#[test]
+fn absent_cpu_limit_in_the_floor_stays_absent() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.spec.snapshot_size = Quantity("200Gi".to_string());
+	replica.spec.resources = None;
+	replica.spec.resources_floor = Some(ResourceRequirements {
+		requests: Some(BTreeMap::from([
+			("cpu".to_string(), Quantity("2".to_string())),
+			("memory".to_string(), Quantity("2Gi".to_string())),
+		])),
+		limits: Some(BTreeMap::from([(
+			"memory".to_string(),
+			Quantity("8Gi".to_string()),
+		)])),
+		..Default::default()
+	});
+
+	let resolved =
+		resolve_postgres_resources(&replica, &restore.spec.snapshot_size).expect("derived");
+
+	assert_eq!(cpu(&resolved, "requests").as_deref(), Some("2"));
+	assert_eq!(
+		cpu(&resolved, "limits"),
+		None,
+		"a floor without a CPU limit must not grow one"
+	);
+	assert_eq!(mem(&resolved, "limits"), gib(20));
+}
+
 #[test]
 fn canopy_restore_job_proxy_is_native_sidecar() {
 	// Regression: the canopy-proxy must be an init container with

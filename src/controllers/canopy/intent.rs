@@ -332,22 +332,33 @@ pub struct IntentConfig {
 	pub ephemeral: bool,
 	/// Floor on the postgres pod's `/dev/shm` sizing. Materialised into
 	/// `PostgresPhysicalReplicaSpec.shm_size_floor` so the shared Deployment
-	/// builder picks `max(computed_from_resources, floor)`. Analytics
-	/// workloads want a higher shm than a 2 GiB memory request derives,
-	/// without paying the k8s scheduling cost of bumping the request.
-	pub shm_size_floor: Quantity,
+	/// builder picks `max(computed_from_resources, floor)`. `None` leaves the
+	/// resource-derived value alone, which is what an intent wants once its
+	/// memory request reflects the pod's real size — shm then lands at 36% of
+	/// memory on its own.
+	pub shm_size_floor: Option<Quantity>,
 }
 
-fn resources(cpu_req: &str, mem_req: &str, cpu_lim: &str, mem_lim: &str) -> ResourceRequirements {
+/// Build an intent's resource floor. `cpu_lim` is optional: a CPU limit on a
+/// database buys nothing the request doesn't already guarantee, and throttles
+/// bursty analytical queries at the ceiling. Memory always carries both, since
+/// [`crate::quantity::scale_memory_for_snapshot`] sets request equal to limit.
+fn resources(
+	cpu_req: &str,
+	mem_req: &str,
+	cpu_lim: Option<&str>,
+	mem_lim: &str,
+) -> ResourceRequirements {
+	let mut limits = BTreeMap::from([("memory".to_string(), Quantity(mem_lim.to_string()))]);
+	if let Some(cpu_lim) = cpu_lim {
+		limits.insert("cpu".to_string(), Quantity(cpu_lim.to_string()));
+	}
 	ResourceRequirements {
 		requests: Some(BTreeMap::from([
 			("cpu".to_string(), Quantity(cpu_req.to_string())),
 			("memory".to_string(), Quantity(mem_req.to_string())),
 		])),
-		limits: Some(BTreeMap::from([
-			("cpu".to_string(), Quantity(cpu_lim.to_string())),
-			("memory".to_string(), Quantity(mem_lim.to_string())),
-		])),
+		limits: Some(limits),
 		..Default::default()
 	}
 }
@@ -360,7 +371,7 @@ fn resources(cpu_req: &str, mem_req: &str, cpu_lim: &str, mem_lim: &str) -> Reso
 pub fn config_for(intent: &str) -> Option<IntentConfig> {
 	match intent {
 		"verify" | "upgrade" => Some(IntentConfig {
-			resources_floor: Some(resources("250m", "512Mi", "2", "2Gi")),
+			resources_floor: Some(resources("250m", "512Mi", Some("2"), "2Gi")),
 			read_only: true,
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
@@ -370,10 +381,13 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			ephemeral: true,
 			resources_maximum: Quantity("8Gi".to_string()),
 			deployment_ready_timeout: None,
-			shm_size_floor: Quantity("512Mi".to_string()),
+			shm_size_floor: Some(Quantity("512Mi".to_string())),
 		}),
 		"analytics" => Some(IntentConfig {
-			resources_floor: Some(resources("500m", "2Gi", "4", "8Gi")),
+			// No CPU limit: dbt runs are bursty and a ceiling only buys CFS
+			// throttling. The request is raised to match, so the guarantee is
+			// higher than the old 500m even though the ceiling is gone.
+			resources_floor: Some(resources("2", "2Gi", None, "8Gi")),
 			read_only: true,
 			minimum_ttl: Some(TimeSpan(
 				Span::new().seconds(DEFAULT_ANALYTICS_MINIMUM_TTL_SECS),
@@ -387,7 +401,10 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			ephemeral: false,
 			resources_maximum: Quantity("64Gi".to_string()),
 			deployment_ready_timeout: None,
-			shm_size_floor: Quantity("2Gi".to_string()),
+			// Unset deliberately. The old 2Gi floor existed only to lift shm
+			// above what a quarter-sized memory request derived; now that the
+			// request matches the limit, shm lands at 36% of memory unaided.
+			shm_size_floor: None,
 		}),
 		_ => None,
 	}
@@ -500,7 +517,7 @@ impl IntentConfig {
 			resources_floor: self.resources_floor.clone(),
 			resources_maximum: Some(resources_maximum),
 			deployment_ready_timeout,
-			shm_size_floor: Some(self.shm_size_floor.clone()),
+			shm_size_floor: self.shm_size_floor.clone(),
 			service_annotations,
 			pod_annotations: None,
 			affinity: None,
@@ -747,6 +764,40 @@ mod tests {
 		);
 		assert!(config_for("analytics-dbt").is_none());
 		assert!(config_for("").is_none());
+	}
+
+	/// A CPU limit on a database only throttles bursty analytical queries; the
+	/// request is what reserves the share. Memory carries both, and
+	/// `scale_memory_for_snapshot` sets them equal, so the floor's memory limit
+	/// is what a small snapshot lands on for request *and* limit.
+	#[test]
+	fn analytics_floor_has_no_cpu_limit() {
+		let floor = config_for("analytics")
+			.unwrap()
+			.resources_floor
+			.expect("analytics declares a floor");
+		let requests = floor.requests.expect("floor sets requests");
+		let limits = floor.limits.expect("floor sets limits");
+
+		assert_eq!(requests.get("cpu").expect("cpu request").0, "2");
+		assert_eq!(requests.get("memory").expect("memory request").0, "2Gi");
+		assert_eq!(limits.get("memory").expect("memory limit").0, "8Gi");
+		assert!(
+			!limits.contains_key("cpu"),
+			"analytics must not cap CPU: the limit throttles dbt without reserving anything the request doesn't"
+		);
+	}
+
+	/// The floor existed only to lift shm above what a quarter-sized memory
+	/// request derived. With request equal to limit, shm settles at 36% of
+	/// memory on its own, so a floor here would be dead configuration.
+	#[test]
+	fn analytics_leaves_shm_to_the_resource_derivation() {
+		assert!(config_for("analytics").unwrap().shm_size_floor.is_none());
+		let spec = config_for("analytics")
+			.unwrap()
+			.to_replica_spec(&entry("analytics", "site", json!({})), vec![]);
+		assert!(spec.shm_size_floor.is_none());
 	}
 
 	#[test]

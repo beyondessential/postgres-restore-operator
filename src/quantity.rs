@@ -85,13 +85,18 @@ impl ParsedQuantityExt for ParsedQuantity {
 /// canopy parameter is the escape hatch for a replica it gets wrong.
 const SNAPSHOT_MEMORY_RATIO: f64 = 0.10;
 
-/// Memory request as a fraction of the limit — the ratio the per-intent
-/// constants already used (a 2Gi request against an 8Gi limit).
-const MEMORY_REQUEST_FRACTION: f64 = 0.25;
-
 /// Derive postgres memory requirements from the snapshot size, clamped to
 /// `[floor, cap]`. Returns `None` if any input fails to parse, so callers can
 /// fall back rather than silently sizing off a bogus value.
+///
+/// Request equals limit, which makes the postgres container Guaranteed QoS. The
+/// request is the only figure the cluster acts on: the scheduler bin-packs on
+/// it, Karpenter picks an instance type from it and decides whether a node is
+/// underutilised by it, and the kubelet orders eviction by it. Declaring less
+/// than the derived limit doesn't reserve headroom, it just hides the pod's real
+/// size from every one of those decisions: a database that asks for a fraction
+/// of its own limit gets scheduled onto a node too small to satisfy that limit,
+/// and is then consolidated away as spare capacity while serving traffic.
 ///
 /// Sets only memory; CPU is left to the caller (see [`SNAPSHOT_MEMORY_RATIO`]).
 pub fn scale_memory_for_snapshot(
@@ -102,23 +107,21 @@ pub fn scale_memory_for_snapshot(
 	let bytes = |q: &Quantity| ParsedQuantity::try_from(q.clone()).ok()?.to_bytes_f64();
 	let (snapshot, floor, cap) = (bytes(snapshot_size)?, bytes(floor)?, bytes(cap)?);
 
-	let limit = (snapshot * SNAPSHOT_MEMORY_RATIO).clamp(floor.min(cap), cap);
-	let request = limit * MEMORY_REQUEST_FRACTION;
+	let memory = (snapshot * SNAPSHOT_MEMORY_RATIO).clamp(floor.min(cap), cap);
 
-	let to_quantity = |b: f64| -> Quantity {
-		ParsedQuantity::from(rust_decimal::Decimal::from(b.ceil() as u64))
+	let quantity: Quantity =
+		ParsedQuantity::from(rust_decimal::Decimal::from(memory.ceil() as u64))
 			.ceil_to(QuantityUnit::Mi)
-			.into()
-	};
+			.into();
 
 	Some(ResourceRequirements {
 		requests: Some(std::collections::BTreeMap::from([(
 			"memory".to_string(),
-			to_quantity(request),
+			quantity.clone(),
 		)])),
 		limits: Some(std::collections::BTreeMap::from([(
 			"memory".to_string(),
-			to_quantity(limit),
+			quantity,
 		)])),
 		..Default::default()
 	})
@@ -262,13 +265,18 @@ mod tests {
 		assert_eq!(limit_bytes(&scaled), 64.0 * (1u64 << 30) as f64);
 	}
 
-	/// Request stays at a quarter of the limit — the ratio the per-intent
-	/// constants already used (2Gi request against an 8Gi limit).
+	/// Request equals limit, so the pod is Guaranteed QoS and every scheduling
+	/// decision made from the request — instance selection, bin-packing,
+	/// consolidation, eviction order — sees the pod's real size. Understating it
+	/// gets the pod placed on a node that cannot satisfy its own limit and then
+	/// consolidated away as spare capacity.
 	#[test]
-	fn request_is_a_quarter_of_the_limit() {
-		let scaled =
-			scale_memory_for_snapshot(&gib(200), &gib(2), &gib(64)).expect("quantities parse");
-		assert_eq!(request_bytes(&scaled), limit_bytes(&scaled) / 4.0);
+	fn request_equals_limit() {
+		for snapshot in [gib(1), gib(200), gib(2000)] {
+			let scaled =
+				scale_memory_for_snapshot(&snapshot, &gib(2), &gib(64)).expect("quantities parse");
+			assert_eq!(request_bytes(&scaled), limit_bytes(&scaled));
+		}
 	}
 
 	fn ceil(input: &str, unit: QuantityUnit) -> String {
@@ -365,6 +373,21 @@ mod tests {
 		let res = resources_with(Some("4Gi"), Some("2Gi"));
 		let (shm, _) = compute_shm_and_shared_buffers(&res);
 		assert_eq!(shm.0, "1024Mi");
+	}
+
+	/// The shape every snapshot-derived pod now has. With request equal to
+	/// limit the `request/2` and `limit/2` caps both fall away and shm settles
+	/// at 36% of memory, putting `shared_buffers` at ~25% — the conventional
+	/// figure for a dedicated postgres. This is what makes `shmSizeFloor`
+	/// unnecessary for the analytics intent.
+	#[test]
+	fn shm_and_shared_buffers_with_request_equal_to_limit() {
+		let res = resources_with(Some("8Gi"), Some("8Gi"));
+		let (shm, sb) = compute_shm_and_shared_buffers(&res);
+		// min(8Gi/2, 36% of 8Gi) = min(4096Mi, ceil(2949.12)Mi) = 2950Mi
+		assert_eq!(shm.0, "2950Mi");
+		// floor(70% of 2950) = 2065MB, ~25% of the 8Gi the pod actually reserves
+		assert_eq!(sb, 2065);
 	}
 
 	#[test]
