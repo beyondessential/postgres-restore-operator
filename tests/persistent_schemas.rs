@@ -173,6 +173,11 @@ async fn persistent_schemas_migration() {
 	.expect("timed out waiting for second restore to become Active");
 
 	println!("--- verifying replica status after switchover");
+	// The replica reaches Ready a moment after the restore goes Active — the
+	// operator patches restore phase and replica status in separate calls, with
+	// the switchover's remaining work in between. Reading straight after the
+	// restore flips catches it mid-transition.
+	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
 	let replica_after = replicas
 		.get(replica_name)
 		.await

@@ -301,6 +301,30 @@ pub async fn read_restore_fixes(pg: &tokio_postgres::Client) -> Result<serde_jso
 	Ok(serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})))
 }
 
+/// Flip `_pgro.restore_info.stage` to `outgoing` on a restore the Service has
+/// just stopped pointing at.
+///
+/// The stage column exists for readers inside the database. A client connected
+/// over libpq cannot see a switchover happen — its connection stays pinned to
+/// this instance until the sweep deletes it, minutes later — so this is the
+/// only channel that reaches it. `restored`, `reindexing` and `ready` are the
+/// stages a restore passes through on the way up; `outgoing` is the one it
+/// leaves on.
+///
+/// Replicas run with `default_transaction_read_only = on`, so the session has
+/// to ask for a writable transaction first — the same thing the init script
+/// does with `PGOPTIONS`.
+pub async fn mark_restore_outgoing(pg: &tokio_postgres::Client) -> Result<()> {
+	pg.execute("SET default_transaction_read_only = off", &[])
+		.await?;
+	pg.execute(
+		"UPDATE _pgro.restore_info SET stage = 'outgoing', last_transition_time = now() WHERE id = 1",
+		&[],
+	)
+	.await?;
+	Ok(())
+}
+
 /// Query the on-disk size of the given database (bytes) via `pg_database_size()`.
 pub async fn measure_database_size(
 	client: &Client,
