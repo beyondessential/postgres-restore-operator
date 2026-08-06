@@ -2535,3 +2535,49 @@ fn collation_branch_runs_alongside_the_reindex_branches() {
 	);
 	assert!(script.contains("rm -f /pgdata/needs-collation-refresh"));
 }
+
+/// The operator ships two non-trivial shell scripts into containers, where a
+/// syntax error surfaces as a crash-looping pod partway through a restore
+/// rather than as a build failure. Parse them here instead.
+///
+/// This catches parse errors, not portability problems: on a host where
+/// `/bin/sh` is bash, `sh -n` accepts bashisms the container's shell would
+/// reject. Worth having anyway — a dropped `fi` is the failure mode that
+/// actually happens when editing a script embedded in Rust.
+#[test]
+fn generated_shell_scripts_are_valid_posix_sh() {
+	use std::io::Write;
+	use std::process::{Command, Stdio};
+
+	for (name, script) in [
+		("setup-auth", setup_auth_script()),
+		("postgres container", postgres_container_script()),
+	] {
+		let spawned = Command::new("sh")
+			.arg("-n")
+			.stdin(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn();
+		let mut child = match spawned {
+			Ok(child) => child,
+			// No POSIX shell on this host — nothing to check against, and
+			// failing here would only punish the developer's machine.
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+			Err(e) => panic!("could not run sh: {e}"),
+		};
+
+		child
+			.stdin
+			.take()
+			.expect("stdin piped")
+			.write_all(script.as_bytes())
+			.expect("write script to sh");
+
+		let output = child.wait_with_output().expect("sh runs to completion");
+		assert!(
+			output.status.success(),
+			"the {name} script is not valid POSIX sh:\n{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+}
