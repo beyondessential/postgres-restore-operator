@@ -7,6 +7,21 @@ pub mod postgres;
 pub mod replica;
 pub mod restore;
 
+/// Label carried by every restore's postgres pod, and required by the
+/// per-replica Service selector alongside the restore name.
+///
+/// Set in the Deployment's pod template so a pod the ReplicaSet replaces —
+/// eviction, node loss, OOM — rejoins the Service as soon as it is Ready,
+/// rather than waiting for the operator to notice and patch it.
+///
+/// It is *not* what keeps a switching restore unreachable: the stable Service
+/// is created with no selector at all and only gets one at switchover, after
+/// operator-side prep has finished, and that selector names a specific
+/// restore. The restore-name component is the gate. This label is the second
+/// term in the same selector, kept because live Services already carry it in
+/// their selector and a merge patch cannot drop a selector key.
+pub const READY_FOR_TRAFFIC_LABEL: &str = "pgro.bes.au/ready-for-traffic";
+
 /// Build an EnvVar that references a key in a Kubernetes Secret.
 pub fn env_from_secret(env_name: &str, secret_ref: &SecretReference, key: &str) -> EnvVar {
 	EnvVar {

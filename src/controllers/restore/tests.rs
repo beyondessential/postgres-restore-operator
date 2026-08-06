@@ -2352,3 +2352,232 @@ fn empty_placement_adds_nothing() {
 	let template = deployment.spec.unwrap().template;
 	assert!(template.spec.unwrap().node_selector.is_none());
 }
+
+/// The Service selector requires this label, so a pod that comes up without it
+/// is invisible to clients until the operator notices and patches it. Declaring
+/// it in the pod template means a replacement pod — eviction, node loss, OOM —
+/// rejoins the Service the moment it is Ready.
+#[test]
+fn deployment_pod_template_carries_the_ready_for_traffic_label() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("17".to_string()),
+		..Default::default()
+	});
+
+	let deployment = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
+
+	let labels = deployment
+		.spec
+		.unwrap()
+		.template
+		.metadata
+		.expect("pod template has metadata")
+		.labels
+		.expect("pod template has labels");
+
+	assert_eq!(
+		labels
+			.get(crate::controllers::READY_FOR_TRAFFIC_LABEL)
+			.map(String::as_str),
+		Some("true"),
+		"a replacement pod must rejoin the Service without waiting for a reconcile"
+	);
+	// The restore label is what the Deployment's own selector matches on, so
+	// adding the traffic label must not have displaced it.
+	assert_eq!(
+		labels.get("pgro.bes.au/restore").map(String::as_str),
+		Some("test-restore")
+	);
+}
+
+/// A restore can land a data directory on a base image whose ICU/glibc differs
+/// from the machine the snapshot came from. Postgres records a version per
+/// collation and an index ordered by a mismatched one may sort wrongly, which
+/// shows up as an index scan quietly missing rows. Detection has to be its own
+/// flag: it is independent of the locale rewrite that drives `needs-reindex`.
+#[test]
+fn setup_auth_flags_collation_version_mismatches() {
+	let script = setup_auth_script();
+
+	assert!(
+		script.contains("touch /pgdata/needs-collation-refresh"),
+		"a version mismatch must raise its own flag, not ride on needs-reindex"
+	);
+	assert!(
+		script.contains("pg_collation_actual_version"),
+		"detection must compare the recorded version against the OS"
+	);
+	// A missing function fails the query at parse time however the runtime
+	// branches, so the probe is what keeps this working on older servers.
+	assert!(
+		script.contains("to_regprocedure('pg_collation_actual_version(oid)')"),
+		"detection must probe for the function rather than assume a version cutoff"
+	);
+	// The script runs under `set -e`; non-numeric input to the arithmetic would
+	// abort the init container and fail the restore outright.
+	assert!(
+		script.contains("tr -cd '0-9'"),
+		"the mismatch count must be sanitised before it reaches shell arithmetic"
+	);
+}
+
+#[test]
+fn collation_refresh_rebuilds_then_refreshes() {
+	let script = postgres_container_script();
+
+	assert!(
+		script.contains("if [ -f /pgdata/needs-collation-refresh ]; then"),
+		"the background block must handle the collation flag"
+	);
+	assert!(
+		script.contains("|| [ -f /pgdata/needs-collation-refresh ]"),
+		"the flag must be able to start the background block on its own, with \
+		 neither reindex flag set"
+	);
+
+	let rebuild = script
+		.find("Collation version refresh:")
+		.expect("collation branch announces itself");
+	let refresh = script
+		.find("ALTER COLLATION $coll REFRESH VERSION;")
+		.expect("recorded versions get refreshed");
+	assert!(
+		rebuild < refresh,
+		"indexes must be rebuilt before their collation's version is refreshed; \
+		 refreshing first trades a correctness warning for silence"
+	);
+}
+
+/// The rebuild loop tolerates individual failures to keep making progress. If
+/// the refresh ran anyway it would stamp the current OS version onto a
+/// collation whose indexes are still wrongly ordered, and postgres would stop
+/// warning about a problem that is still there.
+#[test]
+fn collation_refresh_is_skipped_when_a_rebuild_failed() {
+	let script = postgres_container_script();
+
+	assert!(
+		script.contains("FAILED=$((FAILED + 1))"),
+		"rebuild failures must be counted, not just swallowed"
+	);
+	assert!(
+		script.contains(r#"if [ "$FAILED" = "0" ]; then"#),
+		"the refresh must be gated on a clean rebuild"
+	);
+	// `cmd | while` runs the loop in a subshell, so the counter would be
+	// discarded exactly when it matters.
+	assert!(
+		script.contains(r#"done < "$IDX_FILE""#),
+		"the rebuild loop must read from a file so the failure count survives it"
+	);
+}
+
+/// The locale branch avoids catalog indexes only incidentally — they carry the
+/// C collation, which its `= 100` predicate misses. Matching on collation
+/// version instead sweeps them back in, and REINDEX CONCURRENTLY cannot touch a
+/// system catalog, so the exclusion has to be explicit.
+#[test]
+fn collation_refresh_excludes_system_namespaces() {
+	let script = postgres_container_script();
+
+	assert!(script.contains("n.nspname NOT IN ('pg_catalog', 'information_schema')"));
+	assert!(script.contains("n.nspname NOT LIKE 'pg_toast%'"));
+	assert!(script.contains("n.nspname NOT LIKE 'pg_temp%'"));
+}
+
+/// Database-level collation version tracking, and the statement that clears it,
+/// only exist from PG 15 — but the operator restores older servers too.
+#[test]
+fn database_level_refresh_is_version_gated() {
+	let script = postgres_container_script();
+
+	let gate = script
+		.find(r#"if [ "$SERVER_VERSION_NUM" -ge 150000 ]; then"#)
+		.expect("database-level refresh is gated on server_version_num");
+	let stmt = script
+		.find("REFRESH COLLATION VERSION")
+		.expect("database-level refresh is issued");
+	assert!(gate < stmt, "the gate must precede the statement it guards");
+}
+
+/// The collation branch must not displace the existing ones: a restore can need
+/// any combination of the three, and the stage bookkeeping still has to land on
+/// `ready` afterwards.
+#[test]
+fn collation_branch_runs_alongside_the_reindex_branches() {
+	let script = postgres_container_script();
+
+	let locale_branch = script
+		.find("elif [ -f /pgdata/needs-reindex ]; then")
+		.expect("locale reindex branch still present");
+	let collation_branch = script
+		.find("if [ -f /pgdata/needs-collation-refresh ]; then")
+		.expect("collation branch present");
+	let ready = script
+		.find("stage = 'ready'")
+		.expect("stage still ends at ready");
+
+	assert!(
+		locale_branch < collation_branch,
+		"the collation branch is additional to the reindex branches, not an elif on them"
+	);
+	assert!(
+		collation_branch < ready,
+		"the collation work must finish before the replica is marked ready"
+	);
+	assert!(script.contains("rm -f /pgdata/needs-collation-refresh"));
+}
+
+/// The operator ships two non-trivial shell scripts into containers, where a
+/// syntax error surfaces as a crash-looping pod partway through a restore
+/// rather than as a build failure. Parse them here instead.
+///
+/// This catches parse errors, not portability problems: on a host where
+/// `/bin/sh` is bash, `sh -n` accepts bashisms the container's shell would
+/// reject. Worth having anyway — a dropped `fi` is the failure mode that
+/// actually happens when editing a script embedded in Rust.
+#[test]
+fn generated_shell_scripts_are_valid_posix_sh() {
+	use std::io::Write;
+	use std::process::{Command, Stdio};
+
+	for (name, script) in [
+		("setup-auth", setup_auth_script()),
+		("postgres container", postgres_container_script()),
+	] {
+		let spawned = Command::new("sh")
+			.arg("-n")
+			.stdin(Stdio::piped())
+			.stderr(Stdio::piped())
+			.spawn();
+		let mut child = match spawned {
+			Ok(child) => child,
+			// No POSIX shell on this host — nothing to check against, and
+			// failing here would only punish the developer's machine.
+			Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+			Err(e) => panic!("could not run sh: {e}"),
+		};
+
+		child
+			.stdin
+			.take()
+			.expect("stdin piped")
+			.write_all(script.as_bytes())
+			.expect("write script to sh");
+
+		let output = child.wait_with_output().expect("sh runs to completion");
+		assert!(
+			output.status.success(),
+			"the {name} script is not valid POSIX sh:\n{}",
+			String::from_utf8_lossy(&output.stderr)
+		);
+	}
+}
