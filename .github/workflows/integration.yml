@@ -87,7 +87,7 @@ jobs:
           #     needs_non_pg_snapshot: false
 
     steps:
-      - uses: actions/checkout@v7.0.0
+      - uses: actions/checkout@v7.0.1
 
       - name: Configure toolchain
         run: |
