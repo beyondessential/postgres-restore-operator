@@ -3,7 +3,7 @@ use kube::api::ObjectMeta;
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
 
-use crate::{kopia::Snapshot, types::*, util::TimeSpan};
+use crate::{kopia::Snapshot, placement::PodPlacement, types::*, util::TimeSpan};
 
 use jiff::SignedDuration;
 
@@ -295,14 +295,8 @@ fn parse_kopia_snapshot_with_backslash_paths() {
 	assert_eq!(snaps[0].source.path, r"C:\Users\backup\data");
 }
 
-#[test]
-fn snapshot_list_job_rotates_kopia_logs() {
-	// Snapshot-list jobs run on every scheduled reconcile (many times
-	// per day per replica). Without log rotation kopia's CLI logs
-	// accumulate in the pod's writable layer / cache PVC over time and
-	// eventually contribute to filling it. Confirm the script applies
-	// the global log-rotation flags to every kopia invocation.
-	let replica = PostgresPhysicalReplica {
+fn snapshot_list_test_replica() -> PostgresPhysicalReplica {
+	PostgresPhysicalReplica {
 		metadata: ObjectMeta {
 			name: Some("test".into()),
 			namespace: Some("default".into()),
@@ -344,7 +338,17 @@ fn snapshot_list_job_rotates_kopia_logs() {
 			),
 		},
 		status: None,
-	};
+	}
+}
+
+#[test]
+fn snapshot_list_job_rotates_kopia_logs() {
+	// Snapshot-list jobs run on every scheduled reconcile (many times
+	// per day per replica). Without log rotation kopia's CLI logs
+	// accumulate in the pod's writable layer / cache PVC over time and
+	// eventually contribute to filling it. Confirm the script applies
+	// the global log-rotation flags to every kopia invocation.
+	let replica = snapshot_list_test_replica();
 
 	let job = build_snapshot_list_job(
 		&replica,
@@ -353,6 +357,7 @@ fn snapshot_list_job_rotates_kopia_logs() {
 		"kopia:latest",
 		"http://x",
 		None,
+		&PodPlacement::default(),
 	)
 	.expect("job builds");
 	let script = job.spec.unwrap().template.spec.unwrap().containers[0]
@@ -436,4 +441,44 @@ fn uncovered_snapshot_is_created() {
 	// A restore with no status yet (phase None) still counts as live.
 	let pending = [make_restore("snapNew", None)];
 	assert!(snapshot_already_covered("snapNew", None, &pending));
+}
+
+/// The snapshot-list job is a pod like any other and must land on the
+/// configured tier rather than wherever the cluster's default node pool is.
+#[test]
+fn snapshot_list_job_carries_the_placement_defaults() {
+	let replica = snapshot_list_test_replica();
+	let placement = PodPlacement::parse("bes.node.purpose=workload", "a=b");
+	let job = build_snapshot_list_job(
+		&replica,
+		"test-snap",
+		"default",
+		"kopia:latest",
+		"http://x",
+		None,
+		&placement,
+	)
+	.expect("job builds");
+
+	let template = job.spec.unwrap().template;
+	assert_eq!(
+		template
+			.spec
+			.unwrap()
+			.node_selector
+			.unwrap()
+			.get("bes.node.purpose")
+			.unwrap(),
+		"workload"
+	);
+	assert_eq!(
+		template
+			.metadata
+			.unwrap()
+			.annotations
+			.unwrap()
+			.get("a")
+			.unwrap(),
+		"b"
+	);
 }

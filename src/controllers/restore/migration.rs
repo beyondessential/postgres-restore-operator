@@ -27,6 +27,7 @@ use crate::{
 	context::Context,
 	controllers::jobs::{env_from_secret_name, env_literal},
 	error::Result,
+	placement::PodPlacement,
 	types::{
 		MigrationResult, MigrationTarget, MigrationTiming, PostgresPhysicalReplica,
 		PostgresPhysicalRestore,
@@ -60,12 +61,13 @@ pub fn build_migration_job(
 	target: &MigrationTarget,
 	dbname: &str,
 	namespace: &str,
+	placement: &PodPlacement,
 ) -> Job {
 	let restore_name = restore.name_any();
 	let job_name = migration_job_name(&restore_name);
 	let creds = replica.creds_secret_name();
 
-	Job {
+	let mut job = Job {
 		metadata: ObjectMeta {
 			name: Some(job_name),
 			namespace: Some(namespace.to_string()),
@@ -141,7 +143,9 @@ pub fn build_migration_job(
 			..Default::default()
 		}),
 		..Default::default()
-	}
+	};
+	placement.apply_to_job(&mut job);
+	job
 }
 
 /// Drive the migration Job: create it, wait, then record what it did.
@@ -207,7 +211,14 @@ pub async fn reconcile_migrating(
 				database = %dbname,
 				"starting migration test"
 			);
-			let job = build_migration_job(restore, &replica, &target, &dbname, namespace);
+			let job = build_migration_job(
+				restore,
+				&replica,
+				&target,
+				&dbname,
+				namespace,
+				&ctx.pod_placement(),
+			);
 			jobs.create(&PostParams::default(), &job).await?
 		}
 	};

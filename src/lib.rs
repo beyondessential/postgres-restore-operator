@@ -6,6 +6,7 @@ pub mod error;
 pub mod kopia;
 pub mod metrics;
 pub mod notifications;
+pub mod placement;
 pub mod quantity;
 pub mod tailscale;
 pub mod types;

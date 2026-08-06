@@ -22,6 +22,7 @@ use crate::{
 	controllers::{env_from_secret, env_from_secret_optional, kopia_writable_env},
 	error::{Error, Result},
 	kopia::KopiaSource,
+	placement::PodPlacement,
 	quantity::compute_shm_and_shared_buffers,
 	types::*,
 };
@@ -68,6 +69,7 @@ pub fn build_credential_reset_job(
 	replica: &PostgresPhysicalReplica,
 	job_name: &str,
 	namespace: &str,
+	placement: &PodPlacement,
 ) -> Result<Job> {
 	let pvc_name = format!("{}-data", restore.name_any());
 
@@ -107,7 +109,7 @@ echo "Credential reset complete."
 		("pgro.bes.au/job-type".to_string(), "cred-reset".to_string()),
 	]);
 
-	Ok(Job {
+	let mut job = Job {
 		metadata: ObjectMeta {
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
@@ -181,7 +183,9 @@ echo "Credential reset complete."
 			..Default::default()
 		}),
 		..Default::default()
-	})
+	};
+	placement.apply_to_job(&mut job);
+	Ok(job)
 }
 
 pub fn build_version_detect_job(
@@ -189,6 +193,7 @@ pub fn build_version_detect_job(
 	job_name: &str,
 	namespace: &str,
 	pvc_name: &str,
+	placement: &PodPlacement,
 ) -> Job {
 	let script = r#"set -e
 
@@ -253,7 +258,7 @@ echo "$VERSION" > /pgdata/.postgres-version
 echo -n "$VERSION" > /dev/termination-log
 "#;
 
-	Job {
+	let mut job = Job {
 		metadata: ObjectMeta {
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
@@ -333,7 +338,9 @@ echo -n "$VERSION" > /dev/termination-log
 			..Default::default()
 		}),
 		..Default::default()
-	}
+	};
+	placement.apply_to_job(&mut job);
+	job
 }
 
 pub fn build_pvc(
@@ -532,6 +539,10 @@ pub fn build_kopia_cache_pvc(
 	}
 }
 
+#[expect(
+	clippy::too_many_arguments,
+	reason = "internal builder with tightly-coupled params"
+)]
 pub fn build_restore_job(
 	restore: &PostgresPhysicalRestore,
 	job_name: &str,
@@ -540,6 +551,7 @@ pub fn build_restore_job(
 	kopia_image: &str,
 	cache_pressure_callback_url: &str,
 	canopy_proxy: Option<&CanopyProxyArgs<'_>>,
+	placement: &PodPlacement,
 ) -> Result<Job> {
 	let source = replica.kopia_source();
 	let kopia_secret = SecretReference {
@@ -910,7 +922,7 @@ echo -n "$VERSION" > /dev/termination-log
 		7200
 	};
 
-	Ok(Job {
+	let mut job = Job {
 		metadata: ObjectMeta {
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
@@ -951,7 +963,9 @@ echo -n "$VERSION" > /dev/termination-log
 			..Default::default()
 		}),
 		..Default::default()
-	})
+	};
+	placement.apply_to_job(&mut job);
+	Ok(job)
 }
 
 /// All the inputs `build_postgres_deployment_with` needs, factored out so
@@ -989,6 +1003,9 @@ pub struct PostgresDeploymentInputs<'a> {
 	pub postgres_resources: Option<ResourceRequirements>,
 	pub affinity: Option<k8s_openapi::api::core::v1::Affinity>,
 	pub tolerations: Vec<k8s_openapi::api::core::v1::Toleration>,
+	/// Operator-wide scheduling defaults, applied last so anything the replica
+	/// spec set above wins.
+	pub placement: &'a PodPlacement,
 	/// True when the replica redacts its data after restore. Makes the
 	/// postgres container install `postgresql_anonymizer` before starting
 	/// the server (see [`anon_install_prelude`]).
@@ -1039,6 +1056,7 @@ pub fn build_deployment(
 	name: &str,
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
+	placement: &PodPlacement,
 ) -> Result<Deployment> {
 	let pvc_name = format!("{name}-data");
 	// Memory scales with the snapshot this restore holds, so shm and
@@ -1103,6 +1121,7 @@ pub fn build_deployment(
 		postgres_resources,
 		affinity: replica.spec.affinity.clone(),
 		tolerations: replica.spec.tolerations.clone(),
+		placement,
 		redaction_enabled: replica.spec.redaction.is_some(),
 	})
 }
@@ -1270,6 +1289,7 @@ pub fn build_postgres_deployment_with(cfg: &PostgresDeploymentInputs<'_>) -> Res
 		postgres_resources,
 		affinity,
 		tolerations,
+		placement,
 		redaction_enabled,
 	} = cfg;
 	let shm_size = shm_size.clone();
@@ -1677,7 +1697,7 @@ echo "Auth setup complete"
 		},
 	];
 
-	Ok(Deployment {
+	let mut deployment = Deployment {
 		metadata: ObjectMeta {
 			name: Some((*name).to_string()),
 			namespace: Some((*namespace).to_string()),
@@ -1991,5 +2011,7 @@ fi
 			..Default::default()
 		}),
 		..Default::default()
-	})
+	};
+	placement.apply_to_deployment(&mut deployment);
+	Ok(deployment)
 }

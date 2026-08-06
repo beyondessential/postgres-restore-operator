@@ -131,6 +131,45 @@ kind: ConfigMap
 metadata:
     name: postgres-restore-operator-config
     namespace: pgro-system
+# Watched live: edits take effect on the next reconcile, no operator restart.
+# All keys are optional. Recognised keys, with their defaults:
+#
+#   maxConcurrentRestores: "1"
+#     How many restores may run concurrently across all replicas.
+#
+#   kopiaImage: kopia/kopia:0.22.3
+#     Image the kopia restore and snapshot-list Jobs run.
+#
+#   usePortForward: "false"
+#     Reach restore databases through the kube API server rather than pod
+#     IPs. For running the operator outside the cluster.
+#
+#   nodeSelector: ""
+#     Scheduling constraints stamped onto every pod the operator creates:
+#     the postgres Deployments and all of the restore, snapshot-list,
+#     schema-migration, version-detect and credential-reset Jobs. Format is
+#     `key=value` pairs separated by commas; a malformed pair is skipped
+#     with a warning rather than discarding the rest.
+#
+#     Leaving this unset means the operator expresses no placement intent at
+#     all. On a cluster with a weighted autoscaler that is not "the scheduler
+#     picks sensibly" — it means whichever node pool has the highest weight
+#     and happens to match, which may be neither the right instance class nor
+#     the right subnet for a database. See src/placement.rs.
+#
+#   podAnnotations: ""
+#     Annotations merged into every created pod, same `key=value,key=value`
+#     format. Anything the replica spec sets in `podAnnotations` wins on a
+#     key collision. `karpenter.sh/do-not-disrupt=true` stops Karpenter
+#     voluntarily draining a node while a restore is serving traffic or a
+#     restore Job is mid-flight; it does not prevent spot interruption or
+#     node expiry.
+#
+# Example:
+#
+#   data:
+#       nodeSelector: "bes.node.purpose=workload"
+#       podAnnotations: "karpenter.sh/do-not-disrupt=true"
 data: {}
 ---
 apiVersion: v1

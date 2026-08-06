@@ -12,7 +12,7 @@ use kube::ResourceExt;
 use super::builders::{
 	build_deployment, build_restore_job, build_version_detect_job, resolve_postgres_resources,
 };
-use crate::{types::*, util::TimeSpan};
+use crate::{placement::PodPlacement, types::*, util::TimeSpan};
 
 #[test]
 fn deployment_uses_affinity_not_node_selector() {
@@ -89,7 +89,14 @@ fn deployment_uses_affinity_not_node_selector() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy
 		.spec
 		.as_ref()
@@ -172,7 +179,14 @@ fn setup_auth_script() -> String {
 		postgres_version: Some("16".to_string()),
 		..Default::default()
 	});
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let setup_auth = deploy
 		.spec
 		.unwrap()
@@ -195,7 +209,14 @@ fn postgres_container_script() -> String {
 		postgres_version: Some("16".to_string()),
 		..Default::default()
 	});
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let postgres = deploy
 		.spec
 		.unwrap()
@@ -387,6 +408,7 @@ fn canopy_restore_job_proxy_is_native_sidecar() {
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
 		Some(&proxy),
+		&PodPlacement::default(),
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -444,6 +466,7 @@ fn canopy_restore_job_sidecar_carries_run_id() {
 			"kopia:latest",
 			"http://operator/api/v1/cache-pressure/default/test-restore",
 			Some(&proxy),
+			&PodPlacement::default(),
 		)
 		.unwrap();
 		let sidecar = job
@@ -487,6 +510,7 @@ fn restore_job_has_ttl_seconds_after_finished() {
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
 		None,
+		&PodPlacement::default(),
 	)
 	.unwrap();
 	let ttl = job
@@ -514,6 +538,7 @@ fn restore_job_mounts_persistent_kopia_cache() {
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
 		None,
+		&PodPlacement::default(),
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -669,6 +694,7 @@ fn canopy_restore_job_sidecar_carries_progress_callback_url() {
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
 		Some(&proxy),
+		&PodPlacement::default(),
 	)
 	.unwrap();
 	let sidecar = job
@@ -703,6 +729,7 @@ fn restore_job_for(snapshot_size: &str) -> k8s_openapi::api::batch::v1::Job {
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
 		None,
+		&PodPlacement::default(),
 	)
 	.unwrap()
 }
@@ -788,6 +815,7 @@ fn restore_job_passes_cache_caps_and_log_rotation() {
 		"kopia:latest",
 		"http://operator/api/v1/cache-pressure/default/test-restore",
 		None,
+		&PodPlacement::default(),
 	)
 	.unwrap();
 	let pod_spec = job.spec.unwrap().template.spec.unwrap();
@@ -883,7 +911,13 @@ fn kopia_cache_pvc_size_scales_with_snapshot() {
 #[test]
 fn version_detect_job_has_ttl_seconds_after_finished() {
 	let (restore, _replica) = test_restore_and_replica();
-	let job = build_version_detect_job(&restore, "test-version-detect", "default", "test-pvc");
+	let job = build_version_detect_job(
+		&restore,
+		"test-version-detect",
+		"default",
+		"test-pvc",
+		&PodPlacement::default(),
+	);
 	let ttl = job
 		.spec
 		.as_ref()
@@ -901,7 +935,14 @@ fn deployment_has_dshm_volume_with_default_resources() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let dshm_vol = pod_spec
@@ -937,7 +978,14 @@ fn deployment_has_dshm_volume_with_custom_resources() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let dshm_vol = pod_spec
@@ -962,7 +1010,14 @@ fn deployment_mounts_dshm_on_postgres_and_setup_auth() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let postgres = &pod_spec.containers[0];
@@ -996,7 +1051,14 @@ fn deployment_init_script_sets_shared_buffers() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let setup_auth = pod_spec
@@ -1040,7 +1102,14 @@ fn deployment_init_script_grants_superuser_for_read_write() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 	let setup_auth = pod_spec
 		.init_containers
@@ -1073,7 +1142,14 @@ fn deployment_init_script_grants_read_only_on_pg14_plus() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 	let setup_auth = pod_spec
 		.init_containers
@@ -1110,7 +1186,14 @@ fn deployment_init_script_two_stage_pg_resetwal_fallback() {
 		postgres_version: Some("16".to_string()),
 		..Default::default()
 	});
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let setup_auth = deploy
 		.spec
 		.unwrap()
@@ -1166,7 +1249,14 @@ fn deployment_init_script_flags_full_reindex_after_resetwal() {
 		postgres_version: Some("16".to_string()),
 		..Default::default()
 	});
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let setup_auth = deploy
 		.spec
 		.unwrap()
@@ -1283,7 +1373,14 @@ fn deployment_runtime_reindex_handles_full_database_flag() {
 		postgres_version: Some("16".to_string()),
 		..Default::default()
 	});
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let postgres = deploy
 		.spec
 		.unwrap()
@@ -1337,7 +1434,14 @@ fn deployment_readiness_probe_only_gates_on_locale_reindex() {
 		postgres_version: Some("16".to_string()),
 		..Default::default()
 	});
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let postgres = deploy
 		.spec
 		.unwrap()
@@ -1379,7 +1483,14 @@ fn deployment_init_script_overrides_listen_addresses() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let setup_auth = pod_spec
@@ -1409,7 +1520,14 @@ fn init_script_sets_initial_stage_based_on_reindex_flag() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let setup_auth = pod_spec
@@ -1455,7 +1573,14 @@ fn postgres_container_updates_stage_around_reindex() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let postgres = pod_spec
@@ -1546,7 +1671,14 @@ fn deployment_shared_buffers_with_custom_resources() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 
 	let setup_auth = pod_spec
@@ -1600,6 +1732,7 @@ fn migration_job_lets_the_image_entrypoint_take_the_subcommand() {
 		&migration_target(),
 		"tamanu-fiji",
 		"default",
+		&PodPlacement::default(),
 	);
 	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
 
@@ -1629,6 +1762,7 @@ fn migration_job_points_tamanu_at_the_restored_database() {
 		&migration_target(),
 		"tamanu-fiji",
 		"default",
+		&PodPlacement::default(),
 	);
 	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
 
@@ -1673,6 +1807,7 @@ fn migration_job_supplies_a_connection_url_too() {
 		&migration_target(),
 		"tamanu-fiji",
 		"default",
+		&PodPlacement::default(),
 	);
 	let container = &job.spec.unwrap().template.spec.unwrap().containers[0];
 
@@ -1702,6 +1837,7 @@ fn migration_job_does_not_retry_and_is_owned_by_the_restore() {
 		&migration_target(),
 		"tamanu-fiji",
 		"default",
+		&PodPlacement::default(),
 	);
 
 	// A failed migration is the finding; retrying spends the same hours to reach
@@ -1762,7 +1898,14 @@ fn deployment_lifts_read_only_for_a_migration_target() {
 	});
 
 	let script_for = |restore: &PostgresPhysicalRestore| {
-		let deploy = build_deployment(restore, "test-restore", "default", &replica).unwrap();
+		let deploy = build_deployment(
+			restore,
+			"test-restore",
+			"default",
+			&replica,
+			&PodPlacement::default(),
+		)
+		.unwrap();
 		let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
 		pod_spec
 			.init_containers
@@ -1896,7 +2039,14 @@ fn deployment_with_redaction_runs_postgres_as_root_and_installs_anon() {
 		version_fallback_to_base: false,
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod = deploy
 		.spec
 		.as_ref()
@@ -1941,7 +2091,14 @@ fn deployment_without_redaction_keeps_default_securitycontext() {
 		..Default::default()
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let pod = deploy
 		.spec
 		.as_ref()
@@ -1989,8 +2146,14 @@ fn deployment_with_redaction_builds_for_pg16() {
 		version_fallback_to_base: false,
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica)
-		.expect("redaction should build on PG 16");
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.expect("redaction should build on PG 16");
 	let pod = deploy
 		.spec
 		.as_ref()
@@ -2026,7 +2189,14 @@ fn deployment_with_redaction_forces_writable() {
 		version_fallback_to_base: false,
 	});
 
-	let deploy = build_deployment(&restore, "test-restore", "default", &replica).unwrap();
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
 	let script = deploy_init_setup_auth_script(&deploy);
 	// The init script uses `if [ "<read_only>" = "true" ]` and we want
 	// that variable substituted to "false" when redaction is set so the
@@ -2054,4 +2224,131 @@ fn deploy_init_setup_auth_script(deploy: &k8s_openapi::api::apps::v1::Deployment
 		.find(|c| c.name == "setup-auth")
 		.unwrap();
 	setup_auth.args.as_ref().unwrap()[0].clone()
+}
+
+/// Every pod the operator creates has to carry the cluster's placement
+/// defaults. A builder that forgets puts a database — or the job restoring one
+/// — wherever the cluster's default node pool happens to be, which is the
+/// failure this configuration exists to prevent. Covers the builders reachable
+/// from these fixtures; `build_snapshot_list_job` and
+/// `build_schema_migration_job` are covered in their own modules.
+#[test]
+fn every_builder_stamps_the_placement_defaults() {
+	let placement = PodPlacement::parse(
+		"bes.node.purpose=workload",
+		"karpenter.sh/do-not-disrupt=true",
+	);
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("17".to_string()),
+		..Default::default()
+	});
+
+	let deployment =
+		build_deployment(&restore, "test-restore", "default", &replica, &placement).unwrap();
+	let templates = vec![
+		(
+			"postgres deployment",
+			deployment.spec.unwrap().template.clone(),
+		),
+		(
+			"restore job",
+			build_restore_job(
+				&restore,
+				"test-restore-restore",
+				"default",
+				&replica,
+				"kopia:latest",
+				"http://operator/cache-pressure",
+				None,
+				&placement,
+			)
+			.unwrap()
+			.spec
+			.unwrap()
+			.template,
+		),
+		(
+			"version detect job",
+			build_version_detect_job(&restore, "detect", "default", "test-pvc", &placement)
+				.spec
+				.unwrap()
+				.template,
+		),
+		(
+			"credential reset job",
+			super::build_credential_reset_job(
+				&restore,
+				&replica,
+				"cred-reset",
+				"default",
+				&placement,
+			)
+			.unwrap()
+			.spec
+			.unwrap()
+			.template,
+		),
+		(
+			"migration job",
+			super::migration::build_migration_job(
+				&restore,
+				&replica,
+				&migration_target(),
+				"tamanu",
+				"default",
+				&placement,
+			)
+			.spec
+			.unwrap()
+			.template,
+		),
+	];
+
+	for (what, template) in templates {
+		let selector = template
+			.spec
+			.as_ref()
+			.and_then(|s| s.node_selector.as_ref())
+			.unwrap_or_else(|| panic!("{what} must carry a nodeSelector"));
+		assert_eq!(
+			selector.get("bes.node.purpose").map(String::as_str),
+			Some("workload"),
+			"{what} must be pinned to the configured node purpose"
+		);
+
+		let annotations = template
+			.metadata
+			.as_ref()
+			.and_then(|m| m.annotations.as_ref())
+			.unwrap_or_else(|| panic!("{what} must carry the configured pod annotations"));
+		assert_eq!(
+			annotations
+				.get("karpenter.sh/do-not-disrupt")
+				.map(String::as_str),
+			Some("true"),
+			"{what} must carry the configured pod annotations"
+		);
+	}
+}
+
+/// The default placement must leave every builder's output as it was, so an
+/// operator with no ConfigMap entries sees no behaviour change.
+#[test]
+fn empty_placement_adds_nothing() {
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("17".to_string()),
+		..Default::default()
+	});
+	let deployment = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
+	let template = deployment.spec.unwrap().template;
+	assert!(template.spec.unwrap().node_selector.is_none());
 }
