@@ -32,6 +32,7 @@ use crate::{
 	context::{Context, ReplicaKey},
 	error::{Error, Result},
 	kopia,
+	placement::PodPlacement,
 	types::*,
 };
 use scheduling::ScheduleDecision;
@@ -1142,6 +1143,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			&ctx.kopia_image(),
 			&callback_url,
 			canopy_proxy.as_ref(),
+			&ctx.pod_placement(),
 		)?;
 		jobs.create(&PostParams::default(), &job).await?;
 		return Ok(Action::requeue(Duration::from_secs(10)));
@@ -1229,6 +1231,7 @@ async fn ensure_credential_reset(
 	namespace: &str,
 	restore: &PostgresPhysicalRestore,
 	replica: &PostgresPhysicalReplica,
+	placement: &PodPlacement,
 ) -> Result<bool> {
 	let restore_name = restore.name_any();
 	let job_name = credential_reset_job_name(&restore_name);
@@ -1348,7 +1351,7 @@ async fn ensure_credential_reset(
 		job = %job_name,
 		"creating credential reset job"
 	);
-	let job = build_credential_reset_job(restore, replica, &job_name, namespace)?;
+	let job = build_credential_reset_job(restore, replica, &job_name, namespace, placement)?;
 	jobs.create(&PostParams::default(), &job).await?;
 
 	Ok(false)
@@ -1767,7 +1770,15 @@ async fn reconcile_schema_migration(
 				error = %e,
 				"auth failure connecting to active restore; triggering credential reset"
 			);
-			if ensure_credential_reset(client, namespace, old_restore, replica).await? {
+			if ensure_credential_reset(
+				client,
+				namespace,
+				old_restore,
+				replica,
+				&ctx.pod_placement(),
+			)
+			.await?
+			{
 				info!(
 					replica = %replica_name,
 					restore = %old_restore_name,
@@ -1873,7 +1884,15 @@ async fn reconcile_schema_migration(
 				error = %e,
 				"auth failure connecting to switching restore; triggering credential reset"
 			);
-			if ensure_credential_reset(client, namespace, new_restore, replica).await? {
+			if ensure_credential_reset(
+				client,
+				namespace,
+				new_restore,
+				replica,
+				&ctx.pod_placement(),
+			)
+			.await?
+			{
 				info!(
 					replica = %replica_name,
 					restore = %new_restore_name,
@@ -1944,6 +1963,7 @@ async fn reconcile_schema_migration(
 		&target_superuser_secret_name,
 		&callback_url,
 		pg_version,
+		&ctx.pod_placement(),
 	);
 
 	jobs.create(&PostParams::default(), &job).await?;

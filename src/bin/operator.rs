@@ -1,6 +1,6 @@
 use std::collections::HashSet;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use axum::extract::{Path, State};
@@ -27,6 +27,7 @@ use postgres_restore_operator::{
 		DEFAULT_KOPIA_IMAGE, ReplicaKey,
 	},
 	controllers::{self, canopy::intent},
+	placement::PodPlacement,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase},
 };
 
@@ -118,13 +119,128 @@ fn extract_use_port_forward(cm: &ConfigMap) -> bool {
 		.is_some_and(|v| v == "true")
 }
 
-async fn read_config(client: &Client, namespace: &str) -> (usize, String, bool) {
+/// Scheduling defaults for every pod the operator creates. Absent keys give
+/// the empty placement, which leaves pod specs exactly as they were before
+/// this was configurable.
+fn extract_pod_placement(cm: &ConfigMap) -> PodPlacement {
+	let get = |key: &str| {
+		cm.data
+			.as_ref()
+			.and_then(|d| d.get(key))
+			.map_or("", String::as_str)
+	};
+	PodPlacement::parse(get("nodeSelector"), get("podAnnotations"))
+}
+
+/// The live-config slots on [`Context`] that the ConfigMap watcher writes.
+///
+/// Split out of the watcher body so the hot-reload path is testable without a
+/// cluster: `apply` and `reset_to_defaults` are the whole of what the watcher
+/// does with an event.
+struct ConfigTargets {
+	max_concurrent_restores: Arc<AtomicUsize>,
+	kopia_image: Arc<RwLock<String>>,
+	use_port_forward: Arc<AtomicBool>,
+	pod_placement: Arc<RwLock<PodPlacement>>,
+}
+
+impl ConfigTargets {
+	/// Adopt the values in `cm`, logging only what actually changed.
+	fn apply(&self, cm: &ConfigMap) {
+		let new_val = extract_max_concurrent_restores(cm);
+		let old_val = self
+			.max_concurrent_restores
+			.swap(new_val, Ordering::Relaxed);
+		if old_val != new_val {
+			info!(
+				old = old_val,
+				new = new_val,
+				"max_concurrent_restores updated from ConfigMap"
+			);
+		}
+
+		let new_image = extract_kopia_image(cm);
+		let mut image = self.kopia_image.write().unwrap();
+		if *image != new_image {
+			info!(old = %*image, new = new_image, "kopia_image updated from ConfigMap");
+			*image = new_image;
+		}
+
+		let new_pf = extract_use_port_forward(cm);
+		let old_pf = self.use_port_forward.swap(new_pf, Ordering::Relaxed);
+		if old_pf != new_pf {
+			info!(
+				old = old_pf,
+				new = new_pf,
+				"use_port_forward updated from ConfigMap"
+			);
+		}
+
+		let new_placement = extract_pod_placement(cm);
+		let mut placement = self.pod_placement.write().unwrap();
+		if *placement != new_placement {
+			info!(
+				node_selector = ?new_placement.node_selector,
+				pod_annotations = ?new_placement.annotations,
+				"pod_placement updated from ConfigMap"
+			);
+			*placement = new_placement;
+		}
+	}
+
+	/// The ConfigMap went away, so every value it fed reverts to its built-in
+	/// default. For placement that means pods stop carrying any scheduling
+	/// constraint, which is worth a warning rather than an info.
+	fn reset_to_defaults(&self) {
+		let old_val = self
+			.max_concurrent_restores
+			.swap(DEFAULT_MAX_CONCURRENT_RESTORES, Ordering::Relaxed);
+		if old_val != DEFAULT_MAX_CONCURRENT_RESTORES {
+			info!(
+				old = old_val,
+				new = DEFAULT_MAX_CONCURRENT_RESTORES,
+				"ConfigMap deleted, reverted max_concurrent_restores to default"
+			);
+		}
+
+		let mut image = self.kopia_image.write().unwrap();
+		if *image != DEFAULT_KOPIA_IMAGE {
+			info!(
+				old = %*image,
+				new = DEFAULT_KOPIA_IMAGE,
+				"ConfigMap deleted, reverted kopia_image to default"
+			);
+			*image = DEFAULT_KOPIA_IMAGE.to_string();
+		}
+
+		let old_pf = self.use_port_forward.swap(false, Ordering::Relaxed);
+		if old_pf {
+			info!(
+				old = old_pf,
+				new = false,
+				"ConfigMap deleted, reverted use_port_forward to default"
+			);
+		}
+
+		let mut placement = self.pod_placement.write().unwrap();
+		if !placement.is_empty() {
+			warn!(
+				"ConfigMap deleted, cleared pod placement: created pods will land \
+				 wherever the cluster's default lands them"
+			);
+			*placement = PodPlacement::default();
+		}
+	}
+}
+
+async fn read_config(client: &Client, namespace: &str) -> (usize, String, bool, PodPlacement) {
 	let api: Api<ConfigMap> = Api::namespaced(client.clone(), namespace);
 	match api.get(CONFIGMAP_NAME).await {
 		Ok(cm) => (
 			extract_max_concurrent_restores(&cm),
 			extract_kopia_image(&cm),
 			extract_use_port_forward(&cm),
+			extract_pod_placement(&cm),
 		),
 		Err(e) => {
 			warn!(error = %e, "failed to read ConfigMap {CONFIGMAP_NAME}, using defaults");
@@ -132,6 +248,7 @@ async fn read_config(client: &Client, namespace: &str) -> (usize, String, bool) 
 				DEFAULT_MAX_CONCURRENT_RESTORES,
 				DEFAULT_KOPIA_IMAGE.to_string(),
 				false,
+				PodPlacement::default(),
 			)
 		}
 	}
@@ -155,7 +272,7 @@ async fn main() -> anyhow::Result<()> {
 	postgres_restore_operator::crd_install::ensure_crds(&client).await?;
 
 	let namespace = operator_namespace();
-	let (max_concurrent_restores, kopia_image, use_port_forward) =
+	let (max_concurrent_restores, kopia_image, use_port_forward, pod_placement) =
 		read_config(&client, &namespace).await;
 
 	let callback_base_url = if let Ok(url) = std::env::var("CALLBACK_BASE_URL") {
@@ -209,6 +326,20 @@ async fn main() -> anyhow::Result<()> {
 		callback_base_url,
 		deployment_ready_timeout_secs,
 	);
+	if pod_placement.is_empty() {
+		warn!(
+			"no nodeSelector or podAnnotations in ConfigMap {CONFIGMAP_NAME}: created pods carry no \
+			 placement intent and land wherever the cluster's default lands them"
+		);
+	} else {
+		info!(
+			node_selector = ?pod_placement.node_selector,
+			pod_annotations = ?pod_placement.annotations,
+			"pod placement defaults configured"
+		);
+	}
+	*ctx.pod_placement.write().unwrap() = pod_placement;
+
 	ctx.canopy = load_canopy_client(&client, &namespace)
 		.await
 		.unwrap_or_else(|err| {
@@ -258,75 +389,22 @@ async fn main() -> anyhow::Result<()> {
 	let config_api: Api<ConfigMap> = Api::namespaced(client.clone(), &namespace);
 	let config_watcher_config =
 		Config::default().fields(&format!("metadata.name={CONFIGMAP_NAME}"));
-	let max_concurrent_ref = ctx.max_concurrent_restores.clone();
-	let kopia_image_ref = ctx.kopia_image.clone();
-	let use_port_forward_ref = ctx.use_port_forward.clone();
+	let config_targets = ConfigTargets {
+		max_concurrent_restores: ctx.max_concurrent_restores.clone(),
+		kopia_image: ctx.kopia_image.clone(),
+		use_port_forward: ctx.use_port_forward.clone(),
+		pod_placement: ctx.pod_placement.clone(),
+	};
 	tokio::spawn(async move {
 		let stream = watcher::watcher(config_api, config_watcher_config);
 		futures::pin_mut!(stream);
 		while let Some(event) = stream.next().await {
 			match event {
 				Ok(watcher::Event::Apply(cm) | watcher::Event::InitApply(cm)) => {
-					let new_val = extract_max_concurrent_restores(&cm);
-					let old_val = max_concurrent_ref.swap(new_val, Ordering::Relaxed);
-					if old_val != new_val {
-						info!(
-							old = old_val,
-							new = new_val,
-							"max_concurrent_restores updated from ConfigMap"
-						);
-					}
-
-					let new_image = extract_kopia_image(&cm);
-					let mut image = kopia_image_ref.write().unwrap();
-					if *image != new_image {
-						info!(
-							old = %*image,
-							new = new_image,
-							"kopia_image updated from ConfigMap"
-						);
-						*image = new_image;
-					}
-
-					let new_pf = extract_use_port_forward(&cm);
-					let old_pf = use_port_forward_ref.swap(new_pf, Ordering::Relaxed);
-					if old_pf != new_pf {
-						info!(
-							old = old_pf,
-							new = new_pf,
-							"use_port_forward updated from ConfigMap"
-						);
-					}
+					config_targets.apply(&cm);
 				}
 				Ok(watcher::Event::Delete(_)) => {
-					let old_val =
-						max_concurrent_ref.swap(DEFAULT_MAX_CONCURRENT_RESTORES, Ordering::Relaxed);
-					if old_val != DEFAULT_MAX_CONCURRENT_RESTORES {
-						info!(
-							old = old_val,
-							new = DEFAULT_MAX_CONCURRENT_RESTORES,
-							"ConfigMap deleted, reverted max_concurrent_restores to default"
-						);
-					}
-
-					let mut image = kopia_image_ref.write().unwrap();
-					if *image != DEFAULT_KOPIA_IMAGE {
-						info!(
-							old = %*image,
-							new = DEFAULT_KOPIA_IMAGE,
-							"ConfigMap deleted, reverted kopia_image to default"
-						);
-						*image = DEFAULT_KOPIA_IMAGE.to_string();
-					}
-
-					let old_pf = use_port_forward_ref.swap(false, Ordering::Relaxed);
-					if old_pf {
-						info!(
-							old = old_pf,
-							new = false,
-							"ConfigMap deleted, reverted use_port_forward to default"
-						);
-					}
+					config_targets.reset_to_defaults();
 				}
 				Ok(watcher::Event::Init | watcher::Event::InitDone) => {}
 				Err(e) => {
@@ -954,6 +1032,139 @@ mod tests {
 			>::new()))
 		});
 		kube::Client::new(svc, "default")
+	}
+
+	fn configmap(data: Option<&[(&str, &str)]>) -> ConfigMap {
+		ConfigMap {
+			data: data.map(|pairs| {
+				pairs
+					.iter()
+					.map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+					.collect()
+			}),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn pod_placement_from_configmap_keys() {
+		let cm = configmap(Some(&[
+			("nodeSelector", "bes.node.purpose=workload"),
+			("podAnnotations", "karpenter.sh/do-not-disrupt=true"),
+			("kopiaImage", "kopia/kopia:1.2.3"),
+		]));
+		let placement = extract_pod_placement(&cm);
+		assert_eq!(
+			placement.node_selector.get("bes.node.purpose").unwrap(),
+			"workload"
+		);
+		assert_eq!(
+			placement
+				.annotations
+				.get("karpenter.sh/do-not-disrupt")
+				.unwrap(),
+			"true"
+		);
+	}
+
+	/// A ConfigMap that sets other keys but neither placement key, and one with
+	/// no `data` at all, must both leave pods exactly as they were before
+	/// placement was configurable.
+	#[test]
+	fn absent_placement_keys_give_the_empty_placement() {
+		assert!(
+			extract_pod_placement(&configmap(Some(&[("maxConcurrentRestores", "2")]))).is_empty()
+		);
+		assert!(extract_pod_placement(&configmap(None)).is_empty());
+		assert!(extract_pod_placement(&configmap(Some(&[]))).is_empty());
+	}
+
+	/// Only one placement key set is a normal configuration, not a broken one.
+	#[test]
+	fn placement_keys_are_independent() {
+		let selector_only = extract_pod_placement(&configmap(Some(&[("nodeSelector", "a=b")])));
+		assert_eq!(selector_only.node_selector.len(), 1);
+		assert!(selector_only.annotations.is_empty());
+
+		let annotations_only =
+			extract_pod_placement(&configmap(Some(&[("podAnnotations", "a=b")])));
+		assert!(annotations_only.node_selector.is_empty());
+		assert_eq!(annotations_only.annotations.len(), 1);
+	}
+
+	/// An unreadable ConfigMap must not leave the operator guessing: the
+	/// fallback is the empty placement, same as no keys.
+	#[tokio::test]
+	async fn read_config_falls_back_to_the_empty_placement() {
+		let (_, _, _, placement) = read_config(&dummy_client(), "default").await;
+		assert!(placement.is_empty());
+	}
+
+	fn targets() -> ConfigTargets {
+		ConfigTargets {
+			max_concurrent_restores: Arc::new(AtomicUsize::new(DEFAULT_MAX_CONCURRENT_RESTORES)),
+			kopia_image: Arc::new(RwLock::new(DEFAULT_KOPIA_IMAGE.to_string())),
+			use_port_forward: Arc::new(AtomicBool::new(false)),
+			pod_placement: Arc::new(RwLock::new(PodPlacement::default())),
+		}
+	}
+
+	/// Editing the ConfigMap has to take effect without an operator restart —
+	/// that is the whole reason placement lives here rather than in env vars.
+	#[test]
+	fn applying_a_configmap_updates_placement_in_place() {
+		let targets = targets();
+		targets.apply(&configmap(Some(&[
+			("nodeSelector", "bes.node.purpose=workload"),
+			("podAnnotations", "karpenter.sh/do-not-disrupt=true"),
+		])));
+
+		let placement = targets.pod_placement.read().unwrap();
+		assert_eq!(
+			placement.node_selector.get("bes.node.purpose").unwrap(),
+			"workload"
+		);
+		assert_eq!(
+			placement
+				.annotations
+				.get("karpenter.sh/do-not-disrupt")
+				.unwrap(),
+			"true"
+		);
+	}
+
+	/// Removing the key from a still-present ConfigMap has to clear the
+	/// placement, not leave the last-known value latched.
+	#[test]
+	fn removing_the_key_clears_placement() {
+		let targets = targets();
+		targets.apply(&configmap(Some(&[("nodeSelector", "a=b")])));
+		assert!(!targets.pod_placement.read().unwrap().is_empty());
+
+		targets.apply(&configmap(Some(&[("kopiaImage", "kopia/kopia:1.2.3")])));
+		assert!(targets.pod_placement.read().unwrap().is_empty());
+	}
+
+	/// Deleting the ConfigMap reverts every value it fed, placement included.
+	#[test]
+	fn deleting_the_configmap_reverts_every_value() {
+		let targets = targets();
+		targets.apply(&configmap(Some(&[
+			("nodeSelector", "a=b"),
+			("maxConcurrentRestores", "7"),
+			("kopiaImage", "kopia/kopia:1.2.3"),
+			("usePortForward", "true"),
+		])));
+
+		targets.reset_to_defaults();
+
+		assert!(targets.pod_placement.read().unwrap().is_empty());
+		assert_eq!(
+			targets.max_concurrent_restores.load(Ordering::Relaxed),
+			DEFAULT_MAX_CONCURRENT_RESTORES
+		);
+		assert_eq!(*targets.kopia_image.read().unwrap(), DEFAULT_KOPIA_IMAGE);
+		assert!(!targets.use_port_forward.load(Ordering::Relaxed));
 	}
 
 	#[tokio::test]

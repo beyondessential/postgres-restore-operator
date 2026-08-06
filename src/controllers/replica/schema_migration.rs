@@ -9,6 +9,7 @@ use tracing::info;
 
 use crate::{
 	controllers::jobs::{env_from_secret_name, env_literal},
+	placement::PodPlacement,
 	types::PostgresPhysicalReplica,
 };
 
@@ -139,6 +140,7 @@ pub fn build_schema_migration_job(
 	target_superuser_secret_name: &str,
 	callback_url: &str,
 	pg_version: i32,
+	placement: &PodPlacement,
 ) -> Job {
 	let replica_name = replica.name_any();
 	let job_name = migration_job_name(&replica_name);
@@ -156,7 +158,7 @@ pub fn build_schema_migration_job(
 		"building schema migration Job"
 	);
 
-	Job {
+	let mut job = Job {
 		metadata: ObjectMeta {
 			name: Some(job_name),
 			namespace: Some(namespace.to_string()),
@@ -268,7 +270,9 @@ pub fn build_schema_migration_job(
 			..Default::default()
 		}),
 		..Default::default()
-	}
+	};
+	placement.apply_to_job(&mut job);
+	job
 }
 
 #[cfg(test)]
@@ -393,6 +397,7 @@ mod tests {
 			"super",
 			"http://op",
 			18,
+			&PodPlacement::default(),
 		);
 		let resources = job.spec.unwrap().template.spec.unwrap().containers[0]
 			.resources
@@ -414,6 +419,50 @@ mod tests {
 		assert!(
 			mem_ok,
 			"migration memory limit must be at least 2Gi (got {mem_limit})"
+		);
+	}
+
+	/// The migration job is a pod like any other and must land on the
+	/// configured tier rather than wherever the cluster's default node pool is.
+	#[test]
+	fn migration_job_carries_the_placement_defaults() {
+		let replica = make_replica(vec!["dbt"]);
+		let placement = PodPlacement::parse("bes.node.purpose=workload", "a=b");
+		let job = build_schema_migration_job(
+			&replica,
+			"test-ns",
+			"old",
+			"new",
+			"db",
+			"db",
+			&["dbt".to_string()],
+			"reader",
+			"super",
+			"http://op",
+			18,
+			&placement,
+		);
+
+		let template = job.spec.unwrap().template;
+		assert_eq!(
+			template
+				.spec
+				.unwrap()
+				.node_selector
+				.unwrap()
+				.get("bes.node.purpose")
+				.unwrap(),
+			"workload"
+		);
+		assert_eq!(
+			template
+				.metadata
+				.unwrap()
+				.annotations
+				.unwrap()
+				.get("a")
+				.unwrap(),
+			"b"
 		);
 	}
 
@@ -441,6 +490,7 @@ mod tests {
 			"superuser-secret",
 			"http://operator.svc:8080/api/v1/schema-migration-results/test-ns/test-replica",
 			17,
+			&PodPlacement::default(),
 		);
 
 		let meta = &job.metadata;
@@ -516,6 +566,7 @@ mod tests {
 			"superuser-secret",
 			"http://operator.svc:8080/callback",
 			17,
+			&PodPlacement::default(),
 		);
 
 		let env = job
@@ -551,6 +602,7 @@ mod tests {
 			"superuser-secret",
 			"http://operator.svc:8080/callback",
 			17,
+			&PodPlacement::default(),
 		);
 
 		let env = job
@@ -590,6 +642,7 @@ mod tests {
 				"superuser-secret",
 				"http://operator.svc:8080/callback",
 				pg_version,
+				&PodPlacement::default(),
 			);
 
 			let container = &job

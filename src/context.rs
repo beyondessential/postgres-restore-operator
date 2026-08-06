@@ -10,7 +10,7 @@ use jiff::Timestamp;
 use kube::Client;
 use kube::runtime::events::{Recorder, Reporter};
 
-use crate::{controllers::jobs::CallbackStore, metrics::Metrics};
+use crate::{controllers::jobs::CallbackStore, metrics::Metrics, placement::PodPlacement};
 
 pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 pub const DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS: u64 = 30 * 60;
@@ -29,6 +29,10 @@ pub struct Context {
 	pub max_concurrent_restores: Arc<AtomicUsize>,
 	pub kopia_image: Arc<RwLock<String>>,
 	pub use_port_forward: Arc<AtomicBool>,
+	/// Scheduling defaults stamped onto every pod the operator creates, from
+	/// the operator ConfigMap. Empty by default, which reproduces the
+	/// pre-existing "no placement intent at all" behaviour.
+	pub pod_placement: Arc<RwLock<PodPlacement>>,
 	pub http_client: reqwest::Client,
 	/// Canopy integration client — `None` when the operator is running in
 	/// legacy-only mode (no canopy config provided). Populated at startup
@@ -91,6 +95,7 @@ impl Context {
 			max_concurrent_restores: Arc::new(AtomicUsize::new(max_concurrent_restores)),
 			kopia_image: Arc::new(RwLock::new(kopia_image)),
 			use_port_forward: Arc::new(AtomicBool::new(use_port_forward)),
+			pod_placement: Arc::new(RwLock::new(PodPlacement::default())),
 			http_client: reqwest::Client::new(),
 			canopy: None,
 			canopy_broker_base_url: String::new(),
@@ -129,6 +134,10 @@ impl Context {
 
 	pub fn use_port_forward(&self) -> bool {
 		self.use_port_forward.load(Ordering::Relaxed)
+	}
+
+	pub fn pod_placement(&self) -> PodPlacement {
+		self.pod_placement.read().unwrap().clone()
 	}
 
 	/// Build the full callback URL for a snapshot-list job to POST results to.

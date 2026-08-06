@@ -29,6 +29,7 @@ use crate::{
 	},
 	error::Result,
 	kopia::KopiaSource,
+	placement::PodPlacement,
 	types::*,
 };
 
@@ -121,6 +122,7 @@ pub fn build_snapshot_list_job(
 	kopia_image: &str,
 	callback_url: &str,
 	canopy_proxy: Option<&CanopyProxyArgs<'_>>,
+	placement: &PodPlacement,
 ) -> Result<Job> {
 	let source = replica.kopia_source();
 	let kopia_secret = SecretReference {
@@ -328,7 +330,7 @@ fi
 		);
 	}
 
-	Ok(Job {
+	let mut job = Job {
 		metadata: ObjectMeta {
 			name: Some(job_name.to_string()),
 			namespace: Some(namespace.to_string()),
@@ -365,7 +367,9 @@ fi
 			..Default::default()
 		}),
 		..Default::default()
-	})
+	};
+	placement.apply_to_job(&mut job);
+	Ok(job)
 }
 
 impl PostgresPhysicalReplica {

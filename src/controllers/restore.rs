@@ -26,6 +26,7 @@ use super::read_job_termination_message;
 use crate::{
 	context::{Context, ReplicaKey},
 	error::{Error, Result},
+	placement::PodPlacement,
 	types::*,
 };
 
@@ -54,9 +55,10 @@ async fn apply_restore_deployment(
 	replica: &PostgresPhysicalReplica,
 	name: &str,
 	namespace: &str,
+	placement: &PodPlacement,
 ) -> Result<Deployment> {
 	let deployments: Api<Deployment> = Api::namespaced(client.clone(), namespace);
-	let desired = build_deployment(restore, name, namespace, replica)?;
+	let desired = build_deployment(restore, name, namespace, replica, placement)?;
 	let mut patch_value = serde_json::to_value(&desired)?;
 	patch_value["apiVersion"] = serde_json::json!("apps/v1");
 	patch_value["kind"] = serde_json::json!("Deployment");
@@ -516,6 +518,7 @@ async fn reconcile_restoring(
 				&ctx.kopia_image(),
 				&cache_pressure_url,
 				canopy_proxy.as_ref(),
+				&ctx.pod_placement(),
 			)?;
 			jobs.create(&PostParams::default(), &job).await?
 		}
@@ -735,7 +738,15 @@ async fn reconcile_switching(
 		.and_then(|s| s.postgres_version.as_ref())
 		.is_some()
 	{
-		apply_restore_deployment(client, restore, &replica, name, namespace).await?;
+		apply_restore_deployment(
+			client,
+			restore,
+			&replica,
+			name,
+			namespace,
+			&ctx.pod_placement(),
+		)
+		.await?;
 	}
 
 	Ok(Action::requeue(Duration::from_secs(10)))
@@ -763,7 +774,15 @@ async fn reconcile_active(
 		.and_then(|s| s.postgres_version.as_ref())
 		.is_some()
 	{
-		apply_restore_deployment(client, restore, &replica, name, namespace).await?;
+		apply_restore_deployment(
+			client,
+			restore,
+			&replica,
+			name,
+			namespace,
+			&ctx.pod_placement(),
+		)
+		.await?;
 	}
 
 	// Defensively ensure the ready-for-traffic label is on the pod. If the
@@ -805,7 +824,13 @@ async fn reconcile_ready(
 					"postgresVersion missing from status, creating version detection job"
 				);
 				let pvc_name = format!("{name}-data");
-				let job = build_version_detect_job(restore, &detect_job_name, namespace, &pvc_name);
+				let job = build_version_detect_job(
+					restore,
+					&detect_job_name,
+					namespace,
+					&pvc_name,
+					&ctx.pod_placement(),
+				);
 				jobs.create(&PostParams::default(), &job).await?;
 				return Ok(Action::requeue(Duration::from_secs(5)));
 			}
@@ -892,7 +917,15 @@ async fn reconcile_ready(
 	ensure_restore_service(client, restore, name, namespace).await?;
 
 	// Apply desired deployment (creates or updates to converge on operator upgrades)
-	let deploy = apply_restore_deployment(client, restore, &replica, name, namespace).await?;
+	let deploy = apply_restore_deployment(
+		client,
+		restore,
+		&replica,
+		name,
+		namespace,
+		&ctx.pod_placement(),
+	)
+	.await?;
 
 	// Check if ready
 	let ready_replicas = deploy
