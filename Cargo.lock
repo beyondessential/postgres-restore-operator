@@ -983,12 +983,11 @@ checksum = "790eea4361631c5e7d22598ecd5723ff611904e3344ce8720784c93e3d83d40b"
 
 [[package]]
 name = "cronexpr"
-version = "1.5.0"
+version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a366517b317d398f448a2ba76c1b5000108db2ae393c865ec0ed6250dffdce32"
+checksum = "5eb9616333082debdf999b9247615938c2a5355409962ae691238c219fc3c343"
 dependencies = [
  "jiff",
- "winnow 1.0.2",
 ]
 
 [[package]]
@@ -5963,9 +5962,6 @@ name = "winnow"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ee1708bef14716a11bae175f579062d4554d95be2c6829f518df847b7b3fdd0"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "winreg"
