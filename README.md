@@ -141,6 +141,17 @@ If the budget is exceeded — most realistically because some external upstream 
 The intent is that **a usable replica beats carrying the schema through**.
 The next restore cycle will re-attempt the migration if the schemas have been regenerated on the source in the meantime; until then the replica is up and serving the snapshot contents.
 
+##### Checking that schemas actually carried across
+
+The same "a usable replica beats carrying the schema through" tolerance means a migration can lose a schema and still let the switchover proceed — a schema that wasn't on the previous restore when the migration ran has nothing to carry across, and a `pg_dump` that dies mid-stream hands `psql` a truncated dump that `psql` applies and exits cleanly on.
+So the operator does not take the Job's word for it: once the Job finishes it queries the new restore for each configured schema and settles the migration on what is actually there.
+
+- `status.schemaMigrationPhase` is `complete` only when every configured schema is present on the new restore, and `partial` otherwise.
+- `status.persistentSchemasMissing` names the ones that are not, and outlives the sweep that resets the phase.
+- A `PersistentSchemaMissingOnSource` Warning event fires when a configured schema isn't on the previous restore at migration time, and `SchemaMigrationPartial` when one doesn't reach the new one.
+
+A schema that is repeatedly reported missing is normally a cadence problem rather than an operator one: whatever generates it (e.g. a dbt build) has not run since the last switchover, so there was nothing to carry.
+
 #### RedactionSpec
 
 Configures applying a column-masking manifest to the restored data using the [postgresql_anonymizer](https://gitlab.com/dalibo/postgresql_anonymizer) extension.
@@ -222,7 +233,8 @@ Additional fields for `target: graphQL`:
 | `notifications` | `[]NotificationStatus` | Status of each configured notification target. |
 | `conditions` | `[]Condition` | Standard Kubernetes conditions. |
 | `schemaMigrationJob` | `string` | Name of the active schema migration Job (set while migration is in progress). |
-| `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, `partial`, `timeout-skipped`, or `failed: <reason>`). See [Persistent schemas](#persistent-schemas). |
+| `schemaMigrationPhase` | `string` | Phase of the schema migration (`active`, `complete`, `partial`, `timeout-skipped`, or `failed: <reason>`). `complete` means every configured schema is present on the new restore; `partial` means at least one is not, and `persistentSchemasMissing` names which. See [Persistent schemas](#persistent-schemas). |
+| `persistentSchemasMissing` | `[]string` | The configured `persistentSchemas` that were absent from the new restore once the last migration settled. Empty when everything carried across. Not cleared when the sweep resets `schemaMigrationPhase`, so it stays readable long after the switchover that dropped them. |
 | `persistentSchemaDataSize` | `Quantity` | Measured size of persistent schema data from the last successful migration. Used to size the next restore PVC. |
 | `redactionPhase` | `string` | Phase of the current restore's redaction (`active`, `complete`, `partial`, or `failed: <reason>`). `partial` means masking ran but some columns were skipped and tolerated as errors (e.g. a column the manifest names that this database doesn't have). `failed:` holds the switchover — the replica keeps serving its previous restore rather than an unredacted one — and the next reconcile retries. |
 | `redactionVersion` | `string` | The manifest version resolved during the last redaction run (when `manifestUrl` is version-templated). |

@@ -25,7 +25,8 @@ pub fn migration_job_name(replica_name: &str) -> String {
 /// - Iterates through comma-separated schema names in $SCHEMAS
 /// - Uses pg_dump with --schema flags to dump each schema from source
 /// - Pipes to psql to load into target
-/// - Reports success/failure via callback URL
+/// - Reports success/failure via callback URL, including pg_dump's own exit
+///   status (see the `PIPESTATUS` note in the script)
 ///
 /// Environment variables:
 ///   SOURCE_HOST, SOURCE_USER, SOURCE_PASSWORD, SOURCE_DB
@@ -63,7 +64,8 @@ for schema in "${SCHEMA_ARRAY[@]}"; do
   echo "Migrating schema: $schema"
 done
 
-# Capture psql's stderr for visibility on partial failures.
+# Capture each side's stderr for visibility on partial failures.
+DUMP_STDERR=$(mktemp)
 PSQL_STDERR=$(mktemp)
 
 # TCP keepalive options on the connection URI. Without keepalives a
@@ -91,24 +93,63 @@ PGPASSWORD="$SOURCE_PASSWORD" pg_dump \
   "${SCHEMA_ARGS[@]}" \
   --no-owner --no-privileges \
   --no-publications --no-subscriptions \
-  --verbose \
+  --verbose 2> >(tee "$DUMP_STDERR" >&2) \
 | PGPASSWORD="$TARGET_PASSWORD" psql \
   -d "$TARGET_URI" \
   --quiet 2> >(tee "$PSQL_STDERR" >&2)
 
-PSQL_EXIT=$?
+# $? is psql's status alone, and psql exits 0 whenever it applied the bytes
+# it was given — including when pg_dump died partway and gave it a
+# truncated dump. PIPESTATUS is the only way to see the producer's fate.
+PIPE_STATUS=("${PIPESTATUS[@]}")
+DUMP_EXIT=${PIPE_STATUS[0]:-0}
+PSQL_EXIT=${PIPE_STATUS[1]:-0}
+
 PSQL_ERROR_COUNT=$(grep -c '^ERROR:' "$PSQL_STDERR" 2>/dev/null || echo 0)
 PSQL_ERROR_COUNT=${PSQL_ERROR_COUNT:-0}
-rm -f "$PSQL_STDERR"
+DUMP_ERROR=$(grep -m1 'pg_dump: error:' "$DUMP_STDERR" 2>/dev/null || true)
+rm -f "$PSQL_STDERR" "$DUMP_STDERR"
 
 echo ""
+
+# Collected into one body so the callback names every reason at once
+# rather than only whichever the first branch happened to catch.
+REASONS=()
+
+if [ "$DUMP_EXIT" -ne 0 ]; then
+  # pg_dump emits its objects grouped and ordered by schema, so a dump
+  # that dies mid-stream hands psql a truncated prefix: the schemas it
+  # had already reached arrive intact and every later one is missing or
+  # half-written. psql applies that prefix and exits 0, which is why this
+  # has to be reported from pg_dump's own status.
+  echo "=== pg_dump exited $DUMP_EXIT; the dump is truncated, so schemas after the cut-off are incomplete ===" >&2
+  if [ -n "$DUMP_ERROR" ]; then
+    REASONS+=("pg_dump exited $DUMP_EXIT ($DUMP_ERROR)")
+  else
+    REASONS+=("pg_dump exited $DUMP_EXIT")
+  fi
+fi
+
 if [ "$PSQL_EXIT" -ne 0 ]; then
   echo "=== psql exited non-zero ($PSQL_EXIT); proceeding so the replica can come up ===" >&2
+  REASONS+=("psql exited $PSQL_EXIT")
 fi
 
 if [ "$PSQL_ERROR_COUNT" -gt 0 ]; then
   echo "=== Schema migration tolerated $PSQL_ERROR_COUNT statement error(s); some objects may need regenerating ===" >&2
-  report_result "partial: $PSQL_ERROR_COUNT statement error(s)"
+  REASONS+=("$PSQL_ERROR_COUNT statement error(s)")
+fi
+
+if [ "${#REASONS[@]}" -gt 0 ]; then
+  SUMMARY=""
+  for reason in "${REASONS[@]}"; do
+    if [ -n "$SUMMARY" ]; then
+      SUMMARY="$SUMMARY; $reason"
+    else
+      SUMMARY="$reason"
+    fi
+  done
+  report_result "partial: $SUMMARY"
 else
   echo "=== Schema migration completed successfully ==="
   report_result 'success'
@@ -344,6 +385,55 @@ mod tests {
 		assert!(
 			MIGRATION_SCRIPT.contains("partial"),
 			"migration script must report partial migrations via the callback so the operator can surface them"
+		);
+	}
+
+	/// pg_dump writes its objects grouped in schema order, so a dump that
+	/// dies mid-stream hands psql a truncated prefix: alphabetically earlier
+	/// schemas arrive intact and later ones are missing. psql applies that
+	/// prefix and exits 0, so reading `$?` — which in a pipeline is the last
+	/// command's status — makes an OOM-killed or disconnected pg_dump
+	/// indistinguishable from a clean run. `[analytics, public_tupaia]`
+	/// losing only `public_tupaia`, silently and every cycle, is what that
+	/// looks like in production.
+	#[test]
+	fn migration_script_checks_pg_dump_exit_status() {
+		assert!(
+			MIGRATION_SCRIPT.contains("PIPESTATUS"),
+			"migration script must read PIPESTATUS; $? alone reports only psql, which exits 0 on a truncated dump"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains("DUMP_EXIT"),
+			"migration script must capture pg_dump's own exit status"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains(r#"[ "$DUMP_EXIT" -ne 0 ]"#),
+			"migration script must branch on pg_dump's exit status"
+		);
+		// A truncated dump must reach the operator as a partial, not as a
+		// success — the whole point is that it stops being silent.
+		let dump_branch = MIGRATION_SCRIPT
+			.split(r#"[ "$DUMP_EXIT" -ne 0 ]"#)
+			.nth(1)
+			.expect("DUMP_EXIT branch present");
+		assert!(
+			dump_branch.contains("REASONS+="),
+			"a non-zero pg_dump status must be recorded as a partial-migration reason"
+		);
+	}
+
+	/// pg_dump's diagnostics go to its own stderr, not psql's, so the
+	/// existing `^ERROR:` grep never sees them. Without capturing them the
+	/// callback can say a dump failed but never why.
+	#[test]
+	fn migration_script_captures_pg_dump_stderr() {
+		assert!(
+			MIGRATION_SCRIPT.contains("DUMP_STDERR"),
+			"migration script must capture pg_dump's stderr separately from psql's"
+		);
+		assert!(
+			MIGRATION_SCRIPT.contains("pg_dump: error:"),
+			"migration script must surface pg_dump's own error text in the callback"
 		);
 	}
 

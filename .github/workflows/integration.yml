@@ -54,6 +54,7 @@ jobs:
               test-ps-conflict
               test-ps-skip-missing
               test-ps-all-missing
+              test-ps-ordering
             needs_non_pg_snapshot: false
 
           - name: redaction

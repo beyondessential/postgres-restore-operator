@@ -1441,22 +1441,34 @@ async fn ensure_credential_reset(
 	Ok(false)
 }
 
-/// Mark schema migration as complete in the replica status without running a
-/// Job. Used by the early-return branches of `reconcile_schema_migration`
-/// (first restore, empty config, all schemas missing on source) so that the
-/// cleanup gate in `reconcile_replica` can fire — it requires
-/// `schemaMigrationPhase == "complete"` whenever `persistent_schemas` is set
-/// in spec.
-async fn mark_schema_migration_complete(
+/// Settle the schema migration in the replica status without running a Job.
+/// Used by the early-return branches of `reconcile_schema_migration` (empty
+/// config, all schemas missing on source) so that the cleanup gate in
+/// `reconcile_replica` can fire — it needs a settled `schemaMigrationPhase`
+/// whenever `persistent_schemas` is set in spec.
+///
+/// `missing` names the configured schemas that did not make it onto the new
+/// restore. A non-empty list settles as `partial` rather than `complete`:
+/// the switchover still proceeds (an unfinished migration must never wedge a
+/// replica), but "some of your persistent schemas are gone" must not read
+/// the same as "all of them carried across".
+async fn mark_schema_migration_settled(
 	client: &Client,
 	replica_name: &str,
 	namespace: &str,
+	missing: &[String],
 ) -> Result<()> {
+	let phase = if missing.is_empty() {
+		SchemaMigrationPhase::Complete
+	} else {
+		SchemaMigrationPhase::Partial
+	};
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
 	let patch = serde_json::json!({
 		"status": {
 			"schemaMigrationJob": null,
-			"schemaMigrationPhase": SchemaMigrationPhase::Complete,
+			"schemaMigrationPhase": phase,
+			"persistentSchemasMissing": missing,
 		}
 	});
 	replicas
@@ -1527,6 +1539,55 @@ async fn drop_persistent_schemas_on_target(
 	)
 	.await?;
 	postgres::drop_schemas_on(&conn.client, schemas).await
+}
+
+/// Which of `expected` are absent from the new restore's database.
+///
+/// The migration Job cannot answer this itself. `pg_dump | psql` reports
+/// success whenever psql applied the bytes it was handed, and pg_dump emits
+/// its objects grouped in schema order, so a dump that dies mid-stream
+/// yields a truncated prefix — earlier schemas intact, later ones missing —
+/// that still looks clean from psql's side. Asking the target directly is
+/// the only check that catches every way a schema can fail to arrive:
+/// a truncated dump, a schema that was never on the source to begin with,
+/// or statement errors that took the whole schema down with them.
+async fn schemas_missing_on_target(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	new_restore_name: &str,
+	expected: &[String],
+) -> Result<Vec<String>> {
+	if expected.is_empty() {
+		return Ok(Vec::new());
+	}
+	let reader_secret_name = replica.creds_secret_name();
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let reader_secret = secrets.get(&reader_secret_name).await?;
+	let reader_user = postgres::read_secret_field(&reader_secret, "username")?;
+	let reader_password = postgres::read_secret_field(&reader_secret, "password")?;
+	let target_dbname = postgres::discover_restore_database(
+		client,
+		namespace,
+		new_restore_name,
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+	let conn = postgres::connect_to_restore(
+		client,
+		namespace,
+		new_restore_name,
+		&target_dbname,
+		&reader_user,
+		&reader_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+	let present = postgres::existing_schemas_on(&conn.client, expected).await?;
+	Ok(postgres::missing_from(expected, &present))
 }
 
 async fn timeout_schema_migration(
@@ -1672,7 +1733,7 @@ async fn reconcile_schema_migration(
 	// Edge case: No persistent schemas configured
 	if schemas.is_empty() {
 		info!(replica = %replica_name, "no persistent schemas configured, skipping migration");
-		mark_schema_migration_complete(client, &replica_name, namespace).await?;
+		mark_schema_migration_settled(client, &replica_name, namespace, &[]).await?;
 		return Ok(true);
 	}
 
@@ -1713,27 +1774,73 @@ async fn reconcile_schema_migration(
 				// The migration script reports a partial-success callback body
 				// when psql exited cleanly but some individual statements
 				// failed (typical when dbt views reference renamed/dropped
-				// upstream columns). We treat it as completion either way —
-				// the replica must come up — but surface partials as a
-				// Warning event so operators can find them.
+				// upstream columns), or when pg_dump itself died mid-stream.
+				// We treat it as completion either way — the replica must
+				// come up — but surface partials as a Warning event so
+				// operators can find them.
 				let callback = ctx.schema_migration_results.take(namespace, &replica_name);
-				let is_partial = callback
+				let callback_partial = callback
 					.as_deref()
 					.is_some_and(|b| b.starts_with("partial"));
+
+				// A clean callback is not proof the schemas arrived, so ask
+				// the target what it actually has. Failing to check must not
+				// hold back a replica that is otherwise ready: treat an
+				// unreachable target as "unverified" and fall back to the
+				// Job's own verdict.
+				let missing = match schemas_missing_on_target(
+					client,
+					ctx,
+					replica,
+					namespace,
+					&new_restore_name,
+					schemas,
+				)
+				.await
+				{
+					Ok(missing) => missing,
+					Err(e) => {
+						warn!(
+							replica = %replica_name,
+							restore = %new_restore_name,
+							error = %e,
+							"could not verify persistent schemas on the new restore; falling back to the Job's own result"
+						);
+						Vec::new()
+					}
+				};
+
+				let is_partial = callback_partial || !missing.is_empty();
 
 				if is_partial {
 					warn!(
 						replica = %replica_name,
 						result = ?callback,
-						"migration Job succeeded with statement errors; some persistent_schemas objects may need regenerating"
+						missing = ?missing,
+						"migration Job succeeded but not every persistent schema carried across"
 					);
+					let note = if missing.is_empty() {
+						callback.clone()
+					} else {
+						Some(format!(
+							"Persistent schemas [{}] are not present on restore {} after migration. \
+							 Either they were absent from the previous restore when the migration ran \
+							 (nothing to carry across), or the dump did not reach them.{}",
+							missing.join(", "),
+							new_restore_name,
+							callback
+								.as_deref()
+								.map(|c| format!(" Migration Job reported: {c}."))
+								.unwrap_or_default(),
+						))
+					};
 					if let Err(e) = ctx
 						.recorder
 						.publish(
 							&Event {
 								type_: EventType::Warning,
 								reason: "SchemaMigrationPartial".into(),
-								note: callback.clone(),
+								note,
 								action: "Restore".into(),
 								secondary: Some(new_restore.object_ref(&())),
 							},
@@ -1758,6 +1865,7 @@ async fn reconcile_schema_migration(
 					"status": {
 						"schemaMigrationJob": null,
 						"schemaMigrationPhase": phase,
+						"persistentSchemasMissing": missing,
 					}
 				});
 				replicas
@@ -1894,17 +2002,41 @@ async fn reconcile_schema_migration(
 		let size = postgres::database_size_on(&conn.client).await?;
 		(existing, size)
 	};
-	let existing_set: HashSet<&str> = schemas.iter().map(String::as_str).collect();
-	let skipped: Vec<&String> = all_schemas
-		.iter()
-		.filter(|s| !existing_set.contains(s.as_str()))
-		.collect();
+	let skipped = postgres::missing_from(all_schemas, &schemas);
 	if !skipped.is_empty() {
 		warn!(
 			restore = %old_restore_name,
 			skipped = ?skipped,
 			"persistent schemas not found on source, skipping"
 		);
+		// A configured schema that isn't on the source is the one failure
+		// mode with nothing to observe downstream — no Job error, no psql
+		// output, just an absence. Without an event it reads as a clean
+		// migration, which is how a schema can quietly stop persisting for
+		// cycles before anyone notices.
+		let note = format!(
+			"Persistent schemas [{}] were not found on restore {} and will not be carried across. \
+			 This is expected if they have not been generated yet; if they should exist, \
+			 whatever writes them has not run since the last switchover.",
+			skipped.join(", "),
+			old_restore_name,
+		);
+		if let Err(e) = ctx
+			.recorder
+			.publish(
+				&Event {
+					type_: EventType::Warning,
+					reason: "PersistentSchemaMissingOnSource".into(),
+					note: Some(note),
+					action: "Restore".into(),
+					secondary: Some(old_restore.object_ref(&())),
+				},
+				&replica.object_ref(&()),
+			)
+			.await
+		{
+			warn!(replica = %replica_name, error = %e, "failed to publish PersistentSchemaMissingOnSource event");
+		}
 	}
 
 	if schemas.is_empty() {
@@ -1912,7 +2044,7 @@ async fn reconcile_schema_migration(
 			replica = %replica_name,
 			"no persistent schemas exist on source, skipping migration"
 		);
-		mark_schema_migration_complete(client, &replica_name, namespace).await?;
+		mark_schema_migration_settled(client, &replica_name, namespace, all_schemas).await?;
 		return Ok(true);
 	}
 

@@ -1,5 +1,5 @@
 use k8s_openapi::api::core::v1::{LocalObjectReference, Secret};
-use kube::{Api, ResourceExt as _, api::PostParams};
+use kube::{Api, Client, ResourceExt as _, api::PostParams};
 use postgres_restore_operator::types::{
 	PostgresPhysicalReplica, PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, ReplicaPhase,
 	RestorePhase, SchemaMigrationPhase,
@@ -570,7 +570,10 @@ async fn persistent_schemas_skip_missing_on_source() {
 		.await
 		.expect("failed to create second restore");
 
-	println!("--- waiting for schema migration to complete");
+	// `partial`, not `complete`: one of the two configured schemas did not
+	// carry across. A migration that silently drops a configured schema must
+	// not settle as if everything arrived.
+	println!("--- waiting for schema migration to settle as partial");
 	timeout(LONG_PHASE_TIMEOUT, async {
 		loop {
 			if let Ok(replica) = replicas.get(replica_name).await {
@@ -579,15 +582,20 @@ async fn persistent_schemas_skip_missing_on_source() {
 					.as_ref()
 					.and_then(|s| s.schema_migration_phase.as_ref());
 				println!("[{replica_name}] schemaMigrationPhase: {phase:?}");
-				if matches!(phase, Some(SchemaMigrationPhase::Complete)) {
+				if matches!(phase, Some(SchemaMigrationPhase::Partial)) {
 					return;
 				}
+				assert_ne!(
+					phase,
+					Some(&SchemaMigrationPhase::Complete),
+					"nonexistent_schema did not carry across, so the migration must not settle as complete"
+				);
 			}
 			sleep(POLL_INTERVAL).await;
 		}
 	})
 	.await
-	.expect("timed out waiting for schema migration to complete");
+	.expect("timed out waiting for schema migration to settle as partial");
 
 	println!("--- waiting for second restore to become Active");
 	timeout(LONG_PHASE_TIMEOUT, async {
@@ -665,6 +673,16 @@ async fn persistent_schemas_skip_missing_on_source() {
 	assert_eq!(
 		status.current_restore.as_deref(),
 		Some(second_restore_name.as_str()),
+	);
+
+	// The status must name which schema went missing, not merely that one
+	// did: with several configured schemas, "partial" alone doesn't say
+	// which of them stopped persisting.
+	println!("--- verifying persistentSchemasMissing names nonexistent_schema");
+	assert_eq!(
+		status.persistent_schemas_missing,
+		vec!["nonexistent_schema".to_string()],
+		"the schema that failed to carry across must be named in status"
 	);
 
 	println!("--- skip-missing-schema assertions passed, cleaning up");
@@ -764,18 +782,26 @@ async fn persistent_schemas_all_missing_prunes_previous_restore() {
 	.await
 	.expect("timed out waiting for switchover to second restore");
 
-	println!("--- asserting schemaMigrationPhase == complete");
+	println!("--- asserting schemaMigrationPhase == partial");
 	let post_switchover = replicas
 		.get(replica_name)
 		.await
 		.expect("failed to get replica after switchover");
+	let post_status = post_switchover
+		.status
+		.as_ref()
+		.expect("replica has no status");
+	// Settled (so the sweep below can fire) but not `complete`: nothing
+	// carried across, and that has to stay visible on the replica.
 	assert_eq!(
-		post_switchover
-			.status
-			.as_ref()
-			.and_then(|s| s.schema_migration_phase.as_ref()),
-		Some(&SchemaMigrationPhase::Complete),
-		"schemaMigrationPhase must be set to complete even when all schemas are skipped"
+		post_status.schema_migration_phase.as_ref(),
+		Some(&SchemaMigrationPhase::Partial),
+		"schemaMigrationPhase must settle as partial when every configured schema is skipped"
+	);
+	assert_eq!(
+		post_status.persistent_schemas_missing,
+		vec!["never_created".to_string()],
+		"the skipped schema must be named in status"
 	);
 
 	println!("--- waiting for first restore to be swept after grace period");
@@ -799,4 +825,300 @@ async fn persistent_schemas_all_missing_prunes_previous_restore() {
 
 	println!("--- all-missing-schema sweep assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &[replica_name]).await;
+}
+
+/// Regression for the reported bug: with `persistentSchemas:
+/// [analytics, public_tupaia]`, only `analytics` survived a new restore and
+/// `public_tupaia` did not, every cycle.
+///
+/// The names are not incidental, so this test uses the reported ones
+/// verbatim. Two independent mechanisms would single out `public_tupaia`:
+///
+///   * **Position.** It is the second entry, so anything that handled only
+///     `persistentSchemas[0]` would carry `analytics` and drop it.
+///   * **Sort order.** pg_dump emits objects grouped in schema order, and
+///     `analytics` sorts before `public_tupaia`. A dump truncated mid-stream
+///     (OOM-kill, dropped connection) leaves psql a prefix that is exactly
+///     "the earlier schema, intact" — and psql exits 0 on it.
+///
+/// A third, `public_tupaia` sharing a prefix with the `public` schema every
+/// database has, would single it out by name alone.
+///
+/// So the test switches over twice with the order reversed the second time.
+/// If either round loses a schema, the two rounds together say which
+/// mechanism did it: a loss that follows the *position* is a loop or
+/// truncation bug, one that follows the *name* is schema-specific.
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn persistent_schemas_carry_every_entry_regardless_of_order() {
+	let client = make_client().await;
+	let ns = "test-ps-ordering";
+	let replica_name = "ps-order-replica";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	println!("--- creating kopia secret");
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "ps-order-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating replica with persistent_schemas: [\"analytics\", \"public_tupaia\"]");
+	let mut replica = build_replica(
+		replica_name,
+		"ps-order-kopia-creds",
+		ReplicaOpts {
+			read_only: false,
+			..Default::default()
+		},
+	);
+	replica.spec.persistent_schemas =
+		Some(vec!["analytics".to_string(), "public_tupaia".to_string()]);
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for first restore to become Active");
+	let first_restore_name =
+		wait_for_restore_phase(&restores, replica_name, RestorePhase::Active, PHASE_TIMEOUT).await;
+	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
+	println!("--- first restore active: {first_restore_name}");
+
+	// Distinct row counts per schema so a mixed-up migration can't pass by
+	// accident: each schema has to arrive with its *own* contents.
+	seed_ordering_schemas(ns, &first_restore_name, 7, 13).await;
+	assert_ordering_schemas(ns, &first_restore_name, 7, 13, "first restore").await;
+
+	// Round 1: [analytics, public_tupaia] — the reported configuration.
+	let second_restore_name = format!("{replica_name}-second");
+	switch_over_once(
+		&client,
+		ns,
+		replica_name,
+		&first_restore_name,
+		&second_restore_name,
+	)
+	.await;
+	assert_ordering_schemas(ns, &second_restore_name, 7, 13, "second restore").await;
+
+	// Round 2: the same two schemas, listed the other way round. The
+	// suggested repro for a position bug — if the loss follows the slot
+	// rather than the name, this round drops `analytics` instead.
+	println!("--- reversing persistent_schemas to [\"public_tupaia\", \"analytics\"]");
+	let patch = serde_json::json!({
+		"spec": { "persistentSchemas": ["public_tupaia", "analytics"] }
+	});
+	replicas
+		.patch(
+			replica_name,
+			&kube::api::PatchParams::default(),
+			&kube::api::Patch::Merge(&patch),
+		)
+		.await
+		.expect("failed to reverse persistentSchemas");
+
+	// Re-seed with different counts so round 2 asserts against fresh data
+	// rather than passing on whatever round 1 happened to leave behind.
+	seed_ordering_schemas(ns, &second_restore_name, 21, 34).await;
+
+	let third_restore_name = format!("{replica_name}-third");
+	switch_over_once(
+		&client,
+		ns,
+		replica_name,
+		&second_restore_name,
+		&third_restore_name,
+	)
+	.await;
+	assert_ordering_schemas(ns, &third_restore_name, 21, 34, "third restore").await;
+
+	println!("--- schema-ordering assertions passed, cleaning up");
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+}
+
+/// Create `analytics` and `public_tupaia` on `restore_name` with the given
+/// row counts.
+async fn seed_ordering_schemas(
+	ns: &str,
+	restore_name: &str,
+	analytics_rows: u32,
+	tupaia_rows: u32,
+) {
+	println!(
+		"--- seeding analytics ({analytics_rows} rows) and public_tupaia ({tupaia_rows} rows) on {restore_name}"
+	);
+	let sql = format!(
+		"DROP SCHEMA IF EXISTS analytics CASCADE; \
+		 DROP SCHEMA IF EXISTS public_tupaia CASCADE; \
+		 CREATE SCHEMA analytics; \
+		 CREATE TABLE analytics.models (id serial PRIMARY KEY, value text NOT NULL); \
+		 INSERT INTO analytics.models (value) \
+		   SELECT 'analytics-' || i FROM generate_series(1, {analytics_rows}) AS i; \
+		 CREATE SCHEMA public_tupaia; \
+		 CREATE TABLE public_tupaia.models (id serial PRIMARY KEY, value text NOT NULL); \
+		 INSERT INTO public_tupaia.models (value) \
+		   SELECT 'tupaia-' || i FROM generate_series(1, {tupaia_rows}) AS i"
+	);
+	kubectl_exec(
+		ns,
+		&format!("deployment/{restore_name}"),
+		&["psql", "-U", "analytics", "-d", "myapp", "-c", &sql],
+	)
+	.await;
+}
+
+/// Assert both schemas are present on `restore_name` with their own row
+/// counts. Checks each schema by exact name so a `public` / `public_tupaia`
+/// mix-up cannot pass.
+async fn assert_ordering_schemas(
+	ns: &str,
+	restore_name: &str,
+	analytics_rows: u32,
+	tupaia_rows: u32,
+	label: &str,
+) {
+	let deploy = format!("deployment/{restore_name}");
+	for (schema, expected) in [
+		("analytics", analytics_rows),
+		("public_tupaia", tupaia_rows),
+	] {
+		let exists = kubectl_exec(
+			ns,
+			&deploy,
+			&[
+				"psql",
+				"-U",
+				"analytics",
+				"-d",
+				"myapp",
+				"-t",
+				"-A",
+				"-c",
+				&format!(
+					"SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name = '{schema}'"
+				),
+			],
+		)
+		.await;
+		assert_eq!(
+			exists.trim(),
+			"1",
+			"schema {schema} must exist on the {label}"
+		);
+
+		let count = kubectl_exec(
+			ns,
+			&deploy,
+			&[
+				"psql",
+				"-U",
+				"analytics",
+				"-d",
+				"myapp",
+				"-t",
+				"-A",
+				"-c",
+				&format!("SELECT COUNT(*) FROM {schema}.models"),
+			],
+		)
+		.await;
+		assert_eq!(
+			count.trim(),
+			expected.to_string(),
+			"schema {schema} must carry its own {expected} rows across to the {label}"
+		);
+	}
+}
+
+/// Drive one switchover from `from_restore` to a newly created
+/// `to_restore`, waiting for the migration to settle as `complete` and the
+/// replica to land on the new restore.
+async fn switch_over_once(
+	client: &Client,
+	ns: &str,
+	replica_name: &str,
+	from_restore: &str,
+	to_restore: &str,
+) {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	let from = restores
+		.get(from_restore)
+		.await
+		.expect("failed to get source restore");
+	let replica = replicas
+		.get(replica_name)
+		.await
+		.expect("failed to get replica");
+
+	println!("--- creating restore {to_restore} to switch over from {from_restore}");
+	restores
+		.create(
+			&PostParams::default(),
+			&build_second_restore(to_restore, ns, &from, &replica),
+		)
+		.await
+		.expect("failed to create restore");
+
+	println!("--- waiting for schema migration to settle as complete");
+	timeout(LONG_PHASE_TIMEOUT, async {
+		loop {
+			if let Ok(replica) = replicas.get(replica_name).await {
+				let status = replica.status.as_ref();
+				let phase = status.and_then(|s| s.schema_migration_phase.as_ref());
+				println!("[{replica_name}] schemaMigrationPhase: {phase:?}");
+				match phase {
+					Some(SchemaMigrationPhase::Complete) => {
+						// Both configured schemas reached the new restore.
+						assert!(
+							status
+								.map(|s| s.persistent_schemas_missing.is_empty())
+								.unwrap_or(true),
+							"complete must mean nothing was left behind, but status reports missing schemas: {:?}",
+							status.map(|s| &s.persistent_schemas_missing)
+						);
+						return;
+					}
+					// `partial` is the operator saying a configured schema
+					// did not carry across — exactly the reported bug.
+					Some(SchemaMigrationPhase::Partial) => panic!(
+						"migration settled as partial; schemas that did not carry across: {:?}",
+						status.map(|s| &s.persistent_schemas_missing)
+					),
+					_ => {}
+				}
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for schema migration to settle");
+
+	println!("--- waiting for {to_restore} to become Active");
+	timeout(LONG_PHASE_TIMEOUT, async {
+		loop {
+			if let Ok(restore) = restores.get(to_restore).await
+				&& restore.status.as_ref().and_then(|s| s.phase.as_ref())
+					== Some(&RestorePhase::Active)
+			{
+				return;
+			}
+			sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("timed out waiting for restore to become Active");
+
+	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
 }

@@ -353,8 +353,25 @@ pub fn quote_ident(s: &str) -> String {
 	format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// The names in `expected` that `present` does not contain, in `expected`'s
+/// own order.
+///
+/// Comparison is exact and whole-string: a schema whose name merely starts
+/// with another's (`public_tupaia` against `public`) is a different schema,
+/// and every entry is judged the same way regardless of where it sits in the
+/// list.
+pub fn missing_from(expected: &[String], present: &[String]) -> Vec<String> {
+	let present: HashSet<&str> = present.iter().map(String::as_str).collect();
+	expected
+		.iter()
+		.filter(|s| !present.contains(s.as_str()))
+		.cloned()
+		.collect()
+}
+
 /// Return the subset of `candidates` that exist as schemas in the
-/// database the connection is bound to. Reusable on an open connection.
+/// database the connection is bound to, in `candidates`' own order.
+/// Reusable on an open connection.
 pub async fn existing_schemas_on(
 	pg: &tokio_postgres::Client,
 	candidates: &[String],
@@ -460,6 +477,72 @@ pub async fn drop_schemas_in_restore(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn strs(v: &[&str]) -> Vec<String> {
+		v.iter().map(|s| (*s).to_string()).collect()
+	}
+
+	/// Every configured schema must be judged on its own, whatever its
+	/// position. The reported bug looked exactly like a first-entry-only
+	/// loop: `[analytics, public_tupaia]` carried `analytics` across and
+	/// dropped `public_tupaia` every cycle.
+	#[test]
+	fn missing_from_is_independent_of_position() {
+		let both = strs(&["analytics", "public_tupaia"]);
+		let swapped = strs(&["public_tupaia", "analytics"]);
+
+		assert!(missing_from(&both, &both).is_empty());
+		assert!(missing_from(&swapped, &swapped).is_empty());
+
+		// Whichever one is absent is the one reported, at either position.
+		assert_eq!(
+			missing_from(&both, &strs(&["analytics"])),
+			strs(&["public_tupaia"])
+		);
+		assert_eq!(
+			missing_from(&swapped, &strs(&["analytics"])),
+			strs(&["public_tupaia"])
+		);
+		assert_eq!(
+			missing_from(&both, &strs(&["public_tupaia"])),
+			strs(&["analytics"])
+		);
+		assert_eq!(
+			missing_from(&swapped, &strs(&["public_tupaia"])),
+			strs(&["analytics"])
+		);
+	}
+
+	/// A schema named `public_something` shares a prefix with `public` and
+	/// must not be mistaken for it in either direction.
+	#[test]
+	fn missing_from_matches_whole_names_not_prefixes() {
+		assert_eq!(
+			missing_from(&strs(&["public_tupaia"]), &strs(&["public"])),
+			strs(&["public_tupaia"])
+		);
+		assert_eq!(
+			missing_from(&strs(&["public"]), &strs(&["public_tupaia"])),
+			strs(&["public"])
+		);
+		assert!(
+			missing_from(
+				&strs(&["public_tupaia"]),
+				&strs(&["public", "public_tupaia"])
+			)
+			.is_empty()
+		);
+	}
+
+	#[test]
+	fn missing_from_reports_every_absent_entry() {
+		assert_eq!(
+			missing_from(&strs(&["a", "b", "c"]), &strs(&["b"])),
+			strs(&["a", "c"])
+		);
+		assert!(missing_from(&[], &strs(&["a"])).is_empty());
+		assert_eq!(missing_from(&strs(&["a"]), &[]), strs(&["a"]));
+	}
 
 	#[test]
 	fn quote_ident_plain() {

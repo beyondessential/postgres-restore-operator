@@ -1028,6 +1028,16 @@ spec:
                   Used to size the next restore PVC.
                 nullable: true
                 x-kubernetes-int-or-string: true
+              persistentSchemasMissing:
+                description: |-
+                  Configured `persistent_schemas` that were absent from the new restore
+                  once the last migration settled — the schemas that did *not* carry
+                  across. Deliberately outlives the sweep's reset of
+                  `schemaMigrationPhase`: "which of my schemas stopped persisting" is a
+                  question asked hours after the switchover that dropped them.
+                items:
+                  type: string
+                type: array
               phase:
                 enum:
                 - Pending

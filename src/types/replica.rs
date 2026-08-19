@@ -424,6 +424,14 @@ pub struct PostgresPhysicalReplicaStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub persistent_schema_data_size: Option<Quantity>,
 
+	/// Configured `persistent_schemas` that were absent from the new restore
+	/// once the last migration settled — the schemas that did *not* carry
+	/// across. Deliberately outlives the sweep's reset of
+	/// `schemaMigrationPhase`: "which of my schemas stopped persisting" is a
+	/// question asked hours after the switchover that dropped them.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub persistent_schemas_missing: Vec<String>,
+
 	/// Number of consecutive restore failures for this replica.
 	/// Reset to 0 on a successful restore. After 3 consecutive failures
 	/// the operator stops scheduling new restores until the condition is
