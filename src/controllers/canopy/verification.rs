@@ -66,9 +66,7 @@ pub async fn report(
 		Ok(ids) => ids,
 		Err(missing) => {
 			if let Some(ns_labels) = namespace_labels(ctx, replica).await {
-				for (key, value) in ns_labels {
-					labels.entry(key).or_insert(value);
-				}
+				fill_missing_labels(&mut labels, ns_labels);
 			}
 			match canopy_ids(&labels) {
 				Ok(ids) => {
@@ -239,6 +237,23 @@ fn canopy_ids(labels: &BTreeMap<String, String>) -> Result<CanopyIds, Vec<&'stat
 			replica_id,
 		}),
 		_ => Err(missing),
+	}
+}
+
+/// Fill gaps in `labels` from `fallback`, leaving existing entries alone.
+///
+/// The CR is the authority on its own identity; the namespace only supplies
+/// what the CR has lost. Overwriting instead would let a stale or hand-set CR
+/// value be replaced silently, and reporting the wrong group misfiles the
+/// result in canopy.
+///
+/// Applies to the whole label set rather than just the three ids. `TYPE` and
+/// `INTENT` come from the same `WorklistEntry`, so recovering them alongside is
+/// strictly better than sending the empty strings they would otherwise default
+/// to — and never worse, since the CR's own values always win.
+fn fill_missing_labels(labels: &mut BTreeMap<String, String>, fallback: BTreeMap<String, String>) {
+	for (key, value) in fallback {
+		labels.entry(key).or_insert(value);
 	}
 }
 
@@ -511,16 +526,14 @@ mod tests {
 
 	#[test]
 	fn namespace_labels_fill_only_the_gaps() {
-		// Mirrors the merge in `report`: the CR wins where it has a value, and
-		// the namespace supplies the rest, so a partially-labelled CR keeps its
-		// own identity rather than being overwritten wholesale.
+		// Exercises the merge `report` actually calls, not a copy of it: an
+		// inlined `or_insert` loop here would keep passing if the real one
+		// were changed to overwrite.
 		let other = "99999999-9999-9999-9999-999999999999";
 		let mut cr = label_set(&[(labels::GROUP, other)]);
 		assert!(canopy_ids(&cr).is_err(), "precondition: CR alone is short");
 
-		for (key, value) in full_labels() {
-			cr.entry(key).or_insert(value);
-		}
+		fill_missing_labels(&mut cr, full_labels());
 
 		let ids = canopy_ids(&cr).expect("the merged set parses");
 		assert_eq!(
@@ -530,6 +543,31 @@ mod tests {
 		);
 		assert_eq!(ids.server_id, uuid(SERVER_ID));
 		assert_eq!(ids.replica_id, uuid(REPLICA_ID));
+	}
+
+	#[test]
+	fn the_fallback_never_overwrites_what_the_cr_already_has() {
+		// Pins the direction on its own, across every key rather than just the
+		// ids: `insert` in place of `or_insert` would let the namespace
+		// silently rewrite a CR's identity, and reporting the wrong group
+		// misfiles the result in canopy.
+		let mut cr = label_set(&[(labels::GROUP, GROUP_ID), (labels::TYPE, "cr-type")]);
+		fill_missing_labels(
+			&mut cr,
+			label_set(&[
+				(labels::GROUP, REPLICA_ID),
+				(labels::TYPE, "ns-type"),
+				(labels::INTENT, "ns-intent"),
+			]),
+		);
+
+		assert_eq!(cr.get(labels::GROUP).map(String::as_str), Some(GROUP_ID));
+		assert_eq!(cr.get(labels::TYPE).map(String::as_str), Some("cr-type"));
+		assert_eq!(
+			cr.get(labels::INTENT).map(String::as_str),
+			Some("ns-intent"),
+			"a key the CR lacks entirely should still be filled"
+		);
 	}
 
 	#[test]
