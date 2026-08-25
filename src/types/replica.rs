@@ -476,6 +476,24 @@ pub struct PostgresPhysicalReplicaStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub verified_snapshot_id: Option<String>,
 
+	/// UID of the postgres pod that `persistentUsers` were last provisioned
+	/// against.
+	///
+	/// The restore's `setup-auth` initContainer re-runs on every pod start and
+	/// nulls the password of every login role it doesn't own, so a replaced pod
+	/// silently locks these users out. Recording the pod lets the reconciler
+	/// notice a new one and reprovision, instead of leaving them broken until
+	/// the next switchover.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub persistent_users_pod: Option<String>,
+
+	/// When `persistentUsers` were last provisioned. Drives a periodic
+	/// re-assertion, which covers the case a pod UID can't see: kubelet
+	/// recreating a pod's sandbox in place (e.g. after a node reboot) re-runs
+	/// the initContainer without changing the pod's identity.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub persistent_users_provisioned_at: Option<Time>,
+
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub connection_info: Option<ConnectionInfo>,
 

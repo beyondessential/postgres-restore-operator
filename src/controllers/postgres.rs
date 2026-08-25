@@ -134,6 +134,25 @@ pub async fn find_pod_by_label(
 	Ok(pod.name_any())
 }
 
+/// UID of the running pod matching the selector, or `None` when there isn't
+/// one yet. Unlike the name, a UID is never reused, so a change means a
+/// genuinely new pod — and therefore a fresh run of the `setup-auth`
+/// initContainer.
+pub async fn find_pod_uid_by_label(
+	client: &Client,
+	namespace: &str,
+	label_selector: &str,
+) -> Result<Option<String>> {
+	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+	let lp = ListParams::default().labels(label_selector);
+	let list = pods.list(&lp).await?;
+	Ok(list
+		.items
+		.into_iter()
+		.find(|p| p.status.as_ref().and_then(|s| s.phase.as_deref()) == Some("Running"))
+		.and_then(|p| p.metadata.uid))
+}
+
 /// Find the IP of a running pod that matches the given label selector.
 pub async fn find_pod_ip_by_label(
 	client: &Client,

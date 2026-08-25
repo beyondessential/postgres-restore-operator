@@ -1,11 +1,14 @@
-use k8s_openapi::{api::core::v1::SecretReference, apimachinery::pkg::api::resource::Quantity};
+use k8s_openapi::{
+	api::core::v1::SecretReference,
+	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
+};
 use kube::api::ObjectMeta;
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
 
 use crate::{kopia::Snapshot, placement::PodPlacement, types::*, util::TimeSpan};
 
-use jiff::SignedDuration;
+use jiff::{SignedDuration, Timestamp};
 
 use super::{
 	generate_password, persistent_schemas_migration_settled,
@@ -483,4 +486,72 @@ fn snapshot_list_job_carries_the_placement_defaults() {
 			.unwrap(),
 		"b"
 	);
+}
+
+/// A replica whose persistent users were last provisioned against `pod` at
+/// `at`, or never when both are `None`.
+fn replica_provisioned(pod: Option<&str>, at: Option<Timestamp>) -> PostgresPhysicalReplica {
+	let mut replica = make_replica(None, None);
+	replica.status = Some(PostgresPhysicalReplicaStatus {
+		persistent_users_pod: pod.map(str::to_string),
+		persistent_users_provisioned_at: at.map(Time),
+		..Default::default()
+	});
+	replica
+}
+
+#[test]
+fn provisioning_is_skipped_for_the_same_pod_when_recent() {
+	let now = Timestamp::now();
+	let replica = replica_provisioned(Some("pod-uid-1"), Some(now));
+	assert!(!super::persistent_users_need_provisioning(
+		&replica,
+		"pod-uid-1",
+		now
+	));
+}
+
+#[test]
+fn a_replaced_pod_triggers_provisioning() {
+	// setup-auth re-runs on the new pod and nulls the persistent users'
+	// passwords, so a different UID must always reprovision however recent
+	// the last run was.
+	let now = Timestamp::now();
+	let replica = replica_provisioned(Some("pod-uid-1"), Some(now));
+	assert!(super::persistent_users_need_provisioning(
+		&replica,
+		"pod-uid-2",
+		now
+	));
+}
+
+#[test]
+fn an_unrecorded_replica_triggers_provisioning() {
+	let now = Timestamp::now();
+	assert!(super::persistent_users_need_provisioning(
+		&replica_provisioned(None, None),
+		"pod-uid-1",
+		now
+	));
+	// A pod recorded without a timestamp is treated as never run rather than
+	// as up to date, so a partial status write can't wedge it.
+	assert!(super::persistent_users_need_provisioning(
+		&replica_provisioned(Some("pod-uid-1"), None),
+		"pod-uid-1",
+		now
+	));
+}
+
+#[test]
+fn a_stale_run_triggers_provisioning_on_an_unchanged_pod() {
+	// Covers kubelet recreating a sandbox in place: same UID, but setup-auth
+	// ran again, so the users are broken and only the age gives it away.
+	let now = Timestamp::now();
+	let stale = now - SignedDuration::from_secs(601);
+	let replica = replica_provisioned(Some("pod-uid-1"), Some(stale));
+	assert!(super::persistent_users_need_provisioning(
+		&replica,
+		"pod-uid-1",
+		now
+	));
 }

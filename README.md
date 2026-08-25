@@ -219,6 +219,15 @@ The operator refuses to adopt a Secret whose `pgro.bes.au/replica` label names a
 A schema listed in `readSchemas` that is absent from the restore — typically because its migration was skipped or timed out — is skipped with a `PersistentUserSchemaMissing` Warning event rather than blocking the switchover.
 The role, its `CONNECT` grant and its `searchPath` are still applied.
 
+Provisioning is also re-asserted outside switchovers.
+The restore's `setup-auth` initContainer re-runs on every pod start and nulls the password of every login role except `postgres`, so a replaced pod (node drain, eviction, rollout) would otherwise lock these users out until the next scheduled restore.
+The reconciler notices the new pod — via `status.persistentUsersPod` — and reprovisions, so a pod replacement self-heals within one reconcile rather than hours.
+`status.persistentUsersProvisionedAt` drives a 10-minute re-assertion on top, covering an in-place sandbox recreation that re-runs the initContainer without changing the pod's UID.
+
+On a `readOnly` replica the analytics user is kept `SUPERUSER` for the provisioning window — `pg_read_all_data` cannot `CREATE ROLE` — and demoted immediately afterwards, so the elevation does not outlive the switchover.
+The database itself stays read-only throughout.
+Replicas that also set `persistentSchemas` are writable by design and keep the elevation, exactly as they do without persistent users.
+
 #### SnapshotFilter
 
 | Field | Type | Required | Description |

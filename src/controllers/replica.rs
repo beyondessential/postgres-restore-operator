@@ -442,6 +442,15 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(10)));
 	}
 
+	// Outside a switchover, keep the Active restore's persistent users alive:
+	// a replaced pod re-runs setup-auth, which nulls their passwords and
+	// re-elevates the analytics role. No-op when the replica has no persistent
+	// users, or when the pod hasn't changed and the last run is recent.
+	if let Some(active) = active_restore {
+		reprovision_persistent_users(client, &ctx, &replica, &namespace, &active.name_any(), now)
+			.await?;
+	}
+
 	// Ephemeral teardown. For a `spec.ephemeral` replica (e.g. the `verify`
 	// intent) the point of the restore is to prove the snapshot comes up —
 	// once it's Active (the switchover block above ran and, for canopy
@@ -1550,6 +1559,107 @@ async fn drop_persistent_schemas_on_target(
 	postgres::drop_schemas_on(&conn.client, schemas).await
 }
 
+/// How often persistent users are re-asserted against an unchanged pod.
+///
+/// A new pod is normally caught by its UID changing, but kubelet can recreate
+/// a pod's sandbox in place — a node reboot, for instance — which re-runs the
+/// `setup-auth` initContainer under the same UID. This bounds how long the
+/// resulting lockout can last.
+const PERSISTENT_USERS_REFRESH: Duration = Duration::from_secs(600);
+
+/// Whether the Active restore's persistent users need (re)provisioning.
+///
+/// True when the pod differs from the one last provisioned against, when
+/// nothing has been recorded yet, or when the recorded run is older than
+/// [`PERSISTENT_USERS_REFRESH`].
+fn persistent_users_need_provisioning(
+	replica: &PostgresPhysicalReplica,
+	pod_uid: &str,
+	now: Timestamp,
+) -> bool {
+	let status = replica.status.as_ref();
+	if status.and_then(|s| s.persistent_users_pod.as_deref()) != Some(pod_uid) {
+		return true;
+	}
+	let Some(last) = status.and_then(|s| s.persistent_users_provisioned_at.as_ref()) else {
+		return true;
+	};
+	now.duration_since(last.0)
+		>= SignedDuration::try_from(PERSISTENT_USERS_REFRESH).unwrap_or(SignedDuration::MAX)
+}
+
+/// Re-assert persistent users against the Active restore outside a switchover.
+///
+/// The restore's `setup-auth` initContainer re-runs on every pod start and
+/// nulls the password of every login role except `postgres`, then recreates
+/// only the analytics user. A replaced pod therefore locks every persistent
+/// user out — and, because the same script re-takes the SUPERUSER branch,
+/// leaves the analytics role elevated. Provisioning only at switchover would
+/// leave both until the next restore, which can be hours.
+///
+/// Idempotent, and skipped entirely while a switchover is in flight, since
+/// that path provisions the incoming restore itself.
+async fn reprovision_persistent_users(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	restore_name: &str,
+	now: Timestamp,
+) -> Result<()> {
+	if replica.spec.persistent_users.is_empty() {
+		return Ok(());
+	}
+
+	let Some(pod_uid) = postgres::find_pod_uid_by_label(
+		client,
+		namespace,
+		&format!("pgro.bes.au/restore={restore_name}"),
+	)
+	.await?
+	else {
+		// No running pod yet; nothing to provision against.
+		return Ok(());
+	};
+
+	if !persistent_users_need_provisioning(replica, &pod_uid, now) {
+		return Ok(());
+	}
+
+	info!(
+		replica = %replica.name_any(),
+		restore = %restore_name,
+		pod = %pod_uid,
+		"re-provisioning persistent users against the active restore"
+	);
+	provision_persistent_users(client, ctx, replica, namespace, restore_name).await
+}
+
+/// Persist which pod the users were provisioned against, and when.
+async fn record_persistent_users_provisioned(
+	client: &Client,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	pod_uid: &str,
+	now: Timestamp,
+) -> Result<()> {
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), namespace);
+	let patch = serde_json::json!({
+		"status": {
+			"persistentUsersPod": pod_uid,
+			"persistentUsersProvisionedAt": Time(now),
+		}
+	});
+	replicas
+		.patch_status(
+			&replica.name_any(),
+			&PatchParams::apply("postgres-restore-operator"),
+			&Patch::Merge(&patch),
+		)
+		.await?;
+	Ok(())
+}
+
 /// Recreate every `persistentUsers` entry on the incoming restore.
 ///
 /// Connects as the analytics user, which is SUPERUSER on the restore, so it can
@@ -1646,6 +1756,37 @@ async fn provision_persistent_users(
 			.await
 	{
 		warn!(replica = %replica_name, error = %e, "failed to publish PersistentUserSchemaMissing event");
+	}
+
+	// Record which pod this ran against so the reconciler can tell when a
+	// replacement pod has re-run setup-auth and wiped these roles again.
+	// Best-effort: losing the marker costs a redundant reprovision next tick,
+	// which is idempotent, so it must not fail a switchover that has otherwise
+	// succeeded.
+	match postgres::find_pod_uid_by_label(
+		client,
+		namespace,
+		&format!("pgro.bes.au/restore={restore_name}"),
+	)
+	.await
+	{
+		Ok(Some(pod_uid)) => {
+			if let Err(e) = record_persistent_users_provisioned(
+				client,
+				replica,
+				namespace,
+				&pod_uid,
+				Timestamp::now(),
+			)
+			.await
+			{
+				warn!(replica = %replica_name, error = %e, "failed to record persistent users provisioning");
+			}
+		}
+		Ok(None) => {}
+		Err(e) => {
+			warn!(replica = %replica_name, error = %e, "failed to look up pod for persistent users marker")
+		}
 	}
 
 	Ok(())
