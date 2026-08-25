@@ -7,7 +7,7 @@
 
 use bestool_canopy::schema::{MigrationArgs, MigrationTimingArgs, RunOutcome, VerificationArgs};
 use jiff::Timestamp;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Namespace, Secret};
 use kube::{Api, ResourceExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -72,19 +72,34 @@ pub async fn report(
 		return;
 	};
 	// Canopy made `replica_id` required on VerificationArgs, so a report
-	// without one can no longer be constructed. Treat a missing declaration
-	// label the same way as a missing group or server: skip the report rather
-	// than invent an identity canopy would then key its worklist on.
-	let Some(replica_id) = labels
+	// without one can no longer be constructed, and inventing one is not an
+	// option — canopy keys worklist state on it. The syncer stamps the same
+	// label on the Namespace as on the CR, so fall back to that before giving
+	// up: a CR whose labels have been stripped or hand-edited can still be
+	// identified from its namespace.
+	let replica_id = match labels
 		.get(labels::DECLARATION_ID)
 		.and_then(|s| Uuid::parse_str(s).ok())
-	else {
-		warn!(
-			replica = %replica.name_any(),
-			"canopy verification: replica CR missing {} label, skipping report",
-			labels::DECLARATION_ID,
-		);
-		return;
+	{
+		Some(id) => id,
+		None => match declaration_id_from_namespace(ctx, replica).await {
+			Some(id) => {
+				warn!(
+					replica = %replica.name_any(),
+					"canopy verification: replica CR missing {} label, recovered it from the namespace",
+					labels::DECLARATION_ID,
+				);
+				id
+			}
+			None => {
+				warn!(
+					replica = %replica.name_any(),
+					"canopy verification: no {} label on the replica CR or its namespace, skipping report",
+					labels::DECLARATION_ID,
+				);
+				return;
+			}
+		},
 	};
 	let backup_type = labels
 		.get(labels::TYPE)
@@ -191,6 +206,39 @@ pub async fn report(
 			"canopy verification report failed"
 		),
 	}
+}
+
+/// Read the declaration id from the replica's Namespace.
+///
+/// `canopy::ensure_namespace` stamps the same label set on the Namespace as it
+/// does on the replica CR, so the namespace is a second copy of the same fact
+/// rather than a guess. Only reached when the CR's own label is missing, which
+/// the syncer should make impossible — a hand-edited or partially-applied CR
+/// is the case this covers.
+///
+/// Best-effort: a lookup failure, a namespaceless replica or an unparseable
+/// value all read as absent, and the caller skips the report.
+async fn declaration_id_from_namespace(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+) -> Option<Uuid> {
+	let ns_name = replica.namespace()?;
+	let namespaces: Api<Namespace> = Api::all(ctx.client.clone());
+	let ns = match namespaces.get_opt(&ns_name).await {
+		Ok(ns) => ns?,
+		Err(e) => {
+			warn!(
+				replica = %replica.name_any(),
+				namespace = %ns_name,
+				error = %e,
+				"canopy verification: failed to read namespace for declaration id fallback"
+			);
+			return None;
+		}
+	};
+	ns.labels()
+		.get(labels::DECLARATION_ID)
+		.and_then(|s| Uuid::parse_str(s).ok())
 }
 
 /// The canopy run-uuid persisted on the restore status, parsed to a `Uuid`.
