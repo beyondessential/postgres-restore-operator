@@ -166,6 +166,7 @@ mod tests {
 			name: "tupaia_read".into(),
 			read_schemas: vec!["public_tupaia".into()],
 			search_path: vec!["public_tupaia".into()],
+			secret_name: None,
 		}
 	}
 
@@ -235,6 +236,7 @@ mod tests {
 			name: "we\"ird".into(),
 			read_schemas: vec![],
 			search_path: vec![],
+			secret_name: None,
 		};
 		let sql = role_sql(&hostile, "pass'word");
 		assert!(

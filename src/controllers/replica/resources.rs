@@ -27,7 +27,7 @@ use crate::{
 		READY_FOR_TRAFFIC_LABEL, env_from_secret, env_from_secret_optional,
 		restore::builders::{CanopyProxyArgs, PROXY_SIDECAR_POD_LABEL},
 	},
-	error::Result,
+	error::{Error, Result},
 	kopia::KopiaSource,
 	placement::PodPlacement,
 	types::*,
@@ -563,7 +563,25 @@ impl PostgresPhysicalReplica {
 		}
 
 		for (secret_name, user) in &wanted {
-			if secrets.get_opt(secret_name).await?.is_some() {
+			if let Some(existing) = secrets.get_opt(secret_name).await? {
+				// A Secret labelled for a different replica means two replicas
+				// in this namespace resolved to the same name, almost always
+				// via secretName overrides. Adopting it would hand both the
+				// same password and let either one's deletion cascade the
+				// Secret away from the other, so refuse instead.
+				let owner = existing
+					.metadata
+					.labels
+					.as_ref()
+					.and_then(|l| l.get("pgro.bes.au/replica"));
+				if owner.is_some_and(|o| o != &replica_name) {
+					return Err(Error::InvalidSpec(format!(
+						"secret {secret_name:?} for persistentUser {:?} already belongs to \
+						 replica {:?}; set a distinct secretName",
+						user.name,
+						owner.expect("checked above")
+					)));
+				}
 				continue;
 			}
 

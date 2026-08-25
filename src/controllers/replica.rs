@@ -233,7 +233,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	replica.ensure_credentials_secret(client).await?;
 
-	if let Err(reason) = validate_persistent_users(&replica.spec.persistent_users) {
+	if let Err(reason) = validate_persistent_users(&replica.spec.persistent_users, &name) {
 		replica
 			.update_condition(
 				client,

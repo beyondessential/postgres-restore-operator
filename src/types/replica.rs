@@ -285,19 +285,31 @@ pub struct PersistentUser {
 	/// names. Left untouched when empty.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
 	pub search_path: Vec<String>,
+
+	/// Name of the Secret to hold this user's credentials, overriding the
+	/// default `<replica>-user-<role>`.
+	///
+	/// Safe when the namespace holds a single replica. Two replicas in one
+	/// namespace pointing at the same Secret would share a password and have
+	/// it deleted from under one of them when the other is deleted, so the
+	/// operator refuses to adopt a Secret another replica already owns.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub secret_name: Option<String>,
 }
 
 impl PersistentUser {
-	/// Name of the Secret holding this user's credentials, scoped to the
-	/// replica so two replicas never share a password.
+	/// Name of the Secret holding this user's credentials. Defaults to being
+	/// scoped to the replica so two replicas never share a password.
 	///
 	/// Role names may contain characters that are invalid in Kubernetes object
 	/// names (`tupaia_read`), so the role name is lowercased and every
 	/// character outside `[a-z0-9-]` becomes `-`. Two roles in one replica that
-	/// sanitise to the same string are rejected by [`validate_persistent_users`]
-	/// rather than silently sharing a Secret.
+	/// resolve to the same Secret are rejected by [`validate_persistent_users`]
+	/// rather than silently sharing one.
 	pub fn secret_name(&self, replica_name: &str) -> String {
-		format!("{replica_name}-user-{}", sanitize_object_name(&self.name))
+		self.secret_name
+			.clone()
+			.unwrap_or_else(|| format!("{replica_name}-user-{}", sanitize_object_name(&self.name)))
 	}
 }
 
@@ -311,14 +323,17 @@ fn sanitize_object_name(name: &str) -> String {
 /// Reject persistent user lists that would map two roles onto one Secret, or
 /// that repeat a role name. Both are configuration errors that would otherwise
 /// surface as one user silently overwriting another's password.
-pub fn validate_persistent_users(users: &[PersistentUser]) -> Result<(), String> {
+pub fn validate_persistent_users(
+	users: &[PersistentUser],
+	replica_name: &str,
+) -> Result<(), String> {
 	let mut seen: HashMap<String, &str> = HashMap::new();
 	for user in users {
-		let key = sanitize_object_name(&user.name);
+		let key = user.secret_name(replica_name);
 		if let Some(previous) = seen.insert(key.clone(), &user.name) {
 			return Err(format!(
-				"persistentUsers {previous:?} and {:?} both map to secret suffix {key:?}; \
-				 rename one of them",
+				"persistentUsers {previous:?} and {:?} both resolve to secret {key:?}; \
+				 rename one of them or set a distinct secretName",
 				user.name
 			));
 		}
@@ -795,6 +810,7 @@ mod tests {
 			name: name.into(),
 			read_schemas: vec![],
 			search_path: vec![],
+			secret_name: None,
 		}
 	}
 
@@ -808,21 +824,45 @@ mod tests {
 	}
 
 	#[test]
+	fn secret_name_override_wins_and_ignores_the_replica() {
+		let mut user = persistent_user("tupaia_read");
+		user.secret_name = Some("tupaia-read".into());
+		assert_eq!(user.secret_name("prod"), "tupaia-read");
+		assert_eq!(user.secret_name("staging"), "tupaia-read");
+	}
+
+	#[test]
 	fn colliding_persistent_users_are_rejected() {
 		// tupaia_read and tupaia-read both sanitise to tupaia-read; without
 		// this check the second would silently overwrite the first's Secret.
-		let err = validate_persistent_users(&[
-			persistent_user("tupaia_read"),
-			persistent_user("tupaia-read"),
-		])
+		let err = validate_persistent_users(
+			&[
+				persistent_user("tupaia_read"),
+				persistent_user("tupaia-read"),
+			],
+			"prod",
+		)
 		.expect_err("collision must be rejected");
 		assert!(
 			err.contains("tupaia-read"),
 			"error must name the clash: {err}"
 		);
 
-		validate_persistent_users(&[persistent_user("tupaia_read"), persistent_user("reporting")])
-			.expect("distinct names are accepted");
+		validate_persistent_users(
+			&[persistent_user("tupaia_read"), persistent_user("reporting")],
+			"prod",
+		)
+		.expect("distinct names are accepted");
+	}
+
+	#[test]
+	fn secret_name_override_colliding_with_a_default_is_rejected() {
+		// An override can collide with another user's generated name just as
+		// easily as two role names can.
+		let mut overridden = persistent_user("reporting");
+		overridden.secret_name = Some("prod-user-tupaia-read".into());
+		validate_persistent_users(&[persistent_user("tupaia_read"), overridden], "prod")
+			.expect_err("override colliding with a default must be rejected");
 	}
 
 	#[test]

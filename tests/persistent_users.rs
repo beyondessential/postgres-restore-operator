@@ -92,6 +92,7 @@ async fn persistent_user_survives_switchover() {
 		name: "tupaia_read".to_string(),
 		read_schemas: vec!["public_tupaia".to_string()],
 		search_path: vec!["public_tupaia".to_string()],
+		secret_name: None,
 	}];
 	replica.metadata.namespace = Some(ns.into());
 	replicas
@@ -334,10 +335,13 @@ async fn persistent_user_with_missing_schema_still_switches_over() {
 			..Default::default()
 		},
 	);
+	// Also covers the secretName override: the credential lands in a bare
+	// `tupaia-read` rather than the replica-scoped default.
 	replica.spec.persistent_users = vec![PersistentUser {
 		name: "tupaia_read".to_string(),
 		read_schemas: vec!["never_created".to_string()],
 		search_path: vec![],
+		secret_name: Some("tupaia-read".to_string()),
 	}];
 	replica.metadata.namespace = Some(ns.into());
 	replicas
@@ -351,7 +355,7 @@ async fn persistent_user_with_missing_schema_still_switches_over() {
 	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
 
 	println!("--- verifying the role was still created and can connect");
-	let password = read_secret_password(&secrets, "pu-missing-replica-user-tupaia-read").await;
+	let password = read_secret_password(&secrets, "tupaia-read").await;
 	let (ok, stdout, stderr) = psql_as_reader(
 		ns,
 		&format!("deployment/{restore_name}"),

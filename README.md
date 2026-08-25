@@ -121,6 +121,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `name` | `string` | Yes | — | Postgres role name. |
 | `readSchemas` | `[]string` | No | `[]` | Schemas to grant read access on: `USAGE` on the schema, plus `SELECT` on existing and future tables and sequences. Schemas absent from the restore are skipped with a warning. |
 | `searchPath` | `[]string` | No | `[]` | Value for the role's `search_path`, so it can query unqualified table names. Left untouched when empty. |
+| `secretName` | `string` | No | `<replica>-user-<role>` | Name of the Secret holding this user's credentials. Only safe to set when the namespace holds a single replica — see [Persistent users](#persistent-users). |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -197,10 +198,23 @@ persistentUsers:
 
 On each switchover — after the persistent-schema migration, before the new restore accepts traffic — the operator creates the role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`), grants `CONNECT` on the restored database, grants `USAGE` and `SELECT` on each `readSchemas` entry, and issues `ALTER DEFAULT PRIVILEGES FOR ROLE <schema owner>` so tables created in that schema later are readable too.
 
-Each user gets its own Secret, named `<replica>-user-<role>` with the role name lowercased and non-alphanumeric characters replaced by `-` (so `tupaia_read` on replica `prod` becomes `prod-user-tupaia-read`).
-It holds `username` and `password` keys.
+Each user gets its own Secret holding `username` and `password` keys.
 The password is generated once and reused for the life of the replica, which is what makes the credential stable across switchovers; it is **not** shared between replicas.
 Removing a user from the list deletes its Secret.
+
+By default the Secret is named `<replica>-user-<role>`, with the role name lowercased and non-alphanumeric characters replaced by `-` — so `tupaia_read` on replica `prod` becomes `prod-user-tupaia-read`.
+Set `secretName` to override that:
+
+```yaml
+persistentUsers:
+  - name: tupaia_read
+    secretName: tupaia-read
+```
+
+The replica prefix exists because Secrets are namespaced.
+Two replicas in one namespace resolving to the same Secret would share a password, and the Secret carries an `ownerReference` to whichever replica created it — so deleting that replica would cascade the Secret away while the other still depends on it.
+With one replica per namespace that cannot happen and the prefix is just noise.
+The operator refuses to adopt a Secret whose `pgro.bes.au/replica` label names a different replica, so a collision surfaces as an `InvalidSpec` error rather than two replicas silently sharing a credential.
 
 A schema listed in `readSchemas` that is absent from the restore — typically because its migration was skipped or timed out — is skipped with a `PersistentUserSchemaMissing` Warning event rather than blocking the switchover.
 The role, its `CONNECT` grant and its `searchPath` are still applied.
