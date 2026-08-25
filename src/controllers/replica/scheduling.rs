@@ -351,6 +351,7 @@ mod tests {
 
 				persistent_schemas: None,
 				redaction: None,
+				persistent_users: vec![],
 			},
 			status: Some(PostgresPhysicalReplicaStatus {
 				next_scheduled_restore: next_scheduled.map(Time),

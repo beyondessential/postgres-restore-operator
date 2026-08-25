@@ -86,6 +86,12 @@ jobs:
           #       test-canopy-restore
           #     needs_non_pg_snapshot: false
 
+          - name: persistent_users
+            namespaces: >-
+              test-persistent-users
+              test-pu-missing-schema
+            needs_non_pg_snapshot: false
+
     steps:
       - uses: actions/checkout@v7.0.1
 

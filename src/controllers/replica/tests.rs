@@ -173,6 +173,7 @@ fn make_replica(
 			notifications: vec![],
 			persistent_schemas,
 			redaction: None,
+			persistent_users: vec![],
 			storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
 				"2Ti".to_string(),
 			),
@@ -333,6 +334,7 @@ fn snapshot_list_test_replica() -> PostgresPhysicalReplica {
 			notifications: vec![],
 			persistent_schemas: None,
 			redaction: None,
+			persistent_users: vec![],
 			storage_size_maximum: k8s_openapi::apimachinery::pkg::api::resource::Quantity(
 				"2Ti".to_string(),
 			),

@@ -319,6 +319,7 @@ mod tests {
 
 				persistent_schemas: Some(schemas.into_iter().map(String::from).collect()),
 				redaction: None,
+				persistent_users: vec![],
 			},
 			status: None,
 		}

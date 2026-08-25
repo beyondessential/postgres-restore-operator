@@ -112,6 +112,15 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. See [Persistent schemas](#persistent-schemas) below for the migration time budget and what happens on timeout. |
 | `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. See [RedactionSpec](#redactionspec) below. |
 | `migrateTo` | `MigrationTarget` | No | — | Apply a Tamanu version's schema migrations to each restore of this replica and report how they went. `{ version, versionId }`. Set by the canopy worklist syncer for the `upgrade` intent, from the target version canopy names on the worklist entry. A restore carrying this is built read-write, since migrations are DDL, and is torn down once verified. |
+| `persistentUsers` | `[]PersistentUser` | No | `[]` | Read-only login roles recreated on every restore, each with a password that stays stable for the lifetime of the replica. See [Persistent users](#persistent-users) below. |
+
+#### PersistentUser
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `name` | `string` | Yes | — | Postgres role name. |
+| `readSchemas` | `[]string` | No | `[]` | Schemas to grant read access on: `USAGE` on the schema, plus `SELECT` on existing and future tables and sequences. Schemas absent from the restore are skipped with a warning. |
+| `searchPath` | `[]string` | No | `[]` | Value for the role's `search_path`, so it can query unqualified table names. Left untouched when empty. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -170,6 +179,31 @@ Notes:
 - The postgres container runs as root for the prelude (to apt-install and write to system paths) then drops back to UID 999 via `gosu` before exec'ing `postgres`. `gosu` is preinstalled in the official `postgres` image.
 - During redaction the database is writable; once anonymisation completes, the operator sets `default_transaction_read_only = on` at the database level and demotes the analytics user back to non-superuser when `spec.readOnly` is true. Replicas that also set `persistentSchemas` stay writable, because the schema migration runs after redaction and writes to the same database — matching what those replicas do without redaction.
 - If a redaction run fails, the switchover is held: the replica keeps serving its previous restore, a `RedactionFailed` Warning event is recorded, and the next reconcile retries. An unredacted restore is never made live.
+
+#### Persistent users
+
+Every restore is a fresh cluster built from the snapshot, so a role created by hand on one restore is gone after the next switchover, and any role that *did* come across in the snapshot has its password cleared during restore.
+The `analyticsUsername` role is the exception: the operator recreates it each time from a Secret it owns.
+
+`persistentUsers` extends that guarantee to read-only consumers:
+
+```yaml
+persistentSchemas: [public_tupaia]
+persistentUsers:
+  - name: tupaia_read
+    readSchemas: [public_tupaia]
+    searchPath: [public_tupaia]
+```
+
+On each switchover — after the persistent-schema migration, before the new restore accepts traffic — the operator creates the role (`NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS`), grants `CONNECT` on the restored database, grants `USAGE` and `SELECT` on each `readSchemas` entry, and issues `ALTER DEFAULT PRIVILEGES FOR ROLE <schema owner>` so tables created in that schema later are readable too.
+
+Each user gets its own Secret, named `<replica>-user-<role>` with the role name lowercased and non-alphanumeric characters replaced by `-` (so `tupaia_read` on replica `prod` becomes `prod-user-tupaia-read`).
+It holds `username` and `password` keys.
+The password is generated once and reused for the life of the replica, which is what makes the credential stable across switchovers; it is **not** shared between replicas.
+Removing a user from the list deletes its Secret.
+
+A schema listed in `readSchemas` that is absent from the restore — typically because its migration was skipped or timed out — is skipped with a `PersistentUserSchemaMissing` Warning event rather than blocking the switchover.
+The role, its `CONNECT` grant and its `searchPath` are still applied.
 
 #### SnapshotFilter
 

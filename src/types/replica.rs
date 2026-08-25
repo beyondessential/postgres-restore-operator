@@ -166,6 +166,10 @@ pub struct PostgresPhysicalReplicaSpec {
 	/// target that moves mid-restore doesn't change what that restore tested.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub migrate_to: Option<crate::types::MigrationTarget>,
+	/// Read-only login roles recreated on every restore, each with a password
+	/// that stays stable for the lifetime of the replica.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub persistent_users: Vec<PersistentUser>,
 
 	/// Maximum allowed size for the restore PVC. The restore will fail if the
 	/// computed size exceeds this limit. Defaults to 2Ti.
@@ -257,6 +261,69 @@ pub struct SnapshotFilter {
 	/// Windows paths are normalised to Unix style (e.g. `D:\Full` → `/D/Full`).
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub path_pattern: Option<String>,
+}
+
+/// A read-only login role the operator recreates on each restore.
+///
+/// Each restore is a fresh cluster built from the snapshot, so a role created
+/// by hand on a previous restore is gone after the next switchover. Listing it
+/// here makes the operator recreate the role, its grants and its password on
+/// every restore, so downstream consumers keep working across switchovers.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PersistentUser {
+	/// Postgres role name.
+	pub name: String,
+
+	/// Schemas to grant read access on (`USAGE`, plus `SELECT` on existing and
+	/// future tables and sequences). Schemas absent from the restore are
+	/// skipped with a warning rather than failing the switchover.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub read_schemas: Vec<String>,
+
+	/// Value for the role's `search_path`, so it can query unqualified table
+	/// names. Left untouched when empty.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub search_path: Vec<String>,
+}
+
+impl PersistentUser {
+	/// Name of the Secret holding this user's credentials, scoped to the
+	/// replica so two replicas never share a password.
+	///
+	/// Role names may contain characters that are invalid in Kubernetes object
+	/// names (`tupaia_read`), so the role name is lowercased and every
+	/// character outside `[a-z0-9-]` becomes `-`. Two roles in one replica that
+	/// sanitise to the same string are rejected by [`validate_persistent_users`]
+	/// rather than silently sharing a Secret.
+	pub fn secret_name(&self, replica_name: &str) -> String {
+		format!("{replica_name}-user-{}", sanitize_object_name(&self.name))
+	}
+}
+
+fn sanitize_object_name(name: &str) -> String {
+	name.to_lowercase()
+		.chars()
+		.map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+		.collect()
+}
+
+/// Reject persistent user lists that would map two roles onto one Secret, or
+/// that repeat a role name. Both are configuration errors that would otherwise
+/// surface as one user silently overwriting another's password.
+pub fn validate_persistent_users(users: &[PersistentUser]) -> Result<(), String> {
+	let mut seen: HashMap<String, &str> = HashMap::new();
+	for user in users {
+		let key = sanitize_object_name(&user.name);
+		if let Some(previous) = seen.insert(key.clone(), &user.name) {
+			return Err(format!(
+				"persistentUsers {previous:?} and {:?} both map to secret suffix {key:?}; \
+				 rename one of them",
+				user.name
+			));
+		}
+	}
+	Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -722,6 +789,41 @@ impl PostgresPhysicalReplica {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn persistent_user(name: &str) -> PersistentUser {
+		PersistentUser {
+			name: name.into(),
+			read_schemas: vec![],
+			search_path: vec![],
+		}
+	}
+
+	#[test]
+	fn secret_name_sanitises_role_names_and_scopes_to_replica() {
+		// Underscores are legal in Postgres roles but not in Kubernetes object
+		// names, and two replicas must never share a user's password.
+		let user = persistent_user("tupaia_read");
+		assert_eq!(user.secret_name("prod"), "prod-user-tupaia-read");
+		assert_ne!(user.secret_name("prod"), user.secret_name("staging"));
+	}
+
+	#[test]
+	fn colliding_persistent_users_are_rejected() {
+		// tupaia_read and tupaia-read both sanitise to tupaia-read; without
+		// this check the second would silently overwrite the first's Secret.
+		let err = validate_persistent_users(&[
+			persistent_user("tupaia_read"),
+			persistent_user("tupaia-read"),
+		])
+		.expect_err("collision must be rejected");
+		assert!(
+			err.contains("tupaia-read"),
+			"error must name the clash: {err}"
+		);
+
+		validate_persistent_users(&[persistent_user("tupaia_read"), persistent_user("reporting")])
+			.expect("distinct names are accepted");
+	}
 
 	#[test]
 	fn schema_migration_phase_roundtrips_terminal_variants() {

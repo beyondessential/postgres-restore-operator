@@ -1,4 +1,7 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+	collections::{HashMap, HashSet},
+	time::Duration,
+};
 
 use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::{
@@ -353,6 +356,13 @@ pub fn quote_ident(s: &str) -> String {
 	format!("\"{}\"", s.replace('"', "\"\""))
 }
 
+/// Quote a value as a SQL string literal. Used for the handful of statements
+/// that cannot take a bind parameter (`CREATE ROLE … PASSWORD`, and anything
+/// inside a `DO` block body).
+pub fn quote_literal(s: &str) -> String {
+	format!("'{}'", s.replace('\'', "''"))
+}
+
 /// Return the subset of `candidates` that exist as schemas in the
 /// database the connection is bound to. Reusable on an open connection.
 pub async fn existing_schemas_on(
@@ -373,6 +383,37 @@ pub async fn existing_schemas_on(
 		.iter()
 		.filter(|s| found.contains(s.as_str()))
 		.cloned()
+		.collect())
+}
+
+/// Return `(schema, owner)` for each of `candidates` that exists in the
+/// database the connection is bound to, preserving the caller's order.
+///
+/// The owner matters for `ALTER DEFAULT PRIVILEGES FOR ROLE …`: granting on
+/// future objects only works when the statement names the role that will
+/// create them, so the owner is read from the live catalog rather than assumed
+/// to be the analytics user.
+pub async fn schema_owners_on(
+	pg: &tokio_postgres::Client,
+	candidates: &[String],
+) -> Result<Vec<(String, String)>> {
+	if candidates.is_empty() {
+		return Ok(Vec::new());
+	}
+	let rows = pg
+		.query(
+			"SELECT nspname, pg_get_userbyid(nspowner) FROM pg_catalog.pg_namespace \
+			 WHERE nspname = ANY($1)",
+			&[&candidates],
+		)
+		.await?;
+	let owners: HashMap<String, String> = rows
+		.iter()
+		.map(|r| (r.get::<_, String>(0), r.get::<_, String>(1)))
+		.collect();
+	Ok(candidates
+		.iter()
+		.filter_map(|s| owners.get(s).map(|o| (s.clone(), o.clone())))
 		.collect())
 }
 
@@ -469,5 +510,11 @@ mod tests {
 	#[test]
 	fn quote_ident_with_quotes() {
 		assert_eq!(quote_ident("my\"schema"), "\"my\"\"schema\"");
+	}
+
+	#[test]
+	fn quote_literal_escapes_single_quotes() {
+		assert_eq!(quote_literal("pass'word"), "'pass''word'");
+		assert_eq!(quote_literal("plain"), "'plain'");
 	}
 }

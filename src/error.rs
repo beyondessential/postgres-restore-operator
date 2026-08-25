@@ -35,6 +35,9 @@ pub enum Error {
 	#[error("Schema migration error: {0}")]
 	SchemaMigration(String),
 
+	#[error("Invalid spec: {0}")]
+	InvalidSpec(String),
+
 	#[error("Computed PVC size ({}) exceeds storageSizeMaximum ({})", .computed.0, .maximum.0)]
 	StorageLimitExceeded {
 		computed: k8s_openapi::apimachinery::pkg::api::resource::Quantity,

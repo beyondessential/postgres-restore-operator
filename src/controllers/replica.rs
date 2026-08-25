@@ -37,6 +37,7 @@ use crate::{
 };
 use scheduling::ScheduleDecision;
 
+mod persistent_users;
 mod redaction;
 mod resources;
 pub(super) mod scheduling;
@@ -232,6 +233,20 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	replica.ensure_credentials_secret(client).await?;
 
+	if let Err(reason) = validate_persistent_users(&replica.spec.persistent_users) {
+		replica
+			.update_condition(
+				client,
+				"SpecValid",
+				"False",
+				"InvalidPersistentUsers",
+				&reason,
+			)
+			.await?;
+		return Err(Error::InvalidSpec(reason));
+	}
+	replica.ensure_persistent_user_secrets(client).await?;
+
 	replica.ensure_service(client).await?;
 
 	replica
@@ -301,6 +316,12 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 			restore = switching_name,
 			"performing blue-green switchover"
 		);
+
+		// Recreate the persistent read-only roles. Runs here — after the
+		// persistent_schemas migration Job, before the Service selector moves —
+		// because the schemas these roles read from are written by that Job,
+		// and because the window has no external clients connected yet.
+		provision_persistent_users(client, &ctx, &replica, &namespace, &switching_name).await?;
 
 		// Pods carry [[READY_FOR_TRAFFIC_LABEL]] from creation, so this is only
 		// for restores whose pods predate that change. What actually keeps a
@@ -1527,6 +1548,93 @@ async fn drop_persistent_schemas_on_target(
 	)
 	.await?;
 	postgres::drop_schemas_on(&conn.client, schemas).await
+}
+
+/// Recreate every `persistentUsers` entry on the incoming restore.
+///
+/// Connects as the analytics user, which is SUPERUSER on the restore, so it can
+/// create roles and issue `ALTER DEFAULT PRIVILEGES FOR ROLE` on schemas it
+/// does not own. Schemas listed by a user but absent from the restore are
+/// skipped and reported as a Warning event rather than failing the switchover:
+/// a missing schema means the migration Job skipped or timed out, and blocking
+/// handover on that would leave the replica with no serving restore at all.
+async fn provision_persistent_users(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	restore_name: &str,
+) -> Result<()> {
+	let users = &replica.spec.persistent_users;
+	if users.is_empty() {
+		return Ok(());
+	}
+
+	let replica_name = replica.name_any();
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+
+	let admin_secret = secrets.get(&replica.creds_secret_name()).await?;
+	let admin_user = postgres::read_secret_field(&admin_secret, "username")?;
+	let admin_password = postgres::read_secret_field(&admin_secret, "password")?;
+
+	let mut passwords = Vec::with_capacity(users.len());
+	for user in users {
+		let secret = secrets.get(&user.secret_name(&replica_name)).await?;
+		passwords.push(postgres::read_secret_field(&secret, "password")?);
+	}
+
+	let dbname = postgres::discover_restore_database(
+		client,
+		namespace,
+		restore_name,
+		&admin_user,
+		&admin_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let conn = postgres::connect_to_restore(
+		client,
+		namespace,
+		restore_name,
+		&dbname,
+		&admin_user,
+		&admin_password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let skipped = persistent_users::apply(&conn.client, users, &passwords, &dbname).await?;
+
+	info!(
+		replica = %replica_name,
+		restore = %restore_name,
+		count = users.len(),
+		"provisioned persistent users"
+	);
+
+	if !skipped.is_empty()
+		&& let Err(e) = ctx
+			.recorder
+			.publish(
+				&Event {
+					type_: EventType::Warning,
+					reason: "PersistentUserSchemaMissing".into(),
+					note: Some(format!(
+						"Skipped read grants for absent schemas: {}",
+						skipped.join(", ")
+					)),
+					action: "ProvisionPersistentUsers".into(),
+					secondary: None,
+				},
+				&replica.object_ref(&()),
+			)
+			.await
+	{
+		warn!(replica = %replica_name, error = %e, "failed to publish PersistentUserSchemaMissing event");
+	}
+
+	Ok(())
 }
 
 async fn timeout_schema_migration(

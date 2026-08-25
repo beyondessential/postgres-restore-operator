@@ -545,6 +545,81 @@ impl PostgresPhysicalReplica {
 		Ok(())
 	}
 
+	/// Create one Secret per `persistentUsers` entry and delete the Secrets of
+	/// users that have been removed from the spec.
+	///
+	/// Passwords are generated once and then left alone: the whole point of the
+	/// feature is that a consumer's credential survives switchovers, so an
+	/// existing Secret is never rewritten. Secrets are labelled and
+	/// owner-referenced like the replica creds Secret, so deleting the replica
+	/// still cascades.
+	pub async fn ensure_persistent_user_secrets(&self, client: &Client) -> Result<()> {
+		let secrets: Api<Secret> = Api::namespaced(client.clone(), &self.ns());
+		let replica_name = self.name_any();
+
+		let mut wanted = BTreeMap::new();
+		for user in &self.spec.persistent_users {
+			wanted.insert(user.secret_name(&replica_name), user);
+		}
+
+		for (secret_name, user) in &wanted {
+			if secrets.get_opt(secret_name).await?.is_some() {
+				continue;
+			}
+
+			info!(
+				replica = replica_name,
+				user = user.name,
+				secret = secret_name,
+				"creating persistent user secret"
+			);
+
+			let secret = Secret {
+				metadata: ObjectMeta {
+					name: Some(secret_name.clone()),
+					namespace: self.metadata.namespace.clone(),
+					labels: Some(BTreeMap::from([
+						("pgro.bes.au/replica".into(), replica_name.clone()),
+						("pgro.bes.au/persistent-user".into(), user.name.clone()),
+					])),
+					owner_references: Some(vec![self.owner_reference()]),
+					..Default::default()
+				},
+				data: Some(BTreeMap::from([
+					("username".into(), ByteString(user.name.as_bytes().to_vec())),
+					(
+						"password".into(),
+						ByteString(generate_password().into_bytes()),
+					),
+				])),
+				..Default::default()
+			};
+			secrets.create(&PostParams::default(), &secret).await?;
+		}
+
+		let owned = secrets
+			.list(&ListParams::default().labels(&format!(
+				"pgro.bes.au/replica={replica_name},pgro.bes.au/persistent-user"
+			)))
+			.await?;
+		for secret in owned.items {
+			let secret_name = secret.name_any();
+			if wanted.contains_key(&secret_name) {
+				continue;
+			}
+			info!(
+				replica = replica_name,
+				secret = secret_name,
+				"deleting secret for removed persistent user"
+			);
+			if let Err(e) = secrets.delete(&secret_name, &Default::default()).await {
+				warn!(secret = secret_name, error = %e, "failed to delete persistent user secret");
+			}
+		}
+
+		Ok(())
+	}
+
 	pub async fn ensure_service(&self, client: &Client) -> Result<()> {
 		let services: Api<Service> = Api::namespaced(client.clone(), &self.ns());
 
