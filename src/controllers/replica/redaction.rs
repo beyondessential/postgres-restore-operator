@@ -259,8 +259,30 @@ pub async fn reconcile_redaction(
 /// migration runs after this step and loads the dbt schema into this same
 /// database as this same role, so those replicas stay writable exactly as
 /// they do without redaction.
+///
+/// `persistent_users` defers it for a different reason: those roles are
+/// provisioned after this step and their `CREATE ROLE` / `ALTER DEFAULT
+/// PRIVILEGES` need the analytics role to still be SUPERUSER. That path calls
+/// [`enforce_read_only`] itself once provisioning is done.
 fn should_enforce_read_only(replica: &PostgresPhysicalReplica) -> bool {
-	replica.spec.read_only && replica.spec.persistent_schemas.is_none()
+	replica.spec.read_only
+		&& replica.spec.persistent_schemas.is_none()
+		&& replica.spec.persistent_users.is_empty()
+}
+
+/// Put a restore the operator raised to writable back into read-only, and
+/// demote the analytics role.
+///
+/// Lives here because redaction is the original owner of this transition, but
+/// it is also the tail of the `persistent_users` provisioning path — see
+/// [`should_enforce_read_only`]. Idempotent: safe on a restore whose
+/// `postgresql.conf` already sets the transaction default.
+pub(super) async fn enforce_read_only(
+	conn: &PgConnection,
+	dbname: &str,
+	analytics_user: &str,
+) -> Result<()> {
+	apply::enforce_read_only(conn, dbname, analytics_user).await
 }
 
 fn validate_spec(spec: &RedactionSpec) -> Result<()> {
@@ -431,6 +453,21 @@ mod tests {
 	#[test]
 	fn read_only_is_re_enabled_for_a_plain_redacted_replica() {
 		assert!(should_enforce_read_only(&replica_with(true, None)));
+	}
+
+	#[test]
+	fn read_only_is_deferred_when_persistent_users_still_need_provisioning() {
+		// Demoting the analytics user here would break the CREATE ROLE that
+		// runs later in the switchover; that path re-enables read-only itself.
+		let spec = serde_json::json!({
+			"schedule": "0 */6 * * *",
+			"readOnly": true,
+			"redaction": { "manifestUrl": "https://x/m.json" },
+			"persistentUsers": [{ "name": "tupaia_read" }],
+		});
+		let replica =
+			PostgresPhysicalReplica::new("r", serde_json::from_value(spec).expect("spec"));
+		assert!(!should_enforce_read_only(&replica));
 	}
 
 	#[test]

@@ -1613,6 +1613,20 @@ async fn provision_persistent_users(
 		"provisioned persistent users"
 	);
 
+	// The restore kept the analytics role SUPERUSER so the statements above
+	// could run (see `keep_analytics_superuser`). Hand that privilege back now
+	// that they have. Skipped when `persistent_schemas` is set, because those
+	// replicas are writable by design and something downstream still needs the
+	// rights — same carve-out redaction makes.
+	if replica.spec.read_only && replica.spec.persistent_schemas.is_none() {
+		info!(
+			replica = %replica_name,
+			restore = %restore_name,
+			"demoting analytics user and restoring read-only after provisioning"
+		);
+		redaction::enforce_read_only(&conn, &dbname, &admin_user).await?;
+	}
+
 	if !skipped.is_empty()
 		&& let Err(e) = ctx
 			.recorder

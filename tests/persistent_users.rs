@@ -371,11 +371,18 @@ async fn persistent_user_with_missing_schema_still_switches_over() {
 	cleanup_namespace(&client, ns, &[replica_name]).await;
 }
 
-/// A `readOnly` replica — the default — has `default_transaction_read_only = on`
-/// in its postgresql.conf, which fails every `CREATE ROLE` and `GRANT` unless
-/// the provisioning session turns it off first. Without that, provisioning
-/// errors and the switchover never completes, so this asserts the replica
-/// reaches Ready at all as much as it asserts the role works.
+/// A `readOnly` replica — the default — puts two separate obstacles in the way
+/// of provisioning, and this covers both.
+///
+/// The transaction default (`default_transaction_read_only = on` in
+/// postgresql.conf) is the obvious one, handled by the session GUC. The one
+/// that actually bites is privilege: on PG >= 14 the init script would grant
+/// the analytics role only `pg_read_all_data`, which cannot `CREATE ROLE` —
+/// no session setting rescues that, which is why the builder keeps the role
+/// SUPERUSER when `persistentUsers` is set and the operator demotes it after.
+///
+/// Provisioning failures propagate, so the replica reaching Ready at all is
+/// as much the assertion as the role working.
 #[tokio::test]
 #[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
 async fn persistent_user_on_read_only_replica() {
@@ -435,6 +442,29 @@ async fn persistent_user_on_read_only_replica() {
 		"tupaia_read must exist on a read-only replica\nstdout: {stdout}\nstderr: {stderr}"
 	);
 	assert_eq!(stdout.trim(), "1");
+
+	println!("--- verifying the analytics role was demoted after provisioning");
+	let demoted = kubectl_exec(
+		ns,
+		&format!("deployment/{restore_name}"),
+		&[
+			"psql",
+			"-U",
+			"postgres",
+			"-d",
+			"postgres",
+			"-t",
+			"-A",
+			"-c",
+			"SELECT rolsuper FROM pg_roles WHERE rolname = 'analytics'",
+		],
+	)
+	.await;
+	assert_eq!(
+		demoted.trim(),
+		"f",
+		"the SUPERUSER elevation must not outlive the switchover window"
+	);
 
 	println!("--- verifying the replica is still read-only for that role");
 	let (ok, _, stderr) = psql_as_reader(

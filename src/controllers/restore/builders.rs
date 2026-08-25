@@ -1012,6 +1012,17 @@ pub struct PostgresDeploymentInputs<'a> {
 	/// postgres container install `postgresql_anonymizer` before starting
 	/// the server (see [`anon_install_prelude`]).
 	pub redaction_enabled: bool,
+	/// Keep the analytics role SUPERUSER even on an otherwise read-only
+	/// restore, because the operator still has role-management work to do
+	/// against it after startup.
+	///
+	/// Set for replicas with `persistentUsers`: provisioning those roles runs
+	/// `CREATE ROLE` and `ALTER DEFAULT PRIVILEGES FOR ROLE <owner>`, neither
+	/// of which `pg_read_all_data` covers and the latter of which `CREATEROLE`
+	/// doesn't either. The operator demotes the role once provisioning is done
+	/// (see `provision_persistent_users`), so the elevation lasts only for the
+	/// switchover window and the database itself stays read-only throughout.
+	pub keep_analytics_superuser: bool,
 }
 
 /// Shell prelude that makes the `anon` extension available to the postgres
@@ -1125,6 +1136,7 @@ pub fn build_deployment(
 		tolerations: replica.spec.tolerations.clone(),
 		placement,
 		redaction_enabled: replica.spec.redaction.is_some(),
+		keep_analytics_superuser: !replica.spec.persistent_users.is_empty(),
 	})
 }
 
@@ -1293,11 +1305,16 @@ pub fn build_postgres_deployment_with(cfg: &PostgresDeploymentInputs<'_>) -> Res
 		tolerations,
 		placement,
 		redaction_enabled,
+		keep_analytics_superuser,
 	} = cfg;
 	let shm_size = shm_size.clone();
 	let shared_buffers_mb = *shared_buffers_mb;
 	let read_only = *read_only;
 	let redaction_enabled = *redaction_enabled;
+	// The database's read-only posture and the analytics role's privilege are
+	// separate decisions: a `persistentUsers` replica stays read-only for its
+	// clients while the operator keeps the role-management rights it needs.
+	let read_only_analytics_grant = read_only && !*keep_analytics_superuser;
 
 	let pg_image = format!("postgres:{pg_version}");
 
@@ -1626,7 +1643,7 @@ END
 \$\$;
 SQLEOF
 
-if [ "$PG_MAJOR" -ge 14 ] && [ "{read_only}" = "true" ]; then
+if [ "$PG_MAJOR" -ge 14 ] && [ "{read_only_analytics_grant}" = "true" ]; then
   # PG >= 14 read-only: granular read role keeps the surface area minimal
   psql -U postgres -d postgres << SQLEOF
 GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};

@@ -1169,6 +1169,54 @@ fn deployment_init_script_grants_read_only_on_pg14_plus() {
 }
 
 #[test]
+fn read_only_with_persistent_users_keeps_analytics_superuser() {
+	// pg_read_all_data cannot CREATE ROLE, so a read-only replica that has
+	// persistent users to provision would fail the switchover on
+	// "permission denied to create role". The operator demotes the role again
+	// once provisioning is done; the database itself stays read-only either
+	// way, which the second assertion pins.
+	let (mut restore, mut replica) = test_restore_and_replica();
+	replica.spec.read_only = true;
+	replica.spec.persistent_users = vec![PersistentUser {
+		name: "tupaia_read".to_string(),
+		read_schemas: vec![],
+		search_path: vec![],
+		secret_name: None,
+	}];
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
+	let pod_spec = deploy.spec.unwrap().template.spec.unwrap();
+	let setup_auth = pod_spec
+		.init_containers
+		.as_ref()
+		.unwrap()
+		.iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist");
+	let script = &setup_auth.args.as_ref().unwrap()[0];
+
+	assert!(
+		script.contains("ALTER ROLE ${ANALYTICS_USERNAME} WITH SUPERUSER"),
+		"persistent users need the analytics role to keep SUPERUSER: {script}"
+	);
+	assert!(
+		script.contains("default_transaction_read_only = on"),
+		"the database must still come up read-only: {script}"
+	);
+}
+
+#[test]
 fn deployment_init_script_two_stage_pg_resetwal_fallback() {
 	// When a snapshot is taken mid-online-backup the trailing WAL isn't
 	// included, and postgres recovery fails with "WAL ends before end of
