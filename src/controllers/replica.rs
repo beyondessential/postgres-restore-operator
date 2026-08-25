@@ -1655,6 +1655,48 @@ async fn reprovision_persistent_users(
 	provision_persistent_users(client, ctx, replica, namespace, restore_name).await
 }
 
+/// Stamp the current pod and time onto the replica's status, marking its
+/// persistent users up to date.
+///
+/// Best-effort: losing the marker costs a redundant reprovision next tick,
+/// which is idempotent, so it must never fail a switchover that has otherwise
+/// succeeded. Called on both exits from `provision_persistent_users` — the
+/// early return counts as "up to date" just as much as a full run does, and
+/// skipping it there would leave the staleness timer permanently expired.
+async fn mark_persistent_users_current(
+	client: &Client,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	restore_name: &str,
+) {
+	let replica_name = replica.name_any();
+	match postgres::find_pod_uid_by_label(
+		client,
+		namespace,
+		&format!("pgro.bes.au/restore={restore_name}"),
+	)
+	.await
+	{
+		Ok(Some(pod_uid)) => {
+			if let Err(e) = record_persistent_users_provisioned(
+				client,
+				replica,
+				namespace,
+				&pod_uid,
+				Timestamp::now(),
+			)
+			.await
+			{
+				warn!(replica = %replica_name, error = %e, "failed to record persistent users provisioning");
+			}
+		}
+		Ok(None) => {}
+		Err(e) => {
+			warn!(replica = %replica_name, error = %e, "failed to look up pod for persistent users marker")
+		}
+	}
+}
+
 /// Persist which pod the users were provisioned against, and when.
 async fn record_persistent_users_provisioned(
 	client: &Client,
@@ -1749,11 +1791,33 @@ async fn provision_persistent_users(
 		&& replica.spec.persistent_schemas.is_none()
 		&& !persistent_users::analytics_is_superuser(&conn.client, &admin_user).await?
 	{
-		debug!(
-			replica = %replica_name,
-			restore = %restore_name,
-			"persistent users already provisioned on this pod; nothing to do"
-		);
+		// A demoted analytics role usually means "provisioning already ran".
+		// It means something else on a restore whose pod predates the
+		// `persistentUsers` being added: that pod was built when the flag was
+		// false, so the role was never elevated and the users were never
+		// created. That resolves itself — the changed init script rolls the
+		// Deployment and the new pod elevates the role — but it is worth
+		// saying out loud rather than looking like a completed run.
+		let missing = persistent_users::missing_roles(&conn.client, users).await?;
+		if missing.is_empty() {
+			debug!(
+				replica = %replica_name,
+				restore = %restore_name,
+				"persistent users already provisioned on this pod; nothing to do"
+			);
+		} else {
+			warn!(
+				replica = %replica_name,
+				restore = %restore_name,
+				missing = ?missing,
+				"restore pod predates these persistent users; deferring until it is replaced"
+			);
+		}
+		// Refresh the marker either way. Without it the staleness timer would
+		// never advance past the original run, so every reconcile would
+		// re-open two database connections just to reach this same early
+		// return — permanently expired rather than bounding the work.
+		mark_persistent_users_current(client, replica, namespace, restore_name).await;
 		return Ok(());
 	}
 
@@ -1801,36 +1865,7 @@ async fn provision_persistent_users(
 		warn!(replica = %replica_name, error = %e, "failed to publish PersistentUserSchemaMissing event");
 	}
 
-	// Record which pod this ran against so the reconciler can tell when a
-	// replacement pod has re-run setup-auth and wiped these roles again.
-	// Best-effort: losing the marker costs a redundant reprovision next tick,
-	// which is idempotent, so it must not fail a switchover that has otherwise
-	// succeeded.
-	match postgres::find_pod_uid_by_label(
-		client,
-		namespace,
-		&format!("pgro.bes.au/restore={restore_name}"),
-	)
-	.await
-	{
-		Ok(Some(pod_uid)) => {
-			if let Err(e) = record_persistent_users_provisioned(
-				client,
-				replica,
-				namespace,
-				&pod_uid,
-				Timestamp::now(),
-			)
-			.await
-			{
-				warn!(replica = %replica_name, error = %e, "failed to record persistent users provisioning");
-			}
-		}
-		Ok(None) => {}
-		Err(e) => {
-			warn!(replica = %replica_name, error = %e, "failed to look up pod for persistent users marker")
-		}
-	}
+	mark_persistent_users_current(client, replica, namespace, restore_name).await;
 
 	Ok(())
 }

@@ -157,6 +157,26 @@ pub async fn analytics_is_superuser(
 	Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
 }
 
+/// Which of `users` do not yet exist as roles on this restore.
+///
+/// Used to tell "already provisioned, nothing to do" apart from "this pod
+/// predates the `persistentUsers` change and cannot provision yet", which
+/// otherwise look identical from the analytics role's privilege alone.
+pub async fn missing_roles(
+	pg: &tokio_postgres::Client,
+	users: &[PersistentUser],
+) -> Result<Vec<String>> {
+	let names: Vec<String> = users.iter().map(|u| u.name.clone()).collect();
+	let rows = pg
+		.query(
+			"SELECT rolname FROM pg_roles WHERE rolname = ANY($1)",
+			&[&names],
+		)
+		.await?;
+	let found: Vec<String> = rows.iter().map(|r| r.get::<_, String>(0)).collect();
+	Ok(names.into_iter().filter(|n| !found.contains(n)).collect())
+}
+
 /// Apply every persistent user to an open connection against the restore's
 /// main database.
 ///
