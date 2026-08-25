@@ -71,9 +71,21 @@ pub async fn report(
 		);
 		return;
 	};
-	let replica_id = labels
+	// Canopy made `replica_id` required on VerificationArgs, so a report
+	// without one can no longer be constructed. Treat a missing declaration
+	// label the same way as a missing group or server: skip the report rather
+	// than invent an identity canopy would then key its worklist on.
+	let Some(replica_id) = labels
 		.get(labels::DECLARATION_ID)
-		.and_then(|s| Uuid::parse_str(s).ok());
+		.and_then(|s| Uuid::parse_str(s).ok())
+	else {
+		warn!(
+			replica = %replica.name_any(),
+			"canopy verification: replica CR missing {} label, skipping report",
+			labels::DECLARATION_ID,
+		);
+		return;
+	};
 	let backup_type = labels
 		.get(labels::TYPE)
 		.map(String::as_str)
@@ -145,7 +157,7 @@ pub async fn report(
 
 	let args = VerificationArgs::builder()
 		.maybe_migration(migration)
-		.maybe_replica_id(replica_id)
+		.replica_id(replica_id)
 		.maybe_run_id(run_id)
 		.group(group)
 		.server_id(server_id)
