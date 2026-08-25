@@ -5,6 +5,8 @@
 //! loop. This module owns signal 3 — one function called at each terminal
 //! transition (switchover success, restore failure).
 
+use std::collections::BTreeMap;
+
 use bestool_canopy::schema::{MigrationArgs, MigrationTimingArgs, RunOutcome, VerificationArgs};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Namespace, Secret};
@@ -48,59 +50,51 @@ pub async fn report(
 		return;
 	};
 
-	let labels = replica.labels();
-	let Some(group) = labels
-		.get(labels::GROUP)
-		.and_then(|s| Uuid::parse_str(s).ok())
-	else {
-		warn!(
-			replica = %replica.name_any(),
-			"canopy verification: replica CR missing {} label, skipping report",
-			labels::GROUP,
-		);
-		return;
-	};
-	let Some(server_id) = labels
-		.get(labels::SERVER)
-		.and_then(|s| Uuid::parse_str(s).ok())
-	else {
-		warn!(
-			replica = %replica.name_any(),
-			"canopy verification: replica CR missing {} label, skipping report",
-			labels::SERVER,
-		);
-		return;
-	};
 	// Canopy made `replica_id` required on VerificationArgs, so a report
 	// without one can no longer be constructed, and inventing one is not an
-	// option — canopy keys worklist state on it. The syncer stamps the same
-	// label on the Namespace as on the CR, so fall back to that before giving
-	// up: a CR whose labels have been stripped or hand-edited can still be
-	// identified from its namespace.
-	let replica_id = match labels
-		.get(labels::DECLARATION_ID)
-		.and_then(|s| Uuid::parse_str(s).ok())
-	{
-		Some(id) => id,
-		None => match declaration_id_from_namespace(ctx, replica).await {
-			Some(id) => {
-				warn!(
-					replica = %replica.name_any(),
-					"canopy verification: replica CR missing {} label, recovered it from the namespace",
-					labels::DECLARATION_ID,
-				);
-				id
+	// option — canopy keys worklist state on it.
+	//
+	// The syncer stamps the same label set on the Namespace as on the CR, so
+	// fall back to the namespace when the CR is missing any of the three ids.
+	// Resolved together, before any of them is used: the case worth recovering
+	// is a CR whose labels were stripped wholesale, and checking them one at a
+	// time would return on the first missing one without ever consulting the
+	// namespace. Merged rather than substituted, so a CR that has some of them
+	// keeps its own values.
+	let mut labels = replica.labels().clone();
+	let ids = match canopy_ids(&labels) {
+		Ok(ids) => ids,
+		Err(missing) => {
+			if let Some(ns_labels) = namespace_labels(ctx, replica).await {
+				for (key, value) in ns_labels {
+					labels.entry(key).or_insert(value);
+				}
 			}
-			None => {
-				warn!(
-					replica = %replica.name_any(),
-					"canopy verification: no {} label on the replica CR or its namespace, skipping report",
-					labels::DECLARATION_ID,
-				);
-				return;
+			match canopy_ids(&labels) {
+				Ok(ids) => {
+					warn!(
+						replica = %replica.name_any(),
+						?missing,
+						"canopy verification: replica CR missing identity labels, recovered from the namespace",
+					);
+					ids
+				}
+				Err(still_missing) => {
+					warn!(
+						replica = %replica.name_any(),
+						?still_missing,
+						"canopy verification: identity labels absent from the replica CR and its namespace, skipping report",
+					);
+					return;
+				}
 			}
-		},
+		}
 	};
+	let CanopyIds {
+		group,
+		server_id,
+		replica_id,
+	} = ids;
 	let backup_type = labels
 		.get(labels::TYPE)
 		.map(String::as_str)
@@ -208,37 +202,73 @@ pub async fn report(
 	}
 }
 
-/// Read the declaration id from the replica's Namespace.
+/// The three identities a verification report cannot be built without.
+pub struct CanopyIds {
+	pub group: Uuid,
+	pub server_id: Uuid,
+	pub replica_id: Uuid,
+}
+
+/// Parse the identity labels canopy requires, or report which of them are
+/// absent or unparseable.
 ///
-/// `canopy::ensure_namespace` stamps the same label set on the Namespace as it
-/// does on the replica CR, so the namespace is a second copy of the same fact
-/// rather than a guess. Only reached when the CR's own label is missing, which
-/// the syncer should make impossible — a hand-edited or partially-applied CR
-/// is the case this covers.
+/// Pure so the label handling stays testable apart from the namespace lookup
+/// it feeds.
+fn canopy_ids(labels: &BTreeMap<String, String>) -> Result<CanopyIds, Vec<&'static str>> {
+	let id = |key: &str| labels.get(key).and_then(|s| Uuid::parse_str(s).ok());
+	let (group, server_id, replica_id) = (
+		id(labels::GROUP),
+		id(labels::SERVER),
+		id(labels::DECLARATION_ID),
+	);
+
+	let missing: Vec<&'static str> = [
+		(labels::GROUP, group.is_none()),
+		(labels::SERVER, server_id.is_none()),
+		(labels::DECLARATION_ID, replica_id.is_none()),
+	]
+	.into_iter()
+	.filter_map(|(key, absent)| absent.then_some(key))
+	.collect();
+
+	match (group, server_id, replica_id) {
+		(Some(group), Some(server_id), Some(replica_id)) => Ok(CanopyIds {
+			group,
+			server_id,
+			replica_id,
+		}),
+		_ => Err(missing),
+	}
+}
+
+/// Labels on the replica's Namespace.
 ///
-/// Best-effort: a lookup failure, a namespaceless replica or an unparseable
-/// value all read as absent, and the caller skips the report.
-async fn declaration_id_from_namespace(
+/// `canopy::ensure_namespace` stamps the same label set there as
+/// `ensure_replica_cr` does on the CR, both from one `WorklistEntry`, so this
+/// is a second copy of the same fact rather than a guess. It cannot go stale:
+/// the namespace *name* derives from `replica_id ‖ server_id`, so a changed id
+/// lands in a different namespace and the old one is swept.
+///
+/// Best-effort: a namespaceless replica, a lookup failure or an absent
+/// namespace all read as `None`, and the caller skips the report.
+async fn namespace_labels(
 	ctx: &Context,
 	replica: &PostgresPhysicalReplica,
-) -> Option<Uuid> {
+) -> Option<BTreeMap<String, String>> {
 	let ns_name = replica.namespace()?;
 	let namespaces: Api<Namespace> = Api::all(ctx.client.clone());
-	let ns = match namespaces.get_opt(&ns_name).await {
-		Ok(ns) => ns?,
+	match namespaces.get_opt(&ns_name).await {
+		Ok(ns) => Some(ns?.labels().clone()),
 		Err(e) => {
 			warn!(
 				replica = %replica.name_any(),
 				namespace = %ns_name,
 				error = %e,
-				"canopy verification: failed to read namespace for declaration id fallback"
+				"canopy verification: failed to read namespace for identity label fallback"
 			);
-			return None;
+			None
 		}
-	};
-	ns.labels()
-		.get(labels::DECLARATION_ID)
-		.and_then(|s| Uuid::parse_str(s).ok())
+	}
 }
 
 /// The canopy run-uuid persisted on the restore status, parsed to a `Uuid`.
@@ -412,6 +442,86 @@ fn migration_args(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	const ID: &str = "11111111-1111-1111-1111-111111111111";
+
+	fn label_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+		pairs
+			.iter()
+			.map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+			.collect()
+	}
+
+	fn full_labels() -> BTreeMap<String, String> {
+		label_set(&[
+			(labels::GROUP, ID),
+			(labels::SERVER, ID),
+			(labels::DECLARATION_ID, ID),
+		])
+	}
+
+	#[test]
+	fn all_three_ids_parse() {
+		let ids = canopy_ids(&full_labels()).expect("a complete label set parses");
+		let expected = Uuid::parse_str(ID).expect("valid uuid");
+		assert_eq!(ids.group, expected);
+		assert_eq!(ids.server_id, expected);
+		assert_eq!(ids.replica_id, expected);
+	}
+
+	#[test]
+	fn every_absent_id_is_reported_at_once() {
+		// The report is skipped on any of the three, so the caller needs to
+		// know all of them in one pass — checking one at a time would return
+		// before the namespace fallback ever ran.
+		let missing = canopy_ids(&BTreeMap::new()).expect_err("an empty label set cannot parse");
+		assert_eq!(missing.len(), 3, "got {missing:?}");
+		for key in [labels::GROUP, labels::SERVER, labels::DECLARATION_ID] {
+			assert!(
+				missing.contains(&key),
+				"{key} should be reported: {missing:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn only_the_absent_id_is_reported() {
+		let mut labels = full_labels();
+		labels.remove(labels::DECLARATION_ID);
+		let missing = canopy_ids(&labels).expect_err("a missing declaration id cannot parse");
+		assert_eq!(missing, vec![labels::DECLARATION_ID]);
+	}
+
+	#[test]
+	fn an_unparseable_id_counts_as_absent() {
+		// A garbage value must not reach canopy as a silently-dropped field.
+		let mut labels = full_labels();
+		labels.insert(labels::SERVER.to_string(), "not-a-uuid".to_string());
+		let missing = canopy_ids(&labels).expect_err("a malformed uuid cannot parse");
+		assert_eq!(missing, vec![labels::SERVER]);
+	}
+
+	#[test]
+	fn namespace_labels_fill_only_the_gaps() {
+		// Mirrors the merge in `report`: the CR wins where it has a value, and
+		// the namespace supplies the rest, so a partially-labelled CR keeps its
+		// own identity rather than being overwritten wholesale.
+		let other = "22222222-2222-2222-2222-222222222222";
+		let mut cr = label_set(&[(labels::GROUP, other)]);
+		assert!(canopy_ids(&cr).is_err(), "precondition: CR alone is short");
+
+		for (key, value) in full_labels() {
+			cr.entry(key).or_insert(value);
+		}
+
+		let ids = canopy_ids(&cr).expect("the merged set parses");
+		assert_eq!(
+			ids.group,
+			Uuid::parse_str(other).expect("valid uuid"),
+			"the CR's own value must survive the merge"
+		);
+		assert_eq!(ids.replica_id, Uuid::parse_str(ID).expect("valid uuid"));
+	}
 
 	#[test]
 	fn health_details_shape_is_snake_case() {
