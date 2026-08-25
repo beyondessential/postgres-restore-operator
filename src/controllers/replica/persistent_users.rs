@@ -139,6 +139,24 @@ pub fn session_statements(resolved: &[ResolvedUser<'_>], dbname: &str) -> Vec<St
 /// can turn off; the replica stays read-only for everyone else.
 const ALLOW_WRITES: &str = "SET default_transaction_read_only = off;";
 
+/// Whether the analytics role still holds SUPERUSER on this restore.
+///
+/// Reads `pg_roles.rolsuper` rather than `current_setting('is_superuser')`:
+/// the latter is fixed at session start and keeps reporting the old value
+/// after a demotion, so it would answer for the session rather than the role.
+pub async fn analytics_is_superuser(
+	pg: &tokio_postgres::Client,
+	analytics_user: &str,
+) -> Result<bool> {
+	let row = pg
+		.query_opt(
+			"SELECT rolsuper FROM pg_roles WHERE rolname = $1",
+			&[&analytics_user],
+		)
+		.await?;
+	Ok(row.map(|r| r.get::<_, bool>(0)).unwrap_or(false))
+}
+
 /// Apply every persistent user to an open connection against the restore's
 /// main database.
 ///

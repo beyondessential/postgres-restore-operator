@@ -543,6 +543,22 @@ fn an_unrecorded_replica_triggers_provisioning() {
 }
 
 #[test]
+fn a_run_just_inside_the_window_does_not_trigger_provisioning() {
+	// Pins the boundary: without this, >= could drift to > unnoticed, since
+	// the other cases sit at 0s and 601s.
+	let now = Timestamp::now();
+	let replica = replica_provisioned(
+		Some("pod-uid-1"),
+		Some(now - SignedDuration::from_secs(599)),
+	);
+	assert!(!super::persistent_users_need_provisioning(
+		&replica,
+		"pod-uid-1",
+		now
+	));
+}
+
+#[test]
 fn a_stale_run_triggers_provisioning_on_an_unchanged_pod() {
 	// Covers kubelet recreating a sandbox in place: same UID, but setup-auth
 	// ran again, so the users are broken and only the age gives it away.

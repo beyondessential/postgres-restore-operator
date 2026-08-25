@@ -223,6 +223,8 @@ Provisioning is also re-asserted outside switchovers.
 The restore's `setup-auth` initContainer re-runs on every pod start and nulls the password of every login role except `postgres`, so a replaced pod (node drain, eviction, rollout) would otherwise lock these users out until the next scheduled restore.
 The reconciler notices the new pod — via `status.persistentUsersPod` — and reprovisions, so a pod replacement self-heals within one reconcile rather than hours.
 `status.persistentUsersProvisionedAt` drives a 10-minute re-assertion on top, covering an in-place sandbox recreation that re-runs the initContainer without changing the pod's UID.
+That re-assertion is a no-op unless the analytics role is found still holding `SUPERUSER`, which only happens when the initContainer has run again — so a healthy replica does no work beyond one cheap query.
+Failures here are logged and skipped rather than failing the reconcile, so an unreachable database can't stop a replica from scheduling its next restore.
 
 On a `readOnly` replica the analytics user is kept `SUPERUSER` for the provisioning window — `pg_read_all_data` cannot `CREATE ROLE` — and demoted immediately afterwards, so the elevation does not outlive the switchover.
 The database itself stays read-only throughout.

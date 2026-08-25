@@ -446,9 +446,29 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	// a replaced pod re-runs setup-auth, which nulls their passwords and
 	// re-elevates the analytics role. No-op when the replica has no persistent
 	// users, or when the pod hasn't changed and the last run is recent.
-	if let Some(active) = active_restore {
-		reprovision_persistent_users(client, &ctx, &replica, &namespace, &active.name_any(), now)
-			.await?;
+	//
+	// Deliberately not fatal, unlike the switchover call. Everything below
+	// this line — ephemeral teardown, the stale-restore sweep, restore
+	// scheduling — is unrelated to these roles, and letting a database that
+	// happens to be unreachable stop a replica from ever restoring again is a
+	// far worse failure than the users staying stale for another cycle.
+	if let Some(active) = active_restore
+		&& let Err(e) = reprovision_persistent_users(
+			client,
+			&ctx,
+			&replica,
+			&namespace,
+			&active.name_any(),
+			now,
+		)
+		.await
+	{
+		warn!(
+			replica = name,
+			restore = %active.name_any(),
+			error = %e,
+			"failed to re-provision persistent users; continuing reconcile"
+		);
 	}
 
 	// Ephemeral teardown. For a `spec.ephemeral` replica (e.g. the `verify`
@@ -1713,6 +1733,29 @@ async fn provision_persistent_users(
 		ctx.use_port_forward(),
 	)
 	.await?;
+
+	// Provisioning ends by demoting the analytics role, which destroys the very
+	// credential the next run needs — so a blind re-run would fail on
+	// "permission denied to alter role". `setup-auth` re-elevates the role
+	// every time it runs, and it is the only thing that does, so the role still
+	// holding SUPERUSER is exactly the signal that it re-ran and wiped these
+	// users. Already demoted means the last run completed and nothing has
+	// disturbed it since.
+	//
+	// Only meaningful for replicas that get demoted at all: the others keep
+	// SUPERUSER permanently, and re-running against them is harmless — every
+	// statement is idempotent, `pg_default_acl` included.
+	if replica.spec.read_only
+		&& replica.spec.persistent_schemas.is_none()
+		&& !persistent_users::analytics_is_superuser(&conn.client, &admin_user).await?
+	{
+		debug!(
+			replica = %replica_name,
+			restore = %restore_name,
+			"persistent users already provisioned on this pod; nothing to do"
+		);
+		return Ok(());
+	}
 
 	let skipped = persistent_users::apply(&conn.client, users, &passwords, &dbname).await?;
 
