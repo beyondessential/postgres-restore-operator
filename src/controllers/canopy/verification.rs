@@ -203,10 +203,11 @@ pub async fn report(
 }
 
 /// The three identities a verification report cannot be built without.
-pub struct CanopyIds {
-	pub group: Uuid,
-	pub server_id: Uuid,
-	pub replica_id: Uuid,
+#[derive(Debug, Clone, Copy)]
+struct CanopyIds {
+	group: Uuid,
+	server_id: Uuid,
+	replica_id: Uuid,
 }
 
 /// Parse the identity labels canopy requires, or report which of them are
@@ -443,7 +444,15 @@ fn migration_args(
 mod tests {
 	use super::*;
 
-	const ID: &str = "11111111-1111-1111-1111-111111111111";
+	// Distinct per label, so a field read from the wrong key is caught rather
+	// than passing on a coincidence.
+	const GROUP_ID: &str = "11111111-1111-1111-1111-111111111111";
+	const SERVER_ID: &str = "22222222-2222-2222-2222-222222222222";
+	const REPLICA_ID: &str = "33333333-3333-3333-3333-333333333333";
+
+	fn uuid(s: &str) -> Uuid {
+		Uuid::parse_str(s).expect("valid uuid")
+	}
 
 	fn label_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
 		pairs
@@ -454,19 +463,18 @@ mod tests {
 
 	fn full_labels() -> BTreeMap<String, String> {
 		label_set(&[
-			(labels::GROUP, ID),
-			(labels::SERVER, ID),
-			(labels::DECLARATION_ID, ID),
+			(labels::GROUP, GROUP_ID),
+			(labels::SERVER, SERVER_ID),
+			(labels::DECLARATION_ID, REPLICA_ID),
 		])
 	}
 
 	#[test]
 	fn all_three_ids_parse() {
 		let ids = canopy_ids(&full_labels()).expect("a complete label set parses");
-		let expected = Uuid::parse_str(ID).expect("valid uuid");
-		assert_eq!(ids.group, expected);
-		assert_eq!(ids.server_id, expected);
-		assert_eq!(ids.replica_id, expected);
+		assert_eq!(ids.group, uuid(GROUP_ID));
+		assert_eq!(ids.server_id, uuid(SERVER_ID));
+		assert_eq!(ids.replica_id, uuid(REPLICA_ID));
 	}
 
 	#[test]
@@ -506,7 +514,7 @@ mod tests {
 		// Mirrors the merge in `report`: the CR wins where it has a value, and
 		// the namespace supplies the rest, so a partially-labelled CR keeps its
 		// own identity rather than being overwritten wholesale.
-		let other = "22222222-2222-2222-2222-222222222222";
+		let other = "99999999-9999-9999-9999-999999999999";
 		let mut cr = label_set(&[(labels::GROUP, other)]);
 		assert!(canopy_ids(&cr).is_err(), "precondition: CR alone is short");
 
@@ -517,10 +525,11 @@ mod tests {
 		let ids = canopy_ids(&cr).expect("the merged set parses");
 		assert_eq!(
 			ids.group,
-			Uuid::parse_str(other).expect("valid uuid"),
+			uuid(other),
 			"the CR's own value must survive the merge"
 		);
-		assert_eq!(ids.replica_id, Uuid::parse_str(ID).expect("valid uuid"));
+		assert_eq!(ids.server_id, uuid(SERVER_ID));
+		assert_eq!(ids.replica_id, uuid(REPLICA_ID));
 	}
 
 	#[test]
