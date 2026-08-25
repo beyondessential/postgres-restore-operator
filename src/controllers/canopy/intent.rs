@@ -529,6 +529,9 @@ impl IntentConfig {
 			persistent_schemas,
 			migrate_to,
 			redaction: redaction_spec(p),
+			// Canopy-managed replicas are built from a worklist entry, which
+			// has no notion of downstream consumer roles.
+			persistent_users: Vec::new(),
 			storage_size_maximum,
 		}
 	}
