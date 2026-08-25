@@ -90,6 +90,7 @@ jobs:
             namespaces: >-
               test-persistent-users
               test-pu-missing-schema
+              test-pu-read-only
             needs_non_pg_snapshot: false
 
     steps:

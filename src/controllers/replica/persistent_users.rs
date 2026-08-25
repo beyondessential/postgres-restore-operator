@@ -113,6 +113,32 @@ pub fn statements_for(
 	sql
 }
 
+/// One user paired with its password and the `(schema, owner)` entries that
+/// were found to exist in the restore.
+pub type ResolvedUser<'a> = (&'a PersistentUser, &'a String, Vec<(String, String)>);
+
+/// Every statement for a whole provisioning session, in execution order.
+///
+/// Kept separate from [`apply`] so the ordering — in particular that
+/// [`ALLOW_WRITES`] precedes all DDL — is testable without a database.
+pub fn session_statements(resolved: &[ResolvedUser<'_>], dbname: &str) -> Vec<String> {
+	let mut sql = vec![ALLOW_WRITES.to_string()];
+	for (user, password, schemas) in resolved {
+		sql.extend(statements_for(user, password, dbname, schemas));
+	}
+	sql
+}
+
+/// Session GUC issued before any provisioning DDL.
+///
+/// A `readOnly` replica (the default) has `default_transaction_read_only = on`
+/// baked into its `postgresql.conf` by the restore init script, which would
+/// fail every `CREATE ROLE` and `GRANT` here with "cannot execute … in a
+/// read-only transaction". The restore is a promoted standalone rather than a
+/// standby, so the setting is a plain `USERSET` GUC the operator's own session
+/// can turn off; the replica stays read-only for everyone else.
+const ALLOW_WRITES: &str = "SET default_transaction_read_only = off;";
+
 /// Apply every persistent user to an open connection against the restore's
 /// main database.
 ///
@@ -126,6 +152,7 @@ pub async fn apply(
 	dbname: &str,
 ) -> Result<Vec<String>> {
 	let mut skipped = Vec::new();
+	let mut resolved = Vec::with_capacity(users.len());
 
 	for (user, password) in users.iter().zip(passwords) {
 		let present = postgres::schema_owners_on(pg, &user.read_schemas).await?;
@@ -135,16 +162,16 @@ pub async fn apply(
 				.filter(|s| !present.iter().any(|(found, _)| found == *s))
 				.map(|s| format!("{}/{s}", user.name)),
 		);
-
-		for stmt in statements_for(user, password, dbname, &present) {
-			pg.batch_execute(&stmt).await?;
-		}
-
 		info!(
 			user = %user.name,
 			schemas = ?present,
-			"provisioned persistent user"
+			"provisioning persistent user"
 		);
+		resolved.push((user, password, present));
+	}
+
+	for stmt in session_statements(&resolved, dbname) {
+		pg.batch_execute(&stmt).await?;
 	}
 
 	if !skipped.is_empty() {
@@ -264,6 +291,61 @@ mod tests {
 		);
 		assert!(sql[1].contains("GRANT CONNECT ON DATABASE \"tamanu\""));
 		assert!(sql.last().expect("non-empty").contains("search_path"));
+	}
+
+	#[test]
+	fn writes_are_re_enabled_before_any_ddl() {
+		// readOnly replicas (the default) carry default_transaction_read_only
+		// = on, which fails CREATE ROLE and every GRANT. The session must turn
+		// it off first or provisioning blocks the switchover outright.
+		let user = user();
+		let password = "pw".to_string();
+		let sql = session_statements(
+			&[(
+				&user,
+				&password,
+				vec![("public_tupaia".into(), "analytics".into())],
+			)],
+			"tamanu",
+		);
+		assert_eq!(
+			sql.first().map(String::as_str),
+			Some("SET default_transaction_read_only = off;"),
+			"writes must be enabled before anything else: {sql:?}"
+		);
+		assert!(
+			sql[1..]
+				.iter()
+				.all(|s| !s.contains("default_transaction_read_only")),
+			"the GUC should only be set once, up front: {sql:?}"
+		);
+	}
+
+	#[test]
+	fn session_covers_every_user_once() {
+		let a = PersistentUser {
+			name: "reader_a".into(),
+			read_schemas: vec![],
+			search_path: vec![],
+			secret_name: None,
+		};
+		let b = PersistentUser {
+			name: "reader_b".into(),
+			read_schemas: vec![],
+			search_path: vec![],
+			secret_name: None,
+		};
+		let (pw_a, pw_b) = ("pa".to_string(), "pb".to_string());
+		let sql = session_statements(&[(&a, &pw_a, vec![]), (&b, &pw_b, vec![])], "tamanu");
+		for name in ["reader_a", "reader_b"] {
+			assert_eq!(
+				sql.iter()
+					.filter(|s| s.contains("CREATE ROLE") && s.contains(name))
+					.count(),
+				1,
+				"{name} must be created exactly once: {sql:?}"
+			);
+		}
 	}
 
 	#[test]

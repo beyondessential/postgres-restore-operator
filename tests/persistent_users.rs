@@ -370,3 +370,89 @@ async fn persistent_user_with_missing_schema_still_switches_over() {
 
 	cleanup_namespace(&client, ns, &[replica_name]).await;
 }
+
+/// A `readOnly` replica — the default — has `default_transaction_read_only = on`
+/// in its postgresql.conf, which fails every `CREATE ROLE` and `GRANT` unless
+/// the provisioning session turns it off first. Without that, provisioning
+/// errors and the switchover never completes, so this asserts the replica
+/// reaches Ready at all as much as it asserts the role works.
+#[tokio::test]
+#[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
+async fn persistent_user_on_read_only_replica() {
+	let client = make_client().await;
+	let ns = "test-pu-read-only";
+	let replica_name = "pu-ro-replica";
+
+	setup_namespace(&client, ns).await;
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), ns);
+	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(client.clone(), ns);
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), ns);
+
+	secrets
+		.create(
+			&PostParams::default(),
+			&build_kopia_secret(ns, "pu-ro-kopia-creds", "test-bucket"),
+		)
+		.await
+		.expect("failed to create kopia secret");
+
+	println!("--- creating a readOnly replica with a persistent user");
+	let mut replica = build_replica(replica_name, "pu-ro-kopia-creds", ReplicaOpts::default());
+	assert!(
+		replica.spec.read_only,
+		"this test is meaningless unless the replica is read-only"
+	);
+	replica.spec.persistent_users = vec![PersistentUser {
+		name: "tupaia_read".to_string(),
+		read_schemas: vec!["public".to_string()],
+		search_path: vec!["public".to_string()],
+		secret_name: None,
+	}];
+	replica.metadata.namespace = Some(ns.into());
+	replicas
+		.create(&PostParams::default(), &replica)
+		.await
+		.expect("failed to create replica");
+
+	println!("--- waiting for the restore to become Active (provisioning must not block it)");
+	let restore_name =
+		wait_for_restore_phase(&restores, replica_name, RestorePhase::Active, PHASE_TIMEOUT).await;
+	wait_for_replica_phase(&replicas, replica_name, ReplicaPhase::Ready, PHASE_TIMEOUT).await;
+
+	println!("--- verifying the role was created despite the read-only default");
+	let password = read_secret_password(&secrets, "pu-ro-replica-user-tupaia-read").await;
+	let (ok, stdout, stderr) = psql_as_reader(
+		ns,
+		&format!("deployment/{restore_name}"),
+		&password,
+		&["-c", "SELECT 1"],
+	)
+	.await;
+	assert!(
+		ok,
+		"tupaia_read must exist on a read-only replica\nstdout: {stdout}\nstderr: {stderr}"
+	);
+	assert_eq!(stdout.trim(), "1");
+
+	println!("--- verifying the replica is still read-only for that role");
+	let (ok, _, stderr) = psql_as_reader(
+		ns,
+		&format!("deployment/{restore_name}"),
+		&password,
+		&[
+			"-v",
+			"ON_ERROR_STOP=1",
+			"-c",
+			"CREATE TABLE public.should_not_exist (id int)",
+		],
+	)
+	.await;
+	assert!(
+		!ok,
+		"the operator's session GUC must not leave the replica writable: {stderr}"
+	);
+
+	cleanup_namespace(&client, ns, &[replica_name]).await;
+}
