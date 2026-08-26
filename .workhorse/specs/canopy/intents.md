@@ -38,15 +38,13 @@ supports it.
   migrated to it. Canopy withholds the entry entirely when the server has no
   candidate version, so an intent carrying `migrate` runs only where there is a
   version to aim at.
-- [ ] An optional-migrate semantic behaves like `migrate` but does not withhold:
-  canopy names a target version when an operator has set one, and otherwise
-  dispatches the entry with no target. (Working token `migrate?`; the exact string
-  is canopy's contract to settle.)
+- [ ] `migrate?` — behaves like `migrate` but does not withhold: canopy names a
+  target version when an operator has set one, and otherwise dispatches the entry
+  with no target.
 - [ ] `redact` — the intent may de-identify the restored data before serving it.
 - [ ] `verify` opts into `check` and `once`.
 - [ ] `upgrade` opts into `check`, `once`, and `migrate`.
-- [ ] `analytics` opts into `check`, `url`, `redact`, and the optional-migrate
-  semantic.
+- [ ] `analytics` opts into `check`, `url`, `redact`, and `migrate?`.
 
 ## Migrating a restore to a target version
 

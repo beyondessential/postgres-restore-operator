@@ -149,7 +149,6 @@ pub fn build_migration_job(
 }
 
 /// Drive the migration Job: create it, wait, then record what it did.
-// spec: RST#what-a-migration-test-reports
 pub async fn reconcile_migrating(
 	restore: &PostgresPhysicalRestore,
 	ctx: &Context,
