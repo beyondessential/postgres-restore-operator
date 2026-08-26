@@ -44,42 +44,47 @@ stays and only restores again when a newer snapshot is offered.
 
 ## The two asks
 
-### 1. Keep the replica alive after the upgrade
+### 1. Keep the replica alive after the upgrade — pgro
 
-This is pgro-side. `upgrade` currently takes no params; it would gain a boolean
-(working name `persist`) that, when set, materialises `ephemeral: false` so the
-migrated restore is not torn down after the test passes.
+`upgrade` grows a single boolean param, `ephemeral`, **defaulting to true** so the
+existing "restore, test, discard" behaviour is unchanged. Setting it false
+materialises `PostgresPhysicalReplicaSpec.ephemeral = false`, so the replica
+controller keeps the migrated restore running instead of tearing it down once it
+reaches `Active`.
 
-Flipping `ephemeral` is the small part. The open question is what a kept-alive
-upgrade replica *is*, since `upgrade` is built as a throwaway:
+Decisions that follow from the "run read processes against an upgraded database"
+use case:
 
-- **Re-restore behaviour.** analytics restores the latest snapshot repeatedly and
-  switches over. An upgrade replica migrated to a fixed version probably wants to
-  stay pinned on the snapshot it upgraded, not chase new snapshots — otherwise
-  each new snapshot re-runs the whole migration. Needs deciding against the `once`
-  semantic.
-- **Access.** `upgrade` has no `url` semantic and no `expose` param, so a
-  kept-alive replica is reachable only in-cluster. If the point is to poke at the
-  upgraded database, it may want exposing like analytics.
-- **Sizing.** `upgrade` uses the verify resource floor (250m / 512Mi), sized to
-  prove-it-boots, not to serve queries.
+- **Exposed.** A persisted upgrade replica is reachable on the tailnet, just like
+  an analytics replica. This means the `upgrade` intent gains the `url` semantic,
+  and pgro sets the expose annotations + reports the replica URL whenever the
+  replica is persisted (`ephemeral = false`). Exposure is tied to persisting, not
+  a separate param — an ephemeral upgrade has no lasting URL to expose.
+- **Sizing unchanged.** The processes run against it are read-only and light, so
+  it keeps the verify/upgrade resource floor (250m / 512Mi, 2Gi limit). No bump.
+- **Follows new snapshots.** With `ephemeral = false` the replica behaves like a
+  normal long-lived replica: each new snapshot canopy offers is restored,
+  re-migrated to the target version, and switched over to. See the open question
+  below — this re-runs the upgrade on every new backup.
 
-### 2. Target a particular terminal version
+The purpose is running (read-only) processes against an already-upgraded database,
+not pointing a staging app at it.
+
+### 2. Target a particular terminal version — canopy, no pgro change
 
 Version selection is canopy's, and the report is keyed by canopy's
-`target_version_id`. So this half is mostly a **canopy** decision, not pgro:
+`target_version_id`, so pgro needs no change here. Canopy already names the version
++ id on the worklist entry; its intent form currently hides the version field. The
+work is to have canopy surface that field so an operator can pin a terminal
+version, after which the existing pgro path runs and reports it unchanged.
 
-- If canopy grows a per-entry "pin this version" setting, it just names that
-  version + id on the worklist entry and pgro needs no change at all.
-- If instead an operator sets a raw target version in pgro (a text param on the
-  `upgrade` intent), pgro has a version to run but no `version_id` to report
-  against, so the migration outcome can't be joined back in canopy. That's a real
-  gap that needs a reporting story before it's viable.
+*Action: coordinate with the canopy team to expose the version field on the intent
+form.* Tracked outside this card / repo.
 
-## Open questions (for the user)
+## Open question (for the user)
 
-1. Is the version targeting meant to be a **canopy** feature (canopy pins and
-   names the version, pgro unchanged) or a **pgro** override? If pgro, how should
-   the result be reported without a canopy version id?
-2. What is the kept-alive replica *for* — manual poking, staging app, data
-   inspection? That decides expose / sizing / re-restore.
+- A persisted upgrade replica following new snapshots re-runs the whole migration
+  on every new backup (potentially hours, and canopy re-reports each). Is that the
+  intent — always the latest backup, freshly upgraded — or should it stay **pinned**
+  to the one snapshot it first upgraded, giving a stable database to work against?
+  If it should follow, a `minimum_ttl` to throttle re-migration is worth adding.
