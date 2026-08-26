@@ -149,6 +149,7 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 	PostgresPhysicalReplica::new(
 		name,
 		PostgresPhysicalReplicaSpec {
+			pre_migrate_drop_schemas: None,
 			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some(secret_ref.into()),

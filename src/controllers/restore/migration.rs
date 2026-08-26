@@ -204,6 +204,7 @@ pub async fn reconcile_migrating(
 				)
 				.await?;
 			}
+			drop_pre_migrate_schemas(ctx, &replica, name, namespace, &creds, &dbname).await?;
 			info!(
 				restore = name,
 				target = %target.version,
@@ -269,6 +270,51 @@ pub async fn reconcile_migrating(
 }
 
 /// The replica's app credentials, as (user, password).
+/// Drop the replica's `pre_migrate_drop_schemas` from the restore.
+///
+/// A view over a table the migration alters blocks the DDL outright, so a
+/// deployment that drops and regenerates those schemas around a real upgrade
+/// names them and the test starts from the same place. Idempotent, so a crash
+/// between this and the Job re-runs it harmlessly.
+async fn drop_pre_migrate_schemas(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	restore_name: &str,
+	namespace: &str,
+	creds: &(String, String),
+	dbname: &str,
+) -> Result<()> {
+	let Some(schemas) = replica.spec.pre_migrate_drop_schemas.as_ref() else {
+		return Ok(());
+	};
+	if schemas.is_empty() {
+		return Ok(());
+	}
+
+	let conn = crate::controllers::postgres::connect_to_restore(
+		&ctx.client,
+		namespace,
+		restore_name,
+		dbname,
+		&creds.0,
+		&creds.1,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let present = crate::controllers::postgres::existing_schemas_on(&conn.client, schemas).await?;
+	if present.is_empty() {
+		return Ok(());
+	}
+
+	info!(
+		restore = restore_name,
+		schemas = ?present,
+		"dropping schemas before migration"
+	);
+	crate::controllers::postgres::drop_schemas_on(&conn.client, &present).await
+}
+
 async fn credentials(
 	ctx: &Context,
 	replica: &PostgresPhysicalReplica,

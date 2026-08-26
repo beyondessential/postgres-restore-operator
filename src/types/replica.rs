@@ -169,6 +169,13 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub persistent_schemas: Option<Vec<String>>,
 
+	/// Schemas dropped from the restore before its migration Job runs. Views
+	/// over a table a migration alters block the DDL, so a deployment that
+	/// drops and regenerates such schemas around a real upgrade names them
+	/// here to model that.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pre_migrate_drop_schemas: Option<Vec<String>>,
+
 	/// Tamanu version whose schema migrations each restore should apply once
 	/// healthy, from canopy's worklist entry. Present only while canopy names a
 	/// target; each restore snapshots it into its own spec at creation so a

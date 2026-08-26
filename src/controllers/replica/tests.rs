@@ -144,6 +144,7 @@ fn make_replica(
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
+			pre_migrate_drop_schemas: None,
 			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
@@ -331,6 +332,7 @@ fn snapshot_list_test_replica() -> PostgresPhysicalReplica {
 			..Default::default()
 		},
 		spec: PostgresPhysicalReplicaSpec {
+			pre_migrate_drop_schemas: None,
 			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
