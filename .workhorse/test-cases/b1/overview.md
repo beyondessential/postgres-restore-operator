@@ -20,10 +20,12 @@ entry (needs a cluster with MinIO + kopia, so CI only).
 - [x] each extra user gets indexed name/password env, password sourced from its Secret (verifies spec: USER)
 - [x] a new extra user is created, an existing one updated, both as `LOGIN SUPERUSER` (verifies spec: USER)
 - [x] extra users are provisioned as SUPERUSER even when the replica is read-only (verifies spec: USER)
+- [x] an extra user's role sets `default_transaction_read_only = off`, applied before read-only mode is enabled (verifies spec: USER)
 - [x] a replica with no extra users carries no extra-user env or SQL
 
 ## End-to-end (integration)
 
 - [ ] an extra user's credentials Secret is created before the restore initialises, carrying `username`/`password` (verifies spec: USER)
-- [ ] the extra user exists as a superuser and can write despite a read-only replica (verifies spec: USER)
+- [ ] the extra user exists as a superuser and can write despite a read-only replica, without disabling read-only mode itself (verifies spec: USER)
+- [ ] the analytics user's sessions stay read-only on the same replica (verifies spec: USER)
 - [ ] the per-user Secret is cleaned up when the replica is deleted (owner reference) (verifies spec: USER)

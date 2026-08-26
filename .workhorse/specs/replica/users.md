@@ -21,6 +21,7 @@ The primary login role, named by `analyticsUsername` (default `analytics`).
 A replica may declare additional login roles through `extraUsers`, a list of usernames. The `analytics` canopy intent carries this as the `extra_users` text parameter, a comma-separated list of usernames the operator splits into the list.
 
 - Each named user is created as a `LOGIN` role with `SUPERUSER`, giving it write access. This holds regardless of the replica's `readOnly` setting.
+- The role's sessions start read-write, so an extra user can write to a read-only replica without disabling read-only mode itself. This applies to the extra user's own sessions only, leaving the analytics user and every other role read-only.
 - The operator generates a password for each extra user and stores it in a per-user Secret named `<replica>-user-<name>-creds`, with `username` and `password` keys. The Secret is owned by the replica, so it is cleaned up when the replica is deleted.
 - Each extra user's Secret is created before the restore's initialisation runs, so the generated password is available when the role is created.
 - An extra user whose name matches the analytics user is ignored — that role is already provisioned.

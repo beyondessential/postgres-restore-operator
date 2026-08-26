@@ -2728,6 +2728,33 @@ fn extra_users_are_superuser_even_when_read_only() {
 	assert!(script.contains("WITH LOGIN SUPERUSER PASSWORD %L"));
 }
 
+/// SUPERUSER on its own leaves the role's sessions starting read-only on a
+/// read-only replica, so the role setting is what actually grants write access.
+#[test]
+fn extra_users_default_to_read_write_sessions() {
+	let setup_auth = setup_auth_with_extra_users(vec!["writer".to_string()]);
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(
+		script.contains("ALTER ROLE %I SET default_transaction_read_only = off"),
+		"an extra user's sessions must default to read-write"
+	);
+
+	let read_only_line = script
+		.lines()
+		.position(|l| {
+			l.contains(r#"default_transaction_read_only = on" >> "$PGDATA/postgresql.conf""#)
+		})
+		.expect("read-only mode is enabled somewhere in the setup script");
+	let alter_role_line = script
+		.lines()
+		.position(|l| l.contains("SET default_transaction_read_only = off"))
+		.expect("the extra user's role setting is applied somewhere");
+	assert!(
+		alter_role_line < read_only_line,
+		"the role setting must be applied while the database is still writable"
+	);
+}
+
 #[test]
 fn no_extra_users_means_no_extra_user_env_or_sql() {
 	let setup_auth = setup_auth_with_extra_users(vec![]);

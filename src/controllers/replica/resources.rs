@@ -573,10 +573,7 @@ impl PostgresPhysicalReplica {
 					namespace: self.metadata.namespace.clone(),
 					labels: Some(BTreeMap::from([
 						("pgro.bes.au/replica".into(), self.name_any()),
-						(
-							"pgro.bes.au/component".into(),
-							"extra-user-creds".into(),
-						),
+						("pgro.bes.au/component".into(), "extra-user-creds".into()),
 					])),
 					owner_references: Some(vec![self.owner_reference()]),
 					..Default::default()

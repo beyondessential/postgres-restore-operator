@@ -105,8 +105,29 @@ async fn extra_user_provisioned_with_write_access() {
 		"the extra user should exist and be a superuser"
 	);
 
+	println!("--- verifying the extra user's sessions default to read-write");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SHOW default_transaction_read_only",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"off",
+		"the extra user's sessions should start read-write"
+	);
+
 	println!("--- verifying the extra user can write despite the read-only replica");
-	kubectl_exec(
+	let out = kubectl_exec(
 		ns,
 		&deploy_target,
 		&[
@@ -116,10 +137,35 @@ async fn extra_user_provisioned_with_write_access() {
 			"-d",
 			"postgres",
 			"-c",
-			"SET default_transaction_read_only = off; CREATE SCHEMA test_writer",
+			"CREATE SCHEMA test_writer",
 		],
 	)
 	.await;
+	assert!(
+		out.contains("CREATE SCHEMA"),
+		"the extra user should be able to write without disabling read-only mode itself, got: {out}"
+	);
+
+	println!("--- verifying the analytics user is still read-only");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SHOW default_transaction_read_only",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"on",
+		"the extra user's role setting must not leak to the analytics user"
+	);
 
 	println!("--- all assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &["extra-users-replica"]).await;

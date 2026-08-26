@@ -1071,6 +1071,14 @@ cp -a /pgdata/.anon-cache/anon.so "/usr/lib/postgresql/{pg_version}/lib/"
 /// with `%I` / `%L` applies proper identifier and literal quoting, making an
 /// arbitrary username safe. SUPERUSER is granted regardless of the replica's
 /// read-only setting — these roles are for write access.
+///
+/// SUPERUSER alone does not make the role's sessions writable: a read-only
+/// replica carries `default_transaction_read_only = on` in postgresql.conf, and
+/// the redaction path additionally sets it per-database, so every transaction
+/// the role opens would start read-only. The role-level setting overrides both
+/// (postgresql.conf < ALTER DATABASE < ALTER ROLE), so it is what actually
+/// delivers write access. This block runs before read-only mode is enabled,
+/// while the temporary postgres is still writable.
 fn extra_user_setup_block(index: usize) -> String {
 	format!(
 		r#"echo "Provisioning extra user (index {index})..."
@@ -1083,6 +1091,7 @@ SELECT format('CREATE ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'pgro_username
 \else
 SELECT format('ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'pgro_username', :'pgro_password') \gexec
 \endif
+SELECT format('ALTER ROLE %I SET default_transaction_read_only = off', :'pgro_username') \gexec
 SQLEOF
 "#
 	)
