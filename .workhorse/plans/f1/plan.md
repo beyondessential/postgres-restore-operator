@@ -79,7 +79,7 @@ the ephemeral `upgrade` intent — an upgrade test with no version to aim at has
 nothing to prove — so `migrate` must keep it there. Analytics needs the opposite:
 migrate *if* a version is set, but dispatch normally when it isn't.
 
-So introduce a distinct optional-migrate semantic (working name `migrate?`):
+So introduce a distinct optional-migrate semantic: `migrate?`:
 
 - `upgrade` keeps `migrate` (mandatory; withhold when no candidate version).
 - `analytics` gains `migrate?` (optional; name a version if the operator set one,
