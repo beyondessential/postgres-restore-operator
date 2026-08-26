@@ -105,13 +105,6 @@ to agree.
 The existing ephemeral `upgrade` intent stays unchanged — it remains the
 restore-test-discard check gated by mandatory `migrate`.
 
-## Remaining decisions
-
-- **Sizing** — a migrating analytics replica keeps the analytics resource floor
-  (2 CPU / 2Gi, 8Gi limit) and its resource params. The user noted the read
-  processes are light; no change needed unless we want a lever to pin it smaller
-  (the existing `memory_request` / `cpu_request` params already allow that).
-
 ## Canopy-side work (outside this repo)
 
 - Surface a "migrate to Tamanu version" field on the analytics intent form, and
