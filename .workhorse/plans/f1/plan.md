@@ -87,8 +87,7 @@ So introduce a distinct optional-migrate semantic: `migrate?`.
 
 pgro's only change is declaring the new semantic on the analytics descriptor.
 Canopy owns the two behaviours and surfaces the version field on the analytics
-form. The exact token (`migrate?` vs e.g. `migrate-optional`) is canopy's contract
-to agree.
+form.
 
 ### What each ask maps to
 
