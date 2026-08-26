@@ -107,8 +107,6 @@ restore-test-discard check gated by mandatory `migrate`.
 
 ## Remaining decisions
 
-- **Optional-migrate semantic token** — `migrate?` or another spelling. Coordinate
-  with canopy, since canopy interprets it.
 - **Sizing** — a migrating analytics replica keeps the analytics resource floor
   (2 CPU / 2Gi, 8Gi limit) and its resource params. The user noted the read
   processes are light; no change needed unless we want a lever to pin it smaller
