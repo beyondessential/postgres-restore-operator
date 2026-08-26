@@ -42,49 +42,66 @@ replicas, verification reported), the replica controller tears the restore down
 and records `verifiedSnapshotId` (`src/controllers/replica.rs`). The replica CR
 stays and only restores again when a newer snapshot is offered.
 
-## The two asks
+## Chosen shape: a long-lived migrating intent that reuses analytics
 
-### 1. Keep the replica alive after the upgrade — pgro
+Rather than grow the throwaway `upgrade` intent into a second parametrised
+long-lived intent (duplicating analytics' whole param plumbing), the persistent
+"upgraded query replica" is **analytics with a migration target**. A new intent
+reuses the existing `analytics_param_schema()` and analytics-shaped config, and
+adds the `migrate` (and `url`) semantics so canopy names a version for it.
 
-`upgrade` grows a single boolean param, `ephemeral`, **defaulting to true** so the
-existing "restore, test, discard" behaviour is unchanged. Setting it false
-materialises `PostgresPhysicalReplicaSpec.ephemeral = false`, so the replica
-controller keeps the migrated restore running instead of tearing it down once it
-reaches `Active`.
+This is cheap because **pgro's migration path is already intent-agnostic**:
 
-Decisions that follow from the "run read processes against an upgraded database"
-use case:
+- `to_replica_spec` sets `migrate_to` from the entry's `target_version` /
+  `target_version_id` regardless of intent (intent.rs:478). The
+  `only_a_named_target_migrates` test confirms an analytics entry carrying a target
+  *would* migrate today — canopy just never names one for it.
+- The restore controller runs the migration Job whenever `migrate_to` is set, and
+  the verification reporter forwards the result keyed by `target_version_id`. None
+  of that is `upgrade`-specific.
 
-- **Exposed.** A persisted upgrade replica is reachable on the tailnet, just like
-  an analytics replica. This means the `upgrade` intent gains the `url` semantic,
-  and pgro sets the expose annotations + reports the replica URL whenever the
-  replica is persisted (`ephemeral = false`). Exposure is tied to persisting, not
-  a separate param — an ephemeral upgrade has no lasting URL to expose.
-- **Sizing unchanged.** The processes run against it are read-only and light, so
-  it keeps the verify/upgrade resource floor (250m / 512Mi, 2Gi limit). No bump.
-- **Follows new snapshots.** With `ephemeral = false` the replica behaves like a
-  normal long-lived replica: each new snapshot canopy offers is restored,
-  re-migrated to the target version, and switched over to. See the open question
-  below — this re-runs the upgrade on every new backup.
+So the new intent needs almost no new machinery: the migration, persistence
+(`ephemeral: false`, inherited from the analytics config), expose (`expose` param),
+sizing, `minimum_ttl` throttling and snapshot-following all come from the analytics
+path already. The delta is a new descriptor + a `config_for` arm.
 
-The purpose is running (read-only) processes against an already-upgraded database,
-not pointing a staging app at it.
+### Why a new intent, not a flag on `analytics`
 
-### 2. Target a particular terminal version — canopy, no pgro change
+The `migrate` semantic makes canopy **withhold the entry when the server has no
+candidate version**. Adding it to the existing `analytics` intent would therefore
+stop plain analytics replicas dispatching for any server without a candidate
+version — a regression. A separate intent keeps plain `analytics` running
+everywhere while the migrating variant only dispatches when a version is named
+(which, with an operator-pinned terminal version, it always is).
 
-Version selection is canopy's, and the report is keyed by canopy's
-`target_version_id`, so pgro needs no change here. Canopy already names the version
-+ id on the worklist entry; its intent form currently hides the version field. The
-work is to have canopy surface that field so an operator can pin a terminal
-version, after which the existing pgro path runs and reports it unchanged.
+### What each ask maps to
 
-*Action: coordinate with the canopy team to expose the version field on the intent
-form.* Tracked outside this card / repo.
+1. **Keep the replica alive** → the new intent's config is analytics-shaped:
+   `ephemeral: false`, long-lived, exposed (via the `expose` param), follows new
+   snapshots and re-migrates on each, throttled by `minimum_ttl`. This is what the
+   user asked for: a database that stays upgraded and queryable, following the
+   latest backup, for running read-only processes against.
 
-## Open question (for the user)
+2. **Target a particular terminal version** → canopy's, no pgro change. Canopy
+   names the version + id on the worklist entry as it does for `upgrade`; its intent
+   form currently hides the version field. *Action: coordinate with the canopy team
+   to surface that field.* Tracked outside this card / repo.
 
-- A persisted upgrade replica following new snapshots re-runs the whole migration
-  on every new backup (potentially hours, and canopy re-reports each). Is that the
-  intent — always the latest backup, freshly upgraded — or should it stay **pinned**
-  to the one snapshot it first upgraded, giving a stable database to work against?
-  If it should follow, a `minimum_ttl` to throttle re-migration is worth adding.
+The existing ephemeral `upgrade` intent stays unchanged — it remains the
+restore-test-discard check that runs for every server with a candidate version.
+
+## Remaining decisions
+
+- **Name for the new intent.** `upgrade` is taken by the ephemeral test and
+  `analytics` by the plain query replica. Working options: `analytics-upgrade`,
+  `upgraded-analytics`. Needs picking (and coordinating with canopy, since canopy
+  offers the intent by name).
+- **Which analytics params carry over verbatim.** The schema is reused whole, so
+  `expose`, `minimum_ttl`, `switchover_grace`, sizing, `storage_size_maximum`,
+  `deployment_ready_timeout` all apply. `persistent_schemas` and the `redaction_*`
+  params come along too — harmless, and redaction may even be wanted for an
+  upgraded replica serving deidentified data. Confirm none should be dropped.
+- **Resource floor.** The analytics floor (2 CPU / 2Gi, 8Gi limit) is larger than
+  the verify/upgrade floor. The user said the read processes are light and need no
+  extra space; decide whether the new intent keeps the analytics floor or takes a
+  smaller one.
