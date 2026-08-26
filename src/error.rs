@@ -49,6 +49,9 @@ pub enum Error {
 
 	#[error("Canopy error: {0}")]
 	Canopy(String),
+
+	#[error("Reconciler panicked: {0}")]
+	ReconcilePanic(String),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
