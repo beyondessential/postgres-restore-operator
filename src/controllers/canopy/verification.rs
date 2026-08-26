@@ -5,9 +5,11 @@
 //! loop. This module owns signal 3 — one function called at each terminal
 //! transition (switchover success, restore failure).
 
+use std::collections::BTreeMap;
+
 use bestool_canopy::schema::{MigrationArgs, MigrationTimingArgs, RunOutcome, VerificationArgs};
 use jiff::Timestamp;
-use k8s_openapi::api::core::v1::Secret;
+use k8s_openapi::api::core::v1::{Namespace, Secret};
 use kube::{Api, ResourceExt};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -48,32 +50,49 @@ pub async fn report(
 		return;
 	};
 
-	let labels = replica.labels();
-	let Some(group) = labels
-		.get(labels::GROUP)
-		.and_then(|s| Uuid::parse_str(s).ok())
-	else {
-		warn!(
-			replica = %replica.name_any(),
-			"canopy verification: replica CR missing {} label, skipping report",
-			labels::GROUP,
-		);
-		return;
+	// Canopy made `replica_id` required on VerificationArgs, so a report
+	// without one can no longer be constructed, and inventing one is not an
+	// option — canopy keys worklist state on it.
+	//
+	// The syncer stamps the same label set on the Namespace as on the CR, so
+	// fall back to the namespace when the CR is missing any of the three ids.
+	// Resolved together, before any of them is used: the case worth recovering
+	// is a CR whose labels were stripped wholesale, and checking them one at a
+	// time would return on the first missing one without ever consulting the
+	// namespace. Merged rather than substituted, so a CR that has some of them
+	// keeps its own values.
+	let mut labels = replica.labels().clone();
+	let ids = match canopy_ids(&labels) {
+		Ok(ids) => ids,
+		Err(missing) => {
+			if let Some(ns_labels) = namespace_labels(ctx, replica).await {
+				fill_missing_labels(&mut labels, ns_labels);
+			}
+			match canopy_ids(&labels) {
+				Ok(ids) => {
+					warn!(
+						replica = %replica.name_any(),
+						?missing,
+						"canopy verification: replica CR missing identity labels, recovered from the namespace",
+					);
+					ids
+				}
+				Err(still_missing) => {
+					warn!(
+						replica = %replica.name_any(),
+						?still_missing,
+						"canopy verification: identity labels absent from the replica CR and its namespace, skipping report",
+					);
+					return;
+				}
+			}
+		}
 	};
-	let Some(server_id) = labels
-		.get(labels::SERVER)
-		.and_then(|s| Uuid::parse_str(s).ok())
-	else {
-		warn!(
-			replica = %replica.name_any(),
-			"canopy verification: replica CR missing {} label, skipping report",
-			labels::SERVER,
-		);
-		return;
-	};
-	let replica_id = labels
-		.get(labels::DECLARATION_ID)
-		.and_then(|s| Uuid::parse_str(s).ok());
+	let CanopyIds {
+		group,
+		server_id,
+		replica_id,
+	} = ids;
 	let backup_type = labels
 		.get(labels::TYPE)
 		.map(String::as_str)
@@ -145,7 +164,7 @@ pub async fn report(
 
 	let args = VerificationArgs::builder()
 		.maybe_migration(migration)
-		.maybe_replica_id(replica_id)
+		.replica_id(replica_id)
 		.maybe_run_id(run_id)
 		.group(group)
 		.server_id(server_id)
@@ -178,6 +197,100 @@ pub async fn report(
 			error = %err,
 			"canopy verification report failed"
 		),
+	}
+}
+
+/// The three identities a verification report cannot be built without.
+#[derive(Debug)]
+struct CanopyIds {
+	group: Uuid,
+	server_id: Uuid,
+	replica_id: Uuid,
+}
+
+/// Parse the identity labels canopy requires, or report which of them are
+/// absent or unparsable.
+///
+/// Pure so the label handling stays testable apart from the namespace lookup
+/// it feeds.
+fn canopy_ids(labels: &BTreeMap<String, String>) -> Result<CanopyIds, Vec<&'static str>> {
+	let id = |key: &str| labels.get(key).and_then(|s| Uuid::parse_str(s).ok());
+	let (group, server_id, replica_id) = (
+		id(labels::GROUP),
+		id(labels::SERVER),
+		id(labels::DECLARATION_ID),
+	);
+
+	let missing: Vec<&'static str> = [
+		(labels::GROUP, group.is_none()),
+		(labels::SERVER, server_id.is_none()),
+		(labels::DECLARATION_ID, replica_id.is_none()),
+	]
+	.into_iter()
+	.filter_map(|(key, absent)| absent.then_some(key))
+	.collect();
+
+	match (group, server_id, replica_id) {
+		(Some(group), Some(server_id), Some(replica_id)) => Ok(CanopyIds {
+			group,
+			server_id,
+			replica_id,
+		}),
+		_ => Err(missing),
+	}
+}
+
+/// Fill gaps in `labels` from `fallback`, leaving existing entries alone.
+///
+/// The CR is the authority on its own identity; the namespace only supplies
+/// what the CR has lost. Overwriting instead would let a stale or hand-set CR
+/// value be replaced silently, and reporting the wrong group misfiles the
+/// result in canopy.
+///
+/// Applies to the whole label set rather than just the three ids. `TYPE` and
+/// `INTENT` come from the same `WorklistEntry`, so *when the fallback runs*
+/// recovering them alongside beats the empty strings they would otherwise
+/// default to — and never loses, since the CR's own values always win. A CR
+/// holding all three ids never reaches here, so one missing `TYPE` on its own
+/// still reports empty rather than costing every successful report an extra
+/// API call.
+///
+/// Copying the namespace's other labels (`MANAGED_BY`, k8s's own
+/// `kubernetes.io/metadata.name`) is inert: `labels` is a local clone read only
+/// by [`canopy_ids`] and the two lookups above, and is never written back.
+fn fill_missing_labels(labels: &mut BTreeMap<String, String>, fallback: BTreeMap<String, String>) {
+	for (key, value) in fallback {
+		labels.entry(key).or_insert(value);
+	}
+}
+
+/// Labels on the replica's Namespace.
+///
+/// `canopy::ensure_namespace` stamps the same label set there as
+/// `ensure_replica_cr` does on the CR, both from one `WorklistEntry`, so this
+/// is a second copy of the same fact rather than a guess. It cannot go stale:
+/// the namespace *name* derives from `replica_id ‖ server_id`, so a changed id
+/// lands in a different namespace and the old one is swept.
+///
+/// Best-effort: a namespaceless replica, a lookup failure or an absent
+/// namespace all read as `None`, and the caller skips the report.
+async fn namespace_labels(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+) -> Option<BTreeMap<String, String>> {
+	let ns_name = replica.namespace()?;
+	let namespaces: Api<Namespace> = Api::all(ctx.client.clone());
+	match namespaces.get_opt(&ns_name).await {
+		Ok(ns) => Some(ns?.labels().clone()),
+		Err(e) => {
+			warn!(
+				replica = %replica.name_any(),
+				namespace = %ns_name,
+				error = %e,
+				"canopy verification: failed to read namespace for identity label fallback"
+			);
+			None
+		}
 	}
 }
 
@@ -352,6 +465,117 @@ fn migration_args(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	// Distinct per label, so a field read from the wrong key is caught rather
+	// than passing on a coincidence.
+	const GROUP_ID: &str = "11111111-1111-1111-1111-111111111111";
+	const SERVER_ID: &str = "22222222-2222-2222-2222-222222222222";
+	const REPLICA_ID: &str = "33333333-3333-3333-3333-333333333333";
+
+	fn uuid(s: &str) -> Uuid {
+		Uuid::parse_str(s).expect("valid uuid")
+	}
+
+	fn label_set(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+		pairs
+			.iter()
+			.map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+			.collect()
+	}
+
+	fn full_labels() -> BTreeMap<String, String> {
+		label_set(&[
+			(labels::GROUP, GROUP_ID),
+			(labels::SERVER, SERVER_ID),
+			(labels::DECLARATION_ID, REPLICA_ID),
+		])
+	}
+
+	#[test]
+	fn all_three_ids_parse() {
+		let ids = canopy_ids(&full_labels()).expect("a complete label set parses");
+		assert_eq!(ids.group, uuid(GROUP_ID));
+		assert_eq!(ids.server_id, uuid(SERVER_ID));
+		assert_eq!(ids.replica_id, uuid(REPLICA_ID));
+	}
+
+	#[test]
+	fn every_absent_id_is_reported_at_once() {
+		// The report is skipped on any of the three, so the caller needs to
+		// know all of them in one pass — checking one at a time would return
+		// before the namespace fallback ever ran.
+		let missing = canopy_ids(&BTreeMap::new()).expect_err("an empty label set cannot parse");
+		assert_eq!(missing.len(), 3, "got {missing:?}");
+		for key in [labels::GROUP, labels::SERVER, labels::DECLARATION_ID] {
+			assert!(
+				missing.contains(&key),
+				"{key} should be reported: {missing:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn only_the_absent_id_is_reported() {
+		let mut labels = full_labels();
+		labels.remove(labels::DECLARATION_ID);
+		let missing = canopy_ids(&labels).expect_err("a missing declaration id cannot parse");
+		assert_eq!(missing, vec![labels::DECLARATION_ID]);
+	}
+
+	#[test]
+	fn an_unparsable_id_counts_as_absent() {
+		// A garbage value must not reach canopy as a silently-dropped field.
+		let mut labels = full_labels();
+		labels.insert(labels::SERVER.to_string(), "not-a-uuid".to_string());
+		let missing = canopy_ids(&labels).expect_err("a malformed uuid cannot parse");
+		assert_eq!(missing, vec![labels::SERVER]);
+	}
+
+	#[test]
+	fn fill_missing_labels_only_fills_the_gaps() {
+		// Exercises the merge `report` actually calls, not a copy of it: an
+		// inlined `or_insert` loop here would keep passing if the real one
+		// were changed to overwrite.
+		let other = "99999999-9999-9999-9999-999999999999";
+		let mut cr = label_set(&[(labels::GROUP, other)]);
+		assert!(canopy_ids(&cr).is_err(), "precondition: CR alone is short");
+
+		fill_missing_labels(&mut cr, full_labels());
+
+		let ids = canopy_ids(&cr).expect("the merged set parses");
+		assert_eq!(
+			ids.group,
+			uuid(other),
+			"the CR's own value must survive the merge"
+		);
+		assert_eq!(ids.server_id, uuid(SERVER_ID));
+		assert_eq!(ids.replica_id, uuid(REPLICA_ID));
+	}
+
+	#[test]
+	fn the_fallback_never_overwrites_what_the_cr_already_has() {
+		// Pins the direction on its own, across every key rather than just the
+		// ids: `insert` in place of `or_insert` would let the namespace
+		// silently rewrite a CR's identity, and reporting the wrong group
+		// misfiles the result in canopy.
+		let mut cr = label_set(&[(labels::GROUP, GROUP_ID), (labels::TYPE, "cr-type")]);
+		fill_missing_labels(
+			&mut cr,
+			label_set(&[
+				(labels::GROUP, REPLICA_ID),
+				(labels::TYPE, "ns-type"),
+				(labels::INTENT, "ns-intent"),
+			]),
+		);
+
+		assert_eq!(cr.get(labels::GROUP).map(String::as_str), Some(GROUP_ID));
+		assert_eq!(cr.get(labels::TYPE).map(String::as_str), Some("cr-type"));
+		assert_eq!(
+			cr.get(labels::INTENT).map(String::as_str),
+			Some("ns-intent"),
+			"a key the CR lacks entirely should still be filled"
+		);
+	}
 
 	#[test]
 	fn health_details_shape_is_snake_case() {

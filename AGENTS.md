@@ -1,4 +1,3 @@
-## LLM Rules to follow
 - When adding or changing features, or when fixing bugs, add tests whenever possible.
 - When adding integration tests, they don't run locally, so ensure the user knows about them so they can be tested in CI. Also add a matrix entry for the new test file in `.github/workflows/integration.yml`.
 - Never write documentation files or readmes. Exception: when adding or changing items in the CRD specs, also change the tables in the readme.
@@ -21,7 +20,7 @@
 - Don't use double spaces after punctuation.
 - Always work from a branch. If you're on `main`, create a new branch.
 - If you can at all do something from the operator, instead of in a script that runs in a job, do so. For example, if you need to query something in a database, you should be able to do so from the operator, instead of writing SQL code in bash logic.
-<!-- end rules -->
+- You are FORBIDDEN from suggesting to change the build behaviour of bestool-canopy wrt CANOPY_OPENAPI_OFFLINE or any other way. The way it works is as designed. DO NOT EVER re-litigate it.
 
 ## Lessons learned
 
