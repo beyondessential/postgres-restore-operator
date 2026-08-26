@@ -575,7 +575,7 @@ async fn main() -> anyhow::Result<()> {
 			},
 		)
 		.run(
-			controllers::replica::reconcile,
+			|obj, ctx| controllers::catching_panics(controllers::replica::reconcile(obj, ctx)),
 			controllers::replica::error_policy,
 			replica_ctx,
 		)
@@ -588,7 +588,7 @@ async fn main() -> anyhow::Result<()> {
 
 	let restore_controller = Controller::new(restore_api, Config::default())
 		.run(
-			controllers::restore::reconcile,
+			|obj, ctx| controllers::catching_panics(controllers::restore::reconcile(obj, ctx)),
 			controllers::restore::error_policy,
 			restore_ctx,
 		)

@@ -1,5 +1,10 @@
+use std::{any::Any, future::Future, panic::AssertUnwindSafe};
+
+use futures::FutureExt;
 use k8s_openapi::api::core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector, SecretReference};
 use kube::{Api, Client};
+
+use crate::error::{Error, Result};
 
 pub mod canopy;
 pub mod jobs;
@@ -21,6 +26,25 @@ pub mod restore;
 /// term in the same selector, kept because live Services already carry it in
 /// their selector and a merge patch cannot drop a selector key.
 pub const READY_FOR_TRAFFIC_LABEL: &str = "pgro.bes.au/ready-for-traffic";
+
+/// Run a reconciler, turning a panic into an error the controller can requeue.
+///
+/// kube-rs unwraps the reconciler's JoinHandle, so a panic that escapes into it
+/// aborts the operator process rather than just this object's reconcile.
+pub async fn catching_panics<T>(fut: impl Future<Output = Result<T>>) -> Result<T> {
+	match AssertUnwindSafe(fut).catch_unwind().await {
+		Ok(result) => result,
+		Err(payload) => Err(Error::ReconcilePanic(panic_message(&payload))),
+	}
+}
+
+fn panic_message(payload: &Box<dyn Any + Send>) -> String {
+	payload
+		.downcast_ref::<&str>()
+		.map(|s| (*s).to_owned())
+		.or_else(|| payload.downcast_ref::<String>().cloned())
+		.unwrap_or_else(|| "unknown panic".to_owned())
+}
 
 /// Build an EnvVar that references a key in a Kubernetes Secret.
 pub fn env_from_secret(env_name: &str, secret_ref: &SecretReference, key: &str) -> EnvVar {
@@ -182,5 +206,22 @@ mod tests {
 		assert_eq!(skr.name, "my-secret");
 		assert_eq!(skr.key, "endpoint");
 		assert_eq!(skr.optional, Some(true));
+	}
+
+	#[tokio::test]
+	async fn a_panicking_reconciler_becomes_a_requeueable_error() {
+		async fn boom() -> Result<()> {
+			panic!("boom");
+		}
+		let err = catching_panics(boom()).await.unwrap_err();
+		assert!(matches!(err, Error::ReconcilePanic(msg) if msg == "boom"));
+	}
+
+	#[tokio::test]
+	async fn a_healthy_reconciler_passes_its_value_through() {
+		async fn fine() -> Result<u8> {
+			Ok(7)
+		}
+		assert_eq!(catching_panics(fine()).await.unwrap(), 7);
 	}
 }
