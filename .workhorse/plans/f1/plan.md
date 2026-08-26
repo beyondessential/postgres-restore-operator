@@ -42,71 +42,67 @@ replicas, verification reported), the replica controller tears the restore down
 and records `verifiedSnapshotId` (`src/controllers/replica.rs`). The replica CR
 stays and only restores again when a newer snapshot is offered.
 
-## Chosen shape: a migration target on the existing analytics intent
+## Chosen shape: a `migrate_to` parameter on the analytics intent
 
-The persistent "upgraded query replica" is just an **analytics replica that also
-migrates to a target version**. Rather than a new intent duplicating analytics'
-field set, the analytics intent gains the ability to carry a migration target: the
-operator sets a "migrate to this Tamanu version" field on the analytics form, and
-that analytics replica runs the version's migrations after each restore.
+The persistent "upgraded query replica" is an **analytics replica that migrates to
+an operator-chosen version**. The analytics intent gains a `migrate_to` text param
+(a Tamanu semver). When set, each restore of that replica migrates to the version;
+when unset, it is a plain analytics replica.
 
 This is cheap because **pgro's migration path is already intent-agnostic**:
 
-- `to_replica_spec` sets `migrate_to` from the entry's `target_version` /
-  `target_version_id` regardless of intent (intent.rs:478). The
-  `only_a_named_target_migrates` test confirms an analytics entry carrying a target
-  *would* migrate today — canopy just never names one for it.
-- The restore controller runs the migration Job whenever `migrate_to` is set, and
-  the verification reporter forwards the result keyed by `target_version_id`. None
-  of that is `upgrade`-specific.
+- `to_replica_spec` sets `migrate_to` on the replica spec, and each restore
+  snapshots it; the restore controller runs the migration Job whenever it is set.
+  None of that is `upgrade`-specific — the `only_a_named_target_migrates` test
+  confirms an analytics replica carrying a target *would* migrate today.
+- So persistence (`ephemeral: false`), expose, sizing, `minimum_ttl` throttling and
+  snapshot-following all already exist on the analytics path. The delta is reading
+  the target from a param and choosing not to report it.
 
-So persistence (`ephemeral: false`), expose, sizing, `minimum_ttl` throttling,
-snapshot-following and the migration + reporting all already exist on the analytics
-path. When no target is set the analytics replica behaves exactly as today (no
-`Migrating` phase); when one is set it re-migrates on each new snapshot it follows.
+### Why a param, not the entry / `migrate` semantic
 
-**The target still rides on `entry.target_version` / `entry.target_version_id`,
-not a params entry** — canopy resolves the operator's chosen version to its version
-id and populates those top-level fields (as it does for `upgrade`). That keeps the
-verification report keyed by a real version id, which an operator-typed raw semver
-param could not provide.
+Canopy names `upgrade`'s target on the entry (`target_version`) because it
+*computes* it — the "next" version. Analytics's target is *operator-chosen*, so it
+is a plain param the operator types on the analytics form. Consequences:
 
-### The `migrate` semantic: needs an optional variant
+- **The `migrate` semantic is untouched.** No `migrate?`, no withholding concern —
+  a param does not gate canopy's dispatch. `upgrade` keeps entry-based canopy-named
+  targets; analytics reads its param.
+- **No canopy change is needed for this card.** Canopy renders advertised params on
+  the form automatically, so advertising `migrate_to` in the analytics param schema
+  is the whole surfacing story.
 
-The blocker is canopy's handling of the `migrate` semantic: it **withholds the
-entry when the server has no candidate version**. That withholding is *correct* for
-the ephemeral `upgrade` intent — an upgrade test with no version to aim at has
-nothing to prove — so `migrate` must keep it there. Analytics needs the opposite:
-migrate *if* a version is set, but dispatch normally when it isn't.
+### No migration report for analytics
 
-So introduce a distinct optional-migrate semantic: `migrate?`.
+The migration report is the upgrade workflow's version-readiness signal. An
+analytics migration is a convenience — an upgraded database to work against — not a
+verification, so its outcome is **not** reported to canopy. The report is gated on
+the intent: only `upgrade` sends the migration block.
 
-- `upgrade` keeps `migrate` (mandatory; withhold when no candidate version).
-- `analytics` gains `migrate?` (optional; name a version if the operator set one,
-  otherwise dispatch as a plain analytics replica).
+### version_id stays, for now
 
-pgro's only change is declaring the new semantic on the analytics descriptor.
-Canopy owns the two behaviours and surfaces the version field on the analytics
-form.
+`MigrationTarget` keeps `version_id` this card (don't touch the upgrade intake or
+report). The analytics param path has no canopy version id; since analytics
+migrations aren't reported, the id is never read for them, so the analytics target
+is built with an empty id as an interim. Removing `version_id` from pgro entirely —
+intake and report — is the **follow-up card**, to land once canopy drops the
+requirement from the verification contract.
 
-### What each ask maps to
+## Implementation checklist (this card)
 
-1. **Keep the replica alive** → inherent to analytics (`ephemeral: false`,
-   long-lived, exposed via the `expose` param, follows new snapshots throttled by
-   `minimum_ttl`). Nothing new: setting a migration target on an analytics replica
-   gives a database that stays upgraded and queryable, following the latest backup,
-   for running read-only processes against.
+- [ ] Add `migrate_to` (text) to `analytics_param_schema()` and its
+      `params::` name constant.
+- [ ] In `to_replica_spec`, build the replica's migration target from the analytics
+      `migrate_to` param (empty version id), keeping the existing entry-based target
+      for `upgrade`.
+- [ ] In `verification.rs`, omit the migration block unless the intent is `upgrade`.
+- [ ] Tests: analytics with `migrate_to` migrates and does not report; analytics
+      without it is unchanged; `upgrade` still reports.
+- [ ] Update the README analytics param table with `migrate_to`.
 
-2. **Target a particular terminal version** → canopy's, via the new form field +
-   the `migrate?` semantic. pgro reads the resulting target through the existing
-   path.
+## Follow-up card (separate)
 
-The existing ephemeral `upgrade` intent stays unchanged — it remains the
-restore-test-discard check gated by mandatory `migrate`.
-
-## Canopy-side work (outside this repo)
-
-- Surface a "migrate to Tamanu version" field on the analytics intent form, and
-  resolve it to `target_version` + `target_version_id` on the worklist entry.
-- Give the `migrate?` semantic optional behaviour (migrate if a version is set,
-  don't withhold otherwise).
+Once canopy drops the `version_id` requirement from the restore-verification
+contract, remove `version_id` from pgro entirely — the `MigrationTarget` intake
+from the worklist entry and the field on the verification report — and report the
+`upgrade` migration keyed by semver alone. Blocked on the canopy change landing.
