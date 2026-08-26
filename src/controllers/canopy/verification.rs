@@ -523,7 +523,7 @@ mod tests {
 	}
 
 	#[test]
-	fn an_unparseable_id_counts_as_absent() {
+	fn an_unparsable_id_counts_as_absent() {
 		// A garbage value must not reach canopy as a silently-dropped field.
 		let mut labels = full_labels();
 		labels.insert(labels::SERVER.to_string(), "not-a-uuid".to_string());
