@@ -764,10 +764,14 @@ mod tests {
 				.type_,
 			ParamType::Boolean
 		);
+		assert_eq!(
+			params.get(params::MIGRATE_TO).unwrap().type_,
+			ParamType::Text
+		);
 		// Only the params pgro actually acts on are advertised.
 		assert_eq!(
 			params.len(),
-			15,
+			16,
 			"advertising a param pgro doesn't read, or dropping one it does"
 		);
 		assert!(params.get("anonymise").is_none());
