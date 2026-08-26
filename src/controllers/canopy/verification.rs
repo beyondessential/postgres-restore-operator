@@ -201,7 +201,7 @@ pub async fn report(
 }
 
 /// The three identities a verification report cannot be built without.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug)]
 struct CanopyIds {
 	group: Uuid,
 	server_id: Uuid,
@@ -248,9 +248,16 @@ fn canopy_ids(labels: &BTreeMap<String, String>) -> Result<CanopyIds, Vec<&'stat
 /// result in canopy.
 ///
 /// Applies to the whole label set rather than just the three ids. `TYPE` and
-/// `INTENT` come from the same `WorklistEntry`, so recovering them alongside is
-/// strictly better than sending the empty strings they would otherwise default
-/// to — and never worse, since the CR's own values always win.
+/// `INTENT` come from the same `WorklistEntry`, so *when the fallback runs*
+/// recovering them alongside beats the empty strings they would otherwise
+/// default to — and never loses, since the CR's own values always win. A CR
+/// holding all three ids never reaches here, so one missing `TYPE` on its own
+/// still reports empty rather than costing every successful report an extra
+/// API call.
+///
+/// Copying the namespace's other labels (`MANAGED_BY`, k8s's own
+/// `kubernetes.io/metadata.name`) is inert: `labels` is a local clone read only
+/// by [`canopy_ids`] and the two lookups above, and is never written back.
 fn fill_missing_labels(labels: &mut BTreeMap<String, String>, fallback: BTreeMap<String, String>) {
 	for (key, value) in fallback {
 		labels.entry(key).or_insert(value);
@@ -525,7 +532,7 @@ mod tests {
 	}
 
 	#[test]
-	fn namespace_labels_fill_only_the_gaps() {
+	fn fill_missing_labels_only_fills_the_gaps() {
 		// Exercises the merge `report` actually calls, not a copy of it: an
 		// inlined `or_insert` loop here would keep passing if the real one
 		// were changed to overwrite.
