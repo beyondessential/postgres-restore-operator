@@ -33,6 +33,14 @@ use crate::{
 /// operator's broker NetworkPolicy can admit their ingress.
 pub const PROXY_SIDECAR_POD_LABEL: (&str, &str) = ("pgro.bes.au/proxy-sidecar", "true");
 
+/// An extra login role for the setup-auth initContainer to provision: its
+/// name and the Secret holding its operator-generated password (`password`
+/// key).
+pub struct ExtraUser {
+	pub username: String,
+	pub password_secret: SecretReference,
+}
+
 /// Extra inputs the canopy path needs on top of the legacy args.
 pub struct CanopyProxyArgs<'a> {
 	/// Image of the canopy-proxy sidecar (same image as the operator; the
@@ -994,6 +1002,9 @@ pub struct PostgresDeploymentInputs<'a> {
 	pub analytics_username: &'a str,
 	pub analytics_password_secret: &'a SecretReference,
 	pub analytics_password_key: &'a str,
+	/// Extra `LOGIN SUPERUSER` roles the setup-auth initContainer provisions
+	/// alongside the analytics user, each with its own password Secret.
+	pub extra_users: Vec<ExtraUser>,
 	pub snapshot_id: &'a str,
 	pub snapshot_time: &'a str,
 	pub labels: BTreeMap<String, String>,
@@ -1050,6 +1061,33 @@ cp -a /pgdata/.anon-cache/anon.so "/usr/lib/postgresql/{pg_version}/lib/"
 	)
 }
 
+/// Shell + SQL that provisions one extra user (by env-var index) as a
+/// create-or-update `LOGIN SUPERUSER`, run against the temporary postgres in
+/// the setup-auth initContainer.
+///
+/// The username and password are read from `EXTRA_USER_NAME_<i>` /
+/// `EXTRA_USER_PW_<i>` and passed to psql as variables inside a quoted heredoc,
+/// so neither the shell nor the SQL parser ever sees the raw values. `format()`
+/// with `%I` / `%L` applies proper identifier and literal quoting, making an
+/// arbitrary username safe. SUPERUSER is granted regardless of the replica's
+/// read-only setting — these roles are for write access.
+fn extra_user_setup_block(index: usize) -> String {
+	format!(
+		r#"echo "Provisioning extra user (index {index})..."
+psql -U postgres -d postgres \
+  -v pgro_username="$EXTRA_USER_NAME_{index}" \
+  -v pgro_password="$EXTRA_USER_PW_{index}" << 'SQLEOF'
+SELECT NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'pgro_username') AS pgro_create \gset
+\if :pgro_create
+SELECT format('CREATE ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'pgro_username', :'pgro_password') \gexec
+\else
+SELECT format('ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'pgro_username', :'pgro_password') \gexec
+\endif
+SQLEOF
+"#
+	)
+}
+
 /// CRD-path Deployment builder. Fills the shared `PostgresDeploymentInputs`
 /// from the restore + replica CRs and delegates to
 /// [`build_postgres_deployment_with`].
@@ -1102,6 +1140,18 @@ pub fn build_deployment(
 	]);
 	let match_labels = BTreeMap::from([("pgro.bes.au/restore".to_string(), name.to_string())]);
 
+	let extra_users = replica
+		.extra_users()
+		.into_iter()
+		.map(|username| ExtraUser {
+			password_secret: SecretReference {
+				name: Some(replica.extra_user_secret_name(&username)),
+				namespace: Some(namespace.to_string()),
+			},
+			username,
+		})
+		.collect();
+
 	build_postgres_deployment_with(&PostgresDeploymentInputs {
 		name,
 		namespace,
@@ -1114,6 +1164,7 @@ pub fn build_deployment(
 		analytics_username: &replica.spec.analytics_username,
 		analytics_password_secret: &creds_secret,
 		analytics_password_key: "password",
+		extra_users,
 		snapshot_id: &restore.spec.snapshot,
 		snapshot_time: restore.spec.snapshot_time.as_deref().unwrap_or(""),
 		labels,
@@ -1282,6 +1333,7 @@ pub fn build_postgres_deployment_with(cfg: &PostgresDeploymentInputs<'_>) -> Res
 		analytics_username,
 		analytics_password_secret,
 		analytics_password_key,
+		extra_users,
 		snapshot_id,
 		snapshot_time,
 		labels,
@@ -1347,6 +1399,16 @@ EXTRACONFEOF"#
 	} else {
 		String::new()
 	};
+
+	// Provision each extra user as a LOGIN SUPERUSER, create-or-update, while the
+	// temporary postgres is running. The name and password reach the shell via
+	// per-user env vars and are passed to psql as variables, so an arbitrary
+	// username is quoted by `format(%I/%L)` and can't break the SQL or the shell.
+	let extra_users_block = extra_users
+		.iter()
+		.enumerate()
+		.map(|(i, _)| extra_user_setup_block(i))
+		.collect::<String>();
 
 	let init_script = format!(
 		r#"set -ex
@@ -1645,6 +1707,7 @@ ALTER ROLE ${{ANALYTICS_USERNAME}} WITH SUPERUSER;
 SQLEOF
 fi
 
+{extra_users_block}
 # Record which "fix" steps this restore had to apply, so the operator can
 # read them back (SELECT from _pgro.restore_info) and forward them to
 # canopy in the restore-verification health_details. Stored as a jsonb map
@@ -1724,7 +1787,7 @@ echo "Auth setup complete"
 "#
 	);
 
-	let init_env = vec![
+	let mut init_env = vec![
 		EnvVar {
 			name: "ANALYTICS_USERNAME".to_string(),
 			value: Some((*analytics_username).to_string()),
@@ -1751,6 +1814,18 @@ echo "Auth setup complete"
 			..Default::default()
 		},
 	];
+	for (i, user) in extra_users.iter().enumerate() {
+		init_env.push(EnvVar {
+			name: format!("EXTRA_USER_NAME_{i}"),
+			value: Some(user.username.clone()),
+			..Default::default()
+		});
+		init_env.push(env_from_secret(
+			&format!("EXTRA_USER_PW_{i}"),
+			&user.password_secret,
+			"password",
+		));
+	}
 
 	let mut deployment = Deployment {
 		metadata: ObjectMeta {

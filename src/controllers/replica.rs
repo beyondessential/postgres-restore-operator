@@ -232,6 +232,8 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 
 	replica.ensure_credentials_secret(client).await?;
 
+	replica.ensure_extra_user_secrets(client).await?;
+
 	replica.ensure_service(client).await?;
 
 	replica

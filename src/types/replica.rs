@@ -82,6 +82,15 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default = "default_analytics_username")]
 	pub analytics_username: String,
 
+	/// Additional login roles to provision in each restore, beyond the
+	/// analytics user. Each name becomes a `LOGIN SUPERUSER` role with an
+	/// operator-generated password stored in a per-user Secret
+	/// `<replica>-user-<name>-creds`. Provisioned once at restore
+	/// initialisation and never dropped. A name matching `analyticsUsername`
+	/// is ignored.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub extra_users: Vec<String>,
+
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub storage_class: Option<String>,
 
@@ -686,6 +695,28 @@ impl PostgresPhysicalReplica {
 
 	pub fn creds_secret_name(&self) -> String {
 		format!("{name}-creds", name = self.name_any())
+	}
+
+	/// The extra login roles to provision, cleaned up: trimmed, empties and
+	/// duplicates removed, and the analytics user excluded (it's already
+	/// provisioned separately). Order is preserved so the per-user Secret and
+	/// env-var indices are stable across a reconcile.
+	pub fn extra_users(&self) -> Vec<String> {
+		let mut seen = std::collections::HashSet::new();
+		self.spec
+			.extra_users
+			.iter()
+			.map(|u| u.trim())
+			.filter(|u| !u.is_empty() && *u != self.spec.analytics_username.as_str())
+			.filter(|u| seen.insert(u.to_string()))
+			.map(str::to_string)
+			.collect()
+	}
+
+	/// Name of the per-user credentials Secret for an extra user, owned by the
+	/// replica so it's cleaned up when the replica is deleted.
+	pub fn extra_user_secret_name(&self, username: &str) -> String {
+		format!("{name}-user-{username}-creds", name = self.name_any())
 	}
 
 	/// Name of the operator-materialised Secret that holds the canopy path's

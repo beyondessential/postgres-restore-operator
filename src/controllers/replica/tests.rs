@@ -156,6 +156,7 @@ fn make_replica(
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(jiff::Span::new()),
 			analytics_username: "analytics".into(),
+			extra_users: vec![],
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
@@ -182,6 +183,32 @@ fn make_replica(
 			..Default::default()
 		}),
 	}
+}
+
+#[test]
+fn extra_users_trims_dedupes_and_excludes_analytics() {
+	let mut replica = make_replica(None, None);
+	replica.spec.analytics_username = "analytics".into();
+	replica.spec.extra_users = vec![
+		" reporting ".into(),
+		"etl".into(),
+		"reporting".into(),
+		"".into(),
+		"analytics".into(),
+	];
+	assert_eq!(
+		replica.extra_users(),
+		vec!["reporting".to_string(), "etl".to_string()]
+	);
+}
+
+#[test]
+fn extra_user_secret_name_is_derived_from_replica_and_username() {
+	let replica = make_replica(None, None);
+	assert_eq!(
+		replica.extra_user_secret_name("reporting"),
+		"test-user-reporting-creds"
+	);
 }
 
 #[test]
@@ -316,6 +343,7 @@ fn snapshot_list_test_replica() -> PostgresPhysicalReplica {
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(jiff::Span::new()),
 			analytics_username: "analytics".into(),
+			extra_users: vec![],
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,

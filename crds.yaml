@@ -591,6 +591,17 @@ spec:
                   intent, whose whole job is "prove the snapshot restores" — keeping
                   the database idling afterward just wastes cluster resources.
                 type: boolean
+              extraUsers:
+                description: |-
+                  Additional login roles to provision in each restore, beyond the
+                  analytics user. Each name becomes a `LOGIN SUPERUSER` role with an
+                  operator-generated password stored in a per-user Secret
+                  `<replica>-user-<name>-creds`. Provisioned once at restore
+                  initialisation and never dropped. A name matching `analyticsUsername`
+                  is ignored.
+                items:
+                  type: string
+                type: array
               kopiaSecretRef:
                 description: |-
                   Reference to a Secret containing kopia repository credentials.

@@ -74,6 +74,10 @@ pub mod params {
 	pub const PERSISTENT_SCHEMAS: &str = "persistent_schemas";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
+	/// `text` — comma-separated usernames to provision as extra `LOGIN
+	/// SUPERUSER` roles alongside the analytics user, each with its own
+	/// operator-generated password Secret. Empty/unset = analytics user only.
+	pub const EXTRA_USERS: &str = "extra_users";
 	/// `bytes` — pin the postgres memory request, instead of deriving it from
 	/// the snapshot size.
 	pub const MEMORY_REQUEST: &str = "memory_request";
@@ -144,6 +148,10 @@ fn analytics_param_schema() -> ParamSchema {
 		(
 			params::EXPOSE.to_string(),
 			param(ParamType::Boolean, Some(json!(false))),
+		),
+		(
+			params::EXTRA_USERS.to_string(),
+			param(ParamType::Text, None),
 		),
 		(
 			params::MEMORY_REQUEST.to_string(),
@@ -471,6 +479,9 @@ impl IntentConfig {
 			.map(parse_persistent_schemas)
 			.filter(|schemas| !schemas.is_empty())
 			.or_else(|| self.persistent_schemas.clone());
+		let extra_users = param_str(p, params::EXTRA_USERS)
+			.map(parse_comma_list)
+			.unwrap_or_default();
 		let service_annotations = is_exposed(entry).then(|| expose_annotations(&entry.name));
 		// Canopy only names a target for a `migrate` intent, and withholds the
 		// entry entirely when the server has no candidate version, so the pair
@@ -511,6 +522,7 @@ impl IntentConfig {
 			minimum_ttl,
 			switchover_grace_period,
 			analytics_username: "analytics".to_string(),
+			extra_users,
 			storage_class: None,
 			storage_size_override: Some(self.storage_size_override.clone()),
 			resources: pinned_resources,
@@ -553,6 +565,11 @@ impl IntentConfig {
 /// Split a comma-separated `persistent_schemas` param into trimmed,
 /// non-empty schema names.
 fn parse_persistent_schemas(raw: &str) -> Vec<String> {
+	parse_comma_list(raw)
+}
+
+/// Split a comma-separated text param into trimmed, non-empty items.
+fn parse_comma_list(raw: &str) -> Vec<String> {
 	raw.split(',')
 		.map(str::trim)
 		.filter(|s| !s.is_empty())
@@ -661,6 +678,10 @@ mod tests {
 			ParamType::Boolean
 		);
 		assert_eq!(
+			params.get(params::EXTRA_USERS).unwrap().type_,
+			ParamType::Text
+		);
+		assert_eq!(
 			params.get(params::MEMORY_LIMIT).unwrap().type_,
 			ParamType::Bytes
 		);
@@ -690,7 +711,7 @@ mod tests {
 		// Only the params pgro actually acts on are advertised.
 		assert_eq!(
 			params.len(),
-			14,
+			15,
 			"advertising a param pgro doesn't read, or dropping one it does"
 		);
 		assert!(params.get("anonymise").is_none());
@@ -932,6 +953,40 @@ mod tests {
 			annos.get("tailscale.com/expose").map(String::as_str),
 			Some("true")
 		);
+	}
+
+	#[test]
+	fn extra_users_param_parses_into_the_list() {
+		let spec = config_for("analytics").unwrap().to_replica_spec(
+			&entry(
+				"analytics",
+				"site",
+				json!({ "extra_users": "reporting, etl ,dashboards" }),
+			),
+			vec![],
+		);
+		assert_eq!(
+			spec.extra_users,
+			vec![
+				"reporting".to_string(),
+				"etl".to_string(),
+				"dashboards".to_string()
+			]
+		);
+	}
+
+	#[test]
+	fn unset_extra_users_leaves_the_list_empty() {
+		let spec = config_for("analytics")
+			.unwrap()
+			.to_replica_spec(&entry("analytics", "site", json!({})), vec![]);
+		assert!(spec.extra_users.is_empty());
+
+		let spec = config_for("analytics").unwrap().to_replica_spec(
+			&entry("analytics", "site", json!({ "extra_users": "  , " })),
+			vec![],
+		);
+		assert!(spec.extra_users.is_empty());
 	}
 
 	#[test]
