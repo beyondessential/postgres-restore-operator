@@ -359,7 +359,7 @@ async fn read_result(
 	let row = conn
 		.client
 		.query_opt(
-			"SELECT migrations, batch_duration_ms, stats
+			"SELECT ARRAY(SELECT jsonb_array_elements_text(migrations)), batch_duration_ms, stats
 			 FROM logs.migrations
 			 WHERE direction = 'up'
 			   AND ($1::text IS NULL OR logged_at > $1::text::timestamptz)
