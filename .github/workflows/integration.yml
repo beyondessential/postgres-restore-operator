@@ -78,6 +78,11 @@ jobs:
             needs_non_pg_snapshot: false
             needs_locale_snapshot: true
 
+          - name: extra_users
+            namespaces: >-
+              test-extra-users
+            needs_non_pg_snapshot: false
+
           # canopy_integration is a scaffold in tests/canopy_integration.rs
           # but no stub-canopy HTTP server exists yet, so the happy-path
           # test times out. Re-add this matrix entry when the stub lands:

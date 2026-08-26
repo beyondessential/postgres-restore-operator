@@ -298,6 +298,7 @@ mod tests {
 				minimum_ttl: None,
 				switchover_grace_period: crate::util::TimeSpan(jiff::Span::new()),
 				analytics_username: "analytics".into(),
+				extra_users: vec![],
 				storage_class: None,
 				storage_size_override: None,
 				resources: None,

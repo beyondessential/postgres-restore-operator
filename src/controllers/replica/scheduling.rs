@@ -330,6 +330,7 @@ mod tests {
 				minimum_ttl,
 				switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 				analytics_username: "analytics".into(),
+				extra_users: vec![],
 				storage_class: None,
 				storage_size_override: None,
 				resources: None,

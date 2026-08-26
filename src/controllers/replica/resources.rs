@@ -545,6 +545,52 @@ impl PostgresPhysicalReplica {
 		Ok(())
 	}
 
+	/// Ensure a credentials Secret exists for each extra user. Each holds an
+	/// operator-generated password under `password` (and the username under
+	/// `username`), is owned by the replica so it cascades on delete, and is
+	/// created once — an existing Secret is left untouched so the password is
+	/// stable across restores. Created before the restore's init runs so the
+	/// setup-auth container can read the password when it provisions the role.
+	pub async fn ensure_extra_user_secrets(&self, client: &Client) -> Result<()> {
+		let secrets: Api<Secret> = Api::namespaced(client.clone(), &self.ns());
+
+		for username in self.extra_users() {
+			let secret_name = self.extra_user_secret_name(&username);
+			if secrets.get_opt(&secret_name).await?.is_some() {
+				continue;
+			}
+
+			info!(
+				replica = self.name_any(),
+				secret = secret_name,
+				"creating extra user credentials secret"
+			);
+
+			let password = generate_password();
+			let secret = Secret {
+				metadata: ObjectMeta {
+					name: Some(secret_name.clone()),
+					namespace: self.metadata.namespace.clone(),
+					labels: Some(BTreeMap::from([
+						("pgro.bes.au/replica".into(), self.name_any()),
+						("pgro.bes.au/component".into(), "extra-user-creds".into()),
+					])),
+					owner_references: Some(vec![self.owner_reference()]),
+					..Default::default()
+				},
+				data: Some(BTreeMap::from([
+					("username".into(), ByteString(username.as_bytes().to_vec())),
+					("password".into(), ByteString(password.as_bytes().to_vec())),
+				])),
+				..Default::default()
+			};
+
+			secrets.create(&PostParams::default(), &secret).await?;
+		}
+
+		Ok(())
+	}
+
 	pub async fn ensure_service(&self, client: &Client) -> Result<()> {
 		let services: Api<Service> = Api::namespaced(client.clone(), &self.ns());
 

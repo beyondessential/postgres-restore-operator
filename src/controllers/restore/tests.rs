@@ -31,6 +31,7 @@ fn deployment_uses_affinity_not_node_selector() {
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 			analytics_username: "analytics".to_string(),
+			extra_users: vec![],
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
@@ -131,6 +132,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
 			analytics_username: "analytics".to_string(),
+			extra_users: vec![],
 			storage_class: None,
 			storage_size_override: None,
 			resources: None,
@@ -2639,4 +2641,131 @@ fn restore_info_insert_tolerates_an_absent_snapshot_time() {
 		!script.contains("ELSE '${PGRO_SNAPSHOT_TIME}'::timestamptz"),
 		"the CASE form is plan-time unsafe: postgres evaluates the unreachable arm"
 	);
+}
+
+/// Build the `setup-auth` init container for a replica carrying the given
+/// extra users, so tests can inspect both its env and its inline script.
+fn setup_auth_with_extra_users(extra_users: Vec<String>) -> k8s_openapi::api::core::v1::Container {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	replica.spec.extra_users = extra_users;
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
+	deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist")
+}
+
+#[test]
+fn extra_users_get_indexed_env_and_superuser_sql() {
+	let setup_auth = setup_auth_with_extra_users(vec!["reporting".to_string(), "etl".to_string()]);
+
+	let env = setup_auth.env.clone().unwrap();
+	let name0 = env
+		.iter()
+		.find(|e| e.name == "EXTRA_USER_NAME_0")
+		.expect("first extra user's name env");
+	assert_eq!(name0.value.as_deref(), Some("reporting"));
+	let name1 = env
+		.iter()
+		.find(|e| e.name == "EXTRA_USER_NAME_1")
+		.expect("second extra user's name env");
+	assert_eq!(name1.value.as_deref(), Some("etl"));
+
+	// The password comes from the per-user Secret, not an inline value.
+	let pw0 = env
+		.iter()
+		.find(|e| e.name == "EXTRA_USER_PW_0")
+		.expect("first extra user's password env");
+	let secret_ref = pw0
+		.value_from
+		.as_ref()
+		.unwrap()
+		.secret_key_ref
+		.as_ref()
+		.unwrap();
+	assert_eq!(secret_ref.name, "test-replica-user-reporting-creds");
+	assert_eq!(secret_ref.key, "password");
+
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(
+		script.contains("$EXTRA_USER_NAME_0") && script.contains("$EXTRA_USER_NAME_1"),
+		"both users must be provisioned by index"
+	);
+	assert!(
+		script.contains("CREATE ROLE %I WITH LOGIN SUPERUSER PASSWORD %L"),
+		"a new extra user is created as LOGIN SUPERUSER"
+	);
+	assert!(
+		script.contains("ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L"),
+		"an existing extra user is updated to LOGIN SUPERUSER with a fresh password"
+	);
+}
+
+/// A read-only replica still provisions its extra users as SUPERUSER — the
+/// read-only setting governs the analytics user, not the extra ones.
+#[test]
+fn extra_users_are_superuser_even_when_read_only() {
+	let setup_auth = setup_auth_with_extra_users(vec!["writer".to_string()]);
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(script.contains("WITH LOGIN SUPERUSER PASSWORD %L"));
+}
+
+/// SUPERUSER on its own leaves the role's sessions starting read-only on a
+/// read-only replica, so the role setting is what actually grants write access.
+#[test]
+fn extra_users_default_to_read_write_sessions() {
+	let setup_auth = setup_auth_with_extra_users(vec!["writer".to_string()]);
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(
+		script.contains("ALTER ROLE %I SET default_transaction_read_only = off"),
+		"an extra user's sessions must default to read-write"
+	);
+
+	let read_only_line = script
+		.lines()
+		.position(|l| {
+			l.contains(r#"default_transaction_read_only = on" >> "$PGDATA/postgresql.conf""#)
+		})
+		.expect("read-only mode is enabled somewhere in the setup script");
+	let alter_role_line = script
+		.lines()
+		.position(|l| l.contains("SET default_transaction_read_only = off"))
+		.expect("the extra user's role setting is applied somewhere");
+	assert!(
+		alter_role_line < read_only_line,
+		"the role setting must be applied while the database is still writable"
+	);
+}
+
+#[test]
+fn no_extra_users_means_no_extra_user_env_or_sql() {
+	let setup_auth = setup_auth_with_extra_users(vec![]);
+	assert!(
+		!setup_auth
+			.env
+			.unwrap()
+			.iter()
+			.any(|e| e.name.starts_with("EXTRA_USER_")),
+		"a replica with no extra users must not carry extra-user env vars"
+	);
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(!script.contains("EXTRA_USER_NAME_"));
 }
