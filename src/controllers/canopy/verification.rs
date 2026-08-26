@@ -209,7 +209,7 @@ struct CanopyIds {
 }
 
 /// Parse the identity labels canopy requires, or report which of them are
-/// absent or unparseable.
+/// absent or unparsable.
 ///
 /// Pure so the label handling stays testable apart from the namespace lookup
 /// it feeds.
