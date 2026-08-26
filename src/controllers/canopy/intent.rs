@@ -78,6 +78,11 @@ pub mod params {
 	/// reported to canopy: an analytics migration gives the operator an upgraded
 	/// database to work against, not a version-readiness signal.
 	pub const MIGRATE_TO: &str = "migrate_to";
+	/// `text` — comma-separated schemas dropped from the restore before its
+	/// migration Job runs. Views over a table a migration alters block the DDL;
+	/// name here whatever a real upgrade of this deployment drops and
+	/// regenerates, so the test models the same starting state.
+	pub const PRE_MIGRATE_DROP_SCHEMAS: &str = "pre_migrate_drop_schemas";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
 	/// `text` — comma-separated usernames to provision as extra `LOGIN
@@ -126,6 +131,16 @@ fn param(type_: ParamType, default: Option<Value>) -> ParamSpec {
 		.build()
 }
 
+/// The `upgrade` intent's parameter schema. Its version comes from the
+/// worklist entry, so the only thing an operator sets is the starting state
+/// the migration runs against.
+fn upgrade_param_schema() -> ParamSchema {
+	ParamSchema(HashMap::from([(
+		params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+		param(ParamType::Text, None),
+	)]))
+}
+
 /// The `analytics` intent's parameter schema (name → typed spec + default).
 fn analytics_param_schema() -> ParamSchema {
 	ParamSchema(HashMap::from([
@@ -152,6 +167,10 @@ fn analytics_param_schema() -> ParamSchema {
 			param(ParamType::Text, None),
 		),
 		(params::MIGRATE_TO.to_string(), param(ParamType::Text, None)),
+		(
+			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+			param(ParamType::Text, None),
+		),
 		(
 			params::EXPOSE.to_string(),
 			param(ParamType::Boolean, Some(json!(false))),
@@ -299,6 +318,7 @@ pub fn descriptors() -> Vec<IntentDescriptor> {
 				semantics::ONCE.to_string(),
 				semantics::MIGRATE.to_string(),
 			])
+			.params(upgrade_param_schema())
 			.build(),
 		IntentDescriptor::builder()
 			.intent("analytics".to_string())
@@ -486,6 +506,9 @@ impl IntentConfig {
 			.map(parse_persistent_schemas)
 			.filter(|schemas| !schemas.is_empty())
 			.or_else(|| self.persistent_schemas.clone());
+		let pre_migrate_drop_schemas = param_str(p, params::PRE_MIGRATE_DROP_SCHEMAS)
+			.map(parse_comma_list)
+			.filter(|schemas| !schemas.is_empty());
 		let extra_users = param_str(p, params::EXTRA_USERS)
 			.map(parse_comma_list)
 			.unwrap_or_default();
@@ -558,6 +581,7 @@ impl IntentConfig {
 			postgres_extra_config: None,
 			notifications,
 			persistent_schemas,
+			pre_migrate_drop_schemas,
 			migrate_to,
 			redaction: redaction_spec(p),
 			storage_size_maximum,
@@ -650,6 +674,33 @@ mod tests {
 	}
 
 	#[test]
+	fn pre_migrate_drop_schemas_parses_on_every_migrating_intent() {
+		for intent in ["analytics", "upgrade"] {
+			let spec = config_for(intent).unwrap().to_replica_spec(
+				&entry(
+					intent,
+					"site",
+					json!({ "pre_migrate_drop_schemas": "reporting, dbt" }),
+				),
+				vec![],
+			);
+			assert_eq!(
+				spec.pre_migrate_drop_schemas.as_deref(),
+				Some(["reporting".to_string(), "dbt".to_string()].as_slice()),
+				"{intent} should drop the named schemas before migrating"
+			);
+		}
+	}
+
+	#[test]
+	fn pre_migrate_drop_schemas_is_unset_when_absent() {
+		let spec = config_for("analytics")
+			.unwrap()
+			.to_replica_spec(&entry("analytics", "site", json!({})), vec![]);
+		assert!(spec.pre_migrate_drop_schemas.is_none());
+	}
+
+	#[test]
 	fn analytics_migrate_to_param_builds_a_target() {
 		// The operator-chosen version turns an analytics replica into a
 		// persistent, upgraded query replica. It carries no canopy version id —
@@ -699,7 +750,22 @@ mod tests {
 
 		let upgrade = &ds[1];
 		assert_eq!(upgrade.semantics, ["check", "once", "migrate"]);
-		assert!(upgrade.params.is_none(), "upgrade takes no params");
+		let upgrade_params = upgrade
+			.params
+			.as_ref()
+			.expect("upgrade advertises its starting-state params")
+			.0
+			.clone();
+		// The version comes from the worklist entry, so the only thing an
+		// operator sets is what the migration starts from.
+		assert_eq!(upgrade_params.len(), 1);
+		assert_eq!(
+			upgrade_params
+				.get(params::PRE_MIGRATE_DROP_SCHEMAS)
+				.unwrap()
+				.type_,
+			ParamType::Text
+		);
 		assert!(upgrade.description.is_some());
 
 		let analytics = &ds[2];
@@ -768,10 +834,14 @@ mod tests {
 			params.get(params::MIGRATE_TO).unwrap().type_,
 			ParamType::Text
 		);
+		assert_eq!(
+			params.get(params::PRE_MIGRATE_DROP_SCHEMAS).unwrap().type_,
+			ParamType::Text
+		);
 		// Only the params pgro actually acts on are advertised.
 		assert_eq!(
 			params.len(),
-			16,
+			17,
 			"advertising a param pgro doesn't read, or dropping one it does"
 		);
 		assert!(params.get("anonymise").is_none());
@@ -808,7 +878,10 @@ mod tests {
 
 		assert_eq!(v[1]["intent"], "upgrade");
 		assert_eq!(v[1]["semantics"], json!(["check", "once", "migrate"]));
-		assert!(v[1]["params"].is_null(), "upgrade has no params");
+		assert!(
+			v[1]["params"]["pre_migrate_drop_schemas"].is_object(),
+			"upgrade advertises its starting-state param"
+		);
 
 		assert_eq!(v[2]["intent"], "analytics");
 		// `redact` is not a semantic canopy knows yet: it stores unrecognised

@@ -204,6 +204,7 @@ pub async fn reconcile_migrating(
 				)
 				.await?;
 			}
+			drop_pre_migrate_schemas(ctx, &replica, name, namespace, &creds, &dbname).await?;
 			info!(
 				restore = name,
 				target = %target.version,
@@ -269,6 +270,71 @@ pub async fn reconcile_migrating(
 }
 
 /// The replica's app credentials, as (user, password).
+/// Schemas that carry the restore's own data or postgres' catalogs. Dropping
+/// one leaves a restore that migrates but proves nothing, so the param cannot
+/// name them however it was set.
+fn is_droppable_schema(schema: &str) -> bool {
+	!matches!(schema, "public" | "information_schema") && !schema.starts_with("pg_")
+}
+
+/// Drop the replica's `pre_migrate_drop_schemas` from the restore.
+///
+/// A view over a table the migration alters blocks the DDL outright, so a
+/// deployment that drops and regenerates those schemas around a real upgrade
+/// names them and the test starts from the same place. Idempotent, so a crash
+/// between this and the Job re-runs it harmlessly.
+async fn drop_pre_migrate_schemas(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	restore_name: &str,
+	namespace: &str,
+	creds: &(String, String),
+	dbname: &str,
+) -> Result<()> {
+	let Some(schemas) = replica.spec.pre_migrate_drop_schemas.as_ref() else {
+		return Ok(());
+	};
+	if schemas.is_empty() {
+		return Ok(());
+	}
+
+	let conn = crate::controllers::postgres::connect_to_restore(
+		&ctx.client,
+		namespace,
+		restore_name,
+		dbname,
+		&creds.0,
+		&creds.1,
+		ctx.use_port_forward(),
+	)
+	.await?;
+
+	let (droppable, refused): (Vec<String>, Vec<String>) = schemas
+		.iter()
+		.cloned()
+		.partition(|s| is_droppable_schema(s));
+	if !refused.is_empty() {
+		warn!(
+			restore = restore_name,
+			schemas = ?refused,
+			"refusing to drop reserved schemas before migration"
+		);
+	}
+
+	let present =
+		crate::controllers::postgres::existing_schemas_on(&conn.client, &droppable).await?;
+	if present.is_empty() {
+		return Ok(());
+	}
+
+	info!(
+		restore = restore_name,
+		schemas = ?present,
+		"dropping schemas before migration"
+	);
+	crate::controllers::postgres::drop_schemas_on(&conn.client, &present).await
+}
+
 async fn credentials(
 	ctx: &Context,
 	replica: &PostgresPhysicalReplica,
@@ -458,5 +524,24 @@ pub(super) fn result_from_batch(
 		data_bytes_before,
 		data_bytes_after,
 		timings,
+	}
+}
+
+#[cfg(test)]
+mod guard_tests {
+	use super::is_droppable_schema;
+
+	#[test]
+	fn reserved_schemas_are_never_dropped() {
+		for reserved in ["public", "information_schema", "pg_catalog", "pg_toast"] {
+			assert!(!is_droppable_schema(reserved), "{reserved} must be refused");
+		}
+	}
+
+	#[test]
+	fn deployment_schemas_are_droppable() {
+		for schema in ["reporting", "dbt", "analytics", "public_tupaia"] {
+			assert!(is_droppable_schema(schema), "{schema} should be droppable");
+		}
 	}
 }

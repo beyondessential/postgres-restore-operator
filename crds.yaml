@@ -701,6 +701,16 @@ spec:
                 description: Extra lines appended to postgresql.conf (e.g. shared_preload_libraries)
                 nullable: true
                 type: string
+              preMigrateDropSchemas:
+                description: |-
+                  Schemas dropped from the restore before its migration Job runs. Views
+                  over a table a migration alters block the DDL, so a deployment that
+                  drops and regenerates such schemas around a real upgrade names them
+                  here to model that.
+                items:
+                  type: string
+                nullable: true
+                type: array
               readOnly:
                 default: true
                 description: Set database to read-only mode

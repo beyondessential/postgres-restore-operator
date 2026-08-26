@@ -318,6 +318,7 @@ mod tests {
 				..Default::default()
 			},
 			spec: PostgresPhysicalReplicaSpec {
+				pre_migrate_drop_schemas: None,
 				migrate_to: None,
 				kopia_secret_ref: Some(SecretReference {
 					name: Some("test-secret".into()),

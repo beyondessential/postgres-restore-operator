@@ -19,6 +19,7 @@ fn deployment_uses_affinity_not_node_selector() {
 	let mut replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
+			pre_migrate_drop_schemas: None,
 			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
@@ -120,6 +121,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 	let replica = PostgresPhysicalReplica::new(
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
+			pre_migrate_drop_schemas: None,
 			migrate_to: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
