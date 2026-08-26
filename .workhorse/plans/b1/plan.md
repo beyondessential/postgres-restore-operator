@@ -28,5 +28,5 @@ list to the replica: each named role is provisioned once per restore as a
 - [x] Deployment builder: env vars + create-or-update SUPERUSER SQL in `setup-auth`
 - [x] Update `crds.yaml` and the README CRD table
 - [x] Unit tests (intent parse, `extra_users()` dedup/exclude, deployment builder)
-- [x] Integration test `tests/extra_users.rs` + matrix entry in `integration.yml`
+- [x] Integration test `tests/extra_users.rs` (matrix entry in `integration.yml` added manually by the user)
 - [ ] `cargo fmt` + `cargo clippy` (cannot run locally — must pass in CI)
