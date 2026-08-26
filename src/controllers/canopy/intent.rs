@@ -72,6 +72,12 @@ pub mod params {
 	/// `text` — comma-separated schemas migrated into the restore and kept
 	/// across restores (the dbt workload). Empty/unset = a plain replica.
 	pub const PERSISTENT_SCHEMAS: &str = "persistent_schemas";
+	/// `text` — a Tamanu version to migrate this analytics replica's restores
+	/// to, turning it into a persistent, upgraded query replica. Empty/unset
+	/// leaves it a plain replica with no migration step. The outcome is not
+	/// reported to canopy: an analytics migration gives the operator an upgraded
+	/// database to work against, not a version-readiness signal.
+	pub const MIGRATE_TO: &str = "migrate_to";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
 	/// `text` — comma-separated usernames to provision as extra `LOGIN
@@ -145,6 +151,7 @@ fn analytics_param_schema() -> ParamSchema {
 			params::PERSISTENT_SCHEMAS.to_string(),
 			param(ParamType::Text, None),
 		),
+		(params::MIGRATE_TO.to_string(), param(ParamType::Text, None)),
 		(
 			params::EXPOSE.to_string(),
 			param(ParamType::Boolean, Some(json!(false))),
@@ -483,9 +490,12 @@ impl IntentConfig {
 			.map(parse_comma_list)
 			.unwrap_or_default();
 		let service_annotations = is_exposed(entry).then(|| expose_annotations(&entry.name));
-		// Canopy only names a target for a `migrate` intent, and withholds the
-		// entry entirely when the server has no candidate version, so the pair
-		// being present is the whole signal.
+		// Two routes to a target. `upgrade`'s is named by canopy on the entry via
+		// the `migrate` semantic, and canopy withholds the entry entirely when
+		// the server has no candidate version, so the pair being present is the
+		// whole signal. `analytics`'s is the operator's `migrate_to` param, a
+		// version they choose; its outcome isn't reported to canopy, so it
+		// carries no canopy version id and is built with an empty one.
 		let migrate_to = entry
 			.target_version
 			.as_deref()
@@ -493,6 +503,15 @@ impl IntentConfig {
 			.map(|(version, version_id)| crate::types::MigrationTarget {
 				version: version.to_owned(),
 				version_id: version_id.to_string(),
+			})
+			.or_else(|| {
+				param_str(p, params::MIGRATE_TO)
+					.map(str::trim)
+					.filter(|s| !s.is_empty())
+					.map(|version| crate::types::MigrationTarget {
+						version: version.to_owned(),
+						version_id: String::new(),
+					})
 			});
 
 		// Resources are pinned only when the operator declared at least one of
@@ -631,6 +650,39 @@ mod tests {
 	}
 
 	#[test]
+	fn analytics_migrate_to_param_builds_a_target() {
+		// The operator-chosen version turns an analytics replica into a
+		// persistent, upgraded query replica. It carries no canopy version id —
+		// analytics migrations aren't reported — so the id is built empty.
+		let spec = config_for("analytics").unwrap().to_replica_spec(
+			&entry("analytics", "site", json!({ "migrate_to": "2.41.0" })),
+			vec![],
+		);
+		let target = spec
+			.migrate_to
+			.expect("migrate_to param names a target to migrate to");
+		assert_eq!(target.version, "2.41.0");
+		assert_eq!(
+			target.version_id, "",
+			"an analytics target has no canopy version id"
+		);
+	}
+
+	#[test]
+	fn blank_migrate_to_param_leaves_the_replica_unmigrated() {
+		for value in [json!(""), json!("  "), Value::Null] {
+			let spec = config_for("analytics").unwrap().to_replica_spec(
+				&entry("analytics", "site", json!({ "migrate_to": value })),
+				vec![],
+			);
+			assert!(
+				spec.migrate_to.is_none(),
+				"{value:?} must leave the replica a plain query replica"
+			);
+		}
+	}
+
+	#[test]
 	fn descriptors_advertise_expected_intents_and_semantics() {
 		let ds = descriptors();
 		let names: Vec<&str> = ds.iter().map(|d| d.intent.as_str()).collect();
@@ -671,6 +723,10 @@ mod tests {
 		);
 		assert_eq!(
 			params.get(params::PERSISTENT_SCHEMAS).unwrap().type_,
+			ParamType::Text
+		);
+		assert_eq!(
+			params.get(params::MIGRATE_TO).unwrap().type_,
 			ParamType::Text
 		);
 		assert_eq!(

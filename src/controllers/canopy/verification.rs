@@ -151,16 +151,7 @@ pub async fn report(
 	// Typed request body generated from canopy's OpenAPI (bestool#628).
 	// Constructing it here means the field set is checked against canopy's
 	// spec at compile time; `health_details` stays free-form by design.
-	// A migration test's result, when this restore ran one. Canopy reads the
-	// named failing migration as the verdict rather than the report's outcome,
-	// which keeps backup health and version readiness as separate signals: the
-	// backup restored fine even when the version's migrations did not.
-	let migration = restore
-		.status
-		.as_ref()
-		.and_then(|s| s.migration_result.as_ref())
-		.zip(restore.spec.migrate_to.as_ref())
-		.and_then(|(result, target)| migration_args(result, target));
+	let migration = migration_for(&intent, restore);
 
 	let args = VerificationArgs::builder()
 		.maybe_migration(migration)
@@ -428,6 +419,27 @@ async fn gather_from_postgres(
 		.await
 		.unwrap_or_else(|_| json!({}));
 	Ok(PostgresHealth { sizes, fixes })
+}
+
+/// The migration block for a report, if this restore's intent reports one.
+///
+/// Only `upgrade` does: its migration is a version-readiness signal, so canopy
+/// reads the named failing migration as the verdict rather than the report's
+/// outcome, keeping backup health and version readiness separate — the backup
+/// restored fine even when the version's migrations did not. An `analytics`
+/// replica may also migrate (its `migrate_to` param), but that is only to hand
+/// the operator an upgraded database to work against, not to verify a version,
+/// so its outcome is not reported.
+fn migration_for(intent: &str, restore: &PostgresPhysicalRestore) -> Option<MigrationArgs> {
+	if intent != "upgrade" {
+		return None;
+	}
+	restore
+		.status
+		.as_ref()
+		.and_then(|s| s.migration_result.as_ref())
+		.zip(restore.spec.migrate_to.as_ref())
+		.and_then(|(result, target)| migration_args(result, target))
 }
 
 /// Map the operator's recorded result onto canopy's wire shape.
@@ -714,5 +726,65 @@ mod tests {
 		// The id round-trips from canopy, so a malformed one means we would report
 		// against the wrong version; dropping the migration beats guessing.
 		assert!(migration_args(&migration_result(), &target("not-a-uuid")).is_none());
+	}
+
+	fn migrated_restore(
+		target: Option<crate::types::MigrationTarget>,
+		result: Option<crate::types::MigrationResult>,
+	) -> PostgresPhysicalRestore {
+		use k8s_openapi::api::core::v1::LocalObjectReference;
+		use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
+
+		use crate::types::{PostgresPhysicalRestoreSpec, PostgresPhysicalRestoreStatus};
+
+		let mut restore = PostgresPhysicalRestore::new(
+			"r",
+			PostgresPhysicalRestoreSpec {
+				migrate_to: target,
+				replica: LocalObjectReference {
+					name: "rep".to_string(),
+				},
+				snapshot: "snap".to_string(),
+				snapshot_size: Quantity("1Gi".to_string()),
+				snapshot_time: None,
+				storage_size: Quantity("2Gi".to_string()),
+			},
+		);
+		restore.status = Some(PostgresPhysicalRestoreStatus {
+			migration_result: result,
+			..Default::default()
+		});
+		restore
+	}
+
+	#[test]
+	fn upgrade_reports_its_migration() {
+		let id = "55555555-5555-5555-5555-555555555555";
+		let restore = migrated_restore(Some(target(id)), Some(migration_result()));
+		let args = migration_for("upgrade", &restore).expect("upgrade reports its migration");
+		assert_eq!(args.target_version_id, Uuid::parse_str(id).unwrap());
+	}
+
+	#[test]
+	fn analytics_migration_is_not_reported() {
+		// An analytics replica may migrate (its `migrate_to` param), but the
+		// outcome is a convenience, not a version-readiness signal, so no
+		// migration block goes to canopy. The empty version id it carries could
+		// not be reported against a version anyway.
+		let restore = migrated_restore(Some(target("")), Some(migration_result()));
+		assert!(migration_for("analytics", &restore).is_none());
+	}
+
+	#[test]
+	fn a_non_migrating_intent_reports_no_migration() {
+		let restore = migrated_restore(None, None);
+		assert!(migration_for("verify", &restore).is_none());
+	}
+
+	#[test]
+	fn upgrade_without_a_result_reports_no_migration() {
+		// Nothing to report until the migration Job has run and been read back.
+		let restore = migrated_restore(Some(target("55555555-5555-5555-5555-555555555555")), None);
+		assert!(migration_for("upgrade", &restore).is_none());
 	}
 }
