@@ -111,7 +111,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `notifications` | `[]NotificationConfig` | No | `[]` | Notification targets called on restore events. |
 | `persistentSchemas` | `[]string` | No | — | List of schema names to migrate from the previous restore to the new restore on each switchover. See [Persistent schemas](#persistent-schemas) below for the migration time budget and what happens on timeout. |
 | `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. See [RedactionSpec](#redactionspec) below. |
-| `migrateTo` | `MigrationTarget` | No | — | Apply a Tamanu version's schema migrations to each restore of this replica and report how they went. `{ version, versionId }`. Set by the canopy worklist syncer for the `upgrade` intent, from the target version canopy names on the worklist entry. A restore carrying this is built read-write, since migrations are DDL, and is torn down once verified. |
+| `migrateTo` | `MigrationTarget` | No | — | Apply a Tamanu version's schema migrations to each restore of this replica. `{ version, versionId }`. Set by the canopy worklist syncer by two routes: for the `upgrade` intent from the target version canopy names on the worklist entry, whose outcome is reported back as a version-readiness signal; and for an `analytics` replica from its operator-chosen `migrate_to` param, keeping a persistent upgraded query replica, whose outcome is not reported. A restore carrying this is built read-write, since migrations are DDL. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:

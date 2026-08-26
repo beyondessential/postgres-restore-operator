@@ -90,15 +90,18 @@ requirement from the verification contract.
 
 ## Implementation checklist (this card)
 
-- [ ] Add `migrate_to` (text) to `analytics_param_schema()` and its
+- [x] Add `migrate_to` (text) to `analytics_param_schema()` and its
       `params::` name constant.
-- [ ] In `to_replica_spec`, build the replica's migration target from the analytics
+- [x] In `to_replica_spec`, build the replica's migration target from the analytics
       `migrate_to` param (empty version id), keeping the existing entry-based target
       for `upgrade`.
-- [ ] In `verification.rs`, omit the migration block unless the intent is `upgrade`.
-- [ ] Tests: analytics with `migrate_to` migrates and does not report; analytics
+- [x] In `verification.rs`, omit the migration block unless the intent is `upgrade`
+      (extracted as `migration_for`).
+- [x] Tests: analytics with `migrate_to` migrates and does not report; analytics
       without it is unchanged; `upgrade` still reports.
-- [ ] Update the README analytics param table with `migrate_to`.
+- [x] Update the README `migrateTo` CRD-field description with the analytics route.
+      (There is no canopy-intent param table in the README; the intent params are
+      not documented there, so the `migrateTo` field description is the right home.)
 
 ## Follow-up card (separate)
 
