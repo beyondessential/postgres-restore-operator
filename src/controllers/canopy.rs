@@ -29,7 +29,6 @@ use kube::{
 	api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 use rand::RngExt;
-use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -38,6 +37,7 @@ use crate::{
 	controllers::canopy::intent::{IntentConfig, config_for},
 	error::Result,
 	types::{PostgresPhysicalReplica, PostgresPhysicalReplicaSpec},
+	util::{short_hash, slug},
 };
 
 pub mod intent;
@@ -69,48 +69,8 @@ pub fn namespace_name_for(entry: &WorklistEntry) -> String {
 	format!(
 		"{}-{}",
 		slug(&entry.name),
-		short_hash(entry.replica_id, entry.server_id),
+		replica_short_hash(entry.replica_id, entry.server_id),
 	)
-}
-
-/// Slugify to DNS-1123-label-safe: lowercased, non-alphanumeric runs → `-`,
-/// leading/trailing `-` trimmed, truncated to 50 chars (leaves ≥9 chars for
-/// the `-XXXXXXXX` disambiguator suffix in a 63-char label limit).
-fn slug(s: &str) -> String {
-	let mut out = String::with_capacity(s.len());
-	let mut prev_dash = true;
-	for c in s.chars() {
-		let mapped = if c.is_ascii_alphanumeric() {
-			c.to_ascii_lowercase()
-		} else {
-			'-'
-		};
-		if mapped == '-' {
-			if !prev_dash {
-				out.push('-');
-				prev_dash = true;
-			}
-		} else {
-			out.push(mapped);
-			prev_dash = false;
-		}
-	}
-	while out.ends_with('-') {
-		out.pop();
-	}
-	while out.starts_with('-') {
-		out.remove(0);
-	}
-	if out.is_empty() {
-		out.push_str("replica");
-	}
-	if out.len() > 50 {
-		out.truncate(50);
-		while out.ends_with('-') {
-			out.pop();
-		}
-	}
-	out
 }
 
 /// Apply ±20% jitter to a Duration. Scopes the (non-Send) thread rng so the
@@ -122,16 +82,11 @@ fn jittered(base: Duration) -> Duration {
 }
 
 /// 8-hex-char disambiguator from SHA-256 of `replica_id || server_id`.
-fn short_hash(replica_id: Uuid, server_id: Uuid) -> String {
-	let mut hasher = Sha256::new();
-	hasher.update(replica_id.as_bytes());
-	hasher.update(server_id.as_bytes());
-	let digest = hasher.finalize();
-	let mut out = String::with_capacity(8);
-	for byte in &digest[..4] {
-		out.push_str(&format!("{byte:02x}"));
-	}
-	out
+fn replica_short_hash(replica_id: Uuid, server_id: Uuid) -> String {
+	let mut bytes = Vec::with_capacity(32);
+	bytes.extend_from_slice(replica_id.as_bytes());
+	bytes.extend_from_slice(server_id.as_bytes());
+	short_hash(&bytes)
 }
 
 /// Name of the canopy-owned CR inside each per-replica Namespace. Fixed —
@@ -492,56 +447,21 @@ mod tests {
 	}
 
 	#[test]
-	fn slug_ascii_alnum_untouched() {
-		assert_eq!(slug("hello123"), "hello123");
-	}
-
-	#[test]
-	fn slug_lowercases_and_replaces_specials() {
-		assert_eq!(slug("Nauru Prod Analytics!"), "nauru-prod-analytics");
-	}
-
-	#[test]
-	fn slug_collapses_runs_of_specials() {
-		assert_eq!(slug("a__b--c/d.e"), "a-b-c-d-e");
-	}
-
-	#[test]
-	fn slug_trims_edges() {
-		assert_eq!(slug("---weird---"), "weird");
-	}
-
-	#[test]
-	fn slug_empty_becomes_replica() {
-		assert_eq!(slug(""), "replica");
-		assert_eq!(slug("...!!!"), "replica");
-	}
-
-	#[test]
-	fn slug_truncates_at_50_without_trailing_dash() {
-		let out = slug(&"a".repeat(60));
-		assert_eq!(out.len(), 50);
-		let out = slug(&format!("{}{}", "a".repeat(48), "--"));
-		assert!(out.len() <= 50);
-		assert!(!out.ends_with('-'));
-	}
-
-	#[test]
-	fn short_hash_deterministic() {
+	fn replica_short_hash_deterministic() {
 		let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
 		let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
-		let h1 = short_hash(a, b);
-		let h2 = short_hash(a, b);
+		let h1 = replica_short_hash(a, b);
+		let h2 = replica_short_hash(a, b);
 		assert_eq!(h1, h2);
 		assert_eq!(h1.len(), 8);
 	}
 
 	#[test]
-	fn short_hash_differs_by_server() {
+	fn replica_short_hash_differs_by_server() {
 		let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
 		let b1 = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 		let b2 = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
-		assert_ne!(short_hash(a, b1), short_hash(a, b2));
+		assert_ne!(replica_short_hash(a, b1), replica_short_hash(a, b2));
 	}
 
 	#[test]

@@ -203,12 +203,39 @@ fn extra_users_trims_dedupes_and_excludes_analytics() {
 	);
 }
 
+fn is_rfc1123_subdomain(name: &str) -> bool {
+	!name.is_empty()
+		&& name.len() <= 253
+		&& name
+			.chars()
+			.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-' || c == '.')
+		&& name.starts_with(|c: char| c.is_ascii_alphanumeric())
+		&& name.ends_with(|c: char| c.is_ascii_alphanumeric())
+}
+
 #[test]
 fn extra_user_secret_name_is_derived_from_replica_and_username() {
 	let replica = make_replica(None, None);
-	assert_eq!(
-		replica.extra_user_secret_name("reporting"),
-		"test-user-reporting-creds"
+	let name = replica.extra_user_secret_name("reporting");
+	assert!(name.starts_with("test-user-reporting-"), "{name}");
+	assert!(name.ends_with("-creds"), "{name}");
+	assert!(is_rfc1123_subdomain(&name), "{name}");
+}
+
+#[test]
+fn extra_user_secret_name_is_dns_safe_for_underscored_roles() {
+	let replica = make_replica(None, None);
+	let name = replica.extra_user_secret_name("tupaia_read");
+	assert!(name.starts_with("test-user-tupaia-read-"), "{name}");
+	assert!(is_rfc1123_subdomain(&name), "{name}");
+}
+
+#[test]
+fn extra_user_secret_names_differ_when_usernames_slug_alike() {
+	let replica = make_replica(None, None);
+	assert_ne!(
+		replica.extra_user_secret_name("tupaia_read"),
+		replica.extra_user_secret_name("tupaia-read")
 	);
 }
 

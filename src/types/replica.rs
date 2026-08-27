@@ -15,7 +15,7 @@ use kube::{CustomResource, ResourceExt as _};
 use schemars::{JsonSchema, Schema, SchemaGenerator, json_schema};
 use serde::{Deserialize, Serialize};
 
-use crate::util::TimeSpan;
+use crate::util::{TimeSpan, short_hash, slug};
 
 use super::HeaderValue;
 
@@ -722,8 +722,17 @@ impl PostgresPhysicalReplica {
 
 	/// Name of the per-user credentials Secret for an extra user, owned by the
 	/// replica so it's cleaned up when the replica is deleted.
+	///
+	/// Postgres role names allow characters a k8s object name doesn't, so the
+	/// username is slugged and carries a hash of the original to keep roles
+	/// that slug alike (`a_b` and `a-b`) on separate Secrets.
 	pub fn extra_user_secret_name(&self, username: &str) -> String {
-		format!("{name}-user-{username}-creds", name = self.name_any())
+		format!(
+			"{name}-user-{user}-{hash}-creds",
+			name = self.name_any(),
+			user = slug(username),
+			hash = short_hash(username.as_bytes()),
+		)
 	}
 
 	/// Name of the operator-materialised Secret that holds the canopy path's

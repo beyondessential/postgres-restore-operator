@@ -2,6 +2,7 @@ use std::{fmt::Display, str::FromStr};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TimeSpan(
@@ -49,6 +50,57 @@ pub fn glob_matches(pattern: &str, value: &str) -> bool {
 		return false;
 	};
 	glob.compile_matcher().is_match(value)
+}
+
+/// Slugify to DNS-1123-label-safe: lowercased, non-alphanumeric runs → `-`,
+/// leading/trailing `-` trimmed, truncated to 50 chars (leaves ≥9 chars for
+/// the `-XXXXXXXX` disambiguator suffix in a 63-char label limit).
+pub fn slug(s: &str) -> String {
+	let mut out = String::with_capacity(s.len());
+	let mut prev_dash = true;
+	for c in s.chars() {
+		let mapped = if c.is_ascii_alphanumeric() {
+			c.to_ascii_lowercase()
+		} else {
+			'-'
+		};
+		if mapped == '-' {
+			if !prev_dash {
+				out.push('-');
+				prev_dash = true;
+			}
+		} else {
+			out.push(mapped);
+			prev_dash = false;
+		}
+	}
+	while out.ends_with('-') {
+		out.pop();
+	}
+	while out.starts_with('-') {
+		out.remove(0);
+	}
+	if out.is_empty() {
+		out.push_str("replica");
+	}
+	if out.len() > 50 {
+		out.truncate(50);
+		while out.ends_with('-') {
+			out.pop();
+		}
+	}
+	out
+}
+
+/// 8-hex-char disambiguator from the SHA-256 of `input`. Pairs with [`slug`]
+/// to keep distinct inputs apart once slugging has flattened them.
+pub fn short_hash(input: &[u8]) -> String {
+	let digest = Sha256::digest(input);
+	let mut out = String::with_capacity(8);
+	for byte in &digest[..4] {
+		out.push_str(&format!("{byte:02x}"));
+	}
+	out
 }
 
 #[cfg(test)]
@@ -115,5 +167,53 @@ mod tests {
 	fn test_glob_matches_special_chars() {
 		assert!(glob_matches("a+b", "a+b"));
 		assert!(!glob_matches("a+b", "aab"));
+	}
+
+	#[test]
+	fn slug_ascii_alnum_untouched() {
+		assert_eq!(slug("hello123"), "hello123");
+	}
+
+	#[test]
+	fn slug_lowercases_and_replaces_specials() {
+		assert_eq!(slug("Nauru Prod Analytics!"), "nauru-prod-analytics");
+	}
+
+	#[test]
+	fn slug_collapses_runs_of_specials() {
+		assert_eq!(slug("a__b--c/d.e"), "a-b-c-d-e");
+	}
+
+	#[test]
+	fn slug_trims_edges() {
+		assert_eq!(slug("---weird---"), "weird");
+	}
+
+	#[test]
+	fn slug_empty_becomes_replica() {
+		assert_eq!(slug(""), "replica");
+		assert_eq!(slug("...!!!"), "replica");
+	}
+
+	#[test]
+	fn slug_truncates_at_50_without_trailing_dash() {
+		let out = slug(&"a".repeat(60));
+		assert_eq!(out.len(), 50);
+		let out = slug(&format!("{}{}", "a".repeat(48), "--"));
+		assert!(out.len() <= 50);
+		assert!(!out.ends_with('-'));
+	}
+
+	#[test]
+	fn short_hash_is_deterministic_and_eight_hex() {
+		let h = short_hash(b"tupaia_read");
+		assert_eq!(h, short_hash(b"tupaia_read"));
+		assert_eq!(h.len(), 8);
+		assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
+	}
+
+	#[test]
+	fn short_hash_separates_inputs_that_slug_alike() {
+		assert_ne!(short_hash(b"tupaia_read"), short_hash(b"tupaia-read"));
 	}
 }
