@@ -29,6 +29,7 @@ use kube::{
 	api::{DeleteParams, ListParams, Patch, PatchParams, PostParams},
 };
 use rand::RngExt;
+use sha2::{Digest, Sha256};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -37,7 +38,7 @@ use crate::{
 	controllers::canopy::intent::{IntentConfig, config_for},
 	error::Result,
 	types::{PostgresPhysicalReplica, PostgresPhysicalReplicaSpec},
-	util::{short_hash, slug},
+	util::slug,
 };
 
 pub mod intent;
@@ -69,7 +70,7 @@ pub fn namespace_name_for(entry: &WorklistEntry) -> String {
 	format!(
 		"{}-{}",
 		slug(&entry.name),
-		replica_short_hash(entry.replica_id, entry.server_id),
+		short_hash(entry.replica_id, entry.server_id),
 	)
 }
 
@@ -82,11 +83,16 @@ fn jittered(base: Duration) -> Duration {
 }
 
 /// 8-hex-char disambiguator from SHA-256 of `replica_id || server_id`.
-fn replica_short_hash(replica_id: Uuid, server_id: Uuid) -> String {
-	let mut bytes = Vec::with_capacity(32);
-	bytes.extend_from_slice(replica_id.as_bytes());
-	bytes.extend_from_slice(server_id.as_bytes());
-	short_hash(&bytes)
+fn short_hash(replica_id: Uuid, server_id: Uuid) -> String {
+	let mut hasher = Sha256::new();
+	hasher.update(replica_id.as_bytes());
+	hasher.update(server_id.as_bytes());
+	let digest = hasher.finalize();
+	let mut out = String::with_capacity(8);
+	for byte in &digest[..4] {
+		out.push_str(&format!("{byte:02x}"));
+	}
+	out
 }
 
 /// Name of the canopy-owned CR inside each per-replica Namespace. Fixed —
@@ -447,21 +453,21 @@ mod tests {
 	}
 
 	#[test]
-	fn replica_short_hash_deterministic() {
+	fn short_hash_deterministic() {
 		let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
 		let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
-		let h1 = replica_short_hash(a, b);
-		let h2 = replica_short_hash(a, b);
+		let h1 = short_hash(a, b);
+		let h2 = short_hash(a, b);
 		assert_eq!(h1, h2);
 		assert_eq!(h1.len(), 8);
 	}
 
 	#[test]
-	fn replica_short_hash_differs_by_server() {
+	fn short_hash_differs_by_server() {
 		let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
 		let b1 = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 		let b2 = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
-		assert_ne!(replica_short_hash(a, b1), replica_short_hash(a, b2));
+		assert_ne!(short_hash(a, b1), short_hash(a, b2));
 	}
 
 	#[test]

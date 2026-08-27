@@ -2,7 +2,6 @@ use std::{fmt::Display, str::FromStr};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 #[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, JsonSchema)]
 pub struct TimeSpan(
@@ -88,17 +87,6 @@ pub fn slug(s: &str) -> String {
 		while out.ends_with('-') {
 			out.pop();
 		}
-	}
-	out
-}
-
-/// 8-hex-char disambiguator from the SHA-256 of `input`. Pairs with [`slug`]
-/// to keep distinct inputs apart once slugging has flattened them.
-pub fn short_hash(input: &[u8]) -> String {
-	let digest = Sha256::digest(input);
-	let mut out = String::with_capacity(8);
-	for byte in &digest[..4] {
-		out.push_str(&format!("{byte:02x}"));
 	}
 	out
 }
@@ -202,18 +190,5 @@ mod tests {
 		let out = slug(&format!("{}{}", "a".repeat(48), "--"));
 		assert!(out.len() <= 50);
 		assert!(!out.ends_with('-'));
-	}
-
-	#[test]
-	fn short_hash_is_deterministic_and_eight_hex() {
-		let h = short_hash(b"tupaia_read");
-		assert_eq!(h, short_hash(b"tupaia_read"));
-		assert_eq!(h.len(), 8);
-		assert!(h.chars().all(|c| c.is_ascii_hexdigit()));
-	}
-
-	#[test]
-	fn short_hash_separates_inputs_that_slug_alike() {
-		assert_ne!(short_hash(b"tupaia_read"), short_hash(b"tupaia-read"));
 	}
 }

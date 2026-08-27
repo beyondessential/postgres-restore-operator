@@ -2703,12 +2703,7 @@ fn extra_users_get_indexed_env_and_superuser_sql() {
 		.secret_key_ref
 		.as_ref()
 		.unwrap();
-	assert!(
-		secret_ref.name.starts_with("test-replica-user-reporting-")
-			&& secret_ref.name.ends_with("-creds"),
-		"{}",
-		secret_ref.name
-	);
+	assert_eq!(secret_ref.name, "test-replica-user-reporting-creds");
 	assert_eq!(secret_ref.key, "password");
 
 	let script = setup_auth.args.unwrap().remove(0);

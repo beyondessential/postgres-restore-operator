@@ -66,7 +66,7 @@ async fn extra_user_provisioned_with_write_access() {
 
 	println!("--- verifying the per-user credentials secret");
 	let user_secret = secrets
-		.get(&replica.extra_user_secret_name("writer"))
+		.get("extra-users-replica-user-writer-creds")
 		.await
 		.expect("extra user secret not found");
 	let data = user_secret.data.expect("extra user secret has no data");
@@ -84,7 +84,7 @@ async fn extra_user_provisioned_with_write_access() {
 
 	println!("--- verifying the underscored user's credentials secret");
 	let underscored_secret = secrets
-		.get(&replica.extra_user_secret_name("report_writer"))
+		.get("extra-users-replica-user-report-writer-creds")
 		.await
 		.expect("underscored extra user secret not found");
 	assert_eq!(
