@@ -32,13 +32,13 @@ async fn extra_user_provisioned_with_write_access() {
 		.await
 		.expect("failed to create kopia secret");
 
-	println!("--- creating replica with an extra user (readOnly: true)");
+	println!("--- creating replica with extra users (readOnly: true)");
 	let mut replica = build_replica(
 		"extra-users-replica",
 		"extra-users-kopia-creds",
 		ReplicaOpts {
 			read_only: true,
-			extra_users: vec!["writer".into()],
+			extra_users: vec!["writer".into(), "report_writer".into()],
 			..Default::default()
 		},
 	);
@@ -66,7 +66,7 @@ async fn extra_user_provisioned_with_write_access() {
 
 	println!("--- verifying the per-user credentials secret");
 	let user_secret = secrets
-		.get("extra-users-replica-user-writer-creds")
+		.get(&replica.extra_user_secret_name("writer"))
 		.await
 		.expect("extra user secret not found");
 	let data = user_secret.data.expect("extra user secret has no data");
@@ -80,6 +80,22 @@ async fn extra_user_provisioned_with_write_access() {
 			.as_deref(),
 		Some("writer"),
 		"extra user secret should carry the username"
+	);
+
+	println!("--- verifying the underscored user's credentials secret");
+	let underscored_secret = secrets
+		.get(&replica.extra_user_secret_name("report_writer"))
+		.await
+		.expect("underscored extra user secret not found");
+	assert_eq!(
+		underscored_secret
+			.data
+			.expect("underscored extra user secret has no data")
+			.get("username")
+			.map(|b| String::from_utf8_lossy(&b.0).to_string())
+			.as_deref(),
+		Some("report_writer"),
+		"the Secret carries the role name, not the slugged form"
 	);
 
 	let deploy_target = format!("deployment/{restore_name}");
@@ -103,6 +119,27 @@ async fn extra_user_provisioned_with_write_access() {
 		out.trim(),
 		"t",
 		"the extra user should exist and be a superuser"
+	);
+
+	println!("--- verifying the underscored user exists under its real name");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"report_writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT rolname FROM pg_roles WHERE rolname = 'report_writer'",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"report_writer",
+		"the underscored role is created with its declared name"
 	);
 
 	println!("--- verifying the extra user's sessions default to read-write");
