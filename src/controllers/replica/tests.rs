@@ -213,6 +213,15 @@ fn extra_user_secret_name_is_derived_from_replica_and_username() {
 }
 
 #[test]
+fn extra_user_secret_name_slugs_characters_k8s_rejects() {
+	let replica = make_replica(None, None);
+	assert_eq!(
+		replica.extra_user_secret_name("tupaia_read"),
+		"test-user-tupaia-read-creds"
+	);
+}
+
+#[test]
 fn migration_settled_when_persistent_schemas_unset() {
 	let replica = make_replica(None, None);
 	assert!(persistent_schemas_migration_settled(&replica));

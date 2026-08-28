@@ -38,6 +38,7 @@ use crate::{
 	controllers::canopy::intent::{IntentConfig, config_for},
 	error::Result,
 	types::{PostgresPhysicalReplica, PostgresPhysicalReplicaSpec},
+	util::slug,
 };
 
 pub mod intent;
@@ -71,46 +72,6 @@ pub fn namespace_name_for(entry: &WorklistEntry) -> String {
 		slug(&entry.name),
 		short_hash(entry.replica_id, entry.server_id),
 	)
-}
-
-/// Slugify to DNS-1123-label-safe: lowercased, non-alphanumeric runs → `-`,
-/// leading/trailing `-` trimmed, truncated to 50 chars (leaves ≥9 chars for
-/// the `-XXXXXXXX` disambiguator suffix in a 63-char label limit).
-fn slug(s: &str) -> String {
-	let mut out = String::with_capacity(s.len());
-	let mut prev_dash = true;
-	for c in s.chars() {
-		let mapped = if c.is_ascii_alphanumeric() {
-			c.to_ascii_lowercase()
-		} else {
-			'-'
-		};
-		if mapped == '-' {
-			if !prev_dash {
-				out.push('-');
-				prev_dash = true;
-			}
-		} else {
-			out.push(mapped);
-			prev_dash = false;
-		}
-	}
-	while out.ends_with('-') {
-		out.pop();
-	}
-	while out.starts_with('-') {
-		out.remove(0);
-	}
-	if out.is_empty() {
-		out.push_str("replica");
-	}
-	if out.len() > 50 {
-		out.truncate(50);
-		while out.ends_with('-') {
-			out.pop();
-		}
-	}
-	out
 }
 
 /// Apply ±20% jitter to a Duration. Scopes the (non-Send) thread rng so the
@@ -489,41 +450,6 @@ mod tests {
 			"region": "us-east-1",
 		}))
 		.unwrap()
-	}
-
-	#[test]
-	fn slug_ascii_alnum_untouched() {
-		assert_eq!(slug("hello123"), "hello123");
-	}
-
-	#[test]
-	fn slug_lowercases_and_replaces_specials() {
-		assert_eq!(slug("Nauru Prod Analytics!"), "nauru-prod-analytics");
-	}
-
-	#[test]
-	fn slug_collapses_runs_of_specials() {
-		assert_eq!(slug("a__b--c/d.e"), "a-b-c-d-e");
-	}
-
-	#[test]
-	fn slug_trims_edges() {
-		assert_eq!(slug("---weird---"), "weird");
-	}
-
-	#[test]
-	fn slug_empty_becomes_replica() {
-		assert_eq!(slug(""), "replica");
-		assert_eq!(slug("...!!!"), "replica");
-	}
-
-	#[test]
-	fn slug_truncates_at_50_without_trailing_dash() {
-		let out = slug(&"a".repeat(60));
-		assert_eq!(out.len(), 50);
-		let out = slug(&format!("{}{}", "a".repeat(48), "--"));
-		assert!(out.len() <= 50);
-		assert!(!out.ends_with('-'));
 	}
 
 	#[test]
