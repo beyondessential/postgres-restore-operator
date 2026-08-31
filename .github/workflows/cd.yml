@@ -62,7 +62,7 @@ jobs:
           rustup default stable
           rustup target add ${{ matrix.target }}
 
-      - uses: taiki-e/install-action@v2.85.0
+      - uses: taiki-e/install-action@v2.86.2
         with:
           tool: just
 
