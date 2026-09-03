@@ -85,8 +85,8 @@ pub mod params {
 	pub const PRE_MIGRATE_DROP_SCHEMAS: &str = "pre_migrate_drop_schemas";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
-	/// `text` — comma-separated usernames to provision as extra `LOGIN
-	/// SUPERUSER` roles alongside the analytics user, each with its own
+	/// `text` — comma-separated usernames to provision as extra read-only
+	/// `LOGIN` roles alongside the analytics user, each with its own
 	/// operator-generated password Secret. Empty/unset = analytics user only.
 	pub const EXTRA_USERS: &str = "extra_users";
 	/// `bytes` — pin the postgres memory request, instead of deriving it from

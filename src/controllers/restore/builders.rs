@@ -1061,24 +1061,66 @@ cp -a /pgdata/.anon-cache/anon.so "/usr/lib/postgresql/{pg_version}/lib/"
 	)
 }
 
-/// Shell + SQL that provisions one extra user (by env-var index) as a
-/// create-or-update `LOGIN SUPERUSER`, run against the temporary postgres in
-/// the setup-auth initContainer.
+/// Shell + SQL that closes the `public` schema to the `PUBLIC` pseudo-role in
+/// every connectable database, so an extra user provisioned with no grants of
+/// its own can't reach it either.
+///
+/// This is the only mechanism postgres offers. Privileges are additive and
+/// there is no per-role deny, so a privilege `PUBLIC` holds cannot be taken
+/// away from one role — the grant has to come off `PUBLIC` itself. That is a
+/// database-wide change, hence the gate on the replica actually declaring an
+/// extra user.
+///
+/// Nothing that reaches this restore loses access as a result. The analytics
+/// user holds either `pg_read_all_data`, which carries `USAGE` on every schema
+/// in its own right, or `SUPERUSER`, which bypasses the check; the operator's
+/// own connections use one of those two. Roles restored from the source cluster
+/// have had their passwords nulled by this point, so none of them can
+/// authenticate to spend the privilege anyway.
+///
+/// The `DO` block guards on the schema existing: a database that was restored
+/// without `public` would otherwise abort the whole script under `set -e`.
+const PUBLIC_SCHEMA_LOCKDOWN: &str = r#"echo "Closing the public schema to PUBLIC (extra users must not inherit it)..."
+for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+  psql -U postgres -d "$db" << 'SQLEOF'
+DO $$
+BEGIN
+  IF EXISTS (SELECT FROM pg_namespace WHERE nspname = 'public') THEN
+    EXECUTE 'REVOKE ALL ON SCHEMA public FROM PUBLIC';
+  END IF;
+END
+$$;
+SQLEOF
+done
+"#;
+
+/// Shell + SQL that provisions one extra user (by env-var index) against the
+/// temporary postgres in the setup-auth initContainer: created if missing,
+/// then reset to a fixed state regardless — a name colliding with a role
+/// restored from the source cluster gets the same treatment as a fresh one.
 ///
 /// The username and password are read from `EXTRA_USER_NAME_<i>` /
 /// `EXTRA_USER_PW_<i>` and passed to psql as variables inside a quoted heredoc,
 /// so neither the shell nor the SQL parser ever sees the raw values. `format()`
 /// with `%I` / `%L` applies proper identifier and literal quoting, making an
-/// arbitrary username safe. SUPERUSER is granted regardless of the replica's
-/// read-only setting — these roles are for write access.
+/// arbitrary username safe.
 ///
-/// SUPERUSER alone does not make the role's sessions writable: a read-only
-/// replica carries `default_transaction_read_only = on` in postgresql.conf, and
-/// the redaction path additionally sets it per-database, so every transaction
-/// the role opens would start read-only. The role-level setting overrides both
-/// (postgresql.conf < ALTER DATABASE < ALTER ROLE), so it is what actually
-/// delivers write access. This block runs before read-only mode is enabled,
-/// while the temporary postgres is still writable.
+/// The role ends up with no privileges of its own: it can log in and read the
+/// system catalogues, and nothing else until someone grants it something.
+/// `public` is not an exception — [`PUBLIC_SCHEMA_LOCKDOWN`] runs first and
+/// takes that schema away from the `PUBLIC` pseudo-role, which is where the
+/// role would otherwise inherit access to it. Deciding what these accounts may
+/// see is deliberately not the operator's job — and since every restore is a
+/// fresh database, those grants have to be reapplied per restore by whoever
+/// makes them.
+///
+/// Its sessions are read-only on every replica, including a read-write one:
+/// the role-level `default_transaction_read_only` keeps them read-only
+/// whatever the database defaults to, so a later grant can widen what the role
+/// sees without making it writable. Role settings win over both postgresql.conf
+/// and the per-database setting redaction applies (postgresql.conf < ALTER
+/// DATABASE < ALTER ROLE). This block runs while the temporary postgres is
+/// still writable, before read-only mode is enabled.
 fn extra_user_setup_block(index: usize) -> String {
 	format!(
 		r#"echo "Provisioning extra user (index {index})..."
@@ -1087,11 +1129,11 @@ psql -U postgres -d postgres \
   -v pgro_password="$EXTRA_USER_PW_{index}" << 'SQLEOF'
 SELECT NOT EXISTS (SELECT FROM pg_roles WHERE rolname = :'pgro_username') AS pgro_create \gset
 \if :pgro_create
-SELECT format('CREATE ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'pgro_username', :'pgro_password') \gexec
-\else
-SELECT format('ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L', :'pgro_username', :'pgro_password') \gexec
+SELECT format('CREATE ROLE %I', :'pgro_username') \gexec
 \endif
-SELECT format('ALTER ROLE %I SET default_transaction_read_only = off', :'pgro_username') \gexec
+SELECT format('ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L', :'pgro_username', :'pgro_password') \gexec
+SELECT format('ALTER ROLE %I SET default_transaction_read_only = on', :'pgro_username') \gexec
+SELECT format('REVOKE %I FROM %I', r.rolname, :'pgro_username') FROM pg_auth_members m JOIN pg_roles r ON r.oid = m.roleid WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = :'pgro_username') \gexec
 SQLEOF
 "#
 	)
@@ -1409,15 +1451,26 @@ EXTRACONFEOF"#
 		String::new()
 	};
 
-	// Provision each extra user as a LOGIN SUPERUSER, create-or-update, while the
-	// temporary postgres is running. The name and password reach the shell via
-	// per-user env vars and are passed to psql as variables, so an arbitrary
-	// username is quoted by `format(%I/%L)` and can't break the SQL or the shell.
-	let extra_users_block = extra_users
-		.iter()
-		.enumerate()
-		.map(|(i, _)| extra_user_setup_block(i))
-		.collect::<String>();
+	// Provision each extra user as a read-only login role, create-or-update,
+	// while the temporary postgres is running. The name and password reach the
+	// shell via per-user env vars and are passed to psql as variables, so an
+	// arbitrary username is quoted by `format(%I/%L)` and can't break the SQL
+	// or the shell. Nothing here is version-dependent — the role carries no
+	// grants — so it runs on every PG version the restore path supports.
+	//
+	// The `public` lockdown runs first, and only when there is at least one
+	// extra user: it changes what every role in the database can do, so a
+	// replica that declares none keeps the schema exactly as restored.
+	let extra_users_block = if extra_users.is_empty() {
+		String::new()
+	} else {
+		let blocks = extra_users
+			.iter()
+			.enumerate()
+			.map(|(i, _)| extra_user_setup_block(i))
+			.collect::<String>();
+		format!("{PUBLIC_SCHEMA_LOCKDOWN}{blocks}")
+	};
 
 	let init_script = format!(
 		r#"set -ex
@@ -1685,14 +1738,30 @@ echo "Detected PG major version: $PG_MAJOR"
 # ANALYTICS_PASSWORD is generated by the operator (see replica.rs generate_password)
 # and stored in a Kubernetes secret - it is not user-controlled input, so
 # interpolating it directly into the SQL string is safe.
+#
+# Created if missing, then reset to a fixed state (attributes, memberships,
+# password) regardless — a name colliding with a role restored from the source
+# cluster ends up identical to a fresh one, not carrying production's
+# privileges forward. The permission branch below only ever adds to this base.
 psql -U postgres -d postgres << SQLEOF
 DO \$\$
 BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '${{ANALYTICS_USERNAME}}') THEN
-    CREATE ROLE ${{ANALYTICS_USERNAME}} WITH LOGIN PASSWORD '${{ANALYTICS_PASSWORD}}';
-  ELSE
-    ALTER ROLE ${{ANALYTICS_USERNAME}} WITH PASSWORD '${{ANALYTICS_PASSWORD}}';
+    CREATE ROLE ${{ANALYTICS_USERNAME}};
   END IF;
+END
+\$\$;
+ALTER ROLE ${{ANALYTICS_USERNAME}} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD '${{ANALYTICS_PASSWORD}}';
+DO \$\$
+DECLARE granted record;
+BEGIN
+  FOR granted IN
+    SELECT g.rolname FROM pg_auth_members m
+      JOIN pg_roles g ON g.oid = m.roleid
+     WHERE m.member = (SELECT oid FROM pg_roles WHERE rolname = '${{ANALYTICS_USERNAME}}')
+  LOOP
+    EXECUTE format('REVOKE %I FROM %I', granted.rolname, '${{ANALYTICS_USERNAME}}');
+  END LOOP;
 END
 \$\$;
 SQLEOF

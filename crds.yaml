@@ -594,11 +594,16 @@ spec:
               extraUsers:
                 description: |-
                   Additional login roles to provision in each restore, beyond the
-                  analytics user. Each name becomes a `LOGIN SUPERUSER` role with an
-                  operator-generated password stored in a per-user Secret
-                  `<replica>-user-<name>-creds`. Provisioned once at restore
-                  initialisation and never dropped. A name matching `analyticsUsername`
-                  is ignored.
+                  analytics user. Each name is a `LOGIN` role with no privileges of its
+                  own and read-only sessions: it reads nothing but the system catalogues
+                  until something grants it access, and those grants have to be
+                  reapplied per restore. Declaring any extra user also revokes the
+                  `public` schema from the `PUBLIC` pseudo-role in every database, since
+                  that is the only way to keep an ungranted role out of it; the
+                  analytics user is unaffected. The password is operator-generated and
+                  stored in a per-user Secret `<replica>-user-<name>-creds`. Provisioned
+                  once at restore initialisation and never dropped. A name matching
+                  `analyticsUsername` is ignored.
                 items:
                   type: string
                 type: array

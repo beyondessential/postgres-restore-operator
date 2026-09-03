@@ -1091,6 +1091,98 @@ fn deployment_init_script_sets_shared_buffers() {
 	);
 }
 
+/// The analytics role is reset to a known state on every restore, whether it
+/// already exists or not, so a name colliding with a role in the source
+/// cluster doesn't keep production's attributes and grants.
+#[test]
+fn analytics_role_is_normalised_on_every_restore() {
+	let setup_auth = setup_auth_with_extra_users(vec![]);
+	let script = setup_auth.args.unwrap().remove(0);
+
+	assert!(
+		script.contains(
+			"ALTER ROLE ${ANALYTICS_USERNAME} WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD"
+		),
+		"the analytics role's attributes must be reset unconditionally"
+	);
+	assert!(
+		script.contains("CREATE ROLE ${ANALYTICS_USERNAME};"),
+		"a missing analytics role is created bare, then normalised by the same ALTER"
+	);
+	assert!(
+		!script.contains("ALTER ROLE ${ANALYTICS_USERNAME} WITH PASSWORD"),
+		"the password-only branch is what let a restored role keep its attributes"
+	);
+	assert!(
+		script.contains("REVOKE %I FROM %I"),
+		"memberships inherited from the source cluster must be revoked"
+	);
+
+	let normalise = script
+		.lines()
+		.position(|l| l.contains("WITH LOGIN NOSUPERUSER NOCREATEDB"))
+		.expect("the normalising ALTER runs somewhere");
+	let revoke = script
+		.lines()
+		.position(|l| l.contains("REVOKE %I FROM %I"))
+		.expect("the revoke runs somewhere");
+	let grant = script
+		.lines()
+		.position(|l| l.contains("GRANT pg_read_all_data TO ${ANALYTICS_USERNAME}"))
+		.expect("the read grant runs somewhere");
+	assert!(
+		normalise < revoke && revoke < grant,
+		"the role must be reset and stripped before the branch grants it anything"
+	);
+}
+
+/// Normalising must not cost a read-write replica its superuser: the branch
+/// re-applies it after the reset.
+#[test]
+fn analytics_role_is_still_superuser_after_normalising() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	replica.spec.read_only = false;
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("18".to_string()),
+		..Default::default()
+	});
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
+	let script = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist")
+		.args
+		.unwrap()
+		.remove(0);
+
+	let normalise = script
+		.lines()
+		.position(|l| l.contains("WITH LOGIN NOSUPERUSER NOCREATEDB"))
+		.expect("the normalising ALTER runs somewhere");
+	let superuser = script
+		.lines()
+		.position(|l| l.contains("ALTER ROLE ${ANALYTICS_USERNAME} WITH SUPERUSER"))
+		.expect("the superuser grant runs somewhere");
+	assert!(
+		normalise < superuser,
+		"the reset must precede the superuser grant, not undo it"
+	);
+}
+
 #[test]
 fn deployment_init_script_grants_superuser_for_read_write() {
 	// Read-write restores grant SUPERUSER to the analytics user. The
@@ -2676,7 +2768,7 @@ fn setup_auth_with_extra_users(extra_users: Vec<String>) -> k8s_openapi::api::co
 }
 
 #[test]
-fn extra_users_get_indexed_env_and_superuser_sql() {
+fn extra_users_get_indexed_env_and_role_sql() {
 	let setup_auth = setup_auth_with_extra_users(vec!["reporting".to_string(), "etl".to_string()]);
 
 	let env = setup_auth.env.clone().unwrap();
@@ -2712,33 +2804,102 @@ fn extra_users_get_indexed_env_and_superuser_sql() {
 		"both users must be provisioned by index"
 	);
 	assert!(
-		script.contains("CREATE ROLE %I WITH LOGIN SUPERUSER PASSWORD %L"),
-		"a new extra user is created as LOGIN SUPERUSER"
+		script.contains("SELECT format('CREATE ROLE %I', :'pgro_username') \\gexec"),
+		"a missing extra user is created bare, then normalised below"
 	);
 	assert!(
-		script.contains("ALTER ROLE %I WITH LOGIN SUPERUSER PASSWORD %L"),
-		"an existing extra user is updated to LOGIN SUPERUSER with a fresh password"
+		script.contains(
+			"ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L"
+		),
+		"every extra user is normalised to a plain LOGIN role, created or not"
 	);
 }
 
-/// A read-only replica still provisions its extra users as SUPERUSER — the
-/// read-only setting governs the analytics user, not the extra ones.
+/// Extra users are read-only on every replica, so a writable one (here, a
+/// migrating restore) must still provision them without SUPERUSER.
 #[test]
-fn extra_users_are_superuser_even_when_read_only() {
-	let setup_auth = setup_auth_with_extra_users(vec!["writer".to_string()]);
-	let script = setup_auth.args.unwrap().remove(0);
-	assert!(script.contains("WITH LOGIN SUPERUSER PASSWORD %L"));
+fn extra_users_are_read_only_even_on_a_writable_replica() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	restore.spec.migrate_to = Some(migration_target());
+	replica.spec.read_only = false;
+	replica.spec.extra_users = vec!["reporting".to_string()];
+	let deploy = build_deployment(
+		&restore,
+		"test-restore",
+		"default",
+		&replica,
+		&PodPlacement::default(),
+	)
+	.unwrap();
+	let script = deploy
+		.spec
+		.unwrap()
+		.template
+		.spec
+		.unwrap()
+		.init_containers
+		.unwrap()
+		.into_iter()
+		.find(|c| c.name == "setup-auth")
+		.expect("setup-auth init container must exist")
+		.args
+		.unwrap()
+		.remove(0);
+
+	assert!(
+		script.contains("ALTER ROLE ${ANALYTICS_USERNAME} WITH SUPERUSER"),
+		"this fixture must be a writable restore, or the test proves nothing"
+	);
+	assert!(
+		!script.contains("WITH LOGIN SUPERUSER"),
+		"an extra user must never be provisioned as a superuser"
+	);
+	assert!(script.contains("WITH LOGIN NOSUPERUSER"));
 }
 
-/// SUPERUSER on its own leaves the role's sessions starting read-only on a
-/// read-only replica, so the role setting is what actually grants write access.
+/// The operator provisions the account, not what it can see: an extra user
+/// gets no grant of any kind, so it reads nothing beyond what `PUBLIC` already
+/// carries until someone grants it something.
 #[test]
-fn extra_users_default_to_read_write_sessions() {
+fn extra_users_are_granted_nothing() {
+	let setup_auth = setup_auth_with_extra_users(vec!["reporting".to_string()]);
+	let script = setup_auth.args.unwrap().remove(0);
+	let extra_user_sql: String = script
+		.lines()
+		.skip_while(|l| !l.contains("Provisioning extra user (index 0)"))
+		.take_while(|l| !l.contains("Writing restore metadata"))
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(
+		extra_user_sql.contains("ALTER ROLE %I SET default_transaction_read_only = on"),
+		"the fixture must actually contain the extra-user block"
+	);
+	assert!(
+		!extra_user_sql.contains("GRANT"),
+		"an extra user must be provisioned without grants, got: {extra_user_sql}"
+	);
+}
+
+/// `pg_read_all_data` grants SELECT but doesn't stop a session from opening a
+/// write transaction on a writable replica, so the role setting is what pins
+/// the sessions read-only. It has to land while the database still accepts
+/// writes.
+#[test]
+fn extra_users_sessions_are_pinned_read_only() {
 	let setup_auth = setup_auth_with_extra_users(vec!["writer".to_string()]);
 	let script = setup_auth.args.unwrap().remove(0);
 	assert!(
-		script.contains("ALTER ROLE %I SET default_transaction_read_only = off"),
-		"an extra user's sessions must default to read-write"
+		script.contains("ALTER ROLE %I SET default_transaction_read_only = on"),
+		"an extra user's sessions must default to read-only"
+	);
+	assert!(
+		!script.contains("SET default_transaction_read_only = off"),
+		"nothing may opt an extra user back into read-write sessions"
 	);
 
 	let read_only_line = script
@@ -2749,11 +2910,110 @@ fn extra_users_default_to_read_write_sessions() {
 		.expect("read-only mode is enabled somewhere in the setup script");
 	let alter_role_line = script
 		.lines()
-		.position(|l| l.contains("SET default_transaction_read_only = off"))
+		.position(|l| l.contains("ALTER ROLE %I SET default_transaction_read_only = on"))
 		.expect("the extra user's role setting is applied somewhere");
 	assert!(
 		alter_role_line < read_only_line,
 		"the role setting must be applied while the database is still writable"
+	);
+}
+
+/// A name can collide with a role restored from the source cluster, arriving
+/// with production's attributes and grants. The reset is unconditional — the
+/// `\if`/`\endif` only decides whether `CREATE ROLE` runs first — so a
+/// colliding name ends up with exactly the same access as a fresh one.
+#[test]
+fn an_existing_extra_user_is_stripped_of_inherited_privileges() {
+	let setup_auth = setup_auth_with_extra_users(vec!["reporting".to_string()]);
+	let script = setup_auth.args.unwrap().remove(0);
+	let block: String = script
+		.lines()
+		.skip_while(|l| !l.contains("Provisioning extra user (index 0)"))
+		.take_while(|l| !l.contains("SQLEOF") || !l.trim().is_empty())
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	assert!(
+		block.contains("SELECT format('CREATE ROLE %I', :'pgro_username') \\gexec"),
+		"a missing role is created bare, so the reset below is what gives it its access"
+	);
+	assert!(
+		block.contains(
+			"ALTER ROLE %I WITH LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION NOBYPASSRLS PASSWORD %L"
+		),
+		"the reset must run for every extra user, not just newly created ones"
+	);
+	assert!(
+		block.contains("ALTER ROLE %I SET default_transaction_read_only = on"),
+		"the reset must pin sessions read-only regardless of prior state"
+	);
+	assert!(
+		block.contains("REVOKE %I FROM %I"),
+		"memberships inherited from the source cluster must be revoked"
+	);
+	assert!(
+		!block.contains("\\else"),
+		"there must be no branch that leaves an existing role's access untouched"
+	);
+}
+
+/// `USAGE` on `public` reaches an otherwise ungranted role through the `PUBLIC`
+/// pseudo-role, and postgres has no per-role deny, so the grant has to come off
+/// `PUBLIC` itself — in every connectable database, before the roles exist.
+#[test]
+fn extra_users_cannot_reach_the_public_schema() {
+	let setup_auth = setup_auth_with_extra_users(vec!["reporting".to_string()]);
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(
+		script.contains("REVOKE ALL ON SCHEMA public FROM PUBLIC"),
+		"the public schema must be closed to PUBLIC"
+	);
+	assert!(
+		script.contains(
+			"SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"
+		),
+		"the revoke must cover every connectable database, not just postgres"
+	);
+
+	let revoke_line = script
+		.lines()
+		.position(|l| l.contains("REVOKE ALL ON SCHEMA public FROM PUBLIC"))
+		.expect("the revoke runs somewhere");
+	let provision_line = script
+		.lines()
+		.position(|l| l.contains("Provisioning extra user (index 0)"))
+		.expect("the provisioning block is present");
+	assert!(
+		revoke_line < provision_line,
+		"the schema must be closed before any extra user exists to use it"
+	);
+}
+
+/// The revoke changes what every role in the database can do, so a replica that
+/// declares no extra users must keep the schema exactly as restored.
+#[test]
+fn no_extra_users_leaves_the_public_schema_alone() {
+	let setup_auth = setup_auth_with_extra_users(vec![]);
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(
+		!script.contains("REVOKE ALL ON SCHEMA public FROM PUBLIC"),
+		"a replica with no extra users must not touch the public schema"
+	);
+}
+
+/// Nothing about provisioning depends on the server version, so no restore is
+/// skipped over one.
+#[test]
+fn extra_users_are_provisioned_on_every_pg_version() {
+	let setup_auth = setup_auth_with_extra_users(vec!["reporting".to_string()]);
+	let script = setup_auth.args.unwrap().remove(0);
+	assert!(
+		script.contains("Provisioning extra user (index 0)"),
+		"the provisioning block is present"
+	);
+	assert!(
+		!script.contains("skipping extra user provisioning"),
+		"there is no version gate left to skip over"
 	);
 }
 

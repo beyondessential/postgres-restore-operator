@@ -8,11 +8,12 @@ use helpers::*;
 
 mod helpers;
 
-/// An extra user is provisioned as a LOGIN SUPERUSER with its own password
-/// Secret, and can write even though the replica is read-only.
+/// An extra user is provisioned as an unprivileged LOGIN role with its own
+/// password Secret: it can connect, its sessions are read-only, and it holds no
+/// privileges beyond what `PUBLIC` carries.
 #[tokio::test]
 #[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
-async fn extra_user_provisioned_with_write_access() {
+async fn extra_user_provisioned_without_privileges() {
 	let client = make_client().await;
 	let ns = "test-extra-users";
 
@@ -100,7 +101,7 @@ async fn extra_user_provisioned_with_write_access() {
 
 	let deploy_target = format!("deployment/{restore_name}");
 
-	println!("--- verifying the extra user exists as a superuser");
+	println!("--- verifying the extra user exists without elevated attributes");
 	let out = kubectl_exec(
 		ns,
 		&deploy_target,
@@ -111,14 +112,37 @@ async fn extra_user_provisioned_with_write_access() {
 			"-d",
 			"postgres",
 			"-tAc",
-			"SELECT rolsuper FROM pg_roles WHERE rolname = 'writer'",
+			"SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls \
+			 FROM pg_roles WHERE rolname = 'writer'",
 		],
 	)
 	.await;
 	assert_eq!(
 		out.trim(),
-		"t",
-		"the extra user should exist and be a superuser"
+		"f|f|f|f|f",
+		"the extra user should exist with no elevated role attributes"
+	);
+
+	println!("--- verifying the extra user holds no role memberships");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT count(*) FROM pg_auth_members m \
+			 JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'writer'",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"0",
+		"a freshly created extra user should be granted nothing, not even a read role"
 	);
 
 	println!("--- verifying the underscored user exists under its real name");
@@ -142,7 +166,7 @@ async fn extra_user_provisioned_with_write_access() {
 		"the underscored role is created with its declared name"
 	);
 
-	println!("--- verifying the extra user's sessions default to read-write");
+	println!("--- verifying the extra user's sessions are read-only");
 	let out = kubectl_exec(
 		ns,
 		&deploy_target,
@@ -159,11 +183,11 @@ async fn extra_user_provisioned_with_write_access() {
 	.await;
 	assert_eq!(
 		out.trim(),
-		"off",
-		"the extra user's sessions should start read-write"
+		"on",
+		"the extra user's sessions should start read-only"
 	);
 
-	println!("--- verifying the extra user can write despite the read-only replica");
+	println!("--- verifying the extra user cannot write");
 	let out = kubectl_exec(
 		ns,
 		&deploy_target,
@@ -179,8 +203,70 @@ async fn extra_user_provisioned_with_write_access() {
 	)
 	.await;
 	assert!(
-		out.contains("CREATE SCHEMA"),
-		"the extra user should be able to write without disabling read-only mode itself, got: {out}"
+		out.contains("read-only transaction"),
+		"the extra user must not be able to write, got: {out}"
+	);
+
+	println!("--- verifying the extra user cannot reach the public schema");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT has_schema_privilege('writer', 'public', 'USAGE')",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"f",
+		"the extra user must not inherit USAGE on public via PUBLIC"
+	);
+
+	println!("--- verifying the analytics user still reaches schemas");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT has_schema_privilege('analytics', 'public', 'USAGE')",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"t",
+		"closing public to PUBLIC must not cost the analytics user its access"
+	);
+
+	println!("--- verifying the extra user cannot read application data");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"writer",
+			"-d",
+			"postgres",
+			"-c",
+			"SELECT count(*) FROM _pgro.restore_info",
+		],
+	)
+	.await;
+	assert!(
+		out.contains("permission denied"),
+		"the extra user must hold no read grants of its own, got: {out}"
 	);
 
 	println!("--- verifying the analytics user is still read-only");
@@ -201,7 +287,7 @@ async fn extra_user_provisioned_with_write_access() {
 	assert_eq!(
 		out.trim(),
 		"on",
-		"the extra user's role setting must not leak to the analytics user"
+		"provisioning extra users must leave the analytics user read-only"
 	);
 
 	println!("--- all assertions passed, cleaning up");
