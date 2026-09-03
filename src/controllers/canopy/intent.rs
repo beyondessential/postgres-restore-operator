@@ -29,7 +29,7 @@ use k8s_openapi::{
 use serde_json::{Map, Value, json};
 
 use crate::{
-	types::{CanopySource, PostgresPhysicalReplicaSpec, RedactionSpec},
+	types::{CanopySource, ExtraUserSpec, PostgresPhysicalReplicaSpec, RedactionSpec},
 	util::TimeSpan,
 };
 
@@ -85,9 +85,11 @@ pub mod params {
 	pub const PRE_MIGRATE_DROP_SCHEMAS: &str = "pre_migrate_drop_schemas";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
-	/// `text` — comma-separated usernames to provision as extra read-only
-	/// `LOGIN` roles alongside the analytics user, each with its own
-	/// operator-generated password Secret. Empty/unset = analytics user only.
+	/// `text` — comma-separated extra read-only `LOGIN` roles to provision
+	/// alongside the analytics user, each with its own operator-generated
+	/// password Secret. Each item is `name` (no schema access) or
+	/// `name:schema1+schema2` (a `+`-joined schema list after a colon), e.g.
+	/// `reporting,dbt_reader:dbt+staging`. Empty/unset = analytics user only.
 	pub const EXTRA_USERS: &str = "extra_users";
 	/// `bytes` — pin the postgres memory request, instead of deriving it from
 	/// the snapshot size.
@@ -510,7 +512,7 @@ impl IntentConfig {
 			.map(parse_comma_list)
 			.filter(|schemas| !schemas.is_empty());
 		let extra_users = param_str(p, params::EXTRA_USERS)
-			.map(parse_comma_list)
+			.map(parse_extra_users)
 			.unwrap_or_default();
 		let service_annotations = is_exposed(entry).then(|| expose_annotations(&entry.name));
 		// Two routes to a target. `upgrade`'s is named by canopy on the entry via
@@ -617,6 +619,31 @@ fn parse_comma_list(raw: &str) -> Vec<String> {
 		.map(str::trim)
 		.filter(|s| !s.is_empty())
 		.map(str::to_string)
+		.collect()
+}
+
+/// Split the `extra_users` param into per-user specs. Each comma-separated
+/// item is either a bare name (no schema access) or `name:schemas`, where
+/// `schemas` is itself `+`-joined — e.g. `reporting,dbt_reader:dbt+staging`.
+fn parse_extra_users(raw: &str) -> Vec<ExtraUserSpec> {
+	raw.split(',')
+		.map(str::trim)
+		.filter(|s| !s.is_empty())
+		.map(|entry| match entry.split_once(':') {
+			Some((name, schemas)) => ExtraUserSpec {
+				name: name.trim().to_string(),
+				schemas: schemas
+					.split('+')
+					.map(str::trim)
+					.filter(|s| !s.is_empty())
+					.map(str::to_string)
+					.collect(),
+			},
+			None => ExtraUserSpec {
+				name: entry.to_string(),
+				schemas: Vec::new(),
+			},
+		})
 		.collect()
 }
 
@@ -1094,16 +1121,25 @@ mod tests {
 			&entry(
 				"analytics",
 				"site",
-				json!({ "extra_users": "reporting, etl ,dashboards" }),
+				json!({ "extra_users": "reporting, etl ,dashboards:dbt+staging" }),
 			),
 			vec![],
 		);
 		assert_eq!(
 			spec.extra_users,
 			vec![
-				"reporting".to_string(),
-				"etl".to_string(),
-				"dashboards".to_string()
+				ExtraUserSpec {
+					name: "reporting".to_string(),
+					schemas: vec![]
+				},
+				ExtraUserSpec {
+					name: "etl".to_string(),
+					schemas: vec![]
+				},
+				ExtraUserSpec {
+					name: "dashboards".to_string(),
+					schemas: vec!["dbt".to_string(), "staging".to_string()]
+				},
 			]
 		);
 	}
@@ -1146,6 +1182,50 @@ mod tests {
 		);
 		assert!(parse_persistent_schemas("").is_empty());
 		assert!(parse_persistent_schemas(" , ").is_empty());
+	}
+
+	#[test]
+	fn extra_users_parsing() {
+		assert_eq!(
+			parse_extra_users("reporting"),
+			vec![ExtraUserSpec {
+				name: "reporting".to_string(),
+				schemas: vec![]
+			}]
+		);
+		assert_eq!(
+			parse_extra_users("dbt_reader:dbt+staging"),
+			vec![ExtraUserSpec {
+				name: "dbt_reader".to_string(),
+				schemas: vec!["dbt".to_string(), "staging".to_string()]
+			}]
+		);
+		assert_eq!(
+			parse_extra_users(" reporting , dbt_reader : dbt + staging "),
+			vec![
+				ExtraUserSpec {
+					name: "reporting".to_string(),
+					schemas: vec![]
+				},
+				ExtraUserSpec {
+					name: "dbt_reader".to_string(),
+					schemas: vec!["dbt".to_string(), "staging".to_string()]
+				},
+			],
+			"whitespace around names, schemas, and both separators must be trimmed"
+		);
+		// A trailing colon with nothing after it is a name with an empty
+		// schema list, not a parse error — same laxness as an empty item
+		// between commas.
+		assert_eq!(
+			parse_extra_users("reporting:"),
+			vec![ExtraUserSpec {
+				name: "reporting".to_string(),
+				schemas: vec![]
+			}]
+		);
+		assert!(parse_extra_users("").is_empty());
+		assert!(parse_extra_users(" , ").is_empty());
 	}
 
 	#[test]

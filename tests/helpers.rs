@@ -21,8 +21,9 @@ use kube::{
 };
 use postgres_restore_operator::{
 	types::{
-		PostgresPhysicalReplica, PostgresPhysicalReplicaSpec, PostgresPhysicalRestore,
-		PostgresPhysicalRestoreSpec, RedactionSpec, ReplicaPhase, RestorePhase,
+		ExtraUserSpec, PostgresPhysicalReplica, PostgresPhysicalReplicaSpec,
+		PostgresPhysicalRestore, PostgresPhysicalRestoreSpec, RedactionSpec, ReplicaPhase,
+		RestorePhase,
 	},
 	util::TimeSpan,
 };
@@ -123,7 +124,7 @@ pub struct ReplicaOpts {
 	pub read_only: bool,
 	pub ephemeral: bool,
 	pub redaction: Option<RedactionSpec>,
-	pub extra_users: Vec<String>,
+	pub extra_users: Vec<ExtraUserSpec>,
 	/// How long the outgoing restore survives after a switchover. The default
 	/// is short so tests that don't care aren't slowed by it; raise it in tests
 	/// that need to inspect the outgoing instance before the sweep removes it.

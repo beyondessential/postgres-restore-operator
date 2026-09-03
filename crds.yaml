@@ -538,7 +538,12 @@ spec:
                 type: object
               analyticsUsername:
                 default: analytics
-                description: Username for analytics connections
+                description: |-
+                  Username for analytics connections. Reset to a fixed state (attributes,
+                  memberships, password) on every restore, whether or not the name
+                  already exists as a role restored from the source cluster, so it never
+                  carries production's privileges forward. `readOnly` then decides
+                  whether the role gets `pg_read_all_data` or `SUPERUSER`.
                 type: string
               canopySource:
                 description: |-
@@ -594,18 +599,40 @@ spec:
               extraUsers:
                 description: |-
                   Additional login roles to provision in each restore, beyond the
-                  analytics user. Each name is a `LOGIN` role with no privileges of its
-                  own and read-only sessions: it reads nothing but the system catalogues
-                  until something grants it access, and those grants have to be
-                  reapplied per restore. Declaring any extra user also revokes the
-                  `public` schema from the `PUBLIC` pseudo-role in every database, since
-                  that is the only way to keep an ungranted role out of it; the
-                  analytics user is unaffected. The password is operator-generated and
-                  stored in a per-user Secret `<replica>-user-<name>-creds`. Provisioned
-                  once at restore initialisation and never dropped. A name matching
+                  analytics user. Each is a `LOGIN` role with no privileges of its own
+                  and read-only sessions, plus `USAGE` and `SELECT` (including on
+                  tables the persistent-schemas migration creates afterwards) on
+                  whichever of its own `schemas` exist in a given database — nothing
+                  else, and nothing at all if `schemas` is empty, until something
+                  grants it more. Those grants have to be reapplied per restore. Every
+                  restore also revokes the `public` schema (and every other non-system
+                  schema, table, and function) from the `PUBLIC` pseudo-role, since that
+                  is the only way to keep an ungranted role out of them; the analytics
+                  user is unaffected. The password is operator-generated and stored in a
+                  per-user Secret `<replica>-user-<name>-creds`. Provisioned once at
+                  restore initialisation and never dropped. A name matching
                   `analyticsUsername` is ignored.
                 items:
-                  type: string
+                  description: |-
+                    One entry in `extraUsers`: a login role name and the schemas it should
+                    read. `schemas` is per-user rather than replica-wide so one replica can
+                    carry accounts scoped to different data — a `dbt`-only reader alongside
+                    a `public`-only one, say.
+                  properties:
+                    name:
+                      description: The role name to provision.
+                      type: string
+                    schemas:
+                      description: |-
+                        Schemas this user is granted `USAGE` + `SELECT` on, in whichever
+                        databases they exist in. Empty means the role is provisioned with no
+                        access of its own.
+                      items:
+                        type: string
+                      type: array
+                  required:
+                  - name
+                  type: object
                 type: array
               kopiaSecretRef:
                 description: |-

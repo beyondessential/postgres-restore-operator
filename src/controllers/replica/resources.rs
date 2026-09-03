@@ -554,7 +554,8 @@ impl PostgresPhysicalReplica {
 	pub async fn ensure_extra_user_secrets(&self, client: &Client) -> Result<()> {
 		let secrets: Api<Secret> = Api::namespaced(client.clone(), &self.ns());
 
-		for username in self.extra_users() {
+		for user in self.extra_users() {
+			let username = user.name;
 			let secret_name = self.extra_user_secret_name(&username);
 			if secrets.get_opt(&secret_name).await?.is_some() {
 				continue;

@@ -1,7 +1,7 @@
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, api::PostParams};
 use postgres_restore_operator::types::{
-	PostgresPhysicalReplica, PostgresPhysicalRestore, ReplicaPhase, RestorePhase,
+	ExtraUserSpec, PostgresPhysicalReplica, PostgresPhysicalRestore, ReplicaPhase, RestorePhase,
 };
 
 use helpers::*;
@@ -9,8 +9,9 @@ use helpers::*;
 mod helpers;
 
 /// An extra user is provisioned as an unprivileged LOGIN role with its own
-/// password Secret: it can connect, its sessions are read-only, and it holds no
-/// privileges beyond what `PUBLIC` carries.
+/// password Secret: it can connect, its sessions are read-only, and it holds
+/// no privileges beyond what `PUBLIC` carries — except on the schemas it
+/// declares, where it's granted `USAGE`/`SELECT`.
 #[tokio::test]
 #[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
 async fn extra_user_provisioned_without_privileges() {
@@ -39,7 +40,16 @@ async fn extra_user_provisioned_without_privileges() {
 		"extra-users-kopia-creds",
 		ReplicaOpts {
 			read_only: true,
-			extra_users: vec!["writer".into(), "report_writer".into()],
+			extra_users: vec![
+				ExtraUserSpec {
+					name: "writer".into(),
+					schemas: vec![],
+				},
+				ExtraUserSpec {
+					name: "report_writer".into(),
+					schemas: vec!["public".into()],
+				},
+			],
 			..Default::default()
 		},
 	);
@@ -166,6 +176,27 @@ async fn extra_user_provisioned_without_privileges() {
 		"the underscored role is created with its declared name"
 	);
 
+	println!("--- verifying the schema-scoped user reaches its declared schema");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"report_writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT has_schema_privilege('report_writer', 'public', 'USAGE')",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"t",
+		"an extra user with `public` in its schemas must get USAGE on it"
+	);
+
 	println!("--- verifying the extra user's sessions are read-only");
 	let out = kubectl_exec(
 		ns,
@@ -188,7 +219,7 @@ async fn extra_user_provisioned_without_privileges() {
 	);
 
 	println!("--- verifying the extra user cannot write");
-	let out = kubectl_exec(
+	let (ok, stdout, stderr) = try_kubectl_exec(
 		ns,
 		&deploy_target,
 		&[
@@ -202,9 +233,10 @@ async fn extra_user_provisioned_without_privileges() {
 		],
 	)
 	.await;
+	let combined = format!("{stdout}{stderr}");
 	assert!(
-		out.contains("read-only transaction"),
-		"the extra user must not be able to write, got: {out}"
+		!ok || combined.contains("read-only transaction"),
+		"the extra user must not be able to write, got: {combined}"
 	);
 
 	println!("--- verifying the extra user cannot reach the public schema");
@@ -250,7 +282,7 @@ async fn extra_user_provisioned_without_privileges() {
 	);
 
 	println!("--- verifying the extra user cannot read application data");
-	let out = kubectl_exec(
+	let (ok, stdout, stderr) = try_kubectl_exec(
 		ns,
 		&deploy_target,
 		&[
@@ -264,9 +296,10 @@ async fn extra_user_provisioned_without_privileges() {
 		],
 	)
 	.await;
+	let combined = format!("{stdout}{stderr}");
 	assert!(
-		out.contains("permission denied"),
-		"the extra user must hold no read grants of its own, got: {out}"
+		!ok || combined.contains("permission denied"),
+		"the extra user must hold no read grants of its own, got: {combined}"
 	);
 
 	println!("--- verifying the analytics user is still read-only");
