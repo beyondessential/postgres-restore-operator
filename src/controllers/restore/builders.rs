@@ -1166,6 +1166,14 @@ SQLEOF
 /// byte, so leaving it out would mean every database created later in this
 /// instance's life starts back at the open, unrestricted default.
 ///
+/// Each revoke is its own `SELECT ... \gexec`, not a `DO` block looping over
+/// rows: a `DO` block is one statement, so an unhandled exception partway
+/// through — e.g. a stored procedure hitting `REVOKE ... ON FUNCTION`, which
+/// needs `PROCEDURE` instead — rolls back everything the block already did,
+/// silently undoing revokes that ran fine before it. `\gexec` runs each
+/// generated statement as its own independent command, so one bad object
+/// can't take the others down with it.
+///
 /// Finally, for each extra user with a non-empty `schemas` list, grants back
 /// `USAGE` and `SELECT` (current tables/sequences, plus default privileges
 /// for tables the analytics role creates afterwards — the persistent-schemas
@@ -1231,57 +1239,40 @@ SELECT format('DROP OWNED BY %I', :'pgro_extra_user_{i}') \\gexec\n"
 for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
   psql -U postgres -d "$db" \
 {var_flags}    << 'SQLEOF'
-DO $$
-DECLARE
-  r record;
-BEGIN
-  FOR r IN
-    SELECT nspname FROM pg_namespace
-     WHERE nspname NOT IN ('pg_catalog', 'information_schema')
-       AND nspname NOT LIKE 'pg_toast%'
-       AND nspname NOT LIKE 'pg_temp%'
-  LOOP
-    EXECUTE format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', r.nspname);
-  END LOOP;
-
-  FOR r IN
-    SELECT n.nspname, c.relname
-      FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p')
-       AND n.nspname NOT IN ('pg_catalog', 'information_schema')
-       AND n.nspname NOT LIKE 'pg_toast%'
-       AND n.nspname NOT LIKE 'pg_temp%'
-  LOOP
-    EXECUTE format('REVOKE ALL ON %I.%I FROM PUBLIC', r.nspname, r.relname);
-  END LOOP;
-
-  FOR r IN
-    SELECT p.oid::regprocedure::text AS sig
-      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-  LOOP
-    EXECUTE format('REVOKE ALL ON FUNCTION %s FROM PUBLIC', r.sig);
-  END LOOP;
-
-  FOR r IN
-    SELECT pg_get_userbyid(d.defaclrole) AS owner,
-           n.nspname AS schema,
-           d.defaclobjtype AS objtype
-      FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
-     WHERE d.defaclobjtype IN ('r', 'S', 'f', 'T', 'n')
-  LOOP
-    EXECUTE format(
-      'ALTER DEFAULT PRIVILEGES FOR ROLE %I %s REVOKE ALL ON %s FROM PUBLIC',
-      r.owner,
-      CASE WHEN r.schema IS NULL THEN '' ELSE format('IN SCHEMA %I', r.schema) END,
-      CASE r.objtype
-        WHEN 'r' THEN 'TABLES' WHEN 'S' THEN 'SEQUENCES' WHEN 'f' THEN 'FUNCTIONS'
-        WHEN 'T' THEN 'TYPES' WHEN 'n' THEN 'SCHEMAS'
-      END
-    );
-  END LOOP;
-END
-$$;
+SELECT format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', nspname)
+  FROM pg_namespace
+ WHERE nspname NOT IN ('pg_catalog', 'information_schema')
+   AND nspname NOT LIKE 'pg_toast%'
+   AND nspname NOT LIKE 'pg_temp%' \gexec
+SELECT format('REVOKE ALL ON %I.%I FROM PUBLIC', n.nspname, c.relname)
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p')
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname NOT LIKE 'pg_toast%'
+   AND n.nspname NOT LIKE 'pg_temp%' \gexec
+-- Procedures share pg_proc with ordinary functions, aggregates, and window
+-- functions, but GRANT/REVOKE needs PROCEDURE for the first and FUNCTION for
+-- the rest — the wrong keyword raises an error. One `SELECT ... \gexec` per
+-- object, not a `DO` block loop: each generated statement runs and fails
+-- independently, so one bad signature can't roll back every revoke already
+-- applied ahead of it in the same block (the bug that let this happen once).
+SELECT format(
+    CASE WHEN p.prokind = 'p' THEN 'REVOKE ALL ON PROCEDURE %s FROM PUBLIC'
+         ELSE 'REVOKE ALL ON FUNCTION %s FROM PUBLIC' END,
+    p.oid::regprocedure::text
+  )
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \gexec
+SELECT format(
+    'ALTER DEFAULT PRIVILEGES FOR ROLE %I %s REVOKE ALL ON %s FROM PUBLIC',
+    pg_get_userbyid(d.defaclrole),
+    CASE WHEN n.nspname IS NULL THEN '' ELSE format('IN SCHEMA %I', n.nspname) END,
+    CASE d.defaclobjtype
+      WHEN 'r' THEN 'TABLES' WHEN 'S' THEN 'SEQUENCES' WHEN 'f' THEN 'FUNCTIONS'
+      WHEN 'T' THEN 'TYPES' WHEN 'n' THEN 'SCHEMAS' END
+  )
+  FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
+ WHERE d.defaclobjtype IN ('r', 'S', 'f', 'T', 'n') \gexec
 {reassign_lines}{schema_grant_lines}SQLEOF
 done
 "#
@@ -1904,19 +1895,15 @@ if [ "$PG_MAJOR" -ge 14 ] && [ "{read_only}" = "true" ]; then
 GRANT pg_read_all_data TO ${{ANALYTICS_USERNAME}};
 SQLEOF
   for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
-    psql -U postgres -d "$db" << SQLEOF
-DO \$\$
-DECLARE r record;
-BEGIN
-  FOR r IN
-    SELECT p.oid::regprocedure::text AS sig
-      FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
-     WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-  LOOP
-    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %I', r.sig, '${{ANALYTICS_USERNAME}}');
-  END LOOP;
-END
-\$\$;
+    psql -U postgres -d "$db" \
+      -v analytics_username="$ANALYTICS_USERNAME" << 'SQLEOF'
+SELECT format(
+    CASE WHEN p.prokind = 'p' THEN 'GRANT EXECUTE ON PROCEDURE %s TO %I'
+         ELSE 'GRANT EXECUTE ON FUNCTION %s TO %I' END,
+    p.oid::regprocedure::text, :'analytics_username'
+  )
+  FROM pg_proc p JOIN pg_namespace n ON n.oid = p.pronamespace
+ WHERE n.nspname NOT IN ('pg_catalog', 'information_schema') \gexec
 SQLEOF
   done
   echo "Read-only mode with PG >= 14, granted pg_read_all_data and function execute"
