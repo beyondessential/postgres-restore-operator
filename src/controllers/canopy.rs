@@ -438,6 +438,7 @@ mod tests {
 			"replica_id": replica.to_string(),
 			"group_id": Uuid::nil().to_string(),
 			"server_id": server.to_string(),
+			"machine_id": Uuid::nil().to_string(),
 			"type": "tamanu-postgres",
 			"intent": "verify",
 			"name": name,

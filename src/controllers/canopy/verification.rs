@@ -697,7 +697,7 @@ mod tests {
 		let id = "55555555-5555-5555-5555-555555555555";
 		let args = migration_args(&migration_result(), &target(id)).expect("built");
 
-		assert_eq!(args.target_version_id, Uuid::parse_str(id).unwrap());
+		assert_eq!(args.target_version_id, Some(Uuid::parse_str(id).unwrap()));
 		assert_eq!(args.total_elapsed_seconds, 412);
 		assert_eq!(args.failed_migration, None);
 		assert_eq!(args.data_bytes_before, 1_000);
@@ -762,7 +762,7 @@ mod tests {
 		let id = "55555555-5555-5555-5555-555555555555";
 		let restore = migrated_restore(Some(target(id)), Some(migration_result()));
 		let args = migration_for("upgrade", &restore).expect("upgrade reports its migration");
-		assert_eq!(args.target_version_id, Uuid::parse_str(id).unwrap());
+		assert_eq!(args.target_version_id, Some(Uuid::parse_str(id).unwrap()));
 	}
 
 	#[test]

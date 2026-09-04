@@ -186,20 +186,46 @@ fn make_replica(
 	}
 }
 
+/// Schema-less extra user spec, for tests that only care about name handling.
+fn eu(name: &str) -> ExtraUserSpec {
+	ExtraUserSpec {
+		name: name.to_string(),
+		schemas: vec![],
+	}
+}
+
 #[test]
 fn extra_users_trims_dedupes_and_excludes_analytics() {
 	let mut replica = make_replica(None, None);
 	replica.spec.analytics_username = "analytics".into();
 	replica.spec.extra_users = vec![
-		" reporting ".into(),
-		"etl".into(),
-		"reporting".into(),
-		"".into(),
-		"analytics".into(),
+		eu(" reporting "),
+		eu("etl"),
+		eu("reporting"),
+		eu(""),
+		eu("analytics"),
 	];
+	assert_eq!(replica.extra_users(), vec![eu("reporting"), eu("etl")]);
+}
+
+#[test]
+fn extra_user_schemas_are_trimmed_and_deduped() {
+	let mut replica = make_replica(None, None);
+	replica.spec.extra_users = vec![ExtraUserSpec {
+		name: "reporting".to_string(),
+		schemas: vec![
+			" dbt ".to_string(),
+			"dbt".to_string(),
+			"".to_string(),
+			"staging".to_string(),
+		],
+	}];
 	assert_eq!(
 		replica.extra_users(),
-		vec!["reporting".to_string(), "etl".to_string()]
+		vec![ExtraUserSpec {
+			name: "reporting".to_string(),
+			schemas: vec!["dbt".to_string(), "staging".to_string()]
+		}]
 	);
 }
 

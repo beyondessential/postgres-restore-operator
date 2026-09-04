@@ -78,18 +78,30 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default = "default_switchover_grace_period")]
 	pub switchover_grace_period: TimeSpan,
 
-	/// Username for analytics connections
+	/// Username for analytics connections. Reset to a fixed state (attributes,
+	/// memberships, password) on every restore, whether or not the name
+	/// already exists as a role restored from the source cluster, so it never
+	/// carries production's privileges forward. `readOnly` then decides
+	/// whether the role gets `pg_read_all_data` or `SUPERUSER`.
 	#[serde(default = "default_analytics_username")]
 	pub analytics_username: String,
 
 	/// Additional login roles to provision in each restore, beyond the
-	/// analytics user. Each name becomes a `LOGIN SUPERUSER` role with an
-	/// operator-generated password stored in a per-user Secret
-	/// `<replica>-user-<name>-creds`. Provisioned once at restore
-	/// initialisation and never dropped. A name matching `analyticsUsername`
-	/// is ignored.
+	/// analytics user. Each is a `LOGIN` role with no privileges of its own
+	/// and read-only sessions, plus `USAGE` and `SELECT` (including on
+	/// tables the persistent-schemas migration creates afterwards) on
+	/// whichever of its own `schemas` exist in a given database — nothing
+	/// else, and nothing at all if `schemas` is empty, until something
+	/// grants it more. Those grants have to be reapplied per restore. Every
+	/// restore also revokes the `public` schema (and every other non-system
+	/// schema, table, and function) from the `PUBLIC` pseudo-role, since that
+	/// is the only way to keep an ungranted role out of them; the analytics
+	/// user is unaffected. The password is operator-generated and stored in a
+	/// per-user Secret `<replica>-user-<name>-creds`. Provisioned once at
+	/// restore initialisation and never dropped. A name matching
+	/// `analyticsUsername` is ignored.
 	#[serde(default, skip_serializing_if = "Vec::is_empty")]
-	pub extra_users: Vec<String>,
+	pub extra_users: Vec<ExtraUserSpec>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub storage_class: Option<String>,
@@ -239,6 +251,22 @@ fn default_schedule_jitter() -> TimeSpan {
 }
 fn default_analytics_username() -> String {
 	"analytics".to_string()
+}
+
+/// One entry in `extraUsers`: a login role name and the schemas it should
+/// read. `schemas` is per-user rather than replica-wide so one replica can
+/// carry accounts scoped to different data — a `dbt`-only reader alongside
+/// a `public`-only one, say.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct ExtraUserSpec {
+	/// The role name to provision.
+	pub name: String,
+	/// Schemas this user is granted `USAGE` + `SELECT` on, in whichever
+	/// databases they exist in. Empty means the role is provisioned with no
+	/// access of its own.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub schemas: Vec<String>,
 }
 
 /// Points a replica at a canopy-declared restore-replica instead of a
@@ -704,19 +732,39 @@ impl PostgresPhysicalReplica {
 		format!("{name}-creds", name = self.name_any())
 	}
 
-	/// The extra login roles to provision, cleaned up: trimmed, empties and
-	/// duplicates removed, and the analytics user excluded (it's already
-	/// provisioned separately). Order is preserved so the per-user Secret and
-	/// env-var indices are stable across a reconcile.
-	pub fn extra_users(&self) -> Vec<String> {
+	/// The extra login roles to provision, cleaned up: names trimmed, empties
+	/// and duplicate names removed (by name, keeping the first occurrence),
+	/// and the analytics user excluded (it's already provisioned
+	/// separately). Each user's own `schemas` are likewise trimmed,
+	/// deduplicated, and stripped of empties. Order is preserved so the
+	/// per-user Secret and env-var indices are stable across a reconcile.
+	pub fn extra_users(&self) -> Vec<ExtraUserSpec> {
 		let mut seen = std::collections::HashSet::new();
 		self.spec
 			.extra_users
 			.iter()
-			.map(|u| u.trim())
-			.filter(|u| !u.is_empty() && *u != self.spec.analytics_username.as_str())
-			.filter(|u| seen.insert(u.to_string()))
-			.map(str::to_string)
+			.filter_map(|u| {
+				let name = u.name.trim();
+				if name.is_empty() || name == self.spec.analytics_username.as_str() {
+					return None;
+				}
+				if !seen.insert(name.to_string()) {
+					return None;
+				}
+				let mut schemas_seen = std::collections::HashSet::new();
+				let schemas = u
+					.schemas
+					.iter()
+					.map(|s| s.trim())
+					.filter(|s| !s.is_empty())
+					.filter(|s| schemas_seen.insert(s.to_string()))
+					.map(str::to_string)
+					.collect();
+				Some(ExtraUserSpec {
+					name: name.to_string(),
+					schemas,
+				})
+			})
 			.collect()
 	}
 

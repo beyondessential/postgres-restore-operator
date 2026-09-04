@@ -1,18 +1,20 @@
 use k8s_openapi::api::core::v1::Secret;
 use kube::{Api, api::PostParams};
 use postgres_restore_operator::types::{
-	PostgresPhysicalReplica, PostgresPhysicalRestore, ReplicaPhase, RestorePhase,
+	ExtraUserSpec, PostgresPhysicalReplica, PostgresPhysicalRestore, ReplicaPhase, RestorePhase,
 };
 
 use helpers::*;
 
 mod helpers;
 
-/// An extra user is provisioned as a LOGIN SUPERUSER with its own password
-/// Secret, and can write even though the replica is read-only.
+/// An extra user is provisioned as an unprivileged LOGIN role with its own
+/// password Secret: it can connect, its sessions are read-only, and it holds
+/// no privileges beyond what `PUBLIC` carries — except on the schemas it
+/// declares, where it's granted `USAGE`/`SELECT`.
 #[tokio::test]
 #[ignore = "requires a running Kubernetes cluster with MinIO and kopia"]
-async fn extra_user_provisioned_with_write_access() {
+async fn extra_user_provisioned_without_privileges() {
 	let client = make_client().await;
 	let ns = "test-extra-users";
 
@@ -38,7 +40,16 @@ async fn extra_user_provisioned_with_write_access() {
 		"extra-users-kopia-creds",
 		ReplicaOpts {
 			read_only: true,
-			extra_users: vec!["writer".into(), "report_writer".into()],
+			extra_users: vec![
+				ExtraUserSpec {
+					name: "writer".into(),
+					schemas: vec![],
+				},
+				ExtraUserSpec {
+					name: "report_writer".into(),
+					schemas: vec!["public".into()],
+				},
+			],
 			..Default::default()
 		},
 	);
@@ -100,7 +111,7 @@ async fn extra_user_provisioned_with_write_access() {
 
 	let deploy_target = format!("deployment/{restore_name}");
 
-	println!("--- verifying the extra user exists as a superuser");
+	println!("--- verifying the extra user exists without elevated attributes");
 	let out = kubectl_exec(
 		ns,
 		&deploy_target,
@@ -111,14 +122,37 @@ async fn extra_user_provisioned_with_write_access() {
 			"-d",
 			"postgres",
 			"-tAc",
-			"SELECT rolsuper FROM pg_roles WHERE rolname = 'writer'",
+			"SELECT rolsuper, rolcreatedb, rolcreaterole, rolreplication, rolbypassrls \
+			 FROM pg_roles WHERE rolname = 'writer'",
 		],
 	)
 	.await;
 	assert_eq!(
 		out.trim(),
-		"t",
-		"the extra user should exist and be a superuser"
+		"f|f|f|f|f",
+		"the extra user should exist with no elevated role attributes"
+	);
+
+	println!("--- verifying the extra user holds no role memberships");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT count(*) FROM pg_auth_members m \
+			 JOIN pg_roles r ON r.oid = m.member WHERE r.rolname = 'writer'",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"0",
+		"a freshly created extra user should be granted nothing, not even a read role"
 	);
 
 	println!("--- verifying the underscored user exists under its real name");
@@ -142,7 +176,28 @@ async fn extra_user_provisioned_with_write_access() {
 		"the underscored role is created with its declared name"
 	);
 
-	println!("--- verifying the extra user's sessions default to read-write");
+	println!("--- verifying the schema-scoped user reaches its declared schema");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"report_writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT has_schema_privilege('report_writer', 'public', 'USAGE')",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"t",
+		"an extra user with `public` in its schemas must get USAGE on it"
+	);
+
+	println!("--- verifying the extra user's sessions are read-only");
 	let out = kubectl_exec(
 		ns,
 		&deploy_target,
@@ -159,12 +214,12 @@ async fn extra_user_provisioned_with_write_access() {
 	.await;
 	assert_eq!(
 		out.trim(),
-		"off",
-		"the extra user's sessions should start read-write"
+		"on",
+		"the extra user's sessions should start read-only"
 	);
 
-	println!("--- verifying the extra user can write despite the read-only replica");
-	let out = kubectl_exec(
+	println!("--- verifying the extra user cannot write");
+	let (ok, stdout, stderr) = try_kubectl_exec(
 		ns,
 		&deploy_target,
 		&[
@@ -178,9 +233,73 @@ async fn extra_user_provisioned_with_write_access() {
 		],
 	)
 	.await;
+	let combined = format!("{stdout}{stderr}");
 	assert!(
-		out.contains("CREATE SCHEMA"),
-		"the extra user should be able to write without disabling read-only mode itself, got: {out}"
+		!ok || combined.contains("read-only transaction"),
+		"the extra user must not be able to write, got: {combined}"
+	);
+
+	println!("--- verifying the extra user cannot reach the public schema");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"writer",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT has_schema_privilege('writer', 'public', 'USAGE')",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"f",
+		"the extra user must not inherit USAGE on public via PUBLIC"
+	);
+
+	println!("--- verifying the analytics user still reaches schemas");
+	let out = kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"postgres",
+			"-tAc",
+			"SELECT has_schema_privilege('analytics', 'public', 'USAGE')",
+		],
+	)
+	.await;
+	assert_eq!(
+		out.trim(),
+		"t",
+		"closing public to PUBLIC must not cost the analytics user its access"
+	);
+
+	println!("--- verifying the extra user cannot read application data");
+	let (ok, stdout, stderr) = try_kubectl_exec(
+		ns,
+		&deploy_target,
+		&[
+			"psql",
+			"-U",
+			"writer",
+			"-d",
+			"postgres",
+			"-c",
+			"SELECT count(*) FROM _pgro.restore_info",
+		],
+	)
+	.await;
+	let combined = format!("{stdout}{stderr}");
+	assert!(
+		!ok || combined.contains("permission denied"),
+		"the extra user must hold no read grants of its own, got: {combined}"
 	);
 
 	println!("--- verifying the analytics user is still read-only");
@@ -201,7 +320,7 @@ async fn extra_user_provisioned_with_write_access() {
 	assert_eq!(
 		out.trim(),
 		"on",
-		"the extra user's role setting must not leak to the analytics user"
+		"provisioning extra users must leave the analytics user read-only"
 	);
 
 	println!("--- all assertions passed, cleaning up");
