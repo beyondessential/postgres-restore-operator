@@ -8,11 +8,15 @@
 //! pgro-specific logging / retry / cache concerns later.
 
 use bestool_canopy::{
-	CanopyClient, TAILSCALE_URL,
+	CanopyClient, CanopyTransport, TAILSCALE_URL,
 	schema::{
 		BackupPurpose, IntentDescriptor, ProgressArgs, RestoreCapabilitiesArgs, RestoreCredentials,
 		RestoreCredentialsArgs, VerificationArgs, WorklistEntry,
 	},
+};
+use bestool_canopy::{
+	bytes::Bytes,
+	http::{Method, Request, header::CONTENT_TYPE},
 };
 use reqwest::Url;
 use uuid::Uuid;
@@ -212,6 +216,49 @@ impl Client {
 			.restore_verification(args)
 			.await
 			.map_err(|err| Error::Canopy(format!("restore_verification: {err}")))
+	}
+
+	/// Register a built reporting schema as an artifact of `version`, scoped to
+	/// `group`, sending the SQL over the connection pgro already holds.
+	///
+	/// Canopy issues no credential to any store for this, so being authorised to
+	/// register for the group is the whole of what publishing into it takes.
+	///
+	/// This goes through the transport rather than a generated method, because
+	/// the generator emits path parameters only and JSON bodies only, and this
+	/// endpoint takes a query parameter and the artifact's bytes.
+	pub async fn register_reporting_schema(
+		&self,
+		version: &str,
+		group: Uuid,
+		run_id: Option<Uuid>,
+		sql: Bytes,
+	) -> Result<()> {
+		let mut uri = format!("/artifacts/{version}/reporting-schema/any?group={group}");
+		if let Some(run) = run_id {
+			uri.push_str(&format!("&run={run}"));
+		}
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri(&uri)
+			.header(CONTENT_TYPE, "application/sql")
+			.body(sql)
+			.map_err(|err| Error::Canopy(format!("building artifact registration: {err}")))?;
+
+		let response =
+			self.inner.transport().call(request).await.map_err(|err| {
+				Error::Canopy(format!("register_reporting_schema({version}): {err}"))
+			})?;
+
+		if !response.status().is_success() {
+			return Err(Error::Canopy(format!(
+				"register_reporting_schema({version}): canopy answered {}",
+				response.status()
+			)));
+		}
+
+		Ok(())
 	}
 }
 
