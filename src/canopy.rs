@@ -1,22 +1,21 @@
 //! Thin wrapper around `bestool_canopy::CanopyClient`.
 //!
 //! Owns construction (the SOCKS5 proxy wiring to the Tailscale sidecar, plus
-//! optional mTLS fallback) and exposes the four restore-* endpoints pgro
-//! consumes: `restore_capabilities`, `restore_worklist`, `restore_credentials`,
-//! `restore_verification`. Each is a one-line forward; the wrapper exists as
-//! the integration seam tests inject a stub at, and as the place to hang
-//! pgro-specific logging / retry / cache concerns later.
+//! optional mTLS fallback) and exposes the endpoints pgro consumes:
+//! `restore_capabilities`, `restore_worklist`, `restore_credentials`,
+//! `restore_verification`, and artifact registration. Each is a one-line
+//! forward except the last, which the generated client cannot express; the
+//! wrapper exists as the integration seam tests inject a stub at, and as the
+//! place to hang pgro-specific logging / retry / cache concerns later.
 
 use bestool_canopy::{
 	CanopyClient, CanopyTransport, TAILSCALE_URL,
+	bytes::Bytes,
+	http::{Method, Request, header::CONTENT_TYPE},
 	schema::{
 		BackupPurpose, IntentDescriptor, ProgressArgs, RestoreCapabilitiesArgs, RestoreCredentials,
 		RestoreCredentialsArgs, VerificationArgs, WorklistEntry,
 	},
-};
-use bestool_canopy::{
-	bytes::Bytes,
-	http::{Method, Request, header::CONTENT_TYPE},
 };
 use reqwest::Url;
 use uuid::Uuid;
