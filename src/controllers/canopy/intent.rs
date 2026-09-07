@@ -791,6 +791,42 @@ mod tests {
 	}
 
 	#[test]
+	fn builder_image_param_reaches_the_replica_spec() {
+		let cfg = config_for("reporting-schema").expect("reporting-schema is a supported intent");
+		let spec = cfg.to_replica_spec(
+			&entry(
+				"reporting-schema",
+				"site",
+				json!({ "builder_image": "ghcr.io/beyondessential/tamanu-dbt:1" }),
+			),
+			vec![],
+		);
+		assert_eq!(
+			spec.builder_image.as_deref(),
+			Some("ghcr.io/beyondessential/tamanu-dbt:1")
+		);
+	}
+
+	#[test]
+	fn a_blank_builder_image_builds_nothing() {
+		let cfg = config_for("reporting-schema").expect("reporting-schema is a supported intent");
+		for value in ["", "   "] {
+			let spec = cfg.to_replica_spec(
+				&entry(
+					"reporting-schema",
+					"site",
+					json!({ "builder_image": value }),
+				),
+				vec![],
+			);
+			assert!(
+				spec.builder_image.is_none(),
+				"a blank image leaves the replica building nothing, not building with an empty image"
+			);
+		}
+	}
+
+	#[test]
 	fn analytics_migrate_to_param_builds_a_target() {
 		// The operator-chosen version turns an analytics replica into a
 		// persistent, upgraded query replica. It carries no canopy version id —
@@ -827,7 +863,10 @@ mod tests {
 	fn descriptors_advertise_expected_intents_and_semantics() {
 		let ds = descriptors();
 		let names: Vec<&str> = ds.iter().map(|d| d.intent.as_str()).collect();
-		assert_eq!(names, ["verify", "upgrade", "analytics"]);
+		assert_eq!(
+			names,
+			["verify", "upgrade", "analytics", "reporting-schema"]
+		);
 
 		let verify = &ds[0];
 		// `migrate` withholds an entry from a server with no candidate version,
@@ -857,6 +896,29 @@ mod tests {
 			ParamType::Text
 		);
 		assert!(upgrade.description.is_some());
+
+		let build = &ds[3];
+		// `migrate` alongside, because a schema follows from the version's own
+		// migrations: the replica has to be at that version before the build
+		// reads it.
+		assert_eq!(
+			build.semantics,
+			["check", "once", "migrate", "reporting-schema"]
+		);
+		let build_params = build
+			.params
+			.as_ref()
+			.expect("a build advertises what runs it")
+			.0
+			.clone();
+		// The version and group come from the worklist entry, so an operator
+		// sets only what runs the build and what it starts from.
+		assert_eq!(build_params.len(), 2);
+		assert_eq!(
+			build_params.get(params::BUILDER_IMAGE).unwrap().type_,
+			ParamType::Text
+		);
+		assert!(build.description.is_some());
 
 		let analytics = &ds[2];
 		assert_eq!(analytics.semantics, ["check", "url", "redact"]);
