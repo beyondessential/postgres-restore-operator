@@ -1748,8 +1748,7 @@ async fn reconcile_schema_build(
 		}
 		schema_build::BuildOutcome::Succeeded => {
 			let sql = ctx.schema_build_results.take(namespace, &replica_name);
-			let built = sql.is_some();
-			let schema_bytes = sql.as_ref().map(|s| s.len() as i64);
+			let result = completed_build_result(sql.as_deref(), started.elapsed().as_secs() as i64);
 
 			if let (Some(sql), Some(canopy_client)) = (sql, ctx.canopy.as_ref()) {
 				let group = replica
@@ -1768,19 +1767,7 @@ async fn reconcile_schema_build(
 				}
 			}
 
-			record_schema_build(
-				client,
-				namespace,
-				&restore_name,
-				&job_name,
-				SchemaBuildResult {
-					built,
-					error: (!built).then(|| "the build produced no schema".to_string()),
-					total_elapsed_seconds: started.elapsed().as_secs() as i64,
-					schema_bytes,
-				},
-			)
-			.await?;
+			record_schema_build(client, namespace, &restore_name, &job_name, result).await?;
 			Ok(true)
 		}
 		schema_build::BuildOutcome::Failed => {
@@ -1799,6 +1786,22 @@ async fn reconcile_schema_build(
 			.await?;
 			Ok(true)
 		}
+	}
+}
+
+/// What a build Job that exited zero records.
+///
+/// Whether a schema came out of it turns on the callback, not on the exit code:
+/// the exit code says the container ran, and a Job that ran to completion
+/// without posting a schema is a failed build rather than a successful empty
+/// one.
+fn completed_build_result(sql: Option<&str>, elapsed_seconds: i64) -> SchemaBuildResult {
+	let built = sql.is_some();
+	SchemaBuildResult {
+		built,
+		error: (!built).then(|| "the build produced no schema".to_string()),
+		total_elapsed_seconds: elapsed_seconds,
+		schema_bytes: sql.map(|s| s.len() as i64),
 	}
 }
 

@@ -3,6 +3,7 @@ use kube::api::ObjectMeta;
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
 
+use super::completed_build_result;
 use crate::{kopia::Snapshot, placement::PodPlacement, types::*, util::TimeSpan};
 
 use jiff::SignedDuration;
@@ -549,4 +550,41 @@ fn snapshot_list_job_carries_the_placement_defaults() {
 			.unwrap(),
 		"b"
 	);
+}
+
+/// A build whose callback delivered a schema is a build.
+#[test]
+fn a_schema_that_came_back_is_a_built_pair() {
+	let result = completed_build_result(Some("CREATE VIEW reporting.x AS SELECT 1;"), 90);
+
+	assert!(result.built);
+	assert_eq!(result.error, None);
+	assert_eq!(result.schema_bytes, Some(36));
+	assert_eq!(result.total_elapsed_seconds, 90);
+}
+
+/// A Job that exits zero without posting a schema is a failed build, not a
+/// successful empty one. The exit code says the container ran; only the
+/// callback says a schema came out of it. Reading the exit code as the verdict
+/// would settle the pair as built and offer servers nothing.
+#[test]
+fn a_job_that_posted_no_schema_is_a_failed_build() {
+	let result = completed_build_result(None, 12);
+
+	assert!(!result.built);
+	assert_eq!(
+		result.error.as_deref(),
+		Some("the build produced no schema")
+	);
+	assert_eq!(result.schema_bytes, None);
+}
+
+/// An empty schema is still a schema the builder chose to post, so it is not
+/// silently reclassified as a failure.
+#[test]
+fn an_empty_schema_is_reported_as_it_was_posted() {
+	let result = completed_build_result(Some(""), 1);
+
+	assert!(result.built);
+	assert_eq!(result.schema_bytes, Some(0));
 }
