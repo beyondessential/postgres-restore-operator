@@ -1182,6 +1182,11 @@ SQLEOF
 /// matters: `DROP OWNED BY` revokes every direct grant held by that role, so
 /// granting the schema access first would just have it stripped again
 /// immediately after.
+///
+/// This pass only reaches what's in the restored snapshot; a
+/// `persistent_schemas` schema arrives later via the migration Job, so
+/// `controllers::replica::reconcile_extra_user_grants` re-applies these
+/// before switchover.
 fn database_lockdown_block(analytics_username_env: &str, extra_users: &[ExtraUser]) -> String {
 	let mut var_flags = format!("    -v analytics_username=\"${analytics_username_env}\" \\\n");
 	for (i, _) in extra_users.iter().enumerate() {

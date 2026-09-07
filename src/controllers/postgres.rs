@@ -376,6 +376,71 @@ pub async fn existing_schemas_on(
 		.collect())
 }
 
+/// Whether the connected role holds `SUPERUSER`. The analytics credential
+/// the operator holds is one while the restore is writable and a bare
+/// `pg_read_all_data` member once it's locked read-only; `GRANT` on objects
+/// it doesn't own needs the former.
+pub async fn is_superuser_on(pg: &tokio_postgres::Client) -> Result<bool> {
+	let row = pg
+		.query_one(
+			"SELECT rolsuper FROM pg_catalog.pg_roles WHERE rolname = current_user",
+			&[],
+		)
+		.await?;
+	Ok(row.get(0))
+}
+
+/// Every connectable database. `template1` is deliberately included: it's
+/// the byte-for-byte template for databases created later, so grants that
+/// skip it don't reach them.
+pub async fn connectable_databases_on(pg: &tokio_postgres::Client) -> Result<Vec<String>> {
+	let rows = pg
+		.query(
+			"SELECT datname FROM pg_catalog.pg_database \
+			 WHERE datallowconn AND datname <> 'template0' \
+			 ORDER BY datname",
+			&[],
+		)
+		.await?;
+	Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+/// Read access for `username` on `schema`, including default privileges so
+/// tables `owner` creates in it later are readable too. Mirrors the grant
+/// step in `controllers::restore::builders::database_lockdown_block`; kept
+/// pure so the SQL is testable without a server.
+pub fn schema_read_grants(username: &str, schema: &str, owner: &str) -> Vec<String> {
+	let user = quote_ident(username);
+	let ns = quote_ident(schema);
+	vec![
+		format!("GRANT USAGE ON SCHEMA {ns} TO {user}"),
+		format!("GRANT SELECT ON ALL TABLES IN SCHEMA {ns} TO {user}"),
+		format!("GRANT SELECT ON ALL SEQUENCES IN SCHEMA {ns} TO {user}"),
+		format!(
+			"ALTER DEFAULT PRIVILEGES FOR ROLE {owner} IN SCHEMA {ns} GRANT SELECT ON TABLES TO {user}",
+			owner = quote_ident(owner),
+		),
+	]
+}
+
+/// Apply [[schema_read_grants]] on whichever of `schemas` exist in the
+/// current database, returning those. Absent ones are skipped.
+pub async fn grant_schema_read_on(
+	pg: &tokio_postgres::Client,
+	username: &str,
+	schemas: &[String],
+	owner: &str,
+) -> Result<Vec<String>> {
+	let present = existing_schemas_on(pg, schemas).await?;
+	for schema in &present {
+		for stmt in schema_read_grants(username, schema, owner) {
+			debug!(user = username, schema = schema, sql = %stmt, "granting schema read");
+			pg.execute(stmt.as_str(), &[]).await?;
+		}
+	}
+	Ok(present)
+}
+
 /// Terminate every other client backend connected to the current database.
 /// The operator owns each restore's database fully until handover, so any
 /// other session is a transient or stray client whose lock-holding would
@@ -469,5 +534,61 @@ mod tests {
 	#[test]
 	fn quote_ident_with_quotes() {
 		assert_eq!(quote_ident("my\"schema"), "\"my\"\"schema\"");
+	}
+
+	#[test]
+	fn schema_read_grants_covers_usage_tables_sequences_and_defaults() {
+		let stmts = schema_read_grants("reporting", "dbt", "analytics");
+		assert_eq!(
+			stmts,
+			vec![
+				"GRANT USAGE ON SCHEMA \"dbt\" TO \"reporting\"",
+				"GRANT SELECT ON ALL TABLES IN SCHEMA \"dbt\" TO \"reporting\"",
+				"GRANT SELECT ON ALL SEQUENCES IN SCHEMA \"dbt\" TO \"reporting\"",
+				"ALTER DEFAULT PRIVILEGES FOR ROLE \"analytics\" IN SCHEMA \"dbt\" GRANT SELECT ON TABLES TO \"reporting\"",
+			]
+		);
+	}
+
+	/// Role and schema names come from the CRD, so none is spliced in raw.
+	#[test]
+	fn schema_read_grants_quotes_every_identifier() {
+		let stmts = schema_read_grants("odd\"user", "odd\"schema", "odd\"owner");
+		for stmt in &stmts {
+			assert!(
+				stmt.contains("\"odd\"\"schema\""),
+				"schema not quoted in: {stmt}"
+			);
+			assert!(
+				stmt.contains("\"odd\"\"user\""),
+				"username not quoted in: {stmt}"
+			);
+		}
+		assert!(
+			stmts[3].contains("FOR ROLE \"odd\"\"owner\""),
+			"owner not quoted in: {}",
+			stmts[3]
+		);
+	}
+
+	/// Read-only whatever the replica's own read_only flag says.
+	#[test]
+	fn schema_read_grants_are_read_only() {
+		for stmt in schema_read_grants("reporting", "dbt", "analytics") {
+			for forbidden in [
+				"INSERT",
+				"UPDATE",
+				"DELETE",
+				"TRUNCATE",
+				"CREATE",
+				"ALL PRIVILEGES",
+				"GRANT ALL",
+			] {
+				assert!(
+					!stmt.contains(forbidden),
+					"{forbidden} must not appear in a read grant: {stmt}"
+				);
+			}
+		}
 	}
 }
