@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 
 use bestool_canopy::bytes::Bytes;
 use k8s_openapi::api::{
-	batch::v1::{Job, JobSpec},
+	batch::v1::{Job, JobSpec, JobStatus},
 	core::v1::{Container, PodSpec, PodTemplateSpec},
 };
 use kube::{
@@ -146,33 +146,63 @@ pub enum BuildOutcome {
 	Failed,
 }
 
+/// A build Job's state and how long it has taken.
+pub struct BuildStatus {
+	pub outcome: BuildOutcome,
+	pub elapsed_seconds: i64,
+}
+
 pub async fn build_outcome(
 	client: &Client,
 	namespace: &str,
 	job_name: &str,
-) -> Result<BuildOutcome> {
+) -> Result<BuildStatus> {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
 	let Some(job) = jobs.get_opt(job_name).await.map_err(Error::Kube)? else {
-		return Ok(BuildOutcome::Running);
+		return Ok(BuildStatus {
+			outcome: BuildOutcome::Running,
+			elapsed_seconds: 0,
+		});
 	};
 
 	let status = job.status.unwrap_or_default();
-	if status.succeeded.unwrap_or(0) > 0 {
-		Ok(BuildOutcome::Succeeded)
+	let outcome = if status.succeeded.unwrap_or(0) > 0 {
+		BuildOutcome::Succeeded
 	} else if status.failed.unwrap_or(0) > 0 {
-		Ok(BuildOutcome::Failed)
+		BuildOutcome::Failed
 	} else {
-		Ok(BuildOutcome::Running)
-	}
+		BuildOutcome::Running
+	};
+
+	Ok(BuildStatus {
+		outcome,
+		elapsed_seconds: job_elapsed_seconds(&status),
+	})
+}
+
+/// Whole seconds the build itself took, read from the Job's own timestamps.
+///
+/// A reconcile creates the Job and a later one observes it finished, so nothing
+/// the operator holds in memory spans the build.
+fn job_elapsed_seconds(status: &JobStatus) -> i64 {
+	let Some(start) = status.start_time.as_ref() else {
+		return 0;
+	};
+	let end = status
+		.completion_time
+		.as_ref()
+		.map_or_else(jiff::Timestamp::now, |t| t.0);
+
+	end.duration_since(start.0).as_secs().max(0)
 }
 
 /// Register a built schema with canopy, as an artifact of the version it was
 /// built for, scoped to the group whose data it was built from.
 ///
-/// A registration that fails is logged and swallowed: the replica is sound and
-/// the build ran, and canopy notices the pair is still unbuilt on its next pass.
-/// Failing the restore over it would discard a good replica for a transport
-/// problem.
+/// A registration that fails is logged rather than failing the restore: the
+/// replica is sound and the build ran, and discarding a good replica over a
+/// transport problem helps nobody. It is still not a built pair, since canopy
+/// has no artifact to offer, so the caller records it as one that failed.
 pub async fn register(
 	canopy: &crate::canopy::Client,
 	version: &str,
@@ -298,6 +328,41 @@ mod tests {
 				.restart_policy
 				.as_deref(),
 			Some("Never")
+		);
+	}
+
+	/// The elapsed time comes from the Job's own timestamps. One reconcile
+	/// creates the Job and a later one sees it finished, so anything the
+	/// operator times itself measures the reconcile and reports near zero for
+	/// every build.
+	#[test]
+	fn the_build_is_timed_by_the_job() {
+		fn at(s: &str) -> k8s_openapi::apimachinery::pkg::apis::meta::v1::Time {
+			k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(s.parse().expect("a timestamp"))
+		}
+
+		let finished = JobStatus {
+			start_time: Some(at("2026-09-08T01:00:00Z")),
+			completion_time: Some(at("2026-09-08T01:07:30Z")),
+			..Default::default()
+		};
+		assert_eq!(job_elapsed_seconds(&finished), 450);
+
+		let running = JobStatus {
+			start_time: Some(k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(
+				jiff::Timestamp::now() - jiff::SignedDuration::from_secs(90),
+			)),
+			..Default::default()
+		};
+		assert!(
+			job_elapsed_seconds(&running) >= 90,
+			"a Job still going is timed against now"
+		);
+
+		assert_eq!(
+			job_elapsed_seconds(&JobStatus::default()),
+			0,
+			"a Job that has not started has taken no time"
 		);
 	}
 

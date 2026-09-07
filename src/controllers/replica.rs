@@ -1,8 +1,4 @@
-use std::{
-	collections::HashSet,
-	sync::Arc,
-	time::{Duration, Instant},
-};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::{
@@ -1687,9 +1683,9 @@ async fn reconcile_schema_build(
 
 	let restore_name = restore.name_any();
 	let job_name = schema_build::build_job_name(&replica_name);
-	let started = Instant::now();
 
-	match schema_build::build_outcome(client, namespace, &job_name).await? {
+	let build = schema_build::build_outcome(client, namespace, &job_name).await?;
+	match build.outcome {
 		schema_build::BuildOutcome::Running => {
 			// Not created yet on the first pass through.
 			let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
@@ -1736,25 +1732,35 @@ async fn reconcile_schema_build(
 		}
 		schema_build::BuildOutcome::Succeeded => {
 			let sql = ctx.schema_build_results.take(namespace, &replica_name);
-			let result = completed_build_result(sql.as_deref(), started.elapsed().as_secs() as i64);
 
-			if let (Some(sql), Some(canopy_client)) = (sql, ctx.canopy.as_ref()) {
-				let group = replica
-					.labels()
-					.get(canopy_labels::GROUP)
-					.and_then(|s| Uuid::parse_str(s).ok());
-				if let Some(group) = group {
-					schema_build::register(
-						canopy_client,
-						target,
-						group,
-						crate::controllers::canopy::verification::run_id_from_status(restore),
-						Bytes::from(sql),
-					)
-					.await;
+			let registration = match (sql.as_deref(), ctx.canopy.as_ref()) {
+				(Some(sql), Some(canopy_client)) => {
+					match replica
+						.labels()
+						.get(canopy_labels::GROUP)
+						.and_then(|s| Uuid::parse_str(s).ok())
+					{
+						None => Some("the replica names no group to register the schema for"),
+						Some(group) => {
+							let taken = schema_build::register(
+								canopy_client,
+								target,
+								group,
+								crate::controllers::canopy::verification::run_id_from_status(
+									restore,
+								),
+								Bytes::from(sql.to_owned()),
+							)
+							.await;
+							(!taken).then_some("canopy did not take the schema in")
+						}
+					}
 				}
-			}
+				_ => None,
+			};
 
+			let result =
+				completed_build_result(sql.as_deref(), registration, build.elapsed_seconds);
 			record_schema_build(client, namespace, &restore_name, &job_name, result).await?;
 			Ok(true)
 		}
@@ -1767,7 +1773,7 @@ async fn reconcile_schema_build(
 				SchemaBuildResult {
 					built: false,
 					error: Some("the build job failed".to_string()),
-					total_elapsed_seconds: started.elapsed().as_secs() as i64,
+					total_elapsed_seconds: build.elapsed_seconds,
 					schema_bytes: None,
 				},
 			)
@@ -1822,12 +1828,20 @@ fn build_to_do<'a>(
 /// Whether a schema came out of it turns on the callback, not on the exit code:
 /// the exit code says the container ran, and a Job that ran to completion
 /// without posting a schema is a failed build rather than a successful empty
-/// one.
-fn completed_build_result(sql: Option<&str>, elapsed_seconds: i64) -> SchemaBuildResult {
-	let built = sql.is_some();
+/// one. A schema canopy did not take in is not a built pair either: canopy has
+/// no artifact to offer for it, so the size is still worth recording but the
+/// pair is not settled as built.
+fn completed_build_result(
+	sql: Option<&str>,
+	registration: Option<&str>,
+	elapsed_seconds: i64,
+) -> SchemaBuildResult {
 	SchemaBuildResult {
-		built,
-		error: (!built).then(|| "the build produced no schema".to_string()),
+		built: sql.is_some() && registration.is_none(),
+		error: registration.map(str::to_owned).or_else(|| {
+			sql.is_none()
+				.then(|| "the build produced no schema".to_string())
+		}),
 		total_elapsed_seconds: elapsed_seconds,
 		schema_bytes: sql.map(|s| s.len() as i64),
 	}

@@ -555,7 +555,7 @@ fn snapshot_list_job_carries_the_placement_defaults() {
 /// A build whose callback delivered a schema is a build.
 #[test]
 fn a_schema_that_came_back_is_a_built_pair() {
-	let result = completed_build_result(Some("CREATE VIEW reporting.x AS SELECT 1;"), 90);
+	let result = completed_build_result(Some("CREATE VIEW reporting.x AS SELECT 1;"), None, 90);
 
 	assert!(result.built);
 	assert_eq!(result.error, None);
@@ -569,7 +569,7 @@ fn a_schema_that_came_back_is_a_built_pair() {
 /// would settle the pair as built and offer servers nothing.
 #[test]
 fn a_job_that_posted_no_schema_is_a_failed_build() {
-	let result = completed_build_result(None, 12);
+	let result = completed_build_result(None, None, 12);
 
 	assert!(!result.built);
 	assert_eq!(
@@ -583,7 +583,7 @@ fn a_job_that_posted_no_schema_is_a_failed_build() {
 /// silently reclassified as a failure.
 #[test]
 fn an_empty_schema_is_reported_as_it_was_posted() {
-	let result = completed_build_result(Some(""), 1);
+	let result = completed_build_result(Some(""), None, 1);
 
 	assert!(result.built);
 	assert_eq!(result.schema_bytes, Some(0));
@@ -624,7 +624,7 @@ fn what_a_reconcile_has_to_build() {
 	);
 
 	restore.status = Some(PostgresPhysicalRestoreStatus {
-		schema_build_result: Some(completed_build_result(None, 1)),
+		schema_build_result: Some(completed_build_result(None, None, 1)),
 		..Default::default()
 	});
 	assert_eq!(
@@ -632,4 +632,24 @@ fn what_a_reconcile_has_to_build() {
 		BuildToDo::Settled,
 		"a failed build settles the pair as surely as a successful one"
 	);
+}
+
+/// A schema canopy did not take in is not a built pair: canopy has no artifact
+/// to offer for it, so recording `built` would settle the pair against a schema
+/// nothing can fetch. The size still goes on the record, since the build did
+/// produce one and its absence would read as a build that emitted nothing.
+#[test]
+fn a_schema_canopy_did_not_take_is_not_built() {
+	let result = completed_build_result(
+		Some("CREATE VIEW reporting.x AS SELECT 1;"),
+		Some("canopy did not take the schema in"),
+		90,
+	);
+
+	assert!(!result.built);
+	assert_eq!(
+		result.error.as_deref(),
+		Some("canopy did not take the schema in")
+	);
+	assert_eq!(result.schema_bytes, Some(36));
 }
