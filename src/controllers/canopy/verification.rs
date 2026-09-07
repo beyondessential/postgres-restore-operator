@@ -288,7 +288,7 @@ async fn namespace_labels(
 /// The canopy run-uuid persisted on the restore status, parsed to a `Uuid`.
 /// A malformed value is treated as absent rather than failing the report —
 /// canopy still accepts a report without a run_id while the field is optional.
-fn run_id_from_status(restore: &PostgresPhysicalRestore) -> Option<Uuid> {
+pub(crate) fn run_id_from_status(restore: &PostgresPhysicalRestore) -> Option<Uuid> {
 	restore
 		.status
 		.as_ref()

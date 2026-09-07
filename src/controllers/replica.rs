@@ -1760,7 +1760,7 @@ async fn reconcile_schema_build(
 						canopy_client,
 						&target.version,
 						group,
-						None,
+						crate::controllers::canopy::verification::run_id_from_status(restore),
 						Bytes::from(sql),
 					)
 					.await;
