@@ -3,7 +3,7 @@ use kube::api::ObjectMeta;
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
 
-use super::completed_build_result;
+use super::{BuildToDo, build_to_do, completed_build_result};
 use crate::{kopia::Snapshot, placement::PodPlacement, types::*, util::TimeSpan};
 
 use jiff::SignedDuration;
@@ -587,4 +587,49 @@ fn an_empty_schema_is_reported_as_it_was_posted() {
 
 	assert!(result.built);
 	assert_eq!(result.schema_bytes, Some(0));
+}
+
+/// A build needs a version to build against and an image to build with, and it
+/// runs once: the three things that decide whether a reconcile does anything at
+/// all. Getting any of them wrong either builds nothing forever or rebuilds a
+/// settled pair on every pass.
+#[test]
+fn what_a_reconcile_has_to_build() {
+	let mut replica = make_replica(None, None);
+	let mut restore = make_restore("snapA", None);
+
+	assert_eq!(
+		build_to_do(&replica, &restore),
+		BuildToDo::NoTarget,
+		"no version to build against"
+	);
+
+	restore.spec.migrate_to = Some(MigrationTarget {
+		version: "2.60.0".into(),
+		version_id: "00000000-0000-0000-0000-000000000000".into(),
+	});
+	assert_eq!(
+		build_to_do(&replica, &restore),
+		BuildToDo::NoImage,
+		"no image to build with"
+	);
+
+	replica.spec.builder_image = Some("builder:1".into());
+	assert_eq!(
+		build_to_do(&replica, &restore),
+		BuildToDo::Build {
+			image: "builder:1",
+			target: "2.60.0"
+		}
+	);
+
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		schema_build_result: Some(completed_build_result(None, 1)),
+		..Default::default()
+	});
+	assert_eq!(
+		build_to_do(&replica, &restore),
+		BuildToDo::Settled,
+		"a failed build settles the pair as surely as a successful one"
+	);
 }

@@ -1676,25 +1676,13 @@ async fn reconcile_schema_build(
 ) -> Result<bool> {
 	let replica_name = replica.name_any();
 
-	// Already settled: the result is recorded, whichever way it went.
-	if restore
-		.status
-		.as_ref()
-		.and_then(|s| s.schema_build_result.as_ref())
-		.is_some()
-	{
-		return Ok(true);
-	}
-
-	// A build needs the version it is for, which is the one the restore
-	// migrated to. Without it there is nothing to build against.
-	let Some(target) = restore.spec.migrate_to.as_ref() else {
-		warn!(replica = %replica_name, "reporting-schema replica has no target version; skipping build");
-		return Ok(true);
-	};
-
-	let Some(image) = replica.spec.builder_image.as_deref() else {
-		return Ok(true);
+	let (image, target) = match build_to_do(replica, restore) {
+		BuildToDo::Build { image, target } => (image, target),
+		BuildToDo::NoTarget => {
+			warn!(replica = %replica_name, "reporting-schema replica has no target version; skipping build");
+			return Ok(true);
+		}
+		BuildToDo::Settled | BuildToDo::NoImage => return Ok(true),
 	};
 
 	let restore_name = restore.name_any();
@@ -1738,7 +1726,7 @@ async fn reconcile_schema_build(
 				&user,
 				&password,
 				image,
-				&target.version,
+				target,
 				&group,
 				&ctx.schema_build_callback_url(namespace, &replica_name),
 				&ctx.pod_placement(),
@@ -1758,7 +1746,7 @@ async fn reconcile_schema_build(
 				if let Some(group) = group {
 					schema_build::register(
 						canopy_client,
-						&target.version,
+						target,
 						group,
 						crate::controllers::canopy::verification::run_id_from_status(restore),
 						Bytes::from(sql),
@@ -1786,6 +1774,46 @@ async fn reconcile_schema_build(
 			.await?;
 			Ok(true)
 		}
+	}
+}
+
+/// Whether this reconcile has a build to do.
+///
+/// A settled restore keeps the result it recorded, whichever way it went. A
+/// restore with no target version has nothing to build against, and a replica
+/// with no builder image has nothing to build with.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildToDo<'a> {
+	Settled,
+	NoTarget,
+	NoImage,
+	Build { image: &'a str, target: &'a str },
+}
+
+fn build_to_do<'a>(
+	replica: &'a PostgresPhysicalReplica,
+	restore: &'a PostgresPhysicalRestore,
+) -> BuildToDo<'a> {
+	if restore
+		.status
+		.as_ref()
+		.and_then(|s| s.schema_build_result.as_ref())
+		.is_some()
+	{
+		return BuildToDo::Settled;
+	}
+
+	let Some(target) = restore.spec.migrate_to.as_ref() else {
+		return BuildToDo::NoTarget;
+	};
+
+	let Some(image) = replica.spec.builder_image.as_deref() else {
+		return BuildToDo::NoImage;
+	};
+
+	BuildToDo::Build {
+		image,
+		target: &target.version,
 	}
 }
 
