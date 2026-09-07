@@ -56,6 +56,11 @@ mod semantics {
 	/// and have no effect — so declaring it now is how canopy learns the
 	/// capability exists when it grows support for it.
 	pub const REDACT: &str = "redact";
+	/// The restore builds a Tamanu reporting schema and registers it to canopy as
+	/// a group-scoped artifact of the version it was built for. Canopy names that
+	/// version on the entry and keys the entry to the group and version rather
+	/// than the snapshot.
+	pub const REPORTING_SCHEMA: &str = "reporting-schema";
 }
 
 /// Names of the parameters the `analytics` intent advertises. Shared between
@@ -118,6 +123,10 @@ pub mod params {
 	/// `major.minor.0` base version. For sources that publish a manifest
 	/// per minor rather than per patch.
 	pub const REDACTION_VERSION_FALLBACK_TO_BASE: &str = "redaction_version_fallback_to_base";
+	/// `text` — image that builds a reporting schema against the migrated
+	/// restore. pgro hands it a database and takes back the SQL it emits; how a
+	/// schema is made is the image's business.
+	pub const BUILDER_IMAGE: &str = "builder_image";
 }
 
 /// Default minimum TTL for `analytics` replicas when the operator leaves the
@@ -141,6 +150,22 @@ fn upgrade_param_schema() -> ParamSchema {
 		params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
 		param(ParamType::Text, None),
 	)]))
+}
+
+/// The `reporting-schema` intent's parameter schema. Its version and group come
+/// from the worklist entry, so the only thing an operator sets is what runs the
+/// build, plus the starting state the migration runs against.
+fn reporting_schema_param_schema() -> ParamSchema {
+	ParamSchema(HashMap::from([
+		(
+			params::BUILDER_IMAGE.to_string(),
+			param(ParamType::Text, None),
+		),
+		(
+			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+			param(ParamType::Text, None),
+		),
+	]))
 }
 
 /// The `analytics` intent's parameter schema (name → typed spec + default).
@@ -335,6 +360,21 @@ pub fn descriptors() -> Vec<IntentDescriptor> {
 			])
 			.params(analytics_param_schema())
 			.build(),
+		IntentDescriptor::builder()
+			.intent("reporting-schema".to_string())
+			.description(
+				"Restore the snapshot, migrate it to the named version, build this \
+				 deployment's Tamanu reporting schema against it, then discard it."
+					.to_string(),
+			)
+			.semantics(vec![
+				semantics::CHECK.to_string(),
+				semantics::ONCE.to_string(),
+				semantics::MIGRATE.to_string(),
+				semantics::REPORTING_SCHEMA.to_string(),
+			])
+			.params(reporting_schema_param_schema())
+			.build(),
 	]
 }
 
@@ -443,6 +483,22 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			// request matches the limit, shm lands at 36% of memory unaided.
 			shm_size_floor: None,
 		}),
+		"reporting-schema" => Some(IntentConfig {
+			// Throwaway like `verify`, but the workload is a dbt build rather
+			// than a migration, so it takes analytics' CPU shape: bursty, and a
+			// ceiling only buys CFS throttling.
+			resources_floor: Some(resources("2", "2Gi", None, "8Gi")),
+			read_only: true,
+			minimum_ttl: None,
+			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
+			persistent_schemas: None,
+			storage_size_override: Quantity("20Gi".to_string()),
+			storage_size_maximum: Quantity("2Ti".to_string()),
+			ephemeral: true,
+			resources_maximum: Quantity("16Gi".to_string()),
+			deployment_ready_timeout: None,
+			shm_size_floor: Some(Quantity("512Mi".to_string())),
+		}),
 		_ => None,
 	}
 }
@@ -539,6 +595,11 @@ impl IntentConfig {
 					})
 			});
 
+		let builder_image = param_str(p, params::BUILDER_IMAGE)
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.map(str::to_owned);
+
 		// Resources are pinned only when the operator declared at least one of
 		// them in canopy; otherwise they stay unset and the deployment builder
 		// derives memory from the snapshot size, floored by `resources_floor`.
@@ -585,6 +646,7 @@ impl IntentConfig {
 			persistent_schemas,
 			pre_migrate_drop_schemas,
 			migrate_to,
+			builder_image,
 			redaction: redaction_spec(p),
 			storage_size_maximum,
 		}
@@ -729,6 +791,42 @@ mod tests {
 	}
 
 	#[test]
+	fn builder_image_param_reaches_the_replica_spec() {
+		let cfg = config_for("reporting-schema").expect("reporting-schema is a supported intent");
+		let spec = cfg.to_replica_spec(
+			&entry(
+				"reporting-schema",
+				"site",
+				json!({ "builder_image": "ghcr.io/beyondessential/tamanu-dbt:1" }),
+			),
+			vec![],
+		);
+		assert_eq!(
+			spec.builder_image.as_deref(),
+			Some("ghcr.io/beyondessential/tamanu-dbt:1")
+		);
+	}
+
+	#[test]
+	fn a_blank_builder_image_builds_nothing() {
+		let cfg = config_for("reporting-schema").expect("reporting-schema is a supported intent");
+		for value in ["", "   "] {
+			let spec = cfg.to_replica_spec(
+				&entry(
+					"reporting-schema",
+					"site",
+					json!({ "builder_image": value }),
+				),
+				vec![],
+			);
+			assert!(
+				spec.builder_image.is_none(),
+				"a blank image leaves the replica building nothing, not building with an empty image"
+			);
+		}
+	}
+
+	#[test]
 	fn analytics_migrate_to_param_builds_a_target() {
 		// The operator-chosen version turns an analytics replica into a
 		// persistent, upgraded query replica. It carries no canopy version id —
@@ -765,7 +863,10 @@ mod tests {
 	fn descriptors_advertise_expected_intents_and_semantics() {
 		let ds = descriptors();
 		let names: Vec<&str> = ds.iter().map(|d| d.intent.as_str()).collect();
-		assert_eq!(names, ["verify", "upgrade", "analytics"]);
+		assert_eq!(
+			names,
+			["verify", "upgrade", "analytics", "reporting-schema"]
+		);
 
 		let verify = &ds[0];
 		// `migrate` withholds an entry from a server with no candidate version,
@@ -795,6 +896,29 @@ mod tests {
 			ParamType::Text
 		);
 		assert!(upgrade.description.is_some());
+
+		let build = &ds[3];
+		// `migrate` alongside, because a schema follows from the version's own
+		// migrations: the replica has to be at that version before the build
+		// reads it.
+		assert_eq!(
+			build.semantics,
+			["check", "once", "migrate", "reporting-schema"]
+		);
+		let build_params = build
+			.params
+			.as_ref()
+			.expect("a build advertises what runs it")
+			.0
+			.clone();
+		// The version and group come from the worklist entry, so an operator
+		// sets only what runs the build and what it starts from.
+		assert_eq!(build_params.len(), 2);
+		assert_eq!(
+			build_params.get(params::BUILDER_IMAGE).unwrap().type_,
+			ParamType::Text
+		);
+		assert!(build.description.is_some());
 
 		let analytics = &ds[2];
 		assert_eq!(analytics.semantics, ["check", "url", "redact"]);

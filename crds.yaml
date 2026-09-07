@@ -545,6 +545,14 @@ spec:
                   carries production's privileges forward. `readOnly` then decides
                   whether the role gets `pg_read_all_data` or `SUPERUSER`.
                 type: string
+              builderImage:
+                description: |-
+                  Image that builds a Tamanu reporting schema against each migrated
+                  restore. Present only for a `reporting-schema` replica; pgro hands the
+                  image a database and takes back the SQL it emits, so how a schema is made
+                  is the image's business rather than pgro's.
+                nullable: true
+                type: string
               canopySource:
                 description: |-
                   Route kopia through the canopy-mediated proxy sidecar instead of
@@ -1190,6 +1198,13 @@ spec:
         properties:
           spec:
             properties:
+              builderImage:
+                description: |-
+                  Image that builds a reporting schema against this restore once it is
+                  migrated. Set only for a `reporting-schema` intent; without it the
+                  restore switches over without building anything.
+                nullable: true
+                type: string
               migrateTo:
                 description: |-
                   Tamanu version whose schema migrations to apply once the replica is
@@ -1409,6 +1424,39 @@ spec:
                   into the CRD schema.
                 nullable: true
                 type: string
+              schemaBuildJob:
+                description: Name of the reporting-schema build Job, for an operator following it.
+                nullable: true
+                type: string
+              schemaBuildResult:
+                description: |-
+                  What the reporting-schema build did, once its job ends. Absent on a
+                  restore that builds nothing.
+                nullable: true
+                properties:
+                  built:
+                    description: |-
+                      Whether a schema came out of the build. Its absence is what makes the
+                      result a failure, which canopy grades separately from the restore's own
+                      health: a replica can come up soundly and still build nothing.
+                    type: boolean
+                  error:
+                    description: What went wrong, where it did.
+                    nullable: true
+                    type: string
+                  schemaBytes:
+                    description: Size of the schema the build emitted, where it emitted one.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  totalElapsedSeconds:
+                    description: Whole seconds the build took, wall-clock.
+                    format: int64
+                    type: integer
+                required:
+                - built
+                - totalElapsedSeconds
+                type: object
             type: object
         required:
         - spec

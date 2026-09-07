@@ -645,6 +645,10 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			axum::routing::post(post_schema_migration_results),
 		)
 		.route(
+			"/api/v1/schema-build-results/{namespace}/{replica}",
+			axum::routing::post(post_schema_build_results),
+		)
+		.route(
 			"/api/v1/cache-pressure/{namespace}/{restore}",
 			axum::routing::post(post_cache_pressure),
 		)
@@ -690,6 +694,24 @@ async fn post_schema_migration_results(
 	state
 		.ctx
 		.schema_migration_results
+		.store(&namespace, &replica, body);
+	StatusCode::NO_CONTENT
+}
+
+async fn post_schema_build_results(
+	State(state): State<ServerState>,
+	Path((namespace, replica)): Path<(String, String)>,
+	body: String,
+) -> StatusCode {
+	info!(
+		namespace = namespace,
+		replica = replica,
+		bytes = body.len(),
+		"received reporting schema build callback"
+	);
+	state
+		.ctx
+		.schema_build_results
 		.store(&namespace, &replica, body);
 	StatusCode::NO_CONTENT
 }

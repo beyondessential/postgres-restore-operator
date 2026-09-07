@@ -49,6 +49,10 @@ pub struct Context {
 	pub snapshot_results: Arc<CallbackStore>,
 	/// In-memory store for schema migration results POSTed by jobs.
 	pub schema_migration_results: Arc<CallbackStore>,
+	/// Reporting schemas posted back by build Jobs, keyed by namespace and
+	/// replica. The SQL is too big for a Job's termination message, which k8s
+	/// caps at 4 KiB, so the build hands it over the callback instead.
+	pub schema_build_results: Arc<CallbackStore>,
 	/// In-memory store for canopy-proxy sidecar TrafficStats keyed by
 	/// `{namespace}/{job}`. Written on sidecar exit via the operator's
 	/// `/api/v1/canopy-stats/...` callback; read by the canopy
@@ -102,6 +106,7 @@ impl Context {
 			canopy_proxy_image: DEFAULT_CANOPY_PROXY_IMAGE.to_string(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),
+			schema_build_results: Arc::new(CallbackStore::default()),
 			canopy_stats: Arc::new(CallbackStore::default()),
 			callback_base_url,
 			deployment_ready_timeout_secs,
@@ -152,6 +157,14 @@ impl Context {
 	pub fn schema_migration_callback_url(&self, namespace: &str, replica: &str) -> String {
 		format!(
 			"{}/api/v1/schema-migration-results/{namespace}/{replica}",
+			self.callback_base_url
+		)
+	}
+
+	/// Where a reporting-schema build POSTs the SQL it produced.
+	pub fn schema_build_callback_url(&self, namespace: &str, replica: &str) -> String {
+		format!(
+			"{}/api/v1/schema-build-results/{namespace}/{replica}",
 			self.callback_base_url
 		)
 	}

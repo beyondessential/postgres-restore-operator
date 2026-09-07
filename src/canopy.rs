@@ -1,14 +1,17 @@
 //! Thin wrapper around `bestool_canopy::CanopyClient`.
 //!
 //! Owns construction (the SOCKS5 proxy wiring to the Tailscale sidecar, plus
-//! optional mTLS fallback) and exposes the four restore-* endpoints pgro
-//! consumes: `restore_capabilities`, `restore_worklist`, `restore_credentials`,
-//! `restore_verification`. Each is a one-line forward; the wrapper exists as
-//! the integration seam tests inject a stub at, and as the place to hang
-//! pgro-specific logging / retry / cache concerns later.
+//! optional mTLS fallback) and exposes the endpoints pgro consumes:
+//! `restore_capabilities`, `restore_worklist`, `restore_credentials`,
+//! `restore_verification`, and artifact registration. Each is a one-line
+//! forward except the last, which the generated client cannot express; the
+//! wrapper exists as the integration seam tests inject a stub at, and as the
+//! place to hang pgro-specific logging / retry / cache concerns later.
 
 use bestool_canopy::{
-	CanopyClient, TAILSCALE_URL,
+	CanopyClient, CanopyTransport, TAILSCALE_URL,
+	bytes::Bytes,
+	http::{Method, Request, header::CONTENT_TYPE},
 	schema::{
 		BackupPurpose, IntentDescriptor, ProgressArgs, RestoreCapabilitiesArgs, RestoreCredentials,
 		RestoreCredentialsArgs, VerificationArgs, WorklistEntry,
@@ -212,6 +215,49 @@ impl Client {
 			.restore_verification(args)
 			.await
 			.map_err(|err| Error::Canopy(format!("restore_verification: {err}")))
+	}
+
+	/// Register a built reporting schema as an artifact of `version`, scoped to
+	/// `group`, sending the SQL over the connection pgro already holds.
+	///
+	/// Canopy issues no credential to any store for this, so being authorised to
+	/// register for the group is the whole of what publishing into it takes.
+	///
+	/// This goes through the transport rather than a generated method, because
+	/// the generator emits path parameters only and JSON bodies only, and this
+	/// endpoint takes a query parameter and the artifact's bytes.
+	pub async fn register_reporting_schema(
+		&self,
+		version: &str,
+		group: Uuid,
+		run_id: Option<Uuid>,
+		sql: Bytes,
+	) -> Result<()> {
+		let mut uri = format!("/artifacts/{version}/reporting-schema/any?group={group}");
+		if let Some(run) = run_id {
+			uri.push_str(&format!("&run={run}"));
+		}
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri(&uri)
+			.header(CONTENT_TYPE, "application/sql")
+			.body(sql)
+			.map_err(|err| Error::Canopy(format!("building artifact registration: {err}")))?;
+
+		let response =
+			self.inner.transport().call(request).await.map_err(|err| {
+				Error::Canopy(format!("register_reporting_schema({version}): {err}"))
+			})?;
+
+		if !response.status().is_success() {
+			return Err(Error::Canopy(format!(
+				"register_reporting_schema({version}): canopy answered {}",
+				response.status()
+			)));
+		}
+
+		Ok(())
 	}
 }
 

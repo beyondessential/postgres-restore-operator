@@ -629,6 +629,7 @@ mod tests {
 			"r",
 			PostgresPhysicalRestoreSpec {
 				migrate_to: None,
+				builder_image: None,
 				replica: LocalObjectReference {
 					name: "rep".to_string(),
 				},
@@ -741,6 +742,7 @@ mod tests {
 			"r",
 			PostgresPhysicalRestoreSpec {
 				migrate_to: target,
+				builder_image: None,
 				replica: LocalObjectReference {
 					name: "rep".to_string(),
 				},
