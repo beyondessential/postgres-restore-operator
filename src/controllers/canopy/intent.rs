@@ -595,6 +595,11 @@ impl IntentConfig {
 					})
 			});
 
+		let builder_image = param_str(p, params::BUILDER_IMAGE)
+			.map(str::trim)
+			.filter(|s| !s.is_empty())
+			.map(str::to_owned);
+
 		// Resources are pinned only when the operator declared at least one of
 		// them in canopy; otherwise they stay unset and the deployment builder
 		// derives memory from the snapshot size, floored by `resources_floor`.
@@ -641,6 +646,7 @@ impl IntentConfig {
 			persistent_schemas,
 			pre_migrate_drop_schemas,
 			migrate_to,
+			builder_image,
 			redaction: redaction_spec(p),
 			storage_size_maximum,
 		}

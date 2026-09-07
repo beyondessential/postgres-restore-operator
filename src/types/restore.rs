@@ -48,6 +48,12 @@ pub struct PostgresPhysicalRestoreSpec {
 	/// without it the restore is verified and discarded as before.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub migrate_to: Option<MigrationTarget>,
+
+	/// Image that builds a reporting schema against this restore once it is
+	/// migrated. Set only for a `reporting-schema` intent; without it the
+	/// restore switches over without building anything.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub builder_image: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]
@@ -98,6 +104,15 @@ pub struct PostgresPhysicalRestoreStatus {
 	/// What the migrations did, read back off the replica once the job ends.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub migration_result: Option<MigrationResult>,
+
+	/// What the reporting-schema build did, once its job ends. Absent on a
+	/// restore that builds nothing.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub schema_build_result: Option<SchemaBuildResult>,
+
+	/// Name of the reporting-schema build Job, for an operator following it.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub schema_build_job: Option<String>,
 
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub pvc: Option<String>,
@@ -167,6 +182,27 @@ pub struct MigrationResult {
 pub struct MigrationTiming {
 	pub name: String,
 	pub elapsed_seconds: i64,
+}
+
+/// Outcome of building a reporting schema against a migrated restore.
+#[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct SchemaBuildResult {
+	/// Whether a schema came out of the build. Its absence is what makes the
+	/// result a failure, which canopy grades separately from the restore's own
+	/// health: a replica can come up soundly and still build nothing.
+	pub built: bool,
+
+	/// What went wrong, where it did.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<String>,
+
+	/// Whole seconds the build took, wall-clock.
+	pub total_elapsed_seconds: i64,
+
+	/// Size of the schema the build emitted, where it emitted one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub schema_bytes: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

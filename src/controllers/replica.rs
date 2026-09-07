@@ -1,4 +1,8 @@
-use std::{collections::HashSet, sync::Arc, time::Duration};
+use std::{
+	collections::HashSet,
+	sync::Arc,
+	time::{Duration, Instant},
+};
 
 use jiff::{SignedDuration, Timestamp};
 use k8s_openapi::{
@@ -22,7 +26,11 @@ use rand::RngExt;
 use rust_decimal::Decimal;
 use tracing::{debug, info, warn};
 
+use bestool_canopy::bytes::Bytes;
+use uuid::Uuid;
+
 use super::{
+	canopy::labels as canopy_labels,
 	jobs::{JobStatus, classify_job},
 	postgres,
 	postgres::DEFAULT_PG_VERSION,
@@ -40,6 +48,7 @@ use scheduling::ScheduleDecision;
 mod redaction;
 mod resources;
 pub(super) mod scheduling;
+mod schema_build;
 mod schema_migration;
 mod status;
 
@@ -291,6 +300,19 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		.await?;
 
 		if !migration_complete {
+			return Ok(Action::requeue(Duration::from_secs(30)));
+		}
+	}
+
+	// Build the reporting schema before switchover, for the same reason the
+	// other two gates run here: the migrated restore is the only database of
+	// this group at this version that exists, and it exists only until the
+	// switchover discards it.
+	if replica.spec.builder_image.is_some()
+		&& let Some(switching) = switching_restore
+	{
+		let built = reconcile_schema_build(client, &ctx, &replica, &namespace, switching).await?;
+		if !built {
 			return Ok(Action::requeue(Duration::from_secs(30)));
 		}
 	}
@@ -1636,6 +1658,171 @@ async fn timeout_schema_migration(
 		)
 		.await?;
 
+	Ok(())
+}
+
+/// Build the reporting schema against the migrated restore, returning whether
+/// the switchover may proceed.
+///
+/// A build that fails does not hold the switchover: the replica was sound, and
+/// what failed is the schema, which canopy grades on its own. The result is
+/// recorded either way so the report carries it.
+async fn reconcile_schema_build(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	restore: &PostgresPhysicalRestore,
+) -> Result<bool> {
+	let replica_name = replica.name_any();
+
+	// Already settled: the result is recorded, whichever way it went.
+	if restore
+		.status
+		.as_ref()
+		.and_then(|s| s.schema_build_result.as_ref())
+		.is_some()
+	{
+		return Ok(true);
+	}
+
+	// A build needs the version it is for, which is the one the restore
+	// migrated to. Without it there is nothing to build against.
+	let Some(target) = restore.spec.migrate_to.as_ref() else {
+		warn!(replica = %replica_name, "reporting-schema replica has no target version; skipping build");
+		return Ok(true);
+	};
+
+	let Some(image) = replica.spec.builder_image.as_deref() else {
+		return Ok(true);
+	};
+
+	let restore_name = restore.name_any();
+	let job_name = schema_build::build_job_name(&replica_name);
+	let started = Instant::now();
+
+	match schema_build::build_outcome(client, namespace, &job_name).await? {
+		schema_build::BuildOutcome::Running => {
+			// Not created yet on the first pass through.
+			let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+			if jobs.get_opt(&job_name).await?.is_some() {
+				return Ok(false);
+			}
+
+			let reader_secret_name = replica.creds_secret_name();
+			let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+			let reader_secret = secrets.get(&reader_secret_name).await?;
+			let user = postgres::read_secret_field(&reader_secret, "username")?;
+			let password = postgres::read_secret_field(&reader_secret, "password")?;
+			let dbname = postgres::discover_restore_database(
+				client,
+				namespace,
+				&restore_name,
+				&user,
+				&password,
+				ctx.use_port_forward(),
+			)
+			.await?;
+
+			let group = replica
+				.labels()
+				.get(canopy_labels::GROUP)
+				.cloned()
+				.unwrap_or_default();
+
+			let job = schema_build::build_schema_build_job(
+				replica,
+				namespace,
+				&restore_name,
+				&dbname,
+				&user,
+				&password,
+				image,
+				&target.version,
+				&group,
+				&ctx.schema_build_callback_url(namespace, &replica_name),
+				&ctx.pod_placement(),
+			);
+			schema_build::ensure_build_job(client, namespace, job).await?;
+			Ok(false)
+		}
+		schema_build::BuildOutcome::Succeeded => {
+			let sql = ctx.schema_build_results.take(namespace, &replica_name);
+			let built = sql.is_some();
+			let schema_bytes = sql.as_ref().map(|s| s.len() as i64);
+
+			if let (Some(sql), Some(canopy_client)) = (sql, ctx.canopy.as_ref()) {
+				let group = replica
+					.labels()
+					.get(canopy_labels::GROUP)
+					.and_then(|s| Uuid::parse_str(s).ok());
+				if let Some(group) = group {
+					schema_build::register(
+						canopy_client,
+						&target.version,
+						group,
+						None,
+						Bytes::from(sql),
+					)
+					.await;
+				}
+			}
+
+			record_schema_build(
+				client,
+				namespace,
+				&restore_name,
+				&job_name,
+				SchemaBuildResult {
+					built,
+					error: (!built).then(|| "the build produced no schema".to_string()),
+					total_elapsed_seconds: started.elapsed().as_secs() as i64,
+					schema_bytes,
+				},
+			)
+			.await?;
+			Ok(true)
+		}
+		schema_build::BuildOutcome::Failed => {
+			record_schema_build(
+				client,
+				namespace,
+				&restore_name,
+				&job_name,
+				SchemaBuildResult {
+					built: false,
+					error: Some("the build job failed".to_string()),
+					total_elapsed_seconds: started.elapsed().as_secs() as i64,
+					schema_bytes: None,
+				},
+			)
+			.await?;
+			Ok(true)
+		}
+	}
+}
+
+/// Record a build's outcome on the restore, so the report carries it.
+async fn record_schema_build(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	job_name: &str,
+	result: SchemaBuildResult,
+) -> Result<()> {
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
+	restores
+		.patch_status(
+			restore_name,
+			&PatchParams::default(),
+			&Patch::Merge(serde_json::json!({
+				"status": {
+					"schemaBuildJob": job_name,
+					"schemaBuildResult": result,
+				}
+			})),
+		)
+		.await?;
 	Ok(())
 }
 
