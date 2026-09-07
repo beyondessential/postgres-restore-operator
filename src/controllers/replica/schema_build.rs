@@ -191,3 +191,132 @@ pub async fn register(
 		}
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use serde_json::json;
+
+	/// A replica named `kamaka`, enough of one to build a Job from.
+	fn replica() -> PostgresPhysicalReplica {
+		serde_json::from_value(json!({
+			"apiVersion": "pgro.bes.au/v1alpha1",
+			"kind": "PostgresPhysicalReplica",
+			"metadata": { "name": "kamaka", "namespace": "pgro", "uid": "0000-1111" },
+			"spec": { "schedule": "0 3 * * *" },
+		}))
+		.expect("a replica")
+	}
+
+	fn job() -> Job {
+		build_schema_build_job(
+			&replica(),
+			"pgro",
+			"kamaka-restore",
+			"tamanu",
+			"reporter",
+			"hunter2",
+			"ghcr.io/beyondessential/tamanu-dbt:2.60.0",
+			"2.60.0",
+			"kamaka",
+			"https://canopy.example/public/schema-callback",
+			&PodPlacement::default(),
+		)
+	}
+
+	fn env(job: &Job) -> BTreeMap<String, String> {
+		job.spec
+			.as_ref()
+			.unwrap()
+			.template
+			.spec
+			.as_ref()
+			.unwrap()
+			.containers[0]
+			.env
+			.as_ref()
+			.unwrap()
+			.iter()
+			.map(|e| (e.name.clone(), e.value.clone().unwrap_or_default()))
+			.collect()
+	}
+
+	/// The build container's environment is the contract with the builder
+	/// image, which lives outside this repo. A renamed or dropped variable is
+	/// a build that fails inside someone else's container, so the names are
+	/// pinned here rather than left to the image to discover.
+	#[test]
+	fn the_build_container_carries_the_agreed_environment() {
+		let env = env(&job());
+
+		assert_eq!(
+			env.keys().cloned().collect::<Vec<_>>(),
+			vec![
+				"SCHEMA_CALLBACK_URL",
+				"TAMANU_DEPLOYMENT",
+				"TAMANU_DL_DB_DATABASE",
+				"TAMANU_DL_DB_PASSWORD",
+				"TAMANU_DL_DB_URL",
+				"TAMANU_DL_DB_USER",
+				"TAMANU_VERSION",
+			],
+			"the builder image reads exactly these"
+		);
+
+		assert_eq!(env["TAMANU_VERSION"], "2.60.0");
+		assert_eq!(env["TAMANU_DEPLOYMENT"], "kamaka");
+		assert_eq!(env["TAMANU_DL_DB_DATABASE"], "tamanu");
+		assert_eq!(env["TAMANU_DL_DB_USER"], "reporter");
+		assert_eq!(env["TAMANU_DL_DB_PASSWORD"], "hunter2");
+		assert_eq!(
+			env["SCHEMA_CALLBACK_URL"],
+			"https://canopy.example/public/schema-callback"
+		);
+	}
+
+	/// The database it is handed is the restore's own service, in the
+	/// namespace the restore runs in. A build reaching anywhere else would be
+	/// building against the wrong group's data.
+	#[test]
+	fn the_database_is_the_restores_own_service() {
+		assert_eq!(env(&job())["TAMANU_DL_DB_URL"], "kamaka-restore.pgro.svc");
+	}
+
+	/// A build against a fixed version and configuration fails the same way
+	/// every time, so a retry buys nothing and only delays the report.
+	#[test]
+	fn a_failed_build_is_not_retried() {
+		let job = job();
+		let spec = job.spec.as_ref().unwrap();
+
+		assert_eq!(spec.backoff_limit, Some(0));
+		assert_eq!(
+			spec.template
+				.spec
+				.as_ref()
+				.unwrap()
+				.restart_policy
+				.as_deref(),
+			Some("Never")
+		);
+	}
+
+	/// The Job hangs off the replica, so tearing the replica down takes the
+	/// build with it rather than leaving a Job against a restore that is gone.
+	#[test]
+	fn the_job_belongs_to_its_replica() {
+		let job = job();
+		let meta = &job.metadata;
+
+		assert_eq!(meta.namespace.as_deref(), Some("pgro"));
+		assert_eq!(
+			meta.owner_references.as_ref().map(Vec::len),
+			Some(1),
+			"one owner, the replica"
+		);
+
+		let labels = meta.labels.as_ref().expect("labels");
+		assert_eq!(labels["pgro.bes.au/replica"], "kamaka");
+		assert_eq!(labels["pgro.bes.au/component"], "schema-build");
+	}
+}
