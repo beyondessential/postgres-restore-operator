@@ -166,15 +166,36 @@ async fn redaction_applies_masks_to_restored_data() {
 		"SELECT string_agg(single_name, '|' ORDER BY id) FROM users",
 	)
 	.await;
-	// Same hazard as the emails: "Alice" is short enough to turn up inside a
-	// longer generated first name.
+	// `fake_first_name()` draws from anon's own dictionary, which contains the
+	// names this fixture starts with, so a correctly masked row can land on a
+	// name that another row began with — "no original survives anywhere in the
+	// column" fails whenever that happens. Compare each row against its own
+	// original instead, and tolerate one self-collision: a row drawing its own
+	// name back is a legitimate outcome of random masking, not a mask that
+	// didn't run.
+	let originals = ["Alice", "Bob", "Carol", "Dave", "Eve"];
 	let masked_single: Vec<&str> = single_names.trim().split('|').collect();
-	for original in ["Alice", "Bob", "Carol", "Dave", "Eve"] {
-		assert!(
-			!masked_single.contains(&original),
-			"original single_name {original} survived masking, got: {single_names}"
-		);
-	}
+	assert_eq!(
+		masked_single.len(),
+		originals.len(),
+		"expected one single_name per row, got: {single_names}"
+	);
+	let unchanged = masked_single
+		.iter()
+		.zip(originals)
+		.filter(|(masked, original)| **masked == *original)
+		.count();
+	assert!(
+		unchanged <= 1,
+		"single_name looks unmasked ({unchanged} of {} rows kept their original), got: {single_names}",
+		originals.len()
+	);
+	// The CASE-WHEN branch itself: a single name gets `fake_first_name()`, so
+	// none of these may come back with a space in it.
+	assert!(
+		masked_single.iter().all(|name| !name.contains(' ')),
+		"single_name must be masked with a first name, not a full one, got: {single_names}"
+	);
 
 	println!("--- verifying date mask changed dob");
 	let dobs = query_one_value(

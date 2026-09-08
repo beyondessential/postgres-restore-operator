@@ -313,6 +313,13 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
+	// After redaction, the migration and the build have finished rewriting
+	// schemas out from under the grants, and before the Service selector below
+	// moves, so no client sees the restore ungranted.
+	if let Some(switching) = switching_restore {
+		reconcile_extra_user_grants(client, &ctx, &replica, &namespace, switching).await?;
+	}
+
 	// Handle switchover: if a restore is in Switching phase, update Service selector
 	if let Some(switching) = switching_restore {
 		let switching_name = switching.name_any();
@@ -1547,6 +1554,106 @@ async fn drop_persistent_schemas_on_target(
 	)
 	.await?;
 	postgres::drop_schemas_on(&conn.client, schemas).await
+}
+
+/// Extra users declaring at least one schema. An empty `schemas` list means
+/// deliberately ungranted, so the grant step must leave those alone.
+fn extra_users_with_schemas(replica: &PostgresPhysicalReplica) -> Vec<ExtraUserSpec> {
+	replica
+		.extra_users()
+		.into_iter()
+		.filter(|u| !u.schemas.is_empty())
+		.collect()
+}
+
+/// Re-apply every extra user's schema grants on `restore`, in each of its
+/// connectable databases.
+///
+/// The restore's init script grants these too, but can't be the only pass: a
+/// `persistent_schemas` schema either isn't in the snapshot yet (so init's
+/// `JOIN pg_namespace` filter matches nothing) or gets dropped before the
+/// migration Job rewrites it with `--no-privileges`, and `DROP SCHEMA ...
+/// CASCADE` takes the schema's grants and its `pg_default_acl` rows with it.
+///
+/// Skipped when the connected role is no longer a superuser: it couldn't
+/// grant on schemas the analytics role doesn't own anyway, and on a restore
+/// already locked read-only nothing has rewritten a schema since init.
+async fn reconcile_extra_user_grants(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	restore: &PostgresPhysicalRestore,
+) -> Result<()> {
+	let users = extra_users_with_schemas(replica);
+	if users.is_empty() {
+		return Ok(());
+	}
+
+	let replica_name = replica.name_any();
+	let restore_name = restore.name_any();
+	let analytics_user = replica.spec.analytics_username.clone();
+
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let creds = secrets.get(&replica.creds_secret_name()).await?;
+	let admin_user = postgres::read_secret_field(&creds, "username")?;
+	let admin_password = postgres::read_secret_field(&creds, "password")?;
+
+	let databases = {
+		let conn = postgres::connect_to_restore(
+			client,
+			namespace,
+			&restore_name,
+			"postgres",
+			&admin_user,
+			&admin_password,
+			ctx.use_port_forward(),
+		)
+		.await?;
+		if !postgres::is_superuser_on(&conn.client).await? {
+			debug!(
+				replica = %replica_name,
+				restore = %restore_name,
+				"restore is already read-only; leaving the init script's extra user grants as they are"
+			);
+			return Ok(());
+		}
+		postgres::connectable_databases_on(&conn.client).await?
+	};
+
+	for dbname in &databases {
+		let conn = postgres::connect_to_restore(
+			client,
+			namespace,
+			&restore_name,
+			dbname,
+			&admin_user,
+			&admin_password,
+			ctx.use_port_forward(),
+		)
+		.await?;
+		for user in &users {
+			let granted = postgres::grant_schema_read_on(
+				&conn.client,
+				&user.name,
+				&user.schemas,
+				&analytics_user,
+			)
+			.await?;
+			if !granted.is_empty() {
+				info!(
+					replica = %replica_name,
+					restore = %restore_name,
+					database = %dbname,
+					user = %user.name,
+					schemas = ?granted,
+					"re-applied extra user schema grants"
+				);
+			}
+		}
+	}
+
+	Ok(())
 }
 
 async fn timeout_schema_migration(

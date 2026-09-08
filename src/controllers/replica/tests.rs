@@ -9,7 +9,7 @@ use crate::{kopia::Snapshot, placement::PodPlacement, types::*, util::TimeSpan};
 use jiff::SignedDuration;
 
 use super::{
-	generate_password, persistent_schemas_migration_settled,
+	extra_users_with_schemas, generate_password, persistent_schemas_migration_settled,
 	resources::{build_snapshot_list_job, compute_storage_size},
 	scheduling::deployment_ready_timeout,
 	snapshot_already_covered,
@@ -227,6 +227,61 @@ fn extra_user_schemas_are_trimmed_and_deduped() {
 		vec![ExtraUserSpec {
 			name: "reporting".to_string(),
 			schemas: vec!["dbt".to_string(), "staging".to_string()]
+		}]
+	);
+}
+
+/// An empty `schemas` list means "no access of its own", which the grant
+/// step must not quietly upgrade.
+#[test]
+fn grant_step_targets_only_users_that_declare_schemas() {
+	let mut replica = make_replica(None, None);
+	replica.spec.extra_users = vec![
+		eu("writer"),
+		ExtraUserSpec {
+			name: "reporting".to_string(),
+			schemas: vec!["dbt".to_string()],
+		},
+	];
+	assert_eq!(
+		extra_users_with_schemas(&replica),
+		vec![ExtraUserSpec {
+			name: "reporting".to_string(),
+			schemas: vec!["dbt".to_string()],
+		}]
+	);
+}
+
+/// Nothing to grant means no connection is opened at all.
+#[test]
+fn grant_step_is_a_no_op_without_schema_scoped_users() {
+	let mut replica = make_replica(None, None);
+	assert!(extra_users_with_schemas(&replica).is_empty());
+	replica.spec.extra_users = vec![eu("writer"), eu("etl")];
+	assert!(extra_users_with_schemas(&replica).is_empty());
+}
+
+/// Reads `extra_users()`, not `spec.extra_users`, so trimming and the
+/// analytics-user exclusion apply here too.
+#[test]
+fn grant_step_uses_the_cleaned_up_user_list() {
+	let mut replica = make_replica(None, None);
+	replica.spec.analytics_username = "analytics".into();
+	replica.spec.extra_users = vec![
+		ExtraUserSpec {
+			name: "analytics".to_string(),
+			schemas: vec!["dbt".to_string()],
+		},
+		ExtraUserSpec {
+			name: " reporting ".to_string(),
+			schemas: vec![" dbt ".to_string(), "dbt".to_string()],
+		},
+	];
+	assert_eq!(
+		extra_users_with_schemas(&replica),
+		vec![ExtraUserSpec {
+			name: "reporting".to_string(),
+			schemas: vec!["dbt".to_string()],
 		}]
 	);
 }
