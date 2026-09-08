@@ -59,8 +59,8 @@ pub struct SchemaBuildArgs<'a> {
 /// deployment repo already read their connection from `TAMANU_DL_DB_*`, so
 /// naming those is what lets a build run against a database it is handed rather
 /// than one it went looking for.
-pub fn build_schema_build_job(args: SchemaBuildArgs<'_>) -> Job {
-	let SchemaBuildArgs {
+pub fn build_schema_build_job(
+	SchemaBuildArgs {
 		replica,
 		namespace,
 		restore_name,
@@ -72,8 +72,8 @@ pub fn build_schema_build_job(args: SchemaBuildArgs<'_>) -> Job {
 		group,
 		callback_url,
 		placement,
-	} = args;
-
+	}: SchemaBuildArgs<'_>,
+) -> Job {
 	let replica_name = replica.name_any();
 	let job_name = build_job_name(&replica_name);
 	let host = format!("{restore_name}.{namespace}.svc");
