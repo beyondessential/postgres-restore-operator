@@ -304,8 +304,8 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	// other two gates run here: the migrated restore is the only database of
 	// this group at this version that exists, and it exists only until the
 	// switchover discards it.
-	if replica.spec.builder_image.is_some()
-		&& let Some(switching) = switching_restore
+	if let Some(switching) = switching_restore
+		&& switching.spec.builder_image.is_some()
 	{
 		let built = reconcile_schema_build(client, &ctx, &replica, &namespace, switching).await?;
 		if !built {
@@ -1779,7 +1779,7 @@ async fn reconcile_schema_build(
 ) -> Result<bool> {
 	let replica_name = replica.name_any();
 
-	let (image, target) = match build_to_do(replica, restore) {
+	let (image, target) = match build_to_do(restore) {
 		BuildToDo::Build { image, target } => (image, target),
 		BuildToDo::NoTarget => {
 			warn!(replica = %replica_name, "reporting-schema replica has no target version; skipping build");
@@ -1815,11 +1815,22 @@ async fn reconcile_schema_build(
 			)
 			.await?;
 
-			let group = replica
-				.labels()
-				.get(canopy_labels::GROUP)
-				.cloned()
-				.unwrap_or_default();
+			let Some(group) = build_group(replica) else {
+				record_schema_build(
+					client,
+					namespace,
+					&restore_name,
+					&job_name,
+					SchemaBuildResult {
+						built: false,
+						error: Some(NO_GROUP.to_string()),
+						total_elapsed_seconds: 0,
+						schema_bytes: None,
+					},
+				)
+				.await?;
+				return Ok(true);
+			};
 
 			let job = schema_build::build_schema_build_job(schema_build::SchemaBuildArgs {
 				replica,
@@ -1830,7 +1841,7 @@ async fn reconcile_schema_build(
 				password: &password,
 				image,
 				version: target,
-				group: &group,
+				group: &group.to_string(),
 				callback_url: &ctx.schema_build_callback_url(namespace, &replica_name),
 				placement: &ctx.pod_placement(),
 			});
@@ -1838,37 +1849,36 @@ async fn reconcile_schema_build(
 			Ok(false)
 		}
 		schema_build::BuildOutcome::Succeeded => {
-			let sql = ctx.schema_build_results.take(namespace, &replica_name);
+			let sql = ctx.schema_build_results.get(namespace, &replica_name);
 
 			let registration = match (sql.as_deref(), ctx.canopy.as_ref()) {
-				(Some(sql), Some(canopy_client)) => {
-					match replica
-						.labels()
-						.get(canopy_labels::GROUP)
-						.and_then(|s| Uuid::parse_str(s).ok())
-					{
-						None => Some("the replica names no group to register the schema for"),
-						Some(group) => {
-							let taken = schema_build::register(
-								canopy_client,
-								target,
-								group,
-								crate::controllers::canopy::verification::run_id_from_status(
-									restore,
-								),
-								Bytes::from(sql.to_owned()),
-							)
-							.await;
-							(!taken).then_some("canopy did not take the schema in")
-						}
+				(None, _) => None,
+				(Some(_), None) => Some("no canopy client to register the schema with"),
+				(Some(sql), Some(canopy_client)) => match build_group(replica) {
+					None => Some(NO_GROUP),
+					Some(group) => {
+						let taken = schema_build::register(
+							canopy_client,
+							target,
+							group,
+							crate::controllers::canopy::verification::run_id_from_status(restore),
+							Bytes::from(sql.to_owned()),
+						)
+						.await;
+						(!taken).then_some("canopy did not take the schema in")
 					}
-				}
-				_ => None,
+				},
 			};
 
 			let result =
 				completed_build_result(sql.as_deref(), registration, build.elapsed_seconds);
 			record_schema_build(client, namespace, &restore_name, &job_name, result).await?;
+
+			// Only now: a patch that failed leaves the schema to be recorded by
+			// the next pass, and dropping it first would settle a build that
+			// ran as having produced nothing.
+			ctx.schema_build_results.take(namespace, &replica_name);
+			schema_build::delete_build_job(client, namespace, &job_name).await;
 			Ok(true)
 		}
 		schema_build::BuildOutcome::Failed => {
@@ -1885,9 +1895,26 @@ async fn reconcile_schema_build(
 				},
 			)
 			.await?;
+			// A build that posted a schema and then exited non-zero has left
+			// megabytes in a store nothing else empties.
+			ctx.schema_build_results.take(namespace, &replica_name);
+			schema_build::delete_build_job(client, namespace, &job_name).await;
 			Ok(true)
 		}
 	}
+}
+
+/// What a build recorded when the replica names no group it could be built or
+/// registered for.
+const NO_GROUP: &str = "the replica names no group to register the schema for";
+
+/// The canopy group this replica's data belongs to. Required both to build
+/// against the right configuration and to register the result.
+fn build_group(replica: &PostgresPhysicalReplica) -> Option<Uuid> {
+	replica
+		.labels()
+		.get(canopy_labels::GROUP)
+		.and_then(|s| Uuid::parse_str(s).ok())
 }
 
 /// Whether this reconcile has a build to do.
@@ -1903,10 +1930,7 @@ enum BuildToDo<'a> {
 	Build { image: &'a str, target: &'a str },
 }
 
-fn build_to_do<'a>(
-	replica: &'a PostgresPhysicalReplica,
-	restore: &'a PostgresPhysicalRestore,
-) -> BuildToDo<'a> {
+fn build_to_do(restore: &PostgresPhysicalRestore) -> BuildToDo<'_> {
 	if restore
 		.status
 		.as_ref()
@@ -1920,7 +1944,7 @@ fn build_to_do<'a>(
 		return BuildToDo::NoTarget;
 	};
 
-	let Some(image) = replica.spec.builder_image.as_deref() else {
+	let Some(image) = restore.spec.builder_image.as_deref() else {
 		return BuildToDo::NoImage;
 	};
 

@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, State};
 use axum::http::StatusCode;
 use axum::{Router, routing::get};
 use futures::StreamExt;
@@ -18,6 +18,11 @@ use kube::{
 };
 use prometheus::Encoder;
 use tower_http::trace::TraceLayer;
+
+/// Ceiling on a posted reporting schema, matching what canopy will hold. The
+/// callback exists because a schema does not fit a Job's 4 KiB termination
+/// message, so the default limit is nowhere near it.
+const MAX_SCHEMA_BODY_BYTES: usize = 32 * 1024 * 1024;
 use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
@@ -646,7 +651,8 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 		)
 		.route(
 			"/api/v1/schema-build-results/{namespace}/{replica}",
-			axum::routing::post(post_schema_build_results),
+			axum::routing::post(post_schema_build_results)
+				.layer(DefaultBodyLimit::max(MAX_SCHEMA_BODY_BYTES)),
 		)
 		.route(
 			"/api/v1/cache-pressure/{namespace}/{restore}",

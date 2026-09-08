@@ -644,17 +644,31 @@ fn an_empty_schema_is_reported_as_it_was_posted() {
 	assert_eq!(result.schema_bytes, Some(0));
 }
 
+/// A schema with no canopy to register it with is published nowhere, so it is
+/// not a built pair either. Reading that as success settles the pair against
+/// an artifact no server can fetch.
+#[test]
+fn a_schema_with_no_canopy_to_take_it_is_not_built() {
+	let result = completed_build_result(
+		Some("CREATE VIEW reporting.x AS SELECT 1;"),
+		Some("no canopy client to register the schema with"),
+		5,
+	);
+
+	assert!(!result.built);
+	assert_eq!(result.schema_bytes, Some(36));
+}
+
 /// A build needs a version to build against and an image to build with, and it
 /// runs once: the three things that decide whether a reconcile does anything at
 /// all. Getting any of them wrong either builds nothing forever or rebuilds a
 /// settled pair on every pass.
 #[test]
 fn what_a_reconcile_has_to_build() {
-	let mut replica = make_replica(None, None);
 	let mut restore = make_restore("snapA", None);
 
 	assert_eq!(
-		build_to_do(&replica, &restore),
+		build_to_do(&restore),
 		BuildToDo::NoTarget,
 		"no version to build against"
 	);
@@ -664,14 +678,16 @@ fn what_a_reconcile_has_to_build() {
 		version_id: "00000000-0000-0000-0000-000000000000".into(),
 	});
 	assert_eq!(
-		build_to_do(&replica, &restore),
+		build_to_do(&restore),
 		BuildToDo::NoImage,
 		"no image to build with"
 	);
 
-	replica.spec.builder_image = Some("builder:1".into());
+	// The restore's own snapshot of the image, not the replica's live field:
+	// an edit to the replica must not change what this restore builds with.
+	restore.spec.builder_image = Some("builder:1".into());
 	assert_eq!(
-		build_to_do(&replica, &restore),
+		build_to_do(&restore),
 		BuildToDo::Build {
 			image: "builder:1",
 			target: "2.60.0"
@@ -683,7 +699,7 @@ fn what_a_reconcile_has_to_build() {
 		..Default::default()
 	});
 	assert_eq!(
-		build_to_do(&replica, &restore),
+		build_to_do(&restore),
 		BuildToDo::Settled,
 		"a failed build settles the pair as surely as a successful one"
 	);

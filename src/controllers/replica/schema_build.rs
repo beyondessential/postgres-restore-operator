@@ -13,9 +13,12 @@
 use std::collections::BTreeMap;
 
 use bestool_canopy::bytes::Bytes;
-use k8s_openapi::api::{
-	batch::v1::{Job, JobSpec, JobStatus},
-	core::v1::{Container, PodSpec, PodTemplateSpec},
+use k8s_openapi::{
+	api::{
+		batch::v1::{Job, JobSpec, JobStatus},
+		core::v1::{Container, PodSpec, PodTemplateSpec, ResourceRequirements},
+	},
+	apimachinery::pkg::api::resource::Quantity,
 };
 use kube::{
 	Client, ResourceExt,
@@ -24,11 +27,19 @@ use kube::{
 use tracing::{info, warn};
 
 use crate::{
-	controllers::jobs::env_literal,
+	controllers::jobs::{self, env_literal},
 	error::{Error, Result},
 	placement::PodPlacement,
 	types::PostgresPhysicalReplica,
 };
+
+/// Ceiling on a build, after which the Job is killed and the pair records a
+/// failure. Without it a dbt run that cannot finish holds the switchover, and
+/// with it the whole restore, for as long as its pod lives.
+const BUILD_DEADLINE_SECONDS: i64 = 30 * 60;
+
+/// How long a finished build Job is left for an operator to read.
+const BUILD_TTL_SECONDS: i32 = 300;
 
 /// Name of the build Job for a replica. One per replica rather than per
 /// restore: a replica has at most one restore building at a time, and reusing
@@ -104,6 +115,8 @@ pub fn build_schema_build_job(
 			// way every time, so a retry buys nothing and only delays the
 			// report.
 			backoff_limit: Some(0),
+			active_deadline_seconds: Some(BUILD_DEADLINE_SECONDS),
+			ttl_seconds_after_finished: Some(BUILD_TTL_SECONDS),
 			template: PodTemplateSpec {
 				spec: Some(PodSpec {
 					restart_policy: Some("Never".to_string()),
@@ -119,6 +132,21 @@ pub fn build_schema_build_job(
 							env_literal("TAMANU_DEPLOYMENT", group),
 							env_literal("SCHEMA_CALLBACK_URL", callback_url),
 						]),
+						// The build shares a node with the Postgres it is
+						// querying, so an unbounded pod starves the database
+						// it reads and is the first thing evicted under node
+						// pressure.
+						resources: Some(ResourceRequirements {
+							requests: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("100m".to_string())),
+								("memory".to_string(), Quantity("256Mi".to_string())),
+							])),
+							limits: Some(BTreeMap::from([
+								("cpu".to_string(), Quantity("2".to_string())),
+								("memory".to_string(), Quantity("2Gi".to_string())),
+							])),
+							..Default::default()
+						}),
 						..Default::default()
 					}],
 					..Default::default()
@@ -147,6 +175,18 @@ pub async fn ensure_build_job(client: &Client, namespace: &str, job: Job) -> Res
 		.await
 		.map_err(Error::Kube)?;
 	Ok(())
+}
+
+/// Remove the build Job once its outcome is recorded.
+///
+/// The name is per-replica, so a Job left behind makes the next restore's
+/// [`ensure_build_job`] a no-op and settles that pair as having produced no
+/// schema without ever running.
+pub async fn delete_build_job(client: &Client, namespace: &str, job_name: &str) {
+	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+	if let Err(err) = jobs.delete(job_name, &Default::default()).await {
+		warn!(job = %job_name, "deleting the finished build Job failed: {err}");
+	}
 }
 
 /// Whether the build Job has finished, and how.
@@ -179,18 +219,15 @@ pub async fn build_outcome(
 		});
 	};
 
-	let status = job.status.unwrap_or_default();
-	let outcome = if status.succeeded.unwrap_or(0) > 0 {
-		BuildOutcome::Succeeded
-	} else if status.failed.unwrap_or(0) > 0 {
-		BuildOutcome::Failed
-	} else {
-		BuildOutcome::Running
+	let outcome = match jobs::classify_job(&job) {
+		jobs::JobStatus::Succeeded => BuildOutcome::Succeeded,
+		jobs::JobStatus::Failed => BuildOutcome::Failed,
+		jobs::JobStatus::Active => BuildOutcome::Running,
 	};
 
 	Ok(BuildStatus {
 		outcome,
-		elapsed_seconds: job_elapsed_seconds(&status),
+		elapsed_seconds: job_elapsed_seconds(&job.status.unwrap_or_default()),
 	})
 }
 
@@ -342,6 +379,52 @@ mod tests {
 				.restart_policy
 				.as_deref(),
 			Some("Never")
+		);
+	}
+
+	/// A build that cannot finish holds the switchover, and with it the whole
+	/// restore, for as long as its pod lives, so the Job carries its own
+	/// ceiling. Without a TTL the finished Job also survives under a name the
+	/// next restore's build reuses, which makes that build a no-op.
+	#[test]
+	fn a_build_cannot_run_forever_or_outlive_its_restore() {
+		let job = job();
+		let spec = job.spec.as_ref().unwrap();
+
+		assert_eq!(spec.active_deadline_seconds, Some(BUILD_DEADLINE_SECONDS));
+		assert_eq!(spec.ttl_seconds_after_finished, Some(BUILD_TTL_SECONDS));
+	}
+
+	/// The build shares a node with the Postgres it queries, so an unbounded
+	/// pod starves the database it reads and is the first thing the kubelet
+	/// evicts under node pressure.
+	#[test]
+	fn the_build_container_is_bounded() {
+		let job = job();
+		let resources = job
+			.spec
+			.as_ref()
+			.unwrap()
+			.template
+			.spec
+			.as_ref()
+			.unwrap()
+			.containers[0]
+			.resources
+			.as_ref()
+			.expect("resources");
+
+		assert!(
+			resources
+				.requests
+				.as_ref()
+				.is_some_and(|r| r.contains_key("memory"))
+		);
+		assert!(
+			resources
+				.limits
+				.as_ref()
+				.is_some_and(|l| l.contains_key("memory"))
 		);
 	}
 

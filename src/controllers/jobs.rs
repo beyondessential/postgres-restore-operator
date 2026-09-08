@@ -53,6 +53,13 @@ impl CallbackStore {
 		let key = format!("{namespace}/{name}");
 		self.inner.lock().unwrap().remove(&key)
 	}
+
+	/// Read an entry without removing it, for a caller that has to record what
+	/// it did with the payload before it can afford to lose it.
+	pub fn get(&self, namespace: &str, name: &str) -> Option<String> {
+		let key = format!("{namespace}/{name}");
+		self.inner.lock().unwrap().get(&key).cloned()
+	}
 }
 
 /// Build an `EnvVar` that references a key in a named Kubernetes Secret.
