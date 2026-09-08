@@ -233,6 +233,12 @@ impl Client {
 		run_id: Option<Uuid>,
 		sql: Bytes,
 	) -> Result<()> {
+		if !is_path_safe_version(version) {
+			return Err(Error::Canopy(format!(
+				"{version:?} is not a version a schema can be registered against"
+			)));
+		}
+
 		let uri = registration_uri(version, group, run_id);
 
 		let request = Request::builder()
@@ -270,9 +276,42 @@ fn registration_uri(version: &str, group: Uuid, run_id: Option<Uuid>) -> String 
 	uri
 }
 
+/// Whether a version is safe to place in a request path.
+///
+/// `migrate_to.version` is free-form text from the worklist entry or the CRD,
+/// and the path is what canopy authorises: a value carrying `?`, `#`, `&` or a
+/// slash rewrites the target, so the group the schema publishes under stops
+/// being the one this replica is authorised for.
+fn is_path_safe_version(version: &str) -> bool {
+	!version.is_empty()
+		&& version
+			.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The path is what canopy authorises, and `migrate_to.version` is
+	/// free-form text from the worklist or the CRD. A value carrying `?`, `&`
+	/// or a slash rewrites the target, so the group a schema publishes under
+	/// stops being the one this replica is authorised for.
+	#[test]
+	fn a_version_that_would_rewrite_the_path_is_not_a_version() {
+		for version in ["2.60.0", "2.60.0-rc1", "2.60.0+build.4"] {
+			assert!(is_path_safe_version(version), "{version}");
+		}
+		for version in [
+			"",
+			"2.60.0?group=00000000-0000-0000-0000-000000000000&x=",
+			"../../devices",
+			"2.60.0/any",
+			"2.60.0#frag",
+		] {
+			assert!(!is_path_safe_version(version), "{version}");
+		}
+	}
 
 	fn sample() -> ProgressSample {
 		ProgressSample {

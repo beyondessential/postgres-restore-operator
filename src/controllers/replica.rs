@@ -44,7 +44,7 @@ use scheduling::ScheduleDecision;
 mod redaction;
 mod resources;
 pub(super) mod scheduling;
-mod schema_build;
+pub mod schema_build;
 mod schema_migration;
 mod status;
 
@@ -1779,57 +1779,63 @@ async fn reconcile_schema_build(
 ) -> Result<bool> {
 	let replica_name = replica.name_any();
 
-	let (image, target) = match build_to_do(restore) {
-		BuildToDo::Build { image, target } => (image, target),
+	let restore_name = restore.name_any();
+	let job_name = schema_build::build_job_name(&replica_name);
+
+	let (image, target, group) = match build_to_do(replica, restore) {
+		BuildToDo::Build {
+			image,
+			target,
+			group,
+		} => (image, target, group),
 		BuildToDo::NoTarget => {
 			warn!(replica = %replica_name, "reporting-schema replica has no target version; skipping build");
 			return Ok(true);
 		}
+		BuildToDo::NoGroup => {
+			return settle_failed(client, namespace, &restore_name, &job_name, NO_GROUP, 0).await;
+		}
 		BuildToDo::Settled | BuildToDo::NoImage => return Ok(true),
 	};
 
-	let restore_name = restore.name_any();
-	let job_name = schema_build::build_job_name(&replica_name);
-
 	let build = schema_build::build_outcome(client, namespace, &job_name).await?;
 	match build.outcome {
-		schema_build::BuildOutcome::Running => {
-			// Not created yet on the first pass through.
-			let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
-			if jobs.get_opt(&job_name).await?.is_some() {
-				return Ok(false);
-			}
+		schema_build::BuildOutcome::NotStarted => {
+			// The callback publishes SQL to canopy under this group, so it
+			// carries a token only this build is given: without one, anything
+			// that can reach the operator's port publishes for any group.
+			let token = Uuid::new_v4().to_string();
 
+			// A payload held with no Job behind it belongs to no build this
+			// reconcile can record, and it is tens of megabytes.
+			ctx.schema_build_results.take(namespace, &replica_name);
+
+			// A build that cannot be set up is a build that failed, not a
+			// restore that failed: propagating the error here requeues into
+			// this same branch forever and the restore never leaves Switching.
 			let reader_secret_name = replica.creds_secret_name();
-			let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
-			let reader_secret = secrets.get(&reader_secret_name).await?;
-			let user = postgres::read_secret_field(&reader_secret, "username")?;
-			let password = postgres::read_secret_field(&reader_secret, "password")?;
-			let dbname = postgres::discover_restore_database(
+			let dbname = match discover_build_database(
 				client,
+				ctx,
+				&reader_secret_name,
 				namespace,
 				&restore_name,
-				&user,
-				&password,
-				ctx.use_port_forward(),
 			)
-			.await?;
-
-			let Some(group) = build_group(replica) else {
-				record_schema_build(
-					client,
-					namespace,
-					&restore_name,
-					&job_name,
-					SchemaBuildResult {
-						built: false,
-						error: Some(NO_GROUP.to_string()),
-						total_elapsed_seconds: 0,
-						schema_bytes: None,
-					},
-				)
-				.await?;
-				return Ok(true);
+			.await
+			{
+				Ok(dbname) => dbname,
+				Err(err) => {
+					warn!(replica = %replica_name, "could not set up the reporting-schema build: {err}");
+					return settle_failed(
+						client,
+						namespace,
+						&restore_name,
+						&job_name,
+						&format!("the build could not be set up: {err}"),
+						0,
+					)
+					.await;
+				}
 			};
 
 			let job = schema_build::build_schema_build_job(schema_build::SchemaBuildArgs {
@@ -1837,47 +1843,55 @@ async fn reconcile_schema_build(
 				namespace,
 				restore_name: &restore_name,
 				dbname: &dbname,
-				user: &user,
-				password: &password,
+				creds_secret_name: &reader_secret_name,
 				image,
 				version: target,
 				group: &group.to_string(),
-				callback_url: &ctx.schema_build_callback_url(namespace, &replica_name),
+				callback_url: &ctx.schema_build_callback_url(namespace, &replica_name, &token),
+				callback_token: &token,
 				placement: &ctx.pod_placement(),
 			});
-			schema_build::ensure_build_job(client, namespace, job).await?;
+			schema_build::create_build_job(client, namespace, job).await?;
 			Ok(false)
 		}
+		schema_build::BuildOutcome::Running => Ok(false),
 		schema_build::BuildOutcome::Succeeded => {
-			let sql = ctx.schema_build_results.get(namespace, &replica_name);
+			// Taken, not cloned: the schema runs to tens of megabytes, and a
+			// copy per read is paid inside the reconcile loop. A patch that
+			// fails puts it back, since dropping it would settle a build that
+			// ran as having produced nothing.
+			let sql = ctx.schema_build_results.take(namespace, &replica_name);
 
 			let registration = match (sql.as_deref(), ctx.canopy.as_ref()) {
 				(None, _) => None,
-				(Some(_), None) => Some("no canopy client to register the schema with"),
-				(Some(sql), Some(canopy_client)) => match build_group(replica) {
-					None => Some(NO_GROUP),
-					Some(group) => {
-						let taken = schema_build::register(
-							canopy_client,
-							target,
-							group,
-							crate::controllers::canopy::verification::run_id_from_status(restore),
-							Bytes::from(sql.to_owned()),
-						)
-						.await;
-						(!taken).then_some("canopy did not take the schema in")
-					}
-				},
+				(Some(_), None) => Some("no canopy client to register the schema with".to_owned()),
+				(Some(sql), Some(canopy_client)) => schema_build::register(
+					canopy_client,
+					target,
+					group,
+					crate::controllers::canopy::verification::run_id_from_status(restore),
+					Bytes::from(sql.to_owned()),
+				)
+				.await
+				.err()
+				.map(|err| format!("canopy did not take the schema in: {err}")),
 			};
 
-			let result =
-				completed_build_result(sql.as_deref(), registration, build.elapsed_seconds);
-			record_schema_build(client, namespace, &restore_name, &job_name, result).await?;
+			let result = completed_build_result(
+				sql.as_deref(),
+				registration.as_deref(),
+				build.elapsed_seconds,
+			);
+			if let Err(err) =
+				record_schema_build(client, namespace, &restore_name, &job_name, result).await
+			{
+				if let Some(sql) = sql {
+					ctx.schema_build_results
+						.store(namespace, &replica_name, sql);
+				}
+				return Err(err);
+			}
 
-			// Only now: a patch that failed leaves the schema to be recorded by
-			// the next pass, and dropping it first would settle a build that
-			// ran as having produced nothing.
-			ctx.schema_build_results.take(namespace, &replica_name);
 			schema_build::delete_build_job(client, namespace, &job_name).await;
 			Ok(true)
 		}
@@ -1910,11 +1924,70 @@ const NO_GROUP: &str = "the replica names no group to register the schema for";
 
 /// The canopy group this replica's data belongs to. Required both to build
 /// against the right configuration and to register the result.
+///
+/// The spec is what the syncer always writes; the label is a second copy of the
+/// same fact, and a CR that has lost it would otherwise build nothing.
 fn build_group(replica: &PostgresPhysicalReplica) -> Option<Uuid> {
 	replica
-		.labels()
-		.get(canopy_labels::GROUP)
-		.and_then(|s| Uuid::parse_str(s).ok())
+		.spec
+		.canopy_source
+		.as_ref()
+		.and_then(|source| Uuid::parse_str(&source.group).ok())
+		.or_else(|| {
+			replica
+				.labels()
+				.get(canopy_labels::GROUP)
+				.and_then(|s| Uuid::parse_str(s).ok())
+		})
+}
+
+/// Settle the pair as a build that failed, and let the switchover proceed.
+async fn settle_failed(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	job_name: &str,
+	error: &str,
+	elapsed_seconds: i64,
+) -> Result<bool> {
+	record_schema_build(
+		client,
+		namespace,
+		restore_name,
+		job_name,
+		SchemaBuildResult {
+			built: false,
+			error: Some(error.to_owned()),
+			total_elapsed_seconds: elapsed_seconds,
+			schema_bytes: None,
+		},
+	)
+	.await?;
+	Ok(true)
+}
+
+/// The database inside the restore a build runs against.
+async fn discover_build_database(
+	client: &Client,
+	ctx: &Arc<Context>,
+	creds_secret_name: &str,
+	namespace: &str,
+	restore_name: &str,
+) -> Result<String> {
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let secret = secrets.get(creds_secret_name).await?;
+	let user = postgres::read_secret_field(&secret, "username")?;
+	let password = postgres::read_secret_field(&secret, "password")?;
+
+	postgres::discover_restore_database(
+		client,
+		namespace,
+		restore_name,
+		&user,
+		&password,
+		ctx.use_port_forward(),
+	)
+	.await
 }
 
 /// Whether this reconcile has a build to do.
@@ -1927,10 +2000,18 @@ enum BuildToDo<'a> {
 	Settled,
 	NoTarget,
 	NoImage,
-	Build { image: &'a str, target: &'a str },
+	NoGroup,
+	Build {
+		image: &'a str,
+		target: &'a str,
+		group: Uuid,
+	},
 }
 
-fn build_to_do(restore: &PostgresPhysicalRestore) -> BuildToDo<'_> {
+fn build_to_do<'a>(
+	replica: &PostgresPhysicalReplica,
+	restore: &'a PostgresPhysicalRestore,
+) -> BuildToDo<'a> {
 	if restore
 		.status
 		.as_ref()
@@ -1948,9 +2029,14 @@ fn build_to_do(restore: &PostgresPhysicalRestore) -> BuildToDo<'_> {
 		return BuildToDo::NoImage;
 	};
 
+	let Some(group) = build_group(replica) else {
+		return BuildToDo::NoGroup;
+	};
+
 	BuildToDo::Build {
 		image,
 		target: &target.version,
+		group,
 	}
 }
 

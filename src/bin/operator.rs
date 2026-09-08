@@ -31,7 +31,7 @@ use postgres_restore_operator::{
 		Context, DEFAULT_CANOPY_PROXY_IMAGE, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
 		DEFAULT_KOPIA_IMAGE, ReplicaKey,
 	},
-	controllers::{self, canopy::intent},
+	controllers::{self, canopy::intent, replica::schema_build},
 	placement::PodPlacement,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase},
 };
@@ -650,7 +650,7 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			axum::routing::post(post_schema_migration_results),
 		)
 		.route(
-			"/api/v1/schema-build-results/{namespace}/{replica}",
+			"/api/v1/schema-build-results/{namespace}/{replica}/{token}",
 			axum::routing::post(post_schema_build_results)
 				.layer(DefaultBodyLimit::max(MAX_SCHEMA_BODY_BYTES)),
 		)
@@ -704,11 +704,27 @@ async fn post_schema_migration_results(
 	StatusCode::NO_CONTENT
 }
 
+/// Accept the SQL a reporting-schema build POSTs.
+///
+/// What this stores is published to canopy as a group-scoped artifact whose SQL
+/// other servers execute, so unlike the other callbacks it is not enough that
+/// the caller names a replica: the token has to be the one the running build
+/// was given, or anything that can reach this port publishes for any group.
 async fn post_schema_build_results(
 	State(state): State<ServerState>,
-	Path((namespace, replica)): Path<(String, String)>,
+	Path((namespace, replica, token)): Path<(String, String, String)>,
 	body: String,
 ) -> StatusCode {
+	let expected = schema_build::build_token(&state.ctx.client, &namespace, &replica).await;
+	if expected.as_deref() != Some(token.as_str()) {
+		warn!(
+			namespace = namespace,
+			replica = replica,
+			"rejected a reporting schema build callback that does not name the running build"
+		);
+		return StatusCode::FORBIDDEN;
+	}
+
 	info!(
 		namespace = namespace,
 		replica = replica,

@@ -665,10 +665,12 @@ fn a_schema_with_no_canopy_to_take_it_is_not_built() {
 /// settled pair on every pass.
 #[test]
 fn what_a_reconcile_has_to_build() {
+	let group = "9c3a1b2e-0000-0000-0000-000000000001";
+	let mut replica = make_replica(None, None);
 	let mut restore = make_restore("snapA", None);
 
 	assert_eq!(
-		build_to_do(&restore),
+		build_to_do(&replica, &restore),
 		BuildToDo::NoTarget,
 		"no version to build against"
 	);
@@ -678,7 +680,7 @@ fn what_a_reconcile_has_to_build() {
 		version_id: "00000000-0000-0000-0000-000000000000".into(),
 	});
 	assert_eq!(
-		build_to_do(&restore),
+		build_to_do(&replica, &restore),
 		BuildToDo::NoImage,
 		"no image to build with"
 	);
@@ -687,10 +689,23 @@ fn what_a_reconcile_has_to_build() {
 	// an edit to the replica must not change what this restore builds with.
 	restore.spec.builder_image = Some("builder:1".into());
 	assert_eq!(
-		build_to_do(&restore),
+		build_to_do(&replica, &restore),
+		BuildToDo::NoGroup,
+		"no group to build or register for"
+	);
+
+	// The spec is what the syncer writes; a build reads it rather than the
+	// label, which a CR can have lost.
+	replica.spec.canopy_source = Some(crate::types::CanopySource {
+		group: group.into(),
+		r#type: "tamanu-postgres".into(),
+	});
+	assert_eq!(
+		build_to_do(&replica, &restore),
 		BuildToDo::Build {
 			image: "builder:1",
-			target: "2.60.0"
+			target: "2.60.0",
+			group: group.parse().unwrap(),
 		}
 	);
 
@@ -699,7 +714,7 @@ fn what_a_reconcile_has_to_build() {
 		..Default::default()
 	});
 	assert_eq!(
-		build_to_do(&restore),
+		build_to_do(&replica, &restore),
 		BuildToDo::Settled,
 		"a failed build settles the pair as surely as a successful one"
 	);

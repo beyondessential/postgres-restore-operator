@@ -22,12 +22,12 @@ use k8s_openapi::{
 };
 use kube::{
 	Client, ResourceExt,
-	api::{Api, ObjectMeta, PostParams},
+	api::{Api, DeleteParams, ObjectMeta, PostParams},
 };
 use tracing::{info, warn};
 
 use crate::{
-	controllers::jobs::{self, env_literal},
+	controllers::jobs::{self, env_from_secret_name, env_literal},
 	error::{Error, Result},
 	placement::PodPlacement,
 	types::PostgresPhysicalReplica,
@@ -48,6 +48,23 @@ pub fn build_job_name(replica_name: &str) -> String {
 	format!("{replica_name}-schema-build")
 }
 
+/// Where a build's callback token is recorded, so the operator can tell the
+/// running build's POST from anybody else's.
+pub const BUILD_TOKEN_ANNOTATION: &str = "pgro.bes.au/schema-build-token";
+
+/// The token the currently-running build for this replica must present, if
+/// there is a build.
+pub async fn build_token(client: &Client, namespace: &str, replica_name: &str) -> Option<String> {
+	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+	jobs.get_opt(&build_job_name(replica_name))
+		.await
+		.ok()
+		.flatten()?
+		.annotations()
+		.get(BUILD_TOKEN_ANNOTATION)
+		.cloned()
+}
+
 /// Everything a build needs: the restore it runs against, the version and group
 /// it builds for, and where to post the SQL it produces.
 pub struct SchemaBuildArgs<'a> {
@@ -55,12 +72,12 @@ pub struct SchemaBuildArgs<'a> {
 	pub namespace: &'a str,
 	pub restore_name: &'a str,
 	pub dbname: &'a str,
-	pub user: &'a str,
-	pub password: &'a str,
+	pub creds_secret_name: &'a str,
 	pub image: &'a str,
 	pub version: &'a str,
 	pub group: &'a str,
 	pub callback_url: &'a str,
+	pub callback_token: &'a str,
 	pub placement: &'a PodPlacement,
 }
 
@@ -76,12 +93,12 @@ pub fn build_schema_build_job(
 		namespace,
 		restore_name,
 		dbname,
-		user,
-		password,
+		creds_secret_name,
 		image,
 		version,
 		group,
 		callback_url,
+		callback_token,
 		placement,
 	}: SchemaBuildArgs<'_>,
 ) -> Job {
@@ -107,6 +124,10 @@ pub fn build_schema_build_job(
 					"schema-build".to_string(),
 				),
 			])),
+			annotations: Some(BTreeMap::from([(
+				BUILD_TOKEN_ANNOTATION.to_string(),
+				callback_token.to_string(),
+			)])),
 			owner_references: Some(vec![replica.owner_reference()]),
 			..Default::default()
 		},
@@ -125,8 +146,20 @@ pub fn build_schema_build_job(
 						image: Some(image.to_string()),
 						env: Some(vec![
 							env_literal("TAMANU_DL_DB_URL", &host),
-							env_literal("TAMANU_DL_DB_USER", user),
-							env_literal("TAMANU_DL_DB_PASSWORD", password),
+							// By reference, as every other Job in this repo
+							// takes its credentials: a literal value puts the
+							// plaintext in the Job and Pod objects, in etcd and
+							// in the audit log.
+							env_from_secret_name(
+								"TAMANU_DL_DB_USER",
+								creds_secret_name,
+								"username",
+							),
+							env_from_secret_name(
+								"TAMANU_DL_DB_PASSWORD",
+								creds_secret_name,
+								"password",
+							),
 							env_literal("TAMANU_DL_DB_DATABASE", dbname),
 							env_literal("TAMANU_VERSION", version),
 							env_literal("TAMANU_DEPLOYMENT", group),
@@ -162,19 +195,16 @@ pub fn build_schema_build_job(
 	job
 }
 
-/// Create the build Job if it is not already there.
-pub async fn ensure_build_job(client: &Client, namespace: &str, job: Job) -> Result<()> {
+/// Create the build Job. The caller has already established there is none, so
+/// a Job that appeared in between is another reconcile's and left alone.
+pub async fn create_build_job(client: &Client, namespace: &str, job: Job) -> Result<()> {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
-	let name = job.name_any();
 
-	if jobs.get_opt(&name).await.map_err(Error::Kube)?.is_some() {
-		return Ok(());
+	match jobs.create(&PostParams::default(), &job).await {
+		Ok(_) => Ok(()),
+		Err(kube::Error::Api(err)) if err.code == 409 => Ok(()),
+		Err(err) => Err(Error::Kube(err)),
 	}
-
-	jobs.create(&PostParams::default(), &job)
-		.await
-		.map_err(Error::Kube)?;
-	Ok(())
 }
 
 /// Remove the build Job once its outcome is recorded.
@@ -184,13 +214,15 @@ pub async fn ensure_build_job(client: &Client, namespace: &str, job: Job) -> Res
 /// schema without ever running.
 pub async fn delete_build_job(client: &Client, namespace: &str, job_name: &str) {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
-	if let Err(err) = jobs.delete(job_name, &Default::default()).await {
+	if let Err(err) = jobs.delete(job_name, &DeleteParams::background()).await {
 		warn!(job = %job_name, "deleting the finished build Job failed: {err}");
 	}
 }
 
 /// Whether the build Job has finished, and how.
 pub enum BuildOutcome {
+	/// No Job yet; the caller creates one.
+	NotStarted,
 	/// Still going; the caller requeues.
 	Running,
 	/// The Job succeeded. Whether a schema actually came back is the callback's
@@ -214,7 +246,7 @@ pub async fn build_outcome(
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
 	let Some(job) = jobs.get_opt(job_name).await.map_err(Error::Kube)? else {
 		return Ok(BuildStatus {
-			outcome: BuildOutcome::Running,
+			outcome: BuildOutcome::NotStarted,
 			elapsed_seconds: 0,
 		});
 	};
@@ -260,17 +292,14 @@ pub async fn register(
 	group: uuid::Uuid,
 	run_id: Option<uuid::Uuid>,
 	sql: Bytes,
-) -> bool {
-	match canopy
+) -> std::result::Result<(), String> {
+	canopy
 		.register_reporting_schema(version, group, run_id, sql)
 		.await
-	{
-		Ok(()) => true,
-		Err(err) => {
+		.map_err(|err| {
 			warn!(%version, %group, "registering reporting schema failed: {err}");
-			false
-		}
-	}
+			err.to_string()
+		})
 }
 
 #[cfg(test)]
@@ -295,12 +324,12 @@ mod tests {
 			namespace: "pgro",
 			restore_name: "kamaka-restore",
 			dbname: "tamanu",
-			user: "reporter",
-			password: "hunter2",
+			creds_secret_name: "kamaka-creds",
 			image: "ghcr.io/beyondessential/tamanu-dbt:2.60.0",
 			version: "2.60.0",
 			group: "kamaka",
-			callback_url: "https://canopy.example/public/schema-callback",
+			callback_url: "https://canopy.example/public/schema-callback/tok",
+			callback_token: "tok",
 			placement: &PodPlacement::default(),
 		})
 	}
@@ -347,11 +376,54 @@ mod tests {
 		assert_eq!(env["TAMANU_VERSION"], "2.60.0");
 		assert_eq!(env["TAMANU_DEPLOYMENT"], "kamaka");
 		assert_eq!(env["TAMANU_DL_DB_DATABASE"], "tamanu");
-		assert_eq!(env["TAMANU_DL_DB_USER"], "reporter");
-		assert_eq!(env["TAMANU_DL_DB_PASSWORD"], "hunter2");
 		assert_eq!(
 			env["SCHEMA_CALLBACK_URL"],
-			"https://canopy.example/public/schema-callback"
+			"https://canopy.example/public/schema-callback/tok"
+		);
+	}
+
+	/// The credentials go in by reference. A literal value puts the plaintext
+	/// in the Job and Pod objects, in etcd and in the audit log, where every
+	/// other Job in this repo keeps it out.
+	#[test]
+	fn the_build_takes_its_credentials_by_reference() {
+		let job = job();
+		let env = job
+			.spec
+			.as_ref()
+			.unwrap()
+			.template
+			.spec
+			.as_ref()
+			.unwrap()
+			.containers[0]
+			.env
+			.clone()
+			.unwrap();
+
+		for name in ["TAMANU_DL_DB_USER", "TAMANU_DL_DB_PASSWORD"] {
+			let var = env.iter().find(|e| e.name == name).expect(name);
+			assert!(var.value.is_none(), "{name} carries no literal");
+			assert_eq!(
+				var.value_from
+					.as_ref()
+					.and_then(|f| f.secret_key_ref.as_ref())
+					.map(|r| r.name.as_str()),
+				Some("kamaka-creds")
+			);
+		}
+	}
+
+	/// The callback publishes SQL to canopy under the replica's group, so the
+	/// Job carries the token its POST has to present.
+	#[test]
+	fn the_build_records_the_token_its_callback_must_present() {
+		assert_eq!(
+			job()
+				.annotations()
+				.get(BUILD_TOKEN_ANNOTATION)
+				.map(String::as_str),
+			Some("tok")
 		);
 	}
 

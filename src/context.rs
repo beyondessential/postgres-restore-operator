@@ -162,9 +162,14 @@ impl Context {
 	}
 
 	/// Where a reporting-schema build POSTs the SQL it produced.
-	pub fn schema_build_callback_url(&self, namespace: &str, replica: &str) -> String {
+	/// Build the callback URL a reporting-schema build Job POSTs its SQL to.
+	///
+	/// The token is the build's proof of origin: what the callback hands over is
+	/// published to canopy as SQL other servers execute, so the path names the
+	/// build rather than only the replica.
+	pub fn schema_build_callback_url(&self, namespace: &str, replica: &str, token: &str) -> String {
 		format!(
-			"{}/api/v1/schema-build-results/{namespace}/{replica}",
+			"{}/api/v1/schema-build-results/{namespace}/{replica}/{token}",
 			self.callback_base_url
 		)
 	}
