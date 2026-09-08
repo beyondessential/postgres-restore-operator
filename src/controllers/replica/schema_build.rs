@@ -37,29 +37,43 @@ pub fn build_job_name(replica_name: &str) -> String {
 	format!("{replica_name}-schema-build")
 }
 
+/// Everything a build needs: the restore it runs against, the version and group
+/// it builds for, and where to post the SQL it produces.
+pub struct SchemaBuildArgs<'a> {
+	pub replica: &'a PostgresPhysicalReplica,
+	pub namespace: &'a str,
+	pub restore_name: &'a str,
+	pub dbname: &'a str,
+	pub user: &'a str,
+	pub password: &'a str,
+	pub image: &'a str,
+	pub version: &'a str,
+	pub group: &'a str,
+	pub callback_url: &'a str,
+	pub placement: &'a PodPlacement,
+}
+
 /// The Job that runs a reporting-schema build against the migrated restore.
 ///
 /// Everything the build needs arrives as environment: the dbt profiles in each
 /// deployment repo already read their connection from `TAMANU_DL_DB_*`, so
 /// naming those is what lets a build run against a database it is handed rather
 /// than one it went looking for.
-#[expect(
-	clippy::too_many_arguments,
-	reason = "internal builder with tightly-coupled params"
-)]
-pub fn build_schema_build_job(
-	replica: &PostgresPhysicalReplica,
-	namespace: &str,
-	restore_name: &str,
-	dbname: &str,
-	user: &str,
-	password: &str,
-	image: &str,
-	version: &str,
-	group: &str,
-	callback_url: &str,
-	placement: &PodPlacement,
-) -> Job {
+pub fn build_schema_build_job(args: SchemaBuildArgs<'_>) -> Job {
+	let SchemaBuildArgs {
+		replica,
+		namespace,
+		restore_name,
+		dbname,
+		user,
+		password,
+		image,
+		version,
+		group,
+		callback_url,
+		placement,
+	} = args;
+
 	let replica_name = replica.name_any();
 	let job_name = build_job_name(&replica_name);
 	let host = format!("{restore_name}.{namespace}.svc");
@@ -239,19 +253,19 @@ mod tests {
 	}
 
 	fn job() -> Job {
-		build_schema_build_job(
-			&replica(),
-			"pgro",
-			"kamaka-restore",
-			"tamanu",
-			"reporter",
-			"hunter2",
-			"ghcr.io/beyondessential/tamanu-dbt:2.60.0",
-			"2.60.0",
-			"kamaka",
-			"https://canopy.example/public/schema-callback",
-			&PodPlacement::default(),
-		)
+		build_schema_build_job(SchemaBuildArgs {
+			replica: &replica(),
+			namespace: "pgro",
+			restore_name: "kamaka-restore",
+			dbname: "tamanu",
+			user: "reporter",
+			password: "hunter2",
+			image: "ghcr.io/beyondessential/tamanu-dbt:2.60.0",
+			version: "2.60.0",
+			group: "kamaka",
+			callback_url: "https://canopy.example/public/schema-callback",
+			placement: &PodPlacement::default(),
+		})
 	}
 
 	fn env(job: &Job) -> BTreeMap<String, String> {

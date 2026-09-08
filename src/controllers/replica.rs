@@ -1714,19 +1714,19 @@ async fn reconcile_schema_build(
 				.cloned()
 				.unwrap_or_default();
 
-			let job = schema_build::build_schema_build_job(
+			let job = schema_build::build_schema_build_job(schema_build::SchemaBuildArgs {
 				replica,
 				namespace,
-				&restore_name,
-				&dbname,
-				&user,
-				&password,
+				restore_name: &restore_name,
+				dbname: &dbname,
+				user: &user,
+				password: &password,
 				image,
-				target,
-				&group,
-				&ctx.schema_build_callback_url(namespace, &replica_name),
-				&ctx.pod_placement(),
-			);
+				version: target,
+				group: &group,
+				callback_url: &ctx.schema_build_callback_url(namespace, &replica_name),
+				placement: &ctx.pod_placement(),
+			});
 			schema_build::ensure_build_job(client, namespace, job).await?;
 			Ok(false)
 		}
