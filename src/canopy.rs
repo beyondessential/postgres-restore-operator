@@ -281,9 +281,11 @@ fn registration_uri(version: &str, group: Uuid, run_id: Option<Uuid>) -> String 
 /// `migrate_to.version` is free-form text from the worklist entry or the CRD,
 /// and the path is what canopy authorises: a value carrying `?`, `#`, `&` or a
 /// slash rewrites the target, so the group the schema publishes under stops
-/// being the one this replica is authorised for.
+/// being the one this replica is authorised for. A version has to open with an
+/// alphanumeric for the same reason, since a dot segment is resolved away by
+/// any proxy or router between here and canopy.
 fn is_path_safe_version(version: &str) -> bool {
-	!version.is_empty()
+	version.starts_with(|c: char| c.is_ascii_alphanumeric())
 		&& version
 			.chars()
 			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
@@ -294,9 +296,10 @@ mod tests {
 	use super::*;
 
 	/// The path is what canopy authorises, and `migrate_to.version` is
-	/// free-form text from the worklist or the CRD. A value carrying `?`, `&`
-	/// or a slash rewrites the target, so the group a schema publishes under
-	/// stops being the one this replica is authorised for.
+	/// free-form text from the worklist or the CRD. A value carrying `?`, `&`,
+	/// a slash, or a leading dot segment rewrites the target, so the group a
+	/// schema publishes under stops being the one this replica is authorised
+	/// for.
 	#[test]
 	fn a_version_that_would_rewrite_the_path_is_not_a_version() {
 		for version in ["2.60.0", "2.60.0-rc1", "2.60.0+build.4"] {
@@ -306,6 +309,10 @@ mod tests {
 			"",
 			"2.60.0?group=00000000-0000-0000-0000-000000000000&x=",
 			"../../devices",
+			"..",
+			".",
+			".2.60.0",
+			"-2.60.0",
 			"2.60.0/any",
 			"2.60.0#frag",
 		] {
