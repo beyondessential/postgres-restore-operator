@@ -787,16 +787,32 @@ async fn post_schema_build_results(
 	Path((namespace, replica, _token)): Path<(String, String, String)>,
 	body: String,
 ) -> StatusCode {
+	let bytes = body.len();
 	info!(
 		namespace = namespace,
 		replica = replica,
-		bytes = body.len(),
+		bytes,
 		"received reporting schema build callback"
 	);
 	state
 		.ctx
 		.schema_build_results
 		.store(&namespace, &replica, body);
+
+	// A schema held with no receipt behind it reads, after a restart, as a
+	// build that delivered nothing, so a delivery this operator cannot record
+	// is one it has not taken.
+	if let Err(err) =
+		schema_build::record_receipt(&state.ctx.client, &namespace, &replica, bytes).await
+	{
+		warn!(
+			namespace = namespace,
+			replica = replica,
+			"could not record the reporting schema build's delivery: {err}"
+		);
+		return StatusCode::SERVICE_UNAVAILABLE;
+	}
+
 	StatusCode::NO_CONTENT
 }
 

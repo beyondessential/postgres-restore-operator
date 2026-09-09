@@ -61,6 +61,37 @@ fn build_job_name(replica_name: &str) -> String {
 /// running build's POST from anybody else's.
 pub const BUILD_TOKEN_ANNOTATION: &str = "pgro.bes.au/schema-build-token";
 
+/// Where a build's delivery of its schema is recorded, carrying the size it
+/// delivered. The schema itself is held in memory until a reconcile takes it,
+/// so this is what separates a schema an operator restart lost from one that
+/// was never sent.
+pub const BUILD_RECEIPT_ANNOTATION: &str = "pgro.bes.au/schema-build-posted";
+
+/// Record that the running build delivered its schema.
+pub async fn record_receipt(
+	client: &Client,
+	namespace: &str,
+	replica_name: &str,
+	bytes: usize,
+) -> Result<()> {
+	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
+	let annotations = BTreeMap::from([(BUILD_RECEIPT_ANNOTATION.to_string(), bytes.to_string())]);
+	jobs.patch(
+		&build_job_name(replica_name),
+		&PatchParams::default(),
+		&Patch::Merge(serde_json::json!({
+			"metadata": { "annotations": annotations },
+		})),
+	)
+	.await
+	.map_err(Error::Kube)?;
+	Ok(())
+}
+
+fn receipted(job: &Job) -> bool {
+	job.annotations().contains_key(BUILD_RECEIPT_ANNOTATION)
+}
+
 /// The token the currently-running build for this replica must present, if
 /// there is a build.
 ///
@@ -259,10 +290,12 @@ enum BuildOutcome {
 	Failed,
 }
 
-/// A build Job's state and how long it has taken.
+/// A build Job's state, how long it has taken, and whether it recorded
+/// delivering a schema.
 struct BuildStatus {
-	pub outcome: BuildOutcome,
-	pub elapsed_seconds: i64,
+	outcome: BuildOutcome,
+	elapsed_seconds: i64,
+	receipted: bool,
 }
 
 async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Result<BuildStatus> {
@@ -271,6 +304,7 @@ async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Resu
 		return Ok(BuildStatus {
 			outcome: BuildOutcome::NotStarted,
 			elapsed_seconds: 0,
+			receipted: false,
 		});
 	};
 
@@ -288,6 +322,7 @@ async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Resu
 
 	Ok(BuildStatus {
 		outcome,
+		receipted: receipted(&job),
 		elapsed_seconds: job_elapsed_seconds(&job.status.unwrap_or_default()),
 	})
 }
@@ -406,14 +441,22 @@ pub(super) async fn reconcile_schema_build(
 				.take(namespace, &replica_name)
 				.map(Bytes::from)
 			else {
-				return rebuild_or_settle(
-					client,
-					namespace,
-					restore,
-					&job_name,
-					build.elapsed_seconds,
-				)
-				.await;
+				let attempts = attempts_so_far(restore) + 1;
+				return match empty_build(build.receipted, attempts) {
+					EmptyBuild::Rebuild => {
+						rebuild(client, namespace, &restore_name, &job_name, attempts).await
+					}
+					EmptyBuild::Settle => {
+						settle_empty(
+							client,
+							namespace,
+							&restore_name,
+							&job_name,
+							build.elapsed_seconds,
+						)
+						.await
+					}
+				};
 			};
 
 			let registration = match ctx.canopy.as_ref() {
@@ -473,8 +516,8 @@ pub(super) async fn reconcile_schema_build(
 }
 
 /// How many times one restore may go round before its build records a failure
-/// rather than being tried again. Shared by every way a build comes back with
-/// nothing, since what is recorded here is final.
+/// rather than being tried again. Shared by the ways a build is worth trying
+/// again, since what is recorded here is final.
 const BUILD_ATTEMPTS: i64 = 5;
 
 fn attempts_so_far(restore: &PostgresPhysicalRestore) -> i64 {
@@ -539,45 +582,63 @@ async fn retry_or_settle(
 	Ok(false)
 }
 
-/// Answer a Job that ended well with no schema held against it: build again
-/// while there are attempts left, and record the empty build once there are not.
+/// What to do with a Job that ended well and has no schema held against it.
 ///
-/// The schema is held in memory between the callback and this reconcile, so an
-/// operator that restarted in that window holds nothing, which reads exactly
-/// like a build that posted nothing. Nothing durable records the POST, so the
-/// two cannot be told apart, and a record written here is one no later
-/// reconcile revisits.
-async fn rebuild_or_settle(
+/// The schema is held in memory between the callback and the reconcile that
+/// takes it, so an operator that restarted in that window holds nothing. The
+/// build's receipt is what tells that apart from a build that delivered
+/// nothing: only the first is worth building again, and the record written for
+/// the second is one no later reconcile revisits.
+#[derive(Debug, PartialEq, Eq)]
+enum EmptyBuild {
+	Rebuild,
+	Settle,
+}
+
+fn empty_build(receipted: bool, attempts: i64) -> EmptyBuild {
+	if receipted && attempts < BUILD_ATTEMPTS {
+		EmptyBuild::Rebuild
+	} else {
+		EmptyBuild::Settle
+	}
+}
+
+/// Drop the finished Job so the next reconcile builds the schema again.
+async fn rebuild(
 	client: &Client,
 	namespace: &str,
-	restore: &PostgresPhysicalRestore,
+	restore_name: &str,
 	job_name: &str,
-	elapsed_seconds: i64,
+	attempts: i64,
 ) -> Result<bool> {
-	let restore_name = restore.name_any();
-	let attempts = attempts_so_far(restore) + 1;
-
-	if attempts >= BUILD_ATTEMPTS {
-		record_schema_build(
-			client,
-			namespace,
-			&restore_name,
-			Some(job_name),
-			completed_build_result(None, None, elapsed_seconds),
-		)
-		.await?;
-		delete_build_job(client, namespace, job_name).await;
-		return Ok(true);
-	}
-
 	warn!(
 		restore = %restore_name,
 		attempts,
-		"the reporting-schema build ended with no schema held for it; building again"
+		"the reporting-schema build delivered a schema this operator no longer holds; building again"
 	);
-	record_build_attempt(client, namespace, &restore_name, attempts).await?;
+	record_build_attempt(client, namespace, restore_name, attempts).await?;
 	delete_build_job(client, namespace, job_name).await;
 	Ok(false)
+}
+
+/// Record a build that ended with no schema, and let the switchover proceed.
+async fn settle_empty(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	job_name: &str,
+	elapsed_seconds: i64,
+) -> Result<bool> {
+	record_schema_build(
+		client,
+		namespace,
+		restore_name,
+		Some(job_name),
+		completed_build_result(None, None, elapsed_seconds),
+	)
+	.await?;
+	delete_build_job(client, namespace, job_name).await;
+	Ok(true)
 }
 
 /// What a build recorded when the replica names no group it could be built or
@@ -1081,10 +1142,49 @@ mod tests {
 		assert_eq!(result.total_elapsed_seconds, 90);
 	}
 
-	/// The record a Job that exits zero without posting a schema ends with,
-	/// once its attempts have run out. The exit code says the container ran;
-	/// only the callback says a schema came out of it, so reading the exit code
-	/// as the verdict settles the pair as built and offers servers nothing.
+	/// A build that recorded delivering its schema, with nothing held for it,
+	/// was lost between the callback and this reconcile, which only an operator
+	/// restart does. The schema took up to half an hour to make, so it is built
+	/// again rather than recorded as having produced nothing.
+	#[test]
+	fn a_delivered_schema_this_operator_lost_is_built_again() {
+		assert_eq!(empty_build(true, 1), EmptyBuild::Rebuild);
+	}
+
+	/// A Job that ended without ever delivering a schema produced none, and no
+	/// rebuild recovers what was never made. Waiting on it would hold the
+	/// switchover for nothing.
+	#[test]
+	fn a_build_that_delivered_nothing_settles_at_once() {
+		assert_eq!(empty_build(false, 1), EmptyBuild::Settle);
+	}
+
+	/// An operator restarting inside the window on every pass would otherwise
+	/// rebuild for as long as it kept doing it.
+	#[test]
+	fn a_schema_lost_often_enough_stops_being_rebuilt() {
+		assert_eq!(empty_build(true, BUILD_ATTEMPTS), EmptyBuild::Settle);
+	}
+
+	/// The receipt is read off the same annotation the callback writes, and a
+	/// Job without one is a build that delivered nothing.
+	#[test]
+	fn a_job_carries_its_builds_receipt() {
+		assert!(!receipted(&job()));
+
+		let mut delivered = job();
+		delivered
+			.metadata
+			.annotations
+			.get_or_insert_with(BTreeMap::new)
+			.insert(BUILD_RECEIPT_ANNOTATION.to_string(), "4096".to_string());
+		assert!(receipted(&delivered));
+	}
+
+	/// The record a Job that exits zero without delivering a schema ends with.
+	/// The exit code says the container ran; only the callback says a schema
+	/// came out of it, so reading the exit code as the verdict settles the pair
+	/// as built and offers servers nothing.
 	#[test]
 	fn a_job_that_posted_no_schema_is_a_failed_build() {
 		let result = completed_build_result(None, None, 12);
