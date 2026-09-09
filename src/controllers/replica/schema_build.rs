@@ -274,10 +274,16 @@ async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Resu
 		});
 	};
 
-	let outcome = match jobs::classify_job(&job) {
-		jobs::JobStatus::Succeeded => BuildOutcome::Succeeded,
-		jobs::JobStatus::Failed => BuildOutcome::Failed,
-		jobs::JobStatus::Active => BuildOutcome::Running,
+	// A Job on its way out is neither this build nor the next: creating one
+	// under the same name while it deletes conflicts, and leaves none.
+	let outcome = if job.metadata.deletion_timestamp.is_some() {
+		BuildOutcome::Running
+	} else {
+		match jobs::classify_job(&job) {
+			jobs::JobStatus::Succeeded => BuildOutcome::Succeeded,
+			jobs::JobStatus::Failed => BuildOutcome::Failed,
+			jobs::JobStatus::Active => BuildOutcome::Running,
+		}
 	};
 
 	Ok(BuildStatus {
@@ -395,15 +401,24 @@ pub(super) async fn reconcile_schema_build(
 			// copy per read is paid inside the reconcile loop. A patch that
 			// fails puts it back, since dropping it would settle a build that
 			// ran as having produced nothing.
-			let sql = ctx
+			let Some(sql) = ctx
 				.schema_build_results
 				.take(namespace, &replica_name)
-				.map(Bytes::from);
+				.map(Bytes::from)
+			else {
+				return rebuild_or_settle(
+					client,
+					namespace,
+					restore,
+					&job_name,
+					build.elapsed_seconds,
+				)
+				.await;
+			};
 
-			let registration = match (sql.as_ref(), ctx.canopy.as_ref()) {
-				(None, _) => None,
-				(Some(_), None) => Some("no canopy client to register the schema with".to_owned()),
-				(Some(sql), Some(canopy)) => canopy
+			let registration = match ctx.canopy.as_ref() {
+				None => Some("no canopy client to register the schema with".to_owned()),
+				Some(canopy) => canopy
 					.register_reporting_schema(
 						target,
 						group,
@@ -418,21 +433,16 @@ pub(super) async fn reconcile_schema_build(
 					}),
 			};
 
-			let result = completed_build_result(
-				sql.as_deref(),
-				registration.as_deref(),
-				build.elapsed_seconds,
-			);
+			let result =
+				completed_build_result(Some(&sql), registration.as_deref(), build.elapsed_seconds);
 			if let Err(err) =
 				record_schema_build(client, namespace, &restore_name, Some(&job_name), result).await
 			{
-				if let Some(sql) = sql {
-					ctx.schema_build_results.store(
-						namespace,
-						&replica_name,
-						String::from_utf8_lossy(&sql).into_owned(),
-					);
-				}
+				ctx.schema_build_results.store(
+					namespace,
+					&replica_name,
+					String::from_utf8_lossy(&sql).into_owned(),
+				);
 				return Err(err);
 			}
 
@@ -462,9 +472,37 @@ pub(super) async fn reconcile_schema_build(
 	}
 }
 
-/// How many reconciles may fail to set a build up before the pair records a
-/// failure rather than trying again.
-const BUILD_SETUP_ATTEMPTS: i64 = 5;
+/// How many times one restore may go round before its build records a failure
+/// rather than being tried again. Shared by every way a build comes back with
+/// nothing, since what is recorded here is final.
+const BUILD_ATTEMPTS: i64 = 5;
+
+fn attempts_so_far(restore: &PostgresPhysicalRestore) -> i64 {
+	restore
+		.status
+		.as_ref()
+		.and_then(|status| status.schema_build_attempts)
+		.unwrap_or(0)
+}
+
+async fn record_build_attempt(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	attempts: i64,
+) -> Result<()> {
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
+	restores
+		.patch_status(
+			restore_name,
+			&PatchParams::default(),
+			&Patch::Merge(serde_json::json!({
+				"status": { "schemaBuildAttempts": attempts },
+			})),
+		)
+		.await?;
+	Ok(())
+}
 
 /// Answer a setup failure: try again while there are attempts left, and record
 /// a failed build once there are not.
@@ -479,12 +517,7 @@ async fn retry_or_settle(
 	err: Error,
 ) -> Result<bool> {
 	let restore_name = restore.name_any();
-	let attempts = restore
-		.status
-		.as_ref()
-		.and_then(|status| status.schema_build_attempts)
-		.unwrap_or(0)
-		+ 1;
+	let attempts = attempts_so_far(restore) + 1;
 
 	warn!(
 		restore = %restore_name,
@@ -492,7 +525,7 @@ async fn retry_or_settle(
 		"could not set up the reporting-schema build: {err}"
 	);
 
-	if attempts >= BUILD_SETUP_ATTEMPTS {
+	if attempts >= BUILD_ATTEMPTS {
 		return settle_failed(
 			client,
 			namespace,
@@ -502,16 +535,48 @@ async fn retry_or_settle(
 		.await;
 	}
 
-	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
-	restores
-		.patch_status(
+	record_build_attempt(client, namespace, &restore_name, attempts).await?;
+	Ok(false)
+}
+
+/// Answer a Job that ended well with no schema held against it: build again
+/// while there are attempts left, and record the empty build once there are not.
+///
+/// The schema is held in memory between the callback and this reconcile, so an
+/// operator that restarted in that window holds nothing, which reads exactly
+/// like a build that posted nothing. Nothing durable records the POST, so the
+/// two cannot be told apart, and a record written here is one no later
+/// reconcile revisits.
+async fn rebuild_or_settle(
+	client: &Client,
+	namespace: &str,
+	restore: &PostgresPhysicalRestore,
+	job_name: &str,
+	elapsed_seconds: i64,
+) -> Result<bool> {
+	let restore_name = restore.name_any();
+	let attempts = attempts_so_far(restore) + 1;
+
+	if attempts >= BUILD_ATTEMPTS {
+		record_schema_build(
+			client,
+			namespace,
 			&restore_name,
-			&PatchParams::default(),
-			&Patch::Merge(serde_json::json!({
-				"status": { "schemaBuildAttempts": attempts },
-			})),
+			Some(job_name),
+			completed_build_result(None, None, elapsed_seconds),
 		)
 		.await?;
+		delete_build_job(client, namespace, job_name).await;
+		return Ok(true);
+	}
+
+	warn!(
+		restore = %restore_name,
+		attempts,
+		"the reporting-schema build ended with no schema held for it; building again"
+	);
+	record_build_attempt(client, namespace, &restore_name, attempts).await?;
+	delete_build_job(client, namespace, job_name).await;
 	Ok(false)
 }
 
@@ -1016,10 +1081,10 @@ mod tests {
 		assert_eq!(result.total_elapsed_seconds, 90);
 	}
 
-	/// A Job that exits zero without posting a schema is a failed build, not a
-	/// successful empty one. The exit code says the container ran; only the
-	/// callback says a schema came out of it. Reading the exit code as the verdict
-	/// would settle the pair as built and offer servers nothing.
+	/// The record a Job that exits zero without posting a schema ends with,
+	/// once its attempts have run out. The exit code says the container ran;
+	/// only the callback says a schema came out of it, so reading the exit code
+	/// as the verdict settles the pair as built and offers servers nothing.
 	#[test]
 	fn a_job_that_posted_no_schema_is_a_failed_build() {
 		let result = completed_build_result(None, None, 12);

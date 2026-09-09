@@ -1426,10 +1426,10 @@ spec:
                 type: string
               schemaBuildAttempts:
                 description: |-
-                  How many times setting the reporting-schema build up has been tried.
-                  The setup talks to a restore that has just come out of its migration
-                  Job, so one failure is ordinary and only a run of them means a build
-                  that will not start.
+                  How many times this restore's reporting-schema build has been gone
+                  round: a setup that failed, or a Job that ended holding no schema. The
+                  record a build ends with is final, so a run of these is what settles one
+                  rather than the first.
                 format: int64
                 nullable: true
                 type: integer
