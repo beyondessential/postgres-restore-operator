@@ -10,27 +10,36 @@
 //! whatever SQL the build POSTs to the callback. What comes back is registered
 //! with canopy as a group-scoped artifact of that version.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
 use bestool_canopy::bytes::Bytes;
 use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec, JobStatus},
-		core::v1::{Container, PodSpec, PodTemplateSpec, ResourceRequirements},
+		core::v1::{
+			Capabilities, Container, PodSpec, PodTemplateSpec, ResourceRequirements, Secret,
+			SecurityContext,
+		},
 	},
 	apimachinery::pkg::api::resource::Quantity,
 };
 use kube::{
 	Client, ResourceExt,
-	api::{Api, DeleteParams, ObjectMeta, PostParams},
+	api::{Api, DeleteParams, ObjectMeta, Patch, PatchParams, PostParams},
 };
 use tracing::{info, warn};
+use uuid::Uuid;
 
 use crate::{
-	controllers::jobs::{self, env_from_secret_name, env_literal},
+	context::Context,
+	controllers::{
+		canopy::labels as canopy_labels,
+		jobs::{self, env_from_secret_name, env_literal},
+		postgres,
+	},
 	error::{Error, Result},
 	placement::PodPlacement,
-	types::PostgresPhysicalReplica,
+	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, SchemaBuildResult},
 };
 
 /// Ceiling on a build, after which the Job is killed and the pair records a
@@ -44,7 +53,7 @@ const BUILD_TTL_SECONDS: i32 = 300;
 /// Name of the build Job for a replica. One per replica rather than per
 /// restore: a replica has at most one restore building at a time, and reusing
 /// the name is what makes the create idempotent across reconciles.
-pub fn build_job_name(replica_name: &str) -> String {
+fn build_job_name(replica_name: &str) -> String {
 	format!("{replica_name}-schema-build")
 }
 
@@ -54,31 +63,37 @@ pub const BUILD_TOKEN_ANNOTATION: &str = "pgro.bes.au/schema-build-token";
 
 /// The token the currently-running build for this replica must present, if
 /// there is a build.
-pub async fn build_token(client: &Client, namespace: &str, replica_name: &str) -> Option<String> {
+///
+/// A lookup that failed is an error rather than an absent token: the two answer
+/// the caller differently, and reading one as the other refuses a build that
+/// holds the right token.
+pub async fn build_token(
+	client: &Client,
+	namespace: &str,
+	replica_name: &str,
+) -> Result<Option<String>> {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
-	jobs.get_opt(&build_job_name(replica_name))
+	Ok(jobs
+		.get_opt(&build_job_name(replica_name))
 		.await
-		.ok()
-		.flatten()?
-		.annotations()
-		.get(BUILD_TOKEN_ANNOTATION)
-		.cloned()
+		.map_err(Error::Kube)?
+		.and_then(|job| job.annotations().get(BUILD_TOKEN_ANNOTATION).cloned()))
 }
 
 /// Everything a build needs: the restore it runs against, the version and group
 /// it builds for, and where to post the SQL it produces.
-pub struct SchemaBuildArgs<'a> {
-	pub replica: &'a PostgresPhysicalReplica,
-	pub namespace: &'a str,
-	pub restore_name: &'a str,
-	pub dbname: &'a str,
-	pub creds_secret_name: &'a str,
-	pub image: &'a str,
-	pub version: &'a str,
-	pub group: &'a str,
-	pub callback_url: &'a str,
-	pub callback_token: &'a str,
-	pub placement: &'a PodPlacement,
+struct SchemaBuildArgs<'a> {
+	replica: &'a PostgresPhysicalReplica,
+	namespace: &'a str,
+	restore_name: &'a str,
+	dbname: &'a str,
+	creds_secret_name: &'a str,
+	image: &'a str,
+	version: &'a str,
+	group: &'a str,
+	callback_url: &'a str,
+	callback_token: &'a str,
+	placement: &'a PodPlacement,
 }
 
 /// The Job that runs a reporting-schema build against the migrated restore.
@@ -87,7 +102,7 @@ pub struct SchemaBuildArgs<'a> {
 /// deployment repo already read their connection from `TAMANU_DL_DB_*`, so
 /// naming those is what lets a build run against a database it is handed rather
 /// than one it went looking for.
-pub fn build_schema_build_job(
+fn build_schema_build_job(
 	SchemaBuildArgs {
 		replica,
 		namespace,
@@ -141,9 +156,21 @@ pub fn build_schema_build_job(
 			template: PodTemplateSpec {
 				spec: Some(PodSpec {
 					restart_policy: Some("Never".to_string()),
+					// The build talks to the restore's postgres and the
+					// callback, and is the one image pgro does not choose, so
+					// it is given no way to reach the API it runs beside.
+					automount_service_account_token: Some(false),
 					containers: vec![Container {
 						name: "build".to_string(),
 						image: Some(image.to_string()),
+						security_context: Some(SecurityContext {
+							allow_privilege_escalation: Some(false),
+							capabilities: Some(Capabilities {
+								drop: Some(vec!["ALL".to_string()]),
+								..Default::default()
+							}),
+							..Default::default()
+						}),
 						env: Some(vec![
 							env_literal("TAMANU_DL_DB_URL", &host),
 							// By reference, as every other Job in this repo
@@ -197,7 +224,7 @@ pub fn build_schema_build_job(
 
 /// Create the build Job. The caller has already established there is none, so
 /// a Job that appeared in between is another reconcile's and left alone.
-pub async fn create_build_job(client: &Client, namespace: &str, job: Job) -> Result<()> {
+async fn create_build_job(client: &Client, namespace: &str, job: Job) -> Result<()> {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
 
 	match jobs.create(&PostParams::default(), &job).await {
@@ -210,9 +237,9 @@ pub async fn create_build_job(client: &Client, namespace: &str, job: Job) -> Res
 /// Remove the build Job once its outcome is recorded.
 ///
 /// The name is per-replica, so a Job left behind makes the next restore's
-/// [`ensure_build_job`] a no-op and settles that pair as having produced no
+/// [`create_build_job`] a no-op and settles that pair as having produced no
 /// schema without ever running.
-pub async fn delete_build_job(client: &Client, namespace: &str, job_name: &str) {
+async fn delete_build_job(client: &Client, namespace: &str, job_name: &str) {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
 	if let Err(err) = jobs.delete(job_name, &DeleteParams::background()).await {
 		warn!(job = %job_name, "deleting the finished build Job failed: {err}");
@@ -220,7 +247,7 @@ pub async fn delete_build_job(client: &Client, namespace: &str, job_name: &str) 
 }
 
 /// Whether the build Job has finished, and how.
-pub enum BuildOutcome {
+enum BuildOutcome {
 	/// No Job yet; the caller creates one.
 	NotStarted,
 	/// Still going; the caller requeues.
@@ -233,16 +260,12 @@ pub enum BuildOutcome {
 }
 
 /// A build Job's state and how long it has taken.
-pub struct BuildStatus {
+struct BuildStatus {
 	pub outcome: BuildOutcome,
 	pub elapsed_seconds: i64,
 }
 
-pub async fn build_outcome(
-	client: &Client,
-	namespace: &str,
-	job_name: &str,
-) -> Result<BuildStatus> {
+async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Result<BuildStatus> {
 	let jobs: Api<Job> = Api::namespaced(client.clone(), namespace);
 	let Some(job) = jobs.get_opt(job_name).await.map_err(Error::Kube)? else {
 		return Ok(BuildStatus {
@@ -279,32 +302,418 @@ fn job_elapsed_seconds(status: &JobStatus) -> i64 {
 	end.duration_since(start.0).as_secs().max(0)
 }
 
-/// Register a built schema with canopy, as an artifact of the version it was
-/// built for, scoped to the group whose data it was built from.
+/// Build the reporting schema against the migrated restore, returning whether
+/// the switchover may proceed.
 ///
-/// A registration that fails is logged rather than failing the restore: the
-/// replica is sound and the build ran, and discarding a good replica over a
-/// transport problem helps nobody. It is still not a built pair, since canopy
-/// has no artifact to offer, so the caller records it as one that failed.
-pub async fn register(
-	canopy: &crate::canopy::Client,
-	version: &str,
-	group: uuid::Uuid,
-	run_id: Option<uuid::Uuid>,
-	sql: Bytes,
-) -> std::result::Result<(), String> {
-	canopy
-		.register_reporting_schema(version, group, run_id, sql)
-		.await
-		.map_err(|err| {
-			warn!(%version, %group, "registering reporting schema failed: {err}");
-			err.to_string()
+/// A build that fails does not hold the switchover: the replica was sound, and
+/// what failed is the schema, which canopy grades on its own. The result is
+/// recorded either way so the report carries it.
+pub(super) async fn reconcile_schema_build(
+	client: &Client,
+	ctx: &Arc<Context>,
+	replica: &PostgresPhysicalReplica,
+	namespace: &str,
+	restore: &PostgresPhysicalRestore,
+) -> Result<bool> {
+	let replica_name = replica.name_any();
+
+	let restore_name = restore.name_any();
+	let job_name = build_job_name(&replica_name);
+
+	let (image, target, group) = match build_to_do(replica, restore) {
+		BuildToDo::Build {
+			image,
+			target,
+			group,
+		} => (image, target, group),
+		BuildToDo::NoTarget => {
+			warn!(replica = %replica_name, "reporting-schema replica has no target version; skipping build");
+			return Ok(true);
+		}
+		BuildToDo::NoGroup => {
+			return settle_failed(client, namespace, &restore_name, NO_GROUP).await;
+		}
+		BuildToDo::Unmigrated => {
+			return settle_failed(client, namespace, &restore_name, UNMIGRATED).await;
+		}
+		BuildToDo::Settled => {
+			// A schema posted after its build was recorded has no later taker,
+			// and it is tens of megabytes.
+			ctx.schema_build_results.take(namespace, &replica_name);
+			return Ok(true);
+		}
+		BuildToDo::NoImage => return Ok(true),
+	};
+
+	let build = build_outcome(client, namespace, &job_name).await?;
+	match build.outcome {
+		BuildOutcome::NotStarted => {
+			// The callback publishes SQL to canopy under this group, so it
+			// carries a token only this build is given: without one, anything
+			// that can reach the operator's port publishes for any group.
+			let token = Uuid::new_v4().to_string();
+
+			// A payload held with no Job behind it belongs to no build this
+			// reconcile can record, and it is tens of megabytes.
+			ctx.schema_build_results.take(namespace, &replica_name);
+
+			let reader_secret_name = replica.creds_secret_name();
+			let dbname = match discover_build_database(
+				client,
+				ctx,
+				&reader_secret_name,
+				namespace,
+				&restore_name,
+			)
+			.await
+			{
+				Ok(dbname) => dbname,
+				Err(err) => {
+					return retry_or_settle(client, namespace, restore, err).await;
+				}
+			};
+
+			let job = build_schema_build_job(SchemaBuildArgs {
+				replica,
+				namespace,
+				restore_name: &restore_name,
+				dbname: &dbname,
+				creds_secret_name: &reader_secret_name,
+				image,
+				version: target,
+				group: &group.to_string(),
+				callback_url: &ctx.schema_build_callback_url(namespace, &replica_name, &token),
+				callback_token: &token,
+				placement: &ctx.pod_placement(),
+			});
+			create_build_job(client, namespace, job).await?;
+			Ok(false)
+		}
+		BuildOutcome::Running => Ok(false),
+		BuildOutcome::Succeeded => {
+			// Taken, not cloned: the schema runs to tens of megabytes, and a
+			// copy per read is paid inside the reconcile loop. A patch that
+			// fails puts it back, since dropping it would settle a build that
+			// ran as having produced nothing.
+			let sql = ctx
+				.schema_build_results
+				.take(namespace, &replica_name)
+				.map(Bytes::from);
+
+			let registration = match (sql.as_ref(), ctx.canopy.as_ref()) {
+				(None, _) => None,
+				(Some(_), None) => Some("no canopy client to register the schema with".to_owned()),
+				(Some(sql), Some(canopy)) => canopy
+					.register_reporting_schema(
+						target,
+						group,
+						crate::controllers::canopy::verification::run_id_from_status(restore),
+						sql.clone(),
+					)
+					.await
+					.err()
+					.map(|err| {
+						warn!(%target, %group, "registering the reporting schema failed: {err}");
+						format!("canopy did not take the schema in: {err}")
+					}),
+			};
+
+			let result = completed_build_result(
+				sql.as_deref(),
+				registration.as_deref(),
+				build.elapsed_seconds,
+			);
+			if let Err(err) =
+				record_schema_build(client, namespace, &restore_name, Some(&job_name), result).await
+			{
+				if let Some(sql) = sql {
+					ctx.schema_build_results.store(
+						namespace,
+						&replica_name,
+						String::from_utf8_lossy(&sql).into_owned(),
+					);
+				}
+				return Err(err);
+			}
+
+			delete_build_job(client, namespace, &job_name).await;
+			Ok(true)
+		}
+		BuildOutcome::Failed => {
+			record_schema_build(
+				client,
+				namespace,
+				&restore_name,
+				Some(&job_name),
+				SchemaBuildResult {
+					built: false,
+					error: Some("the build job failed".to_string()),
+					total_elapsed_seconds: build.elapsed_seconds,
+					schema_bytes: None,
+				},
+			)
+			.await?;
+			// A build that posted a schema and then exited non-zero has left
+			// megabytes in a store nothing else empties.
+			ctx.schema_build_results.take(namespace, &replica_name);
+			delete_build_job(client, namespace, &job_name).await;
+			Ok(true)
+		}
+	}
+}
+
+/// How many reconciles may fail to set a build up before the pair records a
+/// failure rather than trying again.
+const BUILD_SETUP_ATTEMPTS: i64 = 5;
+
+/// Answer a setup failure: try again while there are attempts left, and record
+/// a failed build once there are not.
+///
+/// The setup reads a Secret and opens a connection to a restore that has just
+/// come out of its migration Job, so a pod still settling answers this way
+/// without the build being at fault, and a recorded failure is final.
+async fn retry_or_settle(
+	client: &Client,
+	namespace: &str,
+	restore: &PostgresPhysicalRestore,
+	err: Error,
+) -> Result<bool> {
+	let restore_name = restore.name_any();
+	let attempts = restore
+		.status
+		.as_ref()
+		.and_then(|status| status.schema_build_attempts)
+		.unwrap_or(0)
+		+ 1;
+
+	warn!(
+		restore = %restore_name,
+		attempts,
+		"could not set up the reporting-schema build: {err}"
+	);
+
+	if attempts >= BUILD_SETUP_ATTEMPTS {
+		return settle_failed(
+			client,
+			namespace,
+			&restore_name,
+			&format!("the build could not be set up: {err}"),
+		)
+		.await;
+	}
+
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
+	restores
+		.patch_status(
+			&restore_name,
+			&PatchParams::default(),
+			&Patch::Merge(serde_json::json!({
+				"status": { "schemaBuildAttempts": attempts },
+			})),
+		)
+		.await?;
+	Ok(false)
+}
+
+/// What a build recorded when the replica names no group it could be built or
+/// registered for.
+const NO_GROUP: &str = "the replica names no group to register the schema for";
+
+/// What a build records when the restore never reached the version the schema
+/// would have been an artifact of.
+const UNMIGRATED: &str =
+	"the restore did not migrate to the target version, so there is no database to build against";
+
+/// The canopy group this replica's data belongs to. Required both to build
+/// against the right configuration and to register the result.
+///
+/// The spec is what the syncer always writes; the label is a second copy of the
+/// same fact, and a CR that has lost it would otherwise build nothing.
+fn build_group(replica: &PostgresPhysicalReplica) -> Option<Uuid> {
+	replica
+		.spec
+		.canopy_source
+		.as_ref()
+		.and_then(|source| Uuid::parse_str(&source.group).ok())
+		.or_else(|| {
+			replica
+				.labels()
+				.get(canopy_labels::GROUP)
+				.and_then(|s| Uuid::parse_str(s).ok())
 		})
+}
+
+/// Settle the pair as a build that failed, and let the switchover proceed.
+///
+/// Nothing ran, so the record names no Job: an operator reading one there would
+/// go looking for a Job that was never created.
+async fn settle_failed(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	error: &str,
+) -> Result<bool> {
+	record_schema_build(
+		client,
+		namespace,
+		restore_name,
+		None,
+		SchemaBuildResult {
+			built: false,
+			error: Some(error.to_owned()),
+			total_elapsed_seconds: 0,
+			schema_bytes: None,
+		},
+	)
+	.await?;
+	Ok(true)
+}
+
+/// The database inside the restore a build runs against.
+async fn discover_build_database(
+	client: &Client,
+	ctx: &Arc<Context>,
+	creds_secret_name: &str,
+	namespace: &str,
+	restore_name: &str,
+) -> Result<String> {
+	let secrets: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let secret = secrets.get(creds_secret_name).await?;
+	let user = postgres::read_secret_field(&secret, "username")?;
+	let password = postgres::read_secret_field(&secret, "password")?;
+
+	postgres::discover_restore_database(
+		client,
+		namespace,
+		restore_name,
+		&user,
+		&password,
+		ctx.use_port_forward(),
+	)
+	.await
+}
+
+/// Whether this reconcile has a build to do.
+///
+/// A settled restore keeps the result it recorded, whichever way it went. A
+/// restore with no target version has nothing to build against, and a replica
+/// with no builder image has nothing to build with.
+#[derive(Debug, PartialEq, Eq)]
+enum BuildToDo<'a> {
+	Settled,
+	NoTarget,
+	NoImage,
+	NoGroup,
+	Unmigrated,
+	Build {
+		image: &'a str,
+		target: &'a str,
+		group: Uuid,
+	},
+}
+
+fn build_to_do<'a>(
+	replica: &PostgresPhysicalReplica,
+	restore: &'a PostgresPhysicalRestore,
+) -> BuildToDo<'a> {
+	if restore
+		.status
+		.as_ref()
+		.and_then(|s| s.schema_build_result.as_ref())
+		.is_some()
+	{
+		return BuildToDo::Settled;
+	}
+
+	let Some(target) = restore.spec.migrate_to.as_ref() else {
+		return BuildToDo::NoTarget;
+	};
+
+	let Some(image) = restore.spec.builder_image.as_deref() else {
+		return BuildToDo::NoImage;
+	};
+
+	if !migrated_to_target(restore) {
+		return BuildToDo::Unmigrated;
+	}
+
+	let Some(group) = build_group(replica) else {
+		return BuildToDo::NoGroup;
+	};
+
+	BuildToDo::Build {
+		image,
+		target: &target.version,
+		group,
+	}
+}
+
+/// Whether the restore's database actually reached the version it targets.
+///
+/// A failed migration leaves the restore healthy and moves it on to switchover
+/// all the same, so the target version alone says only what the restore aimed
+/// at. A schema built here is published as an artifact of that version, and one
+/// built against a database that never got there describes the wrong schema.
+fn migrated_to_target(restore: &PostgresPhysicalRestore) -> bool {
+	restore
+		.status
+		.as_ref()
+		.and_then(|status| status.migration_result.as_ref())
+		.is_some_and(|result| result.failed_migration.is_none())
+}
+
+/// What a build Job that exited zero records.
+///
+/// Whether a schema came out of it turns on the callback, not on the exit code:
+/// the exit code says the container ran, and a Job that ran to completion
+/// without posting a schema is a failed build rather than a successful empty
+/// one. A schema canopy did not take in is not a built pair either: canopy has
+/// no artifact to offer for it, so the size is still worth recording but the
+/// pair is not settled as built.
+fn completed_build_result(
+	sql: Option<&[u8]>,
+	registration: Option<&str>,
+	elapsed_seconds: i64,
+) -> SchemaBuildResult {
+	SchemaBuildResult {
+		built: sql.is_some() && registration.is_none(),
+		error: registration.map(str::to_owned).or_else(|| {
+			sql.is_none()
+				.then(|| "the build produced no schema".to_string())
+		}),
+		total_elapsed_seconds: elapsed_seconds,
+		schema_bytes: sql.map(|s| s.len() as i64),
+	}
+}
+
+/// Record a build's outcome on the restore, so the report carries it.
+async fn record_schema_build(
+	client: &Client,
+	namespace: &str,
+	restore_name: &str,
+	job_name: Option<&str>,
+	result: SchemaBuildResult,
+) -> Result<()> {
+	let restores: Api<PostgresPhysicalRestore> = Api::namespaced(client.clone(), namespace);
+	restores
+		.patch_status(
+			restore_name,
+			&PatchParams::default(),
+			&Patch::Merge(serde_json::json!({
+				"status": {
+					"schemaBuildJob": job_name,
+					"schemaBuildResult": result,
+				}
+			})),
+		)
+		.await?;
+	Ok(())
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::types::{MigrationTarget, PostgresPhysicalRestoreStatus};
 	use serde_json::json;
 
 	/// A replica named `kamaka`, enough of one to build a Job from.
@@ -316,6 +725,22 @@ mod tests {
 			"spec": { "schedule": "0 3 * * *" },
 		}))
 		.expect("a replica")
+	}
+
+	/// A restore of that replica, enough of one to decide a build from.
+	fn restore() -> PostgresPhysicalRestore {
+		serde_json::from_value(json!({
+			"apiVersion": "pgro.bes.au/v1alpha1",
+			"kind": "PostgresPhysicalRestore",
+			"metadata": { "name": "kamaka-restore", "namespace": "pgro" },
+			"spec": {
+				"replica": { "name": "kamaka" },
+				"snapshot": "snapA",
+				"snapshotSize": "1Gi",
+				"storageSize": "2Gi",
+			},
+		}))
+		.expect("a restore")
 	}
 
 	fn job() -> Job {
@@ -500,6 +925,31 @@ mod tests {
 		);
 	}
 
+	/// The builder image is named by a canopy worklist parameter rather than by
+	/// pgro, and it runs in the operator's own namespace holding the restore's
+	/// database credentials. It needs no Kubernetes API access at all, so it is
+	/// given none, and no way to raise what it does hold.
+	#[test]
+	fn the_build_is_given_no_reach_beyond_its_database() {
+		let job = job();
+		let spec = job.spec.as_ref().unwrap().template.spec.as_ref().unwrap();
+
+		assert_eq!(spec.automount_service_account_token, Some(false));
+
+		let security = spec.containers[0]
+			.security_context
+			.as_ref()
+			.expect("a security context");
+		assert_eq!(security.allow_privilege_escalation, Some(false));
+		assert_eq!(
+			security
+				.capabilities
+				.as_ref()
+				.and_then(|c| c.drop.as_deref()),
+			Some(["ALL".to_string()].as_slice())
+		);
+	}
+
 	/// The elapsed time comes from the Job's own timestamps. One reconcile
 	/// creates the Job and a later one sees it finished, so anything the
 	/// operator times itself measures the reconcile and reports near zero for
@@ -552,5 +1002,172 @@ mod tests {
 		let labels = meta.labels.as_ref().expect("labels");
 		assert_eq!(labels["pgro.bes.au/replica"], "kamaka");
 		assert_eq!(labels["pgro.bes.au/component"], "schema-build");
+	}
+
+	/// A build whose callback delivered a schema is a build.
+	#[test]
+	fn a_schema_that_came_back_is_a_built_pair() {
+		let result =
+			completed_build_result(Some(b"CREATE VIEW reporting.x AS SELECT 1;"), None, 90);
+
+		assert!(result.built);
+		assert_eq!(result.error, None);
+		assert_eq!(result.schema_bytes, Some(36));
+		assert_eq!(result.total_elapsed_seconds, 90);
+	}
+
+	/// A Job that exits zero without posting a schema is a failed build, not a
+	/// successful empty one. The exit code says the container ran; only the
+	/// callback says a schema came out of it. Reading the exit code as the verdict
+	/// would settle the pair as built and offer servers nothing.
+	#[test]
+	fn a_job_that_posted_no_schema_is_a_failed_build() {
+		let result = completed_build_result(None, None, 12);
+
+		assert!(!result.built);
+		assert_eq!(
+			result.error.as_deref(),
+			Some("the build produced no schema")
+		);
+		assert_eq!(result.schema_bytes, None);
+	}
+
+	/// An empty schema is still a schema the builder chose to post, so it is not
+	/// silently reclassified as a failure.
+	#[test]
+	fn an_empty_schema_is_reported_as_it_was_posted() {
+		let result = completed_build_result(Some(b""), None, 1);
+
+		assert!(result.built);
+		assert_eq!(result.schema_bytes, Some(0));
+	}
+
+	/// A schema with no canopy to register it with is published nowhere, so it is
+	/// not a built pair either. Reading that as success settles the pair against
+	/// an artifact no server can fetch.
+	#[test]
+	fn a_schema_with_no_canopy_to_take_it_is_not_built() {
+		let result = completed_build_result(
+			Some(b"CREATE VIEW reporting.x AS SELECT 1;"),
+			Some("no canopy client to register the schema with"),
+			5,
+		);
+
+		assert!(!result.built);
+		assert_eq!(result.schema_bytes, Some(36));
+	}
+
+	/// A build needs a version to build against and an image to build with, and it
+	/// runs once: the three things that decide whether a reconcile does anything at
+	/// all. Getting any of them wrong either builds nothing forever or rebuilds a
+	/// settled pair on every pass.
+	#[test]
+	fn what_a_reconcile_has_to_build() {
+		let group = "9c3a1b2e-0000-0000-0000-000000000001";
+		let mut replica = replica();
+		let mut restore = restore();
+
+		assert_eq!(
+			build_to_do(&replica, &restore),
+			BuildToDo::NoTarget,
+			"no version to build against"
+		);
+
+		restore.spec.migrate_to = Some(MigrationTarget {
+			version: "2.60.0".into(),
+			version_id: "00000000-0000-0000-0000-000000000000".into(),
+		});
+		assert_eq!(
+			build_to_do(&replica, &restore),
+			BuildToDo::NoImage,
+			"no image to build with"
+		);
+
+		// The restore's own snapshot of the image, not the replica's live field:
+		// an edit to the replica must not change what this restore builds with.
+		restore.spec.builder_image = Some("builder:1".into());
+		assert_eq!(
+			build_to_do(&replica, &restore),
+			BuildToDo::Unmigrated,
+			"nothing has been migrated to the version yet"
+		);
+
+		restore.status = Some(PostgresPhysicalRestoreStatus {
+			migration_result: Some(crate::types::MigrationResult {
+				total_elapsed_seconds: 60,
+				failed_migration: Some("1710000000-addThing.js".into()),
+				data_bytes_before: 1,
+				data_bytes_after: 1,
+				timings: Vec::new(),
+			}),
+			..Default::default()
+		});
+		assert_eq!(
+			build_to_do(&replica, &restore),
+			BuildToDo::Unmigrated,
+			"a migration that failed leaves no database at the target version"
+		);
+
+		restore.status = Some(PostgresPhysicalRestoreStatus {
+			migration_result: Some(crate::types::MigrationResult {
+				total_elapsed_seconds: 60,
+				failed_migration: None,
+				data_bytes_before: 1,
+				data_bytes_after: 2,
+				timings: Vec::new(),
+			}),
+			..Default::default()
+		});
+		assert_eq!(
+			build_to_do(&replica, &restore),
+			BuildToDo::NoGroup,
+			"no group to build or register for"
+		);
+
+		// The spec is what the syncer writes; a build reads it rather than the
+		// label, which a CR can have lost.
+		replica.spec.canopy_source = Some(crate::types::CanopySource {
+			group: group.into(),
+			r#type: "tamanu-postgres".into(),
+		});
+		assert_eq!(
+			build_to_do(&replica, &restore),
+			BuildToDo::Build {
+				image: "builder:1",
+				target: "2.60.0",
+				group: group.parse().unwrap(),
+			}
+		);
+
+		let migrated = restore.status.take();
+		restore.status = Some(PostgresPhysicalRestoreStatus {
+			schema_build_result: Some(completed_build_result(None, None, 1)),
+			..migrated.expect("a migrated restore")
+		});
+		assert_eq!(
+			build_to_do(&replica, &restore),
+			BuildToDo::Settled,
+			"a failed build settles the pair as surely as a successful one"
+		);
+	}
+
+	/// A schema canopy did not take in is not a built pair: canopy has no artifact
+	/// to offer for it, so recording `built` would settle the pair against a schema
+	/// nothing can fetch. The size still goes on the record, since the build did
+	/// produce one and its absence would read as a build that emitted nothing.
+	#[test]
+	fn a_schema_canopy_did_not_take_is_not_built() {
+		let result = completed_build_result(
+			Some(b"CREATE VIEW reporting.x AS SELECT 1;"),
+			Some("canopy did not take the schema in"),
+			90,
+		);
+
+		assert!(!result.built);
+		assert_eq!(
+			result.error.as_deref(),
+			Some("canopy did not take the schema in")
+		);
+		assert_eq!(result.schema_bytes, Some(36));
 	}
 }

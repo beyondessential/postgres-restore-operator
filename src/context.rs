@@ -161,7 +161,6 @@ impl Context {
 		)
 	}
 
-	/// Where a reporting-schema build POSTs the SQL it produced.
 	/// Build the callback URL a reporting-schema build Job POSTs its SQL to.
 	///
 	/// The token is the build's proof of origin: what the callback hands over is

@@ -114,6 +114,13 @@ pub struct PostgresPhysicalRestoreStatus {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub schema_build_job: Option<String>,
 
+	/// How many times setting the reporting-schema build up has been tried.
+	/// The setup talks to a restore that has just come out of its migration
+	/// Job, so one failure is ordinary and only a run of them means a build
+	/// that will not start.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub schema_build_attempts: Option<i64>,
+
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub pvc: Option<String>,
 

@@ -3,8 +3,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use futures::StreamExt;
 use jiff::Timestamp;
@@ -18,12 +20,12 @@ use kube::{
 };
 use prometheus::Encoder;
 use tower_http::trace::TraceLayer;
+use tracing::{debug, info, warn};
 
 /// Ceiling on a posted reporting schema, matching what canopy will hold. The
 /// callback exists because a schema does not fit a Job's 4 KiB termination
 /// message, so the default limit is nowhere near it.
 const MAX_SCHEMA_BODY_BYTES: usize = 32 * 1024 * 1024;
-use tracing::{debug, info, warn};
 
 use postgres_restore_operator::{
 	canopy::{self, DEFAULT_SOCKS5_PROXY},
@@ -652,7 +654,11 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 		.route(
 			"/api/v1/schema-build-results/{namespace}/{replica}/{token}",
 			axum::routing::post(post_schema_build_results)
-				.layer(DefaultBodyLimit::max(MAX_SCHEMA_BODY_BYTES)),
+				.layer(DefaultBodyLimit::max(MAX_SCHEMA_BODY_BYTES))
+				.route_layer(axum::middleware::from_fn_with_state(
+					state.clone(),
+					verify_build_token,
+				)),
 		)
 		.route(
 			"/api/v1/cache-pressure/{namespace}/{restore}",
@@ -704,27 +710,51 @@ async fn post_schema_migration_results(
 	StatusCode::NO_CONTENT
 }
 
+/// Prove the caller is the running build before its body is read.
+///
+/// The body runs to tens of megabytes, so anything that can reach this port
+/// would otherwise make the operator buffer that much per request without
+/// presenting a token at all.
+async fn verify_build_token(
+	State(state): State<ServerState>,
+	Path((namespace, replica, token)): Path<(String, String, String)>,
+	request: Request,
+	next: Next,
+) -> Response {
+	match schema_build::build_token(&state.ctx.client, &namespace, &replica).await {
+		Ok(expected) if expected.as_deref() == Some(token.as_str()) => next.run(request).await,
+		Ok(_) => {
+			warn!(
+				namespace = namespace,
+				replica = replica,
+				"rejected a reporting schema build callback that does not name the running build"
+			);
+			StatusCode::FORBIDDEN.into_response()
+		}
+		Err(err) => {
+			// The build runs once and its schema took up to half an hour, so a
+			// lookup that failed has to read as retry rather than as a refusal.
+			warn!(
+				namespace = namespace,
+				replica = replica,
+				"could not read the running build's token: {err}"
+			);
+			StatusCode::SERVICE_UNAVAILABLE.into_response()
+		}
+	}
+}
+
 /// Accept the SQL a reporting-schema build POSTs.
 ///
 /// What this stores is published to canopy as a group-scoped artifact whose SQL
 /// other servers execute, so unlike the other callbacks it is not enough that
-/// the caller names a replica: the token has to be the one the running build
-/// was given, or anything that can reach this port publishes for any group.
+/// the caller names a replica: `verify_build_token` has already established the
+/// token is the one the running build was given.
 async fn post_schema_build_results(
 	State(state): State<ServerState>,
-	Path((namespace, replica, token)): Path<(String, String, String)>,
+	Path((namespace, replica, _token)): Path<(String, String, String)>,
 	body: String,
 ) -> StatusCode {
-	let expected = schema_build::build_token(&state.ctx.client, &namespace, &replica).await;
-	if expected.as_deref() != Some(token.as_str()) {
-		warn!(
-			namespace = namespace,
-			replica = replica,
-			"rejected a reporting schema build callback that does not name the running build"
-		);
-		return StatusCode::FORBIDDEN;
-	}
-
 	info!(
 		namespace = namespace,
 		replica = replica,

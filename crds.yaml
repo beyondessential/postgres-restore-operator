@@ -1424,6 +1424,15 @@ spec:
                   into the CRD schema.
                 nullable: true
                 type: string
+              schemaBuildAttempts:
+                description: |-
+                  How many times setting the reporting-schema build up has been tried.
+                  The setup talks to a restore that has just come out of its migration
+                  Job, so one failure is ordinary and only a run of them means a build
+                  that will not start.
+                format: int64
+                nullable: true
+                type: integer
               schemaBuildJob:
                 description: Name of the reporting-schema build Job, for an operator following it.
                 nullable: true
