@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
@@ -26,6 +27,11 @@ use tracing::{debug, info, warn};
 /// callback exists because a schema does not fit a Job's 4 KiB termination
 /// message, so the default limit is nowhere near it.
 const MAX_SCHEMA_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Everything under here carries the build's callback token as its last path
+/// segment. Kept in step with the route below and with
+/// `Context::schema_build_callback_url`.
+const SCHEMA_BUILD_CALLBACK_PREFIX: &str = "/api/v1/schema-build-results/";
 
 use postgres_restore_operator::{
 	canopy::{self, DEFAULT_SOCKS5_PROXY},
@@ -673,7 +679,33 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			axum::routing::post(post_canopy_stats),
 		)
 		.with_state(state)
-		.layer(TraceLayer::new_for_http())
+		.layer(
+			TraceLayer::new_for_http().make_span_with(|request: &Request| {
+				tracing::debug_span!(
+					"request",
+					method = %request.method(),
+					uri = %loggable_target(request.uri()),
+					version = ?request.version(),
+				)
+			}),
+		)
+}
+
+/// The request target as a span may record it.
+///
+/// The reporting-schema build callback carries the build's token as its last
+/// path segment, and a span records the whole target, so a bearer credential
+/// left in it is one in the operator's own logs.
+fn loggable_target(uri: &axum::http::Uri) -> Cow<'_, str> {
+	let path = uri.path();
+	if !path.starts_with(SCHEMA_BUILD_CALLBACK_PREFIX) {
+		return Cow::Borrowed(uri.path_and_query().map_or("/", |target| target.as_str()));
+	}
+
+	match path.rsplit_once('/') {
+		Some((head, _token)) => Cow::Owned(format!("{head}/REDACTED")),
+		None => Cow::Borrowed(path),
+	}
 }
 
 /// Accept snapshot-list JSON POSTed by a job.
@@ -1106,6 +1138,36 @@ mod tests {
 			>::new()))
 		});
 		kube::Client::new(svc, "default")
+	}
+
+	/// The build's callback token is a bearer credential for publishing SQL
+	/// other servers execute, and the route carries it in the path, which a
+	/// request span records whole.
+	#[test]
+	fn a_build_callback_span_carries_no_token() {
+		let uri: axum::http::Uri =
+			"/api/v1/schema-build-results/pgro/kamaka/6f1c0c3a-1111-2222-3333-444455556666"
+				.parse()
+				.expect("a uri");
+
+		assert_eq!(
+			loggable_target(&uri),
+			"/api/v1/schema-build-results/pgro/kamaka/REDACTED"
+		);
+	}
+
+	/// Every other callback names only a namespace and a replica, so the target
+	/// is worth having in full.
+	#[test]
+	fn another_callback_is_logged_as_it_arrived() {
+		let uri: axum::http::Uri = "/api/v1/snapshot-results/pgro/kamaka?x=1"
+			.parse()
+			.expect("a uri");
+
+		assert_eq!(
+			loggable_target(&uri),
+			"/api/v1/snapshot-results/pgro/kamaka?x=1"
+		);
 	}
 
 	fn configmap(data: Option<&[(&str, &str)]>) -> ConfigMap {
