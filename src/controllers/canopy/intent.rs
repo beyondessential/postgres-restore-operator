@@ -63,6 +63,11 @@ mod semantics {
 	pub const REPORTING_SCHEMA: &str = "reporting-schema";
 }
 
+/// The intent whose worklist entries are dispatched per pair of group and
+/// version rather than per machine, so several of them name one declaration and
+/// one machine and differ only in the version they build for.
+pub const REPORTING_SCHEMA_INTENT: &str = "reporting-schema";
+
 /// Names of the parameters the `analytics` intent advertises. Shared between
 /// the descriptor (what canopy collects) and [`IntentConfig::to_replica_spec`]
 /// (what pgro reads back) so the two can't drift.
