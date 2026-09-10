@@ -300,9 +300,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	// other two gates run here: the migrated restore is the only database of
 	// this group at this version that exists, and it exists only until the
 	// switchover discards it.
-	if let Some(switching) = switching_restore
-		&& switching.spec.builder_image.is_some()
-	{
+	if let Some(switching) = switching_restore {
 		let built =
 			schema_build::reconcile_schema_build(client, &ctx, &replica, &namespace, switching)
 				.await?;

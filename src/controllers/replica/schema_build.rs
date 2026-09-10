@@ -773,12 +773,15 @@ fn build_to_do<'a>(
 		return BuildToDo::Settled;
 	}
 
-	let Some(target) = restore.spec.migrate_to.as_ref() else {
-		return BuildToDo::NoTarget;
-	};
-
+	// Before the target version, since every restore reaches here and only a
+	// build names an image: a restore that is not building one is not a restore
+	// missing a version.
 	let Some(image) = restore.spec.builder_image.as_deref() else {
 		return BuildToDo::NoImage;
+	};
+
+	let Some(target) = restore.spec.migrate_to.as_ref() else {
+		return BuildToDo::NoTarget;
 	};
 
 	if !migrated_to_target(restore) {
@@ -1256,6 +1259,15 @@ mod tests {
 
 		assert_eq!(
 			build_to_do(&replica, &restore),
+			BuildToDo::NoImage,
+			"no image to build with"
+		);
+
+		// The restore's own snapshot of the image, not the replica's live field:
+		// an edit to the replica must not change what this restore builds with.
+		restore.spec.builder_image = Some("builder:1".into());
+		assert_eq!(
+			build_to_do(&replica, &restore),
 			BuildToDo::NoTarget,
 			"no version to build against"
 		);
@@ -1264,15 +1276,6 @@ mod tests {
 			version: "2.60.0".into(),
 			version_id: "00000000-0000-0000-0000-000000000000".into(),
 		});
-		assert_eq!(
-			build_to_do(&replica, &restore),
-			BuildToDo::NoImage,
-			"no image to build with"
-		);
-
-		// The restore's own snapshot of the image, not the replica's live field:
-		// an edit to the replica must not change what this restore builds with.
-		restore.spec.builder_image = Some("builder:1".into());
 		assert_eq!(
 			build_to_do(&replica, &restore),
 			BuildToDo::Unmigrated,
