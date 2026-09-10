@@ -10,7 +10,7 @@
 //! whatever SQL the build POSTs to the callback. What comes back is registered
 //! with canopy as a group-scoped artifact of that version.
 
-use std::{collections::BTreeMap, sync::Arc};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use bestool_canopy::bytes::Bytes;
 use k8s_openapi::{
@@ -51,6 +51,11 @@ const BUILD_DEADLINE_SECONDS: i64 = 30 * 60;
 /// reconcile that records it to read its receipt. An operator that was down
 /// while it expired reads no receipt and builds again.
 const BUILD_TTL_SECONDS: i32 = 60 * 60;
+
+/// How long a delivered schema is held for the reconcile that registers it.
+/// A replica deleted while its build was in flight is never reconciled again,
+/// so what it delivered is released by age alone.
+pub const DELIVERED_SCHEMA_MAX_AGE: Duration = Duration::from_secs(60 * 60);
 
 /// Name of the build Job for a replica. One per replica rather than per
 /// restore: a replica has at most one restore building at a time, and reusing
@@ -486,7 +491,8 @@ pub(super) async fn reconcile_schema_build(
 
 						if attempts < BUILD_ATTEMPTS {
 							keep_schema(ctx, namespace, &replica_name, &sql);
-							record_build_attempt(client, namespace, &restore_name, attempts).await?;
+							record_build_attempt(client, namespace, &restore_name, attempts)
+								.await?;
 							return Ok(false);
 						}
 

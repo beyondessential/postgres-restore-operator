@@ -553,6 +553,23 @@ async fn main() -> anyhow::Result<()> {
 		}
 	});
 
+	// A schema is delivered to memory and taken by the reconcile that registers
+	// it, so a replica deleted mid-build leaves tens of megabytes behind that
+	// no later reconcile is there to take.
+	let schema_ctx = ctx.clone();
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(Duration::from_secs(300));
+		loop {
+			interval.tick().await;
+			let dropped = schema_ctx
+				.schema_build_results
+				.sweep(schema_build::DELIVERED_SCHEMA_MAX_AGE);
+			if dropped > 0 {
+				warn!(dropped, "dropped reporting schemas nothing came back for");
+			}
+		}
+	});
+
 	// Start controllers
 	let replica_api: Api<PostgresPhysicalReplica> = Api::all(client.clone());
 	let restore_api: Api<PostgresPhysicalRestore> = Api::all(client.clone());
