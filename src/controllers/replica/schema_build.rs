@@ -459,9 +459,13 @@ pub(super) async fn reconcile_schema_build(
 				};
 			};
 
+			// A recorded result is what settles the build for good, so a
+			// registration that failed on the way to canopy is answered while
+			// the schema is still held rather than recorded against a build
+			// that produced one.
 			let registration = match ctx.canopy.as_ref() {
 				None => Some("no canopy client to register the schema with".to_owned()),
-				Some(canopy) => canopy
+				Some(canopy) => match canopy
 					.register_reporting_schema(
 						target,
 						group,
@@ -469,11 +473,21 @@ pub(super) async fn reconcile_schema_build(
 						sql.clone(),
 					)
 					.await
-					.err()
-					.map(|err| {
-						warn!(%target, %group, "registering the reporting schema failed: {err}");
-						format!("canopy did not take the schema in: {err}")
-					}),
+				{
+					Ok(()) => None,
+					Err(err) => {
+						let attempts = attempts_so_far(restore) + 1;
+						warn!(%target, %group, attempts, "registering the reporting schema failed: {err}");
+
+						if attempts < BUILD_ATTEMPTS {
+							keep_schema(ctx, namespace, &replica_name, &sql);
+							record_build_attempt(client, namespace, &restore_name, attempts).await?;
+							return Ok(false);
+						}
+
+						Some(format!("canopy did not take the schema in: {err}"))
+					}
+				},
 			};
 
 			let result =
@@ -481,11 +495,7 @@ pub(super) async fn reconcile_schema_build(
 			if let Err(err) =
 				record_schema_build(client, namespace, &restore_name, Some(&job_name), result).await
 			{
-				ctx.schema_build_results.store(
-					namespace,
-					&replica_name,
-					String::from_utf8_lossy(&sql).into_owned(),
-				);
+				keep_schema(ctx, namespace, &replica_name, &sql);
 				return Err(err);
 			}
 
@@ -513,6 +523,15 @@ pub(super) async fn reconcile_schema_build(
 			Ok(true)
 		}
 	}
+}
+
+/// Put a taken schema back for the next reconcile.
+fn keep_schema(ctx: &Arc<Context>, namespace: &str, replica_name: &str, sql: &Bytes) {
+	ctx.schema_build_results.store(
+		namespace,
+		replica_name,
+		String::from_utf8_lossy(sql).into_owned(),
+	);
 }
 
 /// How many times one restore may go round before its build records a failure
