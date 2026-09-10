@@ -21,6 +21,7 @@ fn deployment_uses_affinity_not_node_selector() {
 		PostgresPhysicalReplicaSpec {
 			pre_migrate_drop_schemas: None,
 			migrate_to: None,
+			builder_image: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
@@ -76,6 +77,7 @@ fn deployment_uses_affinity_not_node_selector() {
 		"test-restore",
 		PostgresPhysicalRestoreSpec {
 			migrate_to: None,
+			builder_image: None,
 			replica: LocalObjectReference {
 				name: "test-replica".to_string(),
 			},
@@ -123,6 +125,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 		PostgresPhysicalReplicaSpec {
 			pre_migrate_drop_schemas: None,
 			migrate_to: None,
+			builder_image: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("kopia-secret".to_string()),
 				namespace: None,
@@ -161,6 +164,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 		"test-restore",
 		PostgresPhysicalRestoreSpec {
 			migrate_to: None,
+			builder_image: None,
 			replica: LocalObjectReference {
 				name: "test-replica".to_string(),
 			},

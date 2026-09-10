@@ -1,14 +1,17 @@
 //! Thin wrapper around `bestool_canopy::CanopyClient`.
 //!
 //! Owns construction (the SOCKS5 proxy wiring to the Tailscale sidecar, plus
-//! optional mTLS fallback) and exposes the four restore-* endpoints pgro
-//! consumes: `restore_capabilities`, `restore_worklist`, `restore_credentials`,
-//! `restore_verification`. Each is a one-line forward; the wrapper exists as
-//! the integration seam tests inject a stub at, and as the place to hang
-//! pgro-specific logging / retry / cache concerns later.
+//! optional mTLS fallback) and exposes the endpoints pgro consumes:
+//! `restore_capabilities`, `restore_worklist`, `restore_credentials`,
+//! `restore_verification`, and artifact registration. Each is a one-line
+//! forward except the last, which the generated client cannot express; the
+//! wrapper exists as the integration seam tests inject a stub at, and as the
+//! place to hang pgro-specific logging / retry / cache concerns later.
 
 use bestool_canopy::{
-	CanopyClient, TAILSCALE_URL,
+	CanopyClient, CanopyTransport, TAILSCALE_URL,
+	bytes::Bytes,
+	http::{Method, Request, header::CONTENT_TYPE},
 	schema::{
 		BackupPurpose, IntentDescriptor, ProgressArgs, RestoreCapabilitiesArgs, RestoreCredentials,
 		RestoreCredentialsArgs, VerificationArgs, WorklistEntry,
@@ -213,11 +216,109 @@ impl Client {
 			.await
 			.map_err(|err| Error::Canopy(format!("restore_verification: {err}")))
 	}
+
+	/// Register a built reporting schema as an artifact of `version`, scoped to
+	/// `group`, sending the SQL over the connection pgro already holds.
+	///
+	/// Canopy issues no credential to any store for this, so being authorised to
+	/// register for the group is the whole of what publishing into it takes.
+	///
+	/// This goes through the transport rather than a generated method, because
+	/// the generator emits path parameters only and JSON bodies only, and this
+	/// endpoint takes a query parameter and the artifact's bytes.
+	pub async fn register_reporting_schema(
+		&self,
+		version: &str,
+		group: Uuid,
+		run_id: Option<Uuid>,
+		sql: Bytes,
+	) -> Result<()> {
+		if !is_path_safe_version(version) {
+			return Err(Error::Canopy(format!(
+				"{version:?} is not a version a schema can be registered against"
+			)));
+		}
+
+		let uri = registration_uri(version, group, run_id);
+
+		let request = Request::builder()
+			.method(Method::POST)
+			.uri(&uri)
+			.header(CONTENT_TYPE, "application/sql")
+			.body(sql)
+			.map_err(|err| Error::Canopy(format!("building artifact registration: {err}")))?;
+
+		let response =
+			self.inner.transport().call(request).await.map_err(|err| {
+				Error::Canopy(format!("register_reporting_schema({version}): {err}"))
+			})?;
+
+		if !response.status().is_success() {
+			return Err(Error::Canopy(format!(
+				"register_reporting_schema({version}): canopy answered {}",
+				response.status()
+			)));
+		}
+
+		Ok(())
+	}
+}
+
+/// Where a reporting schema is registered.
+///
+/// Canopy authorises this exact path, and a build whose registration misses it
+/// reports a healthy restore and publishes nothing, so the drift is silent.
+fn registration_uri(version: &str, group: Uuid, run_id: Option<Uuid>) -> String {
+	let mut uri = format!("/artifacts/{version}/reporting-schema/any?group={group}");
+	if let Some(run) = run_id {
+		uri.push_str(&format!("&run={run}"));
+	}
+	uri
+}
+
+/// Whether a version is safe to place in a request path.
+///
+/// `migrate_to.version` is free-form text from the worklist entry or the CRD,
+/// and the path is what canopy authorises: a value carrying `?`, `#`, `&` or a
+/// slash rewrites the target, so the group the schema publishes under stops
+/// being the one this replica is authorised for. A version has to open with an
+/// alphanumeric for the same reason, since a dot segment is resolved away by
+/// any proxy or router between here and canopy.
+fn is_path_safe_version(version: &str) -> bool {
+	version.starts_with(|c: char| c.is_ascii_alphanumeric())
+		&& version
+			.chars()
+			.all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-'))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// The path is what canopy authorises, and `migrate_to.version` is
+	/// free-form text from the worklist or the CRD. A value carrying `?`, `&`,
+	/// a slash, or a leading dot segment rewrites the target, so the group a
+	/// schema publishes under stops being the one this replica is authorised
+	/// for.
+	#[test]
+	fn a_version_that_would_rewrite_the_path_is_not_a_version() {
+		for version in ["2.60.0", "2.60.0-rc1", "2.60.0+build.4"] {
+			assert!(is_path_safe_version(version), "{version}");
+		}
+		for version in [
+			"",
+			"2.60.0?group=00000000-0000-0000-0000-000000000000&x=",
+			"../../devices",
+			"..",
+			".",
+			".2.60.0",
+			"-2.60.0",
+			"2.60.0/any",
+			"2.60.0#frag",
+		] {
+			assert!(!is_path_safe_version(version), "{version}");
+		}
+	}
 
 	fn sample() -> ProgressSample {
 		ProgressSample {
@@ -260,6 +361,49 @@ mod tests {
 		assert_eq!(args.errors, None);
 		// A restore has no freeze moment to report.
 		assert_eq!(args.snapshot_taken_at, None);
+	}
+
+	const GROUP: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+
+	/// Canopy authorises `/artifacts/{version}/reporting-schema/any?group={group}`
+	/// and nothing else. A build that posts anywhere near it publishes nothing
+	/// while still reporting a healthy restore, so the drift never surfaces as
+	/// a failure and this literal is the only thing holding it.
+	#[test]
+	fn a_schema_is_registered_at_the_path_canopy_authorises() {
+		let uri = registration_uri("2.60.0", GROUP.parse().unwrap(), None);
+
+		assert_eq!(
+			uri,
+			format!("/artifacts/2.60.0/reporting-schema/any?group={GROUP}")
+		);
+	}
+
+	/// The exact version, never a range: a schema follows the migrations one
+	/// version applies, so one built against a patch is not the schema another
+	/// patch of the same minor describes.
+	#[test]
+	fn the_registration_names_an_exact_version() {
+		let uri = registration_uri("2.60.2", GROUP.parse().unwrap(), None);
+
+		assert!(uri.contains("/artifacts/2.60.2/"), "{uri}");
+		assert!(
+			!uri.contains(".x"),
+			"a range would publish the wrong schema: {uri}"
+		);
+	}
+
+	/// The run correlates the artifact with the build that made it, and is
+	/// carried as a query parameter beside the group rather than replacing it.
+	#[test]
+	fn a_run_is_carried_beside_the_group() {
+		let run = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+		let uri = registration_uri("2.60.0", GROUP.parse().unwrap(), Some(run.parse().unwrap()));
+
+		assert_eq!(
+			uri,
+			format!("/artifacts/2.60.0/reporting-schema/any?group={GROUP}&run={run}")
+		);
 	}
 
 	#[test]

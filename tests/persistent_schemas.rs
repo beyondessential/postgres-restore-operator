@@ -526,6 +526,7 @@ async fn persistent_schemas_skip_missing_on_source() {
 		&second_restore_name,
 		PostgresPhysicalRestoreSpec {
 			migrate_to: None,
+			builder_image: None,
 			replica: LocalObjectReference {
 				name: replica_name.into(),
 			},

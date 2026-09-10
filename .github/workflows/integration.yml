@@ -72,6 +72,12 @@ jobs:
               test-migration
             needs_non_pg_snapshot: false
 
+          - name: schema_build
+            namespaces: >-
+              test-schema-build
+              test-schema-build-absent
+            needs_non_pg_snapshot: false
+
           - name: locale_fix
             namespaces: >-
               test-locale-fix

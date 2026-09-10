@@ -40,6 +40,7 @@ use scheduling::ScheduleDecision;
 mod redaction;
 mod resources;
 pub(super) mod scheduling;
+pub mod schema_build;
 mod schema_migration;
 mod status;
 
@@ -295,9 +296,22 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		}
 	}
 
-	// After redaction and the migration have finished rewriting schemas out
-	// from under the grants, and before the Service selector below moves, so
-	// no client sees the restore ungranted.
+	// Build the reporting schema before switchover, for the same reason the
+	// other two gates run here: the migrated restore is the only database of
+	// this group at this version that exists, and it exists only until the
+	// switchover discards it.
+	if let Some(switching) = switching_restore {
+		let built =
+			schema_build::reconcile_schema_build(client, &ctx, &replica, &namespace, switching)
+				.await?;
+		if !built {
+			return Ok(Action::requeue(Duration::from_secs(30)));
+		}
+	}
+
+	// After redaction, the migration and the build have finished rewriting
+	// schemas out from under the grants, and before the Service selector below
+	// moves, so no client sees the restore ungranted.
 	if let Some(switching) = switching_restore {
 		reconcile_extra_user_grants(client, &ctx, &replica, &namespace, switching).await?;
 	}

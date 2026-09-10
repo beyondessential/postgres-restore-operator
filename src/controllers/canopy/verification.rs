@@ -19,7 +19,7 @@ use uuid::Uuid;
 use crate::{
 	context::Context,
 	controllers::{canopy::labels, postgres},
-	types::{PostgresPhysicalReplica, PostgresPhysicalRestore},
+	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, SchemaBuildResult},
 };
 
 /// The sidecar posts this JSON shape to `/api/v1/canopy-stats/{ns}/{job}`
@@ -288,7 +288,7 @@ async fn namespace_labels(
 /// The canopy run-uuid persisted on the restore status, parsed to a `Uuid`.
 /// A malformed value is treated as absent rather than failing the report —
 /// canopy still accepts a report without a run_id while the field is optional.
-fn run_id_from_status(restore: &PostgresPhysicalRestore) -> Option<Uuid> {
+pub(crate) fn run_id_from_status(restore: &PostgresPhysicalRestore) -> Option<Uuid> {
 	restore
 		.status
 		.as_ref()
@@ -355,7 +355,14 @@ async fn gather_health_details(
 		}
 	};
 
-	build_health_details(duration_sec, pg)
+	build_health_details(
+		duration_sec,
+		pg,
+		restore
+			.status
+			.as_ref()
+			.and_then(|s| s.schema_build_result.as_ref()),
+	)
 }
 
 /// Postgres-derived pieces of the health details: per-database sizes and
@@ -370,7 +377,11 @@ struct PostgresHealth {
 /// Assemble the `health_details` JSON from already-gathered parts. Pure, so
 /// the snake_case wire shape is unit-testable without a database. Omits any
 /// piece that wasn't gathered.
-fn build_health_details(duration_sec: Option<u64>, pg: Option<PostgresHealth>) -> Value {
+fn build_health_details(
+	duration_sec: Option<u64>,
+	pg: Option<PostgresHealth>,
+	schema_build: Option<&SchemaBuildResult>,
+) -> Value {
 	let mut details = serde_json::Map::new();
 	if let Some(secs) = duration_sec {
 		details.insert("restore_duration_sec".into(), json!(secs));
@@ -383,6 +394,24 @@ fn build_health_details(duration_sec: Option<u64>, pg: Option<PostgresHealth>) -
 			.collect();
 		details.insert("sizes".into(), Value::Object(sizes_obj));
 		details.insert("fixes".into(), pg.fixes);
+	}
+	// Canopy carries no field of its own for a build, and this is what tells it
+	// a replica that came up sound built nothing.
+	if let Some(build) = schema_build {
+		let mut block = serde_json::Map::from_iter([
+			("built".to_string(), json!(build.built)),
+			(
+				"elapsed_sec".to_string(),
+				json!(build.total_elapsed_seconds),
+			),
+		]);
+		if let Some(error) = build.error.as_deref() {
+			block.insert("error".into(), json!(error));
+		}
+		if let Some(bytes) = build.schema_bytes {
+			block.insert("schema_bytes".into(), json!(bytes));
+		}
+		details.insert("schema_build".into(), Value::Object(block));
 	}
 	Value::Object(details)
 }
@@ -597,6 +626,7 @@ mod tests {
 				sizes: vec![("tamanu".into(), 1_872_782), ("postgres".into(), 12_829)],
 				fixes: json!({ "locale": true, "reindex": false, "reset_wal": false }),
 			}),
+			None,
 		);
 		assert_eq!(v["restore_duration_sec"], json!(700));
 		assert_eq!(v["sizes"]["tamanu"], json!(1_872_782u64));
@@ -610,13 +640,44 @@ mod tests {
 	#[test]
 	fn health_details_omits_ungathered_parts() {
 		// Failure path: no postgres connection, no createdAt.
-		let v = build_health_details(None, None);
+		let v = build_health_details(None, None, None);
 		assert_eq!(v, json!({}));
 		// Duration known but postgres unreachable: sizes/fixes omitted.
-		let v = build_health_details(Some(42), None);
+		let v = build_health_details(Some(42), None, None);
 		assert_eq!(v, json!({ "restore_duration_sec": 42 }));
 		assert!(v.get("sizes").is_none());
 		assert!(v.get("fixes").is_none());
+	}
+
+	/// A replica can come up sound and still build nothing, and the report is
+	/// where canopy is told so.
+	#[test]
+	fn a_failed_build_is_reported_beside_a_healthy_replica() {
+		let v = build_health_details(
+			Some(700),
+			None,
+			Some(&SchemaBuildResult {
+				built: false,
+				error: Some("canopy did not take the schema in: timed out".to_string()),
+				total_elapsed_seconds: 1_712,
+				schema_bytes: Some(41_002_112),
+			}),
+		);
+
+		assert_eq!(v["schema_build"]["built"], json!(false));
+		assert_eq!(v["schema_build"]["elapsed_sec"], json!(1_712));
+		assert_eq!(v["schema_build"]["schema_bytes"], json!(41_002_112));
+		assert_eq!(
+			v["schema_build"]["error"],
+			json!("canopy did not take the schema in: timed out")
+		);
+	}
+
+	/// A restore that builds no schema carries no build block at all.
+	#[test]
+	fn a_restore_that_builds_nothing_reports_no_build() {
+		let v = build_health_details(Some(42), None, None);
+		assert!(v.get("schema_build").is_none());
 	}
 
 	fn restore_with_run_id(run_id: Option<&str>) -> PostgresPhysicalRestore {
@@ -629,6 +690,7 @@ mod tests {
 			"r",
 			PostgresPhysicalRestoreSpec {
 				migrate_to: None,
+				builder_image: None,
 				replica: LocalObjectReference {
 					name: "rep".to_string(),
 				},
@@ -741,6 +803,7 @@ mod tests {
 			"r",
 			PostgresPhysicalRestoreSpec {
 				migrate_to: target,
+				builder_image: None,
 				replica: LocalObjectReference {
 					name: "rep".to_string(),
 				},

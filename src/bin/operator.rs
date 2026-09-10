@@ -1,10 +1,13 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
-use axum::extract::{Path, State};
+use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::Next;
+use axum::response::{IntoResponse, Response};
 use axum::{Router, routing::get};
 use futures::StreamExt;
 use jiff::Timestamp;
@@ -20,13 +23,23 @@ use prometheus::Encoder;
 use tower_http::trace::TraceLayer;
 use tracing::{debug, info, warn};
 
+/// Ceiling on a posted reporting schema, matching what canopy will hold. The
+/// callback exists because a schema does not fit a Job's 4 KiB termination
+/// message, so the default limit is nowhere near it.
+const MAX_SCHEMA_BODY_BYTES: usize = 32 * 1024 * 1024;
+
+/// Everything under here carries the build's callback token as its last path
+/// segment. Kept in step with the route below and with
+/// `Context::schema_build_callback_url`.
+const SCHEMA_BUILD_CALLBACK_PREFIX: &str = "/api/v1/schema-build-results/";
+
 use postgres_restore_operator::{
 	canopy::{self, DEFAULT_SOCKS5_PROXY},
 	context::{
 		Context, DEFAULT_CANOPY_PROXY_IMAGE, DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS,
 		DEFAULT_KOPIA_IMAGE, ReplicaKey,
 	},
-	controllers::{self, canopy::intent},
+	controllers::{self, canopy::intent, replica::schema_build},
 	placement::PodPlacement,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase},
 };
@@ -540,6 +553,23 @@ async fn main() -> anyhow::Result<()> {
 		}
 	});
 
+	// A schema is delivered to memory and taken by the reconcile that registers
+	// it, so a replica deleted mid-build leaves tens of megabytes behind that
+	// no later reconcile is there to take.
+	let schema_ctx = ctx.clone();
+	tokio::spawn(async move {
+		let mut interval = tokio::time::interval(Duration::from_secs(300));
+		loop {
+			interval.tick().await;
+			let dropped = schema_ctx
+				.schema_build_results
+				.sweep(schema_build::DELIVERED_SCHEMA_MAX_AGE);
+			if dropped > 0 {
+				warn!(dropped, "dropped reporting schemas nothing came back for");
+			}
+		}
+	});
+
 	// Start controllers
 	let replica_api: Api<PostgresPhysicalReplica> = Api::all(client.clone());
 	let restore_api: Api<PostgresPhysicalRestore> = Api::all(client.clone());
@@ -645,6 +675,15 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			axum::routing::post(post_schema_migration_results),
 		)
 		.route(
+			"/api/v1/schema-build-results/{namespace}/{replica}/{token}",
+			axum::routing::post(post_schema_build_results)
+				.layer(DefaultBodyLimit::max(MAX_SCHEMA_BODY_BYTES))
+				.route_layer(axum::middleware::from_fn_with_state(
+					state.clone(),
+					verify_build_token,
+				)),
+		)
+		.route(
 			"/api/v1/cache-pressure/{namespace}/{restore}",
 			axum::routing::post(post_cache_pressure),
 		)
@@ -657,7 +696,33 @@ fn build_router(state: ServerState, metrics_registry: prometheus::Registry) -> R
 			axum::routing::post(post_canopy_stats),
 		)
 		.with_state(state)
-		.layer(TraceLayer::new_for_http())
+		.layer(
+			TraceLayer::new_for_http().make_span_with(|request: &Request| {
+				tracing::debug_span!(
+					"request",
+					method = %request.method(),
+					uri = %loggable_target(request.uri()),
+					version = ?request.version(),
+				)
+			}),
+		)
+}
+
+/// The request target as a span may record it.
+///
+/// The reporting-schema build callback carries the build's token as its last
+/// path segment, and a span records the whole target, so a bearer credential
+/// left in it is one in the operator's own logs.
+fn loggable_target(uri: &axum::http::Uri) -> Cow<'_, str> {
+	let path = uri.path();
+	if !path.starts_with(SCHEMA_BUILD_CALLBACK_PREFIX) {
+		return Cow::Borrowed(uri.path_and_query().map_or("/", |target| target.as_str()));
+	}
+
+	match path.rsplit_once('/') {
+		Some((head, _token)) => Cow::Owned(format!("{head}/REDACTED")),
+		None => Cow::Borrowed(path),
+	}
 }
 
 /// Accept snapshot-list JSON POSTed by a job.
@@ -691,6 +756,80 @@ async fn post_schema_migration_results(
 		.ctx
 		.schema_migration_results
 		.store(&namespace, &replica, body);
+	StatusCode::NO_CONTENT
+}
+
+/// Prove the caller is the running build before its body is read.
+///
+/// The body runs to tens of megabytes, so anything that can reach this port
+/// would otherwise make the operator buffer that much per request without
+/// presenting a token at all.
+async fn verify_build_token(
+	State(state): State<ServerState>,
+	Path((namespace, replica, token)): Path<(String, String, String)>,
+	request: Request,
+	next: Next,
+) -> Response {
+	match schema_build::build_token(&state.ctx.client, &namespace, &replica).await {
+		Ok(expected) if expected.as_deref() == Some(token.as_str()) => next.run(request).await,
+		Ok(_) => {
+			warn!(
+				namespace = namespace,
+				replica = replica,
+				"rejected a reporting schema build callback that does not name the running build"
+			);
+			StatusCode::FORBIDDEN.into_response()
+		}
+		Err(err) => {
+			// The build runs once and its schema took up to half an hour, so a
+			// lookup that failed has to read as retry rather than as a refusal.
+			warn!(
+				namespace = namespace,
+				replica = replica,
+				"could not read the running build's token: {err}"
+			);
+			StatusCode::SERVICE_UNAVAILABLE.into_response()
+		}
+	}
+}
+
+/// Accept the SQL a reporting-schema build POSTs.
+///
+/// What this stores is published to canopy as a group-scoped artifact whose SQL
+/// other servers execute, so unlike the other callbacks it is not enough that
+/// the caller names a replica: `verify_build_token` has already established the
+/// token is the one the running build was given.
+async fn post_schema_build_results(
+	State(state): State<ServerState>,
+	Path((namespace, replica, _token)): Path<(String, String, String)>,
+	body: String,
+) -> StatusCode {
+	let bytes = body.len();
+	info!(
+		namespace = namespace,
+		replica = replica,
+		bytes,
+		"received reporting schema build callback"
+	);
+	state
+		.ctx
+		.schema_build_results
+		.store(&namespace, &replica, body);
+
+	// A schema held with no receipt behind it reads, after a restart, as a
+	// build that delivered nothing, so a delivery this operator cannot record
+	// is one it has not taken.
+	if let Err(err) =
+		schema_build::record_receipt(&state.ctx.client, &namespace, &replica, bytes).await
+	{
+		warn!(
+			namespace = namespace,
+			replica = replica,
+			"could not record the reporting schema build's delivery: {err}"
+		);
+		return StatusCode::SERVICE_UNAVAILABLE;
+	}
+
 	StatusCode::NO_CONTENT
 }
 
@@ -1032,6 +1171,36 @@ mod tests {
 			>::new()))
 		});
 		kube::Client::new(svc, "default")
+	}
+
+	/// The build's callback token is a bearer credential for publishing SQL
+	/// other servers execute, and the route carries it in the path, which a
+	/// request span records whole.
+	#[test]
+	fn a_build_callback_span_carries_no_token() {
+		let uri: axum::http::Uri =
+			"/api/v1/schema-build-results/pgro/kamaka/6f1c0c3a-1111-2222-3333-444455556666"
+				.parse()
+				.expect("a uri");
+
+		assert_eq!(
+			loggable_target(&uri),
+			"/api/v1/schema-build-results/pgro/kamaka/REDACTED"
+		);
+	}
+
+	/// Every other callback names only a namespace and a replica, so the target
+	/// is worth having in full.
+	#[test]
+	fn another_callback_is_logged_as_it_arrived() {
+		let uri: axum::http::Uri = "/api/v1/snapshot-results/pgro/kamaka?x=1"
+			.parse()
+			.expect("a uri");
+
+		assert_eq!(
+			loggable_target(&uri),
+			"/api/v1/snapshot-results/pgro/kamaka?x=1"
+		);
 	}
 
 	fn configmap(data: Option<&[(&str, &str)]>) -> ConfigMap {

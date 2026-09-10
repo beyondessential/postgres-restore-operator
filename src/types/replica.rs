@@ -195,6 +195,13 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub migrate_to: Option<crate::types::MigrationTarget>,
 
+	/// Image that builds a Tamanu reporting schema against each migrated
+	/// restore. Present only for a `reporting-schema` replica; pgro hands the
+	/// image a database and takes back the SQL it emits, so how a schema is made
+	/// is the image's business rather than pgro's.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub builder_image: Option<String>,
+
 	/// Maximum allowed size for the restore PVC. The restore will fail if the
 	/// computed size exceeds this limit. Defaults to 2Ti.
 	#[serde(default = "default_storage_size_maximum")]

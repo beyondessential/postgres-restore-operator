@@ -35,7 +35,7 @@ use uuid::Uuid;
 
 use crate::{
 	context::Context,
-	controllers::canopy::intent::{IntentConfig, config_for},
+	controllers::canopy::intent::{IntentConfig, REPORTING_SCHEMA_INTENT, config_for},
 	error::Result,
 	types::{PostgresPhysicalReplica, PostgresPhysicalReplicaSpec},
 	util::slug,
@@ -65,12 +65,25 @@ pub mod labels {
 
 /// Compute the k8s Namespace name for a worklist entry.
 ///
-/// Format: `<slug(entry.name)>-<8-hex(SHA-256(replica_id || server_id))>`.
+/// Format: `<slug(entry.name)>-<8-hex(SHA-256(replica_id || server_id [||
+/// target_version_id]))>`.
+///
+/// A reporting-schema build is dispatched per pair of group and version, so
+/// one declaration's entries name the same machine and differ only in the
+/// version. That version is part of what identifies the replica: without it
+/// every pair of a group resolves to one namespace, and each pass retargets the
+/// one replica at another version. No other intent carries the version into the
+/// name, since a machine has one entry per declaration there and folding it in
+/// would rename every replica already in the field.
 pub fn namespace_name_for(entry: &WorklistEntry) -> String {
+	let per_pair = (entry.intent == REPORTING_SCHEMA_INTENT)
+		.then_some(entry.target_version_id)
+		.flatten();
+
 	format!(
 		"{}-{}",
 		slug(&entry.name),
-		short_hash(entry.replica_id, entry.server_id),
+		short_hash(entry.replica_id, entry.server_id, per_pair),
 	)
 }
 
@@ -82,11 +95,15 @@ fn jittered(base: Duration) -> Duration {
 	base.mul_f64(1.0 + jitter)
 }
 
-/// 8-hex-char disambiguator from SHA-256 of `replica_id || server_id`.
-fn short_hash(replica_id: Uuid, server_id: Uuid) -> String {
+/// 8-hex-char disambiguator from SHA-256 of `replica_id || server_id`, and the
+/// version where entries of one declaration are told apart by it.
+fn short_hash(replica_id: Uuid, server_id: Uuid, version_id: Option<Uuid>) -> String {
 	let mut hasher = Sha256::new();
 	hasher.update(replica_id.as_bytes());
 	hasher.update(server_id.as_bytes());
+	if let Some(version) = version_id {
+		hasher.update(version.as_bytes());
+	}
 	let digest = hasher.finalize();
 	let mut out = String::with_capacity(8);
 	for byte in &digest[..4] {
@@ -457,8 +474,8 @@ mod tests {
 	fn short_hash_deterministic() {
 		let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
 		let b = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
-		let h1 = short_hash(a, b);
-		let h2 = short_hash(a, b);
+		let h1 = short_hash(a, b, None);
+		let h2 = short_hash(a, b, None);
 		assert_eq!(h1, h2);
 		assert_eq!(h1.len(), 8);
 	}
@@ -468,7 +485,52 @@ mod tests {
 		let a = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
 		let b1 = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
 		let b2 = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
-		assert_ne!(short_hash(a, b1), short_hash(a, b2));
+		assert_ne!(short_hash(a, b1, None), short_hash(a, b2, None));
+	}
+
+	fn build_entry(name: &str, replica: Uuid, server: Uuid, version: Uuid) -> WorklistEntry {
+		let mut entry = entry(name, replica, server);
+		entry.intent = REPORTING_SCHEMA_INTENT.to_string();
+		entry.target_version = Some("2.60.0".to_string());
+		entry.target_version_id = Some(version);
+		entry
+	}
+
+	/// A build is dispatched per pair of group and version, so one
+	/// declaration's entries name the same machine and are told apart by the
+	/// version alone. Sharing a namespace would make them one replica whose
+	/// target moves on every pass.
+	#[test]
+	fn a_build_is_a_replica_per_version() {
+		let replica = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+		let server = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+		let older = Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap();
+		let newer = Uuid::parse_str("44444444-4444-4444-4444-444444444444").unwrap();
+
+		assert_ne!(
+			namespace_name_for(&build_entry("schemas", replica, server, older)),
+			namespace_name_for(&build_entry("schemas", replica, server, newer)),
+		);
+	}
+
+	/// Every other intent has one entry per machine, and the name is what an
+	/// existing replica is found by, so its version stays out of it.
+	#[test]
+	fn a_version_does_not_rename_the_replicas_in_the_field() {
+		let replica = Uuid::parse_str("11111111-1111-1111-1111-111111111111").unwrap();
+		let server = Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap();
+
+		let plain = entry("upgrades", replica, server);
+		let mut targeted = entry("upgrades", replica, server);
+		targeted.intent = "upgrade".to_string();
+		targeted.target_version_id =
+			Some(Uuid::parse_str("33333333-3333-3333-3333-333333333333").unwrap());
+
+		assert_eq!(
+			namespace_name_for(&plain),
+			namespace_name_for(&targeted),
+			"the name a replica is found by does not move with its target"
+		);
 	}
 
 	#[test]
