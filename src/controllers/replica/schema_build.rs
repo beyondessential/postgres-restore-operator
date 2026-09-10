@@ -47,8 +47,10 @@ use crate::{
 /// with it the whole restore, for as long as its pod lives.
 const BUILD_DEADLINE_SECONDS: i64 = 30 * 60;
 
-/// How long a finished build Job is left for an operator to read.
-const BUILD_TTL_SECONDS: i32 = 300;
+/// How long a finished build Job is left for an operator to read, and for the
+/// reconcile that records it to read its receipt. An operator that was down
+/// while it expired reads no receipt and builds again.
+const BUILD_TTL_SECONDS: i32 = 60 * 60;
 
 /// Name of the build Job for a replica. One per replica rather than per
 /// restore: a replica has at most one restore building at a time, and reusing
