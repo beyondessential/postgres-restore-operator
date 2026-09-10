@@ -88,8 +88,11 @@ pub async fn record_receipt(
 	Ok(())
 }
 
-fn receipted(job: &Job) -> bool {
-	job.annotations().contains_key(BUILD_RECEIPT_ANNOTATION)
+/// What the running build recorded delivering, where it recorded one.
+fn delivered_bytes(job: &Job) -> Option<i64> {
+	job.annotations()
+		.get(BUILD_RECEIPT_ANNOTATION)
+		.and_then(|bytes| bytes.parse().ok())
 }
 
 /// The token the currently-running build for this replica must present, if
@@ -290,12 +293,12 @@ enum BuildOutcome {
 	Failed,
 }
 
-/// A build Job's state, how long it has taken, and whether it recorded
-/// delivering a schema.
+/// A build Job's state, how long it has taken, and what it recorded
+/// delivering.
 struct BuildStatus {
 	outcome: BuildOutcome,
 	elapsed_seconds: i64,
-	receipted: bool,
+	delivered_bytes: Option<i64>,
 }
 
 async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Result<BuildStatus> {
@@ -304,7 +307,7 @@ async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Resu
 		return Ok(BuildStatus {
 			outcome: BuildOutcome::NotStarted,
 			elapsed_seconds: 0,
-			receipted: false,
+			delivered_bytes: None,
 		});
 	};
 
@@ -322,7 +325,7 @@ async fn build_outcome(client: &Client, namespace: &str, job_name: &str) -> Resu
 
 	Ok(BuildStatus {
 		outcome,
-		receipted: receipted(&job),
+		delivered_bytes: delivered_bytes(&job),
 		elapsed_seconds: job_elapsed_seconds(&job.status.unwrap_or_default()),
 	})
 }
@@ -442,7 +445,7 @@ pub(super) async fn reconcile_schema_build(
 				.map(Bytes::from)
 			else {
 				let attempts = attempts_so_far(restore) + 1;
-				return match empty_build(build.receipted, attempts) {
+				return match empty_build(build.delivered_bytes.is_some(), attempts) {
 					EmptyBuild::Rebuild => {
 						rebuild(client, namespace, &restore_name, &job_name, attempts).await
 					}
@@ -512,7 +515,7 @@ pub(super) async fn reconcile_schema_build(
 					built: false,
 					error: Some("the build job failed".to_string()),
 					total_elapsed_seconds: build.elapsed_seconds,
-					schema_bytes: None,
+					schema_bytes: build.delivered_bytes,
 				},
 			)
 			.await?;
@@ -1189,7 +1192,7 @@ mod tests {
 	/// Job without one is a build that delivered nothing.
 	#[test]
 	fn a_job_carries_its_builds_receipt() {
-		assert!(!receipted(&job()));
+		assert_eq!(delivered_bytes(&job()), None);
 
 		let mut delivered = job();
 		delivered
@@ -1197,7 +1200,7 @@ mod tests {
 			.annotations
 			.get_or_insert_with(BTreeMap::new)
 			.insert(BUILD_RECEIPT_ANNOTATION.to_string(), "4096".to_string());
-		assert!(receipted(&delivered));
+		assert_eq!(delivered_bytes(&delivered), Some(4096));
 	}
 
 	/// The record a Job that exits zero without delivering a schema ends with.
