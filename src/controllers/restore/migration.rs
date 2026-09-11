@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::{
 	context::Context,
 	controllers::jobs::{env_from_secret_name, env_literal},
-	error::Result,
+	error::{Error, Result},
 	placement::PodPlacement,
 	types::{
 		MigrationResult, MigrationTarget, MigrationTiming, PostgresPhysicalReplica,
@@ -175,7 +175,7 @@ pub async fn reconcile_migrating(
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
 	let replica = replicas.get(&restore.spec.replica.name).await?;
 	let creds = credentials(ctx, &replica, namespace).await?;
-	let dbname = crate::controllers::postgres::discover_restore_database(
+	let dbname = match crate::controllers::postgres::discover_restore_database(
 		&ctx.client,
 		namespace,
 		name,
@@ -183,7 +183,23 @@ pub async fn reconcile_migrating(
 		&creds.1,
 		ctx.use_port_forward(),
 	)
-	.await?;
+	.await
+	{
+		Ok(dbname) => dbname,
+		// Nothing to migrate is a fact about the backup; retrying cannot change it.
+		Err(err @ Error::NoApplicationDatabase) => {
+			return super::fail_restore(
+				ctx,
+				namespace,
+				name,
+				&restore.spec.replica.name,
+				serde_json::json!({ "phase": "Failed" }),
+				&err.to_string(),
+			)
+			.await;
+		}
+		Err(err) => return Err(err),
+	};
 
 	let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
 	let job_name = migration_job_name(name);

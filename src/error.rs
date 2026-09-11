@@ -32,6 +32,9 @@ pub enum Error {
 	#[error("Missing field: {0}")]
 	MissingField(String),
 
+	#[error("restore contains no application database")]
+	NoApplicationDatabase,
+
 	#[error("Schema migration error: {0}")]
 	SchemaMigration(String),
 
