@@ -1,14 +1,18 @@
-use k8s_openapi::{api::core::v1::SecretReference, apimachinery::pkg::api::resource::Quantity};
+use k8s_openapi::{
+	api::core::v1::SecretReference,
+	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
+};
 use kube::api::ObjectMeta;
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
 
 use crate::{kopia::Snapshot, placement::PodPlacement, types::*, util::TimeSpan};
 
-use jiff::SignedDuration;
+use jiff::{SignedDuration, Timestamp};
 
 use super::{
-	extra_users_with_schemas, generate_password, persistent_schemas_migration_settled,
+	extra_users_with_schemas, generate_password, no_successful_restore,
+	persistent_schemas_migration_settled,
 	resources::{build_snapshot_list_job, compute_storage_size},
 	scheduling::deployment_ready_timeout,
 	snapshot_already_covered,
@@ -517,6 +521,38 @@ fn make_restore(snapshot: &str, phase: Option<RestorePhase>) -> PostgresPhysical
 			..Default::default()
 		}),
 	}
+}
+
+/// An ephemeral replica deletes its restore once the snapshot is proved, so
+/// `verifiedSnapshotId` is all that's left to say a restore ever succeeded.
+/// Read as never-restored it takes the immediate-trigger path on every
+/// reconcile and lists snapshots every few seconds.
+#[test]
+fn verified_snapshot_counts_as_a_successful_restore() {
+	let status = PostgresPhysicalReplicaStatus {
+		verified_snapshot_id: Some("snapA".into()),
+		..Default::default()
+	};
+	assert!(!no_successful_restore(Some(&status)));
+}
+
+#[test]
+fn completed_restore_counts_as_a_successful_restore() {
+	let status = PostgresPhysicalReplicaStatus {
+		last_restore_completed_at: Some(Time(Timestamp::now())),
+		..Default::default()
+	};
+	assert!(!no_successful_restore(Some(&status)));
+}
+
+/// A replica with neither marker has genuinely never restored and must still
+/// trigger immediately rather than idling until the first cron tick.
+#[test]
+fn fresh_replica_has_no_successful_restore() {
+	assert!(no_successful_restore(None));
+	assert!(no_successful_restore(Some(
+		&PostgresPhysicalReplicaStatus::default()
+	)));
 }
 
 #[test]
