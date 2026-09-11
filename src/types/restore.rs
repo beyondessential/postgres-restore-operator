@@ -151,6 +151,11 @@ pub struct MigrationResult {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub failed_migration: Option<String>,
 
+	/// Why it failed, redacted: tamanu's structured error where it records one,
+	/// otherwise the tail of the job's log.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<String>,
+
 	/// Database size before the migrations ran, and after. The growth between
 	/// them is what shows a migration that backfills heavily.
 	pub data_bytes_before: i64,
