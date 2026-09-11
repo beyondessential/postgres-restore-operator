@@ -14,6 +14,7 @@ use super::{
 	extra_users_with_schemas, generate_password, no_successful_restore,
 	persistent_schemas_migration_settled,
 	resources::{build_snapshot_list_job, compute_storage_size},
+	restore_in_progress,
 	scheduling::deployment_ready_timeout,
 	snapshot_already_covered,
 };
@@ -520,6 +521,39 @@ fn make_restore(snapshot: &str, phase: Option<RestorePhase>) -> PostgresPhysical
 			phase: Some(p),
 			..Default::default()
 		}),
+	}
+}
+
+/// A restore with a `migrateTo` target sits in `Migrating` between Ready and
+/// Switching. Missed here the replica reads as idle: it lists snapshots on
+/// every reconcile and can start a second restore beside the first.
+#[test]
+fn a_migrating_restore_is_in_progress() {
+	let restore = make_restore("snapA", Some(RestorePhase::Migrating));
+	assert!(restore_in_progress(&restore));
+}
+
+#[test]
+fn every_pre_switchover_phase_is_in_progress() {
+	for phase in [
+		RestorePhase::Pending,
+		RestorePhase::Restoring,
+		RestorePhase::Migrating,
+		RestorePhase::Ready,
+	] {
+		let restore = make_restore("snapA", Some(phase.clone()));
+		assert!(
+			restore_in_progress(&restore),
+			"a {phase:?} restore must stop the replica starting another"
+		);
+	}
+}
+
+#[test]
+fn a_finished_restore_is_not_in_progress() {
+	for phase in [RestorePhase::Active, RestorePhase::Failed] {
+		let restore = make_restore("snapA", Some(phase.clone()));
+		assert!(!restore_in_progress(&restore), "{phase:?} is not in flight");
 	}
 }
 
