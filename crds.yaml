@@ -1330,6 +1330,12 @@ spec:
                       them is what shows a migration that backfills heavily.
                     format: int64
                     type: integer
+                  error:
+                    description: |-
+                      Why it failed, redacted: tamanu's structured error where it records one,
+                      otherwise the tail of the job's log.
+                    nullable: true
+                    type: string
                   failedMigration:
                     description: |-
                       The migration that failed, when one did. Its absence is what makes the

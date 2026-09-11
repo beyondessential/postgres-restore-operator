@@ -742,6 +742,7 @@ mod tests {
 		crate::types::MigrationResult {
 			total_elapsed_seconds: 412,
 			failed_migration: None,
+			error: None,
 			data_bytes_before: 1_000,
 			data_bytes_after: 1_200,
 			timings: vec![
