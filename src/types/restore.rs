@@ -151,8 +151,9 @@ pub struct MigrationResult {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub failed_migration: Option<String>,
 
-	/// Why it failed, redacted: tamanu's structured error where it records one,
-	/// otherwise the tail of the job's log.
+	/// Why it failed: tamanu's structured error where it records one, otherwise
+	/// the tail of the job's log. Carries the row postgres refused, so that a
+	/// deployment can be fixed before the upgrade is retried.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub error: Option<String>,
 

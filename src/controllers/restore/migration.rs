@@ -586,7 +586,7 @@ async fn migration_job_log(ctx: &Context, namespace: &str, job_name: &str) -> Op
 }
 
 /// The cause of a failed migration: tamanu's own structured error where the
-/// version records one, otherwise the redacted tail of the job's log.
+/// version records one, otherwise the tail of the job's log.
 fn migration_error(stats: Option<&serde_json::Value>, log: Option<&str>) -> Option<String> {
 	if let Some(error) = stats.and_then(|stats| stats.get("error")) {
 		let field = |key: &str| {
@@ -612,76 +612,35 @@ fn migration_error(stats: Option<&serde_json::Value>, log: Option<&str>) -> Opti
 		}
 		context.extend(field("constraint").map(str::to_owned));
 
-		let line = match (head.is_empty(), context.is_empty()) {
+		let mut line = match (head.is_empty(), context.is_empty()) {
 			(false, false) => format!("{head} [{}]", context.join(", ")),
 			(false, true) => head,
 			(true, false) => format!("[{}]", context.join(", ")),
 			(true, true) => String::new(),
 		};
+		// Which row postgres refused, which is what a deployment has to fix before the
+		// upgrade is retried. The constraint name alone does not say.
+		for (label, value) in [("DETAIL", field("detail")), ("HINT", field("hint"))] {
+			if let Some(value) = value {
+				line.push_str(&format!(" {label}: {value}"));
+			}
+		}
 		if !line.is_empty() {
-			return Some(line);
+			return Some(line.trim().to_string());
 		}
 	}
 
-	let redacted = redact_migration_log(log?);
-	(!redacted.is_empty()).then_some(redacted)
+	let tail = migration_log_tail(log?);
+	(!tail.is_empty()).then_some(tail)
 }
 
-/// The tail of a migration job's log, with anything that could carry row
-/// contents taken out.
-fn redact_migration_log(log: &str) -> String {
-	// DETAIL, HINT and STATEMENT lines quote the row postgres refused, which is patient data.
-	const DROPPED: [&str; 6] = [
-		"DETAIL",
-		"HINT:",
-		"STATEMENT:",
-		"Failing row",
-		"parameters",
-		"Key (",
-	];
+/// The tail of a migration job's log, bounded so a status field stays readable.
+fn migration_log_tail(log: &str) -> String {
 	const KEEP_LINES: usize = 40;
 	const MAX_BYTES: usize = 2000;
 
-	let blank_quoted = |line: &str| {
-		let mut out = String::with_capacity(line.len());
-		let mut open: Option<char> = None;
-		for c in line.chars() {
-			match open {
-				Some(quote) => {
-					if c == quote {
-						out.push(c);
-						open = None;
-					}
-				}
-				None => {
-					out.push(c);
-					if c == '"' || c == '\'' {
-						out.push('…');
-						open = Some(c);
-					}
-				}
-			}
-		}
-		out
-	};
-
-	let kept: Vec<String> = log
-		.lines()
-		.filter(|line| !DROPPED.iter().any(|marker| line.contains(marker)))
-		.map(|line| {
-			let lower = line.to_lowercase();
-			if ["error", "violates", "invalid"]
-				.iter()
-				.any(|word| lower.contains(word))
-			{
-				blank_quoted(line)
-			} else {
-				line.to_string()
-			}
-		})
-		.collect();
-
-	let tail = kept[kept.len().saturating_sub(KEEP_LINES)..].join("\n");
+	let lines: Vec<&str> = log.lines().collect();
+	let tail = lines[lines.len().saturating_sub(KEEP_LINES)..].join("\n");
 	if tail.len() <= MAX_BYTES {
 		return tail;
 	}
@@ -694,51 +653,22 @@ fn redact_migration_log(log: &str) -> String {
 
 #[cfg(test)]
 mod error_tests {
-	use super::{migration_error, redact_migration_log};
+	use super::{migration_error, migration_log_tail};
 
 	#[test]
-	fn row_data_never_survives_redaction() {
+	fn the_log_is_kept_whole() {
 		let log = concat!(
 			"running 1721000002-addBaz.ts\n",
 			"error: insert or update on table \"encounters\" violates foreign key constraint \"fk_patient\"\n",
 			"DETAIL:  Key (patient_id)=(abc-123) is not present in table \"patients\".\n",
 			"HINT:  add the patient first\n",
-			"STATEMENT:  INSERT INTO encounters VALUES ('Jane Doe')\n",
-			"Failing row contains (abc-123, Jane Doe)\n",
-			"query parameters: $1 = 'Jane Doe'\n",
 		);
 
-		let out = redact_migration_log(log);
+		let out = migration_log_tail(log);
 
-		assert!(!out.contains("abc-123"), "{out}");
-		assert!(!out.contains("Jane Doe"), "{out}");
-		assert!(!out.contains("DETAIL"), "{out}");
-		assert!(!out.contains("HINT"), "{out}");
-		assert!(!out.contains("STATEMENT"), "{out}");
-		assert!(!out.contains("Failing row"), "{out}");
-		assert!(!out.contains("parameters"), "{out}");
 		assert!(out.contains("violates foreign key constraint"), "{out}");
-	}
-
-	#[test]
-	fn literals_are_blanked_only_where_an_error_is_reported() {
-		let log = concat!(
-			"applying 1721000003-fixThing.ts to 'tamanu' at \"public\"\n",
-			"ERROR: invalid input value for enum \"sex\": 'kangaroo'\n",
-		);
-
-		let out = redact_migration_log(log);
-
-		assert!(
-			out.contains("applying 1721000003-fixThing.ts to 'tamanu' at \"public\""),
-			"{out}"
-		);
-		assert!(!out.contains("kangaroo"), "{out}");
-		assert!(!out.contains("\"sex\""), "{out}");
-		assert!(
-			out.contains("invalid input value for enum \"…\": '…'"),
-			"{out}"
-		);
+		assert!(out.contains("Key (patient_id)=(abc-123)"), "{out}");
+		assert!(out.contains("HINT:  add the patient first"), "{out}");
 	}
 
 	#[test]
@@ -748,7 +678,7 @@ mod error_tests {
 			.collect::<Vec<_>>()
 			.join("\n");
 
-		let out = redact_migration_log(&log);
+		let out = migration_log_tail(&log);
 
 		assert!(out.starts_with("applying migration 60"), "{out}");
 		assert!(out.ends_with("applying migration 99"), "{out}");
@@ -762,15 +692,15 @@ mod error_tests {
 			.collect::<Vec<_>>()
 			.join("\n");
 
-		let out = redact_migration_log(&log);
+		let out = migration_log_tail(&log);
 
 		assert!(out.len() <= 2000, "{} bytes", out.len());
 		assert!(out.ends_with("xxx"), "the end of the log is what is kept");
 	}
 
 	#[test]
-	fn empty_input_redacts_to_nothing() {
-		assert_eq!(redact_migration_log(""), "");
+	fn an_empty_log_is_nothing() {
+		assert_eq!(migration_log_tail(""), "");
 	}
 
 	#[test]
@@ -779,6 +709,7 @@ mod error_tests {
 			"error": {
 				"code": "23503",
 				"message": "insert or update violates foreign key constraint",
+				"detail": "Key (patient_id)=(abc-123) is not present in table \"patients\".",
 				"table": "encounters",
 				"column": "patient_id",
 				"constraint": "fk_patient",
@@ -788,7 +719,7 @@ mod error_tests {
 		assert_eq!(
 			migration_error(Some(&stats), Some("ERROR: something else")).as_deref(),
 			Some(
-				"23503: insert or update violates foreign key constraint [encounters.patient_id, fk_patient]"
+				"23503: insert or update violates foreign key constraint [encounters.patient_id, fk_patient] DETAIL: Key (patient_id)=(abc-123) is not present in table \"patients\"."
 			),
 			"structured data wins over the log"
 		);
@@ -807,7 +738,7 @@ mod error_tests {
 	}
 
 	#[test]
-	fn the_redacted_log_stands_in_for_missing_stats() {
+	fn the_log_stands_in_for_missing_stats() {
 		let log = concat!(
 			"running 1721000002-addBaz.ts\n",
 			"ERROR: relation \"patients\" does not exist\n",
@@ -816,8 +747,14 @@ mod error_tests {
 
 		let out = migration_error(None, Some(log)).expect("a failed job's log is the fallback");
 
-		assert!(out.contains("relation \"…\" does not exist"), "{out}");
-		assert!(!out.contains("DETAIL"), "{out}");
+		assert!(
+			out.contains("relation \"patients\" does not exist"),
+			"{out}"
+		);
+		assert!(
+			out.contains("DETAIL:  Key (id)=(1) is not present"),
+			"{out}"
+		);
 		assert_eq!(migration_error(None, None), None);
 		assert_eq!(migration_error(None, Some("")), None);
 	}
