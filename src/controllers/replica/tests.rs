@@ -1,15 +1,20 @@
-use k8s_openapi::{api::core::v1::SecretReference, apimachinery::pkg::api::resource::Quantity};
+use k8s_openapi::{
+	api::core::v1::SecretReference,
+	apimachinery::pkg::{api::resource::Quantity, apis::meta::v1::Time},
+};
 use kube::api::ObjectMeta;
 use kube_quantity::ParsedQuantity;
 use rust_decimal::Decimal;
 
 use crate::{kopia::Snapshot, placement::PodPlacement, types::*, util::TimeSpan};
 
-use jiff::SignedDuration;
+use jiff::{SignedDuration, Timestamp};
 
 use super::{
-	extra_users_with_schemas, generate_password, persistent_schemas_migration_settled,
+	extra_users_with_schemas, generate_password, no_successful_restore,
+	persistent_schemas_migration_settled,
 	resources::{build_snapshot_list_job, compute_storage_size},
+	restore_in_progress,
 	scheduling::deployment_ready_timeout,
 	snapshot_already_covered,
 };
@@ -517,6 +522,71 @@ fn make_restore(snapshot: &str, phase: Option<RestorePhase>) -> PostgresPhysical
 			..Default::default()
 		}),
 	}
+}
+
+/// A restore with a `migrateTo` target sits in `Migrating` between Ready and
+/// Switching. Missed here the replica reads as idle: it lists snapshots on
+/// every reconcile and can start a second restore beside the first.
+#[test]
+fn a_migrating_restore_is_in_progress() {
+	let restore = make_restore("snapA", Some(RestorePhase::Migrating));
+	assert!(restore_in_progress(&restore));
+}
+
+#[test]
+fn every_pre_switchover_phase_is_in_progress() {
+	for phase in [
+		RestorePhase::Pending,
+		RestorePhase::Restoring,
+		RestorePhase::Migrating,
+		RestorePhase::Ready,
+	] {
+		let restore = make_restore("snapA", Some(phase.clone()));
+		assert!(
+			restore_in_progress(&restore),
+			"a {phase:?} restore must stop the replica starting another"
+		);
+	}
+}
+
+#[test]
+fn a_finished_restore_is_not_in_progress() {
+	for phase in [RestorePhase::Active, RestorePhase::Failed] {
+		let restore = make_restore("snapA", Some(phase.clone()));
+		assert!(!restore_in_progress(&restore), "{phase:?} is not in flight");
+	}
+}
+
+/// An ephemeral replica deletes its restore once the snapshot is proved, so
+/// `verifiedSnapshotId` is all that's left to say a restore ever succeeded.
+/// Read as never-restored it takes the immediate-trigger path on every
+/// reconcile and lists snapshots every few seconds.
+#[test]
+fn verified_snapshot_counts_as_a_successful_restore() {
+	let status = PostgresPhysicalReplicaStatus {
+		verified_snapshot_id: Some("snapA".into()),
+		..Default::default()
+	};
+	assert!(!no_successful_restore(Some(&status)));
+}
+
+#[test]
+fn completed_restore_counts_as_a_successful_restore() {
+	let status = PostgresPhysicalReplicaStatus {
+		last_restore_completed_at: Some(Time(Timestamp::now())),
+		..Default::default()
+	};
+	assert!(!no_successful_restore(Some(&status)));
+}
+
+/// A replica with neither marker has genuinely never restored and must still
+/// trigger immediately rather than idling until the first cron tick.
+#[test]
+fn fresh_replica_has_no_successful_restore() {
+	assert!(no_successful_restore(None));
+	assert!(no_successful_restore(Some(
+		&PostgresPhysicalReplicaStatus::default()
+	)));
 }
 
 #[test]

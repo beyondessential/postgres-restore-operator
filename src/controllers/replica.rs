@@ -69,6 +69,26 @@ pub fn persistent_schemas_migration_settled(replica: &PostgresPhysicalReplica) -
 		.is_none_or(SchemaMigrationPhase::is_settled)
 }
 
+/// True while a restore is working toward a switchover, so the replica must
+/// not start another one. `Switching` is absent because the switchover block
+/// returns before any of the trigger logic runs.
+fn restore_in_progress(restore: &PostgresPhysicalRestore) -> bool {
+	matches!(
+		restore.status.as_ref().and_then(|s| s.phase.as_ref()),
+		Some(RestorePhase::Pending)
+			| Some(RestorePhase::Restoring)
+			| Some(RestorePhase::Migrating)
+			| Some(RestorePhase::Ready)
+	)
+}
+
+/// True when nothing records a successful restore for this replica: an
+/// ephemeral restore is torn down, leaving `verifiedSnapshotId` as its only
+/// evidence of success.
+fn no_successful_restore(status: Option<&PostgresPhysicalReplicaStatus>) -> bool {
+	status.is_none_or(|s| s.last_restore_completed_at.is_none() && s.verified_snapshot_id.is_none())
+}
+
 /// True when a snapshot is already covered by an existing restore and must
 /// not be restored again.
 ///
@@ -256,12 +276,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 	let switching_restore = restore_list.items.iter().find(|r| {
 		r.status.as_ref().and_then(|s| s.phase.as_ref()) == Some(&RestorePhase::Switching)
 	});
-	let in_progress_restore = restore_list.items.iter().find(|r| {
-		matches!(
-			r.status.as_ref().and_then(|s| s.phase.as_ref()),
-			Some(RestorePhase::Pending) | Some(RestorePhase::Restoring) | Some(RestorePhase::Ready)
-		)
-	});
+	let in_progress_restore = restore_list.items.iter().find(|r| restore_in_progress(r));
 
 	// Handle redaction before schema migration: if redaction is set,
 	// it rewrites the data in place, and any persistent_schemas migration
@@ -992,12 +1007,7 @@ pub async fn reconcile(replica: Arc<PostgresPhysicalReplica>, ctx: Arc<Context>)
 		return Ok(Action::requeue(Duration::from_secs(30)));
 	}
 
-	let never_restored = active_restore.is_none()
-		&& replica
-			.status
-			.as_ref()
-			.and_then(|s| s.last_restore_completed_at.as_ref())
-			.is_none();
+	let never_restored = active_restore.is_none() && no_successful_restore(replica.status.as_ref());
 
 	// Detect when the active Restore CR referenced in status has been deleted
 	let active_restore_deleted = active_restore.is_none()
