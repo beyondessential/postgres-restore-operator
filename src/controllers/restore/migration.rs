@@ -294,6 +294,15 @@ fn is_droppable_schema(schema: &str) -> bool {
 	!matches!(schema, "public" | "information_schema") && !schema.starts_with("pg_")
 }
 
+/// Split the named schemas into those that may be dropped and those that are
+/// refused, so a replica naming only reserved schemas never opens a connection.
+fn partition_droppable(schemas: &[String]) -> (Vec<String>, Vec<String>) {
+	schemas
+		.iter()
+		.cloned()
+		.partition(|schema| is_droppable_schema(schema))
+}
+
 /// Drop the replica's `pre_migrate_drop_schemas` from the restore.
 ///
 /// A view over a table the migration alters blocks the DDL outright, so a
@@ -315,6 +324,18 @@ async fn drop_pre_migrate_schemas(
 		return Ok(());
 	}
 
+	let (droppable, refused) = partition_droppable(schemas);
+	if !refused.is_empty() {
+		warn!(
+			restore = restore_name,
+			schemas = ?refused,
+			"refusing to drop reserved schemas before migration"
+		);
+	}
+	if droppable.is_empty() {
+		return Ok(());
+	}
+
 	let conn = crate::controllers::postgres::connect_to_restore(
 		&ctx.client,
 		namespace,
@@ -325,18 +346,6 @@ async fn drop_pre_migrate_schemas(
 		ctx.use_port_forward(),
 	)
 	.await?;
-
-	let (droppable, refused): (Vec<String>, Vec<String>) = schemas
-		.iter()
-		.cloned()
-		.partition(|s| is_droppable_schema(s));
-	if !refused.is_empty() {
-		warn!(
-			restore = restore_name,
-			schemas = ?refused,
-			"refusing to drop reserved schemas before migration"
-		);
-	}
 
 	let present =
 		crate::controllers::postgres::existing_schemas_on(&conn.client, &droppable).await?;
@@ -762,7 +771,7 @@ mod error_tests {
 
 #[cfg(test)]
 mod guard_tests {
-	use super::is_droppable_schema;
+	use super::{is_droppable_schema, partition_droppable};
 
 	#[test]
 	fn reserved_schemas_are_never_dropped() {
@@ -776,5 +785,33 @@ mod guard_tests {
 		for schema in ["reporting", "dbt", "analytics", "public_tupaia"] {
 			assert!(is_droppable_schema(schema), "{schema} should be droppable");
 		}
+	}
+
+	fn owned(schemas: &[&str]) -> Vec<String> {
+		schemas.iter().map(|s| s.to_string()).collect()
+	}
+
+	#[test]
+	fn a_mixed_list_keeps_the_droppable_and_reports_the_rest() {
+		let (droppable, refused) = partition_droppable(&owned(&["reporting", "public", "dbt"]));
+
+		assert_eq!(droppable, owned(&["reporting", "dbt"]));
+		assert_eq!(refused, owned(&["public"]));
+	}
+
+	#[test]
+	fn a_list_of_only_reserved_schemas_drops_nothing() {
+		let (droppable, refused) = partition_droppable(&owned(&["public", "pg_catalog"]));
+
+		assert!(droppable.is_empty(), "nothing left to connect for");
+		assert_eq!(refused, owned(&["public", "pg_catalog"]));
+	}
+
+	#[test]
+	fn the_default_is_droppable_on_its_own() {
+		let (droppable, refused) = partition_droppable(&owned(&["reporting"]));
+
+		assert_eq!(droppable, owned(&["reporting"]));
+		assert!(refused.is_empty());
 	}
 }

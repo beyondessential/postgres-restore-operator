@@ -47,6 +47,10 @@ async fn migration_target_drives_a_migration_job() {
 		version: TARGET_VERSION.to_string(),
 		version_id: TARGET_VERSION_ID.to_string(),
 	});
+	// The snapshot carries a reporting schema holding a view over test_data,
+	// which is the shape that blocks a migration's DDL on a real deployment.
+	replica.spec.pre_migrate_drop_schemas =
+		Some(vec!["reporting".to_string(), "public".to_string()]);
 	replica.metadata.namespace = Some(ns.into());
 	replicas
 		.create(&PostParams::default(), &replica)
@@ -62,6 +66,30 @@ async fn migration_target_drives_a_migration_job() {
 	)
 	.await;
 	println!("--- restore {restore_name} is migrating");
+
+	println!("--- checking the named schema was dropped and public was refused");
+	let schemas = kubectl_exec(
+		ns,
+		&format!("deployment/{restore_name}"),
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-tAc",
+			"SELECT nspname FROM pg_namespace WHERE nspname IN ('reporting', 'public') ORDER BY nspname",
+		],
+	)
+	.await;
+	assert!(
+		!schemas.contains("reporting"),
+		"the named schema should be gone before the job runs, got: {schemas}"
+	);
+	assert!(
+		schemas.contains("public"),
+		"public is reserved and must survive being named, got: {schemas}"
+	);
 
 	println!("--- checking the restore is writable despite the replica being read-only");
 	kubectl_exec(
