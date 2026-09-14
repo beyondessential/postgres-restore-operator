@@ -44,6 +44,9 @@ const DEFAULT_METRICS_ADDR: &str = "[::]:8080";
 const DEFAULT_METRICS_PORT: u16 = 8080;
 const DEFAULT_BROKER_ADDR: &str = "[::]:9091";
 const DEFAULT_CANOPY_RECONCILE_INTERVAL_SECS: u64 = 30;
+/// The client certificate bestool mints at construction lives six days, so the
+/// operator re-mints well inside that.
+const CANOPY_CERT_RENEW_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
 const CONFIGMAP_NAME: &str = "postgres-restore-operator-config";
 
 /// Annotate the operator's own pod with the running version.
@@ -440,6 +443,24 @@ async fn main() -> anyhow::Result<()> {
 		let register_ctx = ctx.clone();
 		tokio::spawn(async move {
 			register_capabilities(register_ctx).await;
+		});
+
+		let renew_ctx = ctx.clone();
+		tokio::spawn(async move {
+			let mut interval = tokio::time::interval(CANOPY_CERT_RENEW_INTERVAL);
+			interval.tick().await;
+			loop {
+				interval.tick().await;
+				let Some(canopy) = renew_ctx.canopy.as_ref() else {
+					break;
+				};
+				match canopy.renew().await {
+					Ok(()) => info!("renewed the canopy client certificate"),
+					Err(error) => {
+						warn!(error = %error, "renewing the canopy client certificate failed");
+					}
+				}
+			}
 		});
 
 		let interval_secs = std::env::var("CANOPY_RECONCILE_INTERVAL_SECS")

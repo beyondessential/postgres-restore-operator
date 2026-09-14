@@ -148,6 +148,17 @@ impl Client {
 		Ok(Some(Self { inner }))
 	}
 
+	/// Mint a fresh client certificate from the device key. The certificate the
+	/// client builds at construction is short-lived, so a process outliving it
+	/// authenticates with an expired one and canopy's edge rejects every call.
+	pub async fn renew(&self) -> Result<()> {
+		self.inner
+			.transport()
+			.renew()
+			.await
+			.map_err(|err| Error::Canopy(format!("renew: {err}")))
+	}
+
 	/// Register the intent descriptors this consumer supports. Replaces the
 	/// registered set wholesale (per canopy's semantics). Each descriptor
 	/// carries the intent name, the canopy semantics it opts into, and its
