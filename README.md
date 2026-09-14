@@ -114,6 +114,7 @@ Defines a continuously-refreshed replica of a PostgreSQL database restored from 
 | `preMigrateDropSchemas` | `[]string` | No | — | Schemas dropped from the restore before its migration Job runs. Views over a table a migration alters block the DDL, so a deployment that drops and regenerates such schemas around a real upgrade names them here and the test starts from the same place. `public`, `information_schema` and `pg_*` are refused. Set from the intent's `pre_migrate_drop_schemas` param, which the `upgrade` intent defaults to `reporting`. |
 | `redaction` | `RedactionSpec` | No | — | If set, apply a Tamanu/dbt-shaped masking manifest to the restored data via the `postgresql_anonymizer` extension before switchover. See [RedactionSpec](#redactionspec) below. |
 | `migrateTo` | `MigrationTarget` | No | — | Apply a Tamanu version's schema migrations to each restore of this replica. `{ version, versionId }`. Set by the canopy worklist syncer by two routes: for the `upgrade` intent from the target version canopy names on the worklist entry, whose outcome is reported back as a version-readiness signal; and for an `analytics` replica from its operator-chosen `migrate_to` param, keeping a persistent upgraded query replica, whose outcome is not reported. A restore carrying this is built read-write, since migrations are DDL. |
+| `builderImage` | `string` | No | — | Image that builds a Tamanu reporting schema against each migrated restore. Set by the canopy worklist syncer from the `reporting-schema` intent's `builder_image` param. pgro hands the image a database, a version and a group and takes back the SQL it emits over a callback; how a schema is made is the image's business. Its presence is what sends the restore through a build before switchover. |
 
 The cron expression is parsed using the [cronexpr](https://docs.rs/cronexpr) crate.
 It has two interesting features:
@@ -258,6 +259,7 @@ Deleting this resource will drop the restored database and prompt the Replica to
 | `snapshotSize` | `Quantity` | Yes | Size of the snapshot from Kopia metadata. |
 | `storageSize` | `Quantity` | Yes | Calculated PVC size (snapshot size × 1.1). |
 | `migrateTo` | `MigrationTarget` | No | Copied from the parent replica: the Tamanu version whose schema migrations this restore should apply. Its presence is what sends the restore through `Migrating`. |
+| `builderImage` | `string` | No | Copied from the parent replica: the image that builds a reporting schema against this restore once it is migrated. |
 
 #### Status
 
@@ -270,6 +272,8 @@ Deleting this resource will drop the restored database and prompt the Replica to
 | `restoredAt` | `Time` | When the restore job completed. |
 | `activatedAt` | `Time` | When the service switched to this restore. |
 | `restoreJob` | `JobStatus` | Status of the Kubernetes Job performing the restore (`name`, `phase`, `completedAt`). |
+| `schemaBuildJob` | `string` | Name of the reporting-schema build Job, for an operator following it. |
+| `schemaBuildResult` | `SchemaBuildResult` | What the build did: `built`, `error`, `totalElapsedSeconds`, `schemaBytes`. A failed build does not fail the restore; canopy grades the schema separately from the replica's health. |
 | `pvc` | `string` | Name of the PVC holding the restored data. |
 | `deployment` | `string` | Name of the Deployment running PostgreSQL on the restored data. |
 | `credentialsSecret` | `string` | Shared credentials secret (owned by parent replica). |

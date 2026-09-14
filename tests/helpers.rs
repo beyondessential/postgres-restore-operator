@@ -152,6 +152,7 @@ pub fn build_replica(name: &str, secret_ref: &str, opts: ReplicaOpts) -> Postgre
 		PostgresPhysicalReplicaSpec {
 			pre_migrate_drop_schemas: None,
 			migrate_to: None,
+			builder_image: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some(secret_ref.into()),
 				namespace: None,
@@ -358,6 +359,7 @@ pub fn build_second_restore(
 		name,
 		PostgresPhysicalRestoreSpec {
 			migrate_to: None,
+			builder_image: None,
 			replica: LocalObjectReference {
 				name: replica.name_any(),
 			},

@@ -1,4 +1,8 @@
-use std::{collections::HashMap, sync::Mutex};
+use std::{
+	collections::HashMap,
+	sync::Mutex,
+	time::{Duration, Instant},
+};
 
 use k8s_openapi::api::{
 	batch::v1::Job,
@@ -40,18 +44,41 @@ pub fn classify_job(job: &Job) -> JobStatus {
 /// In-memory store for job callback results, keyed by `{namespace}/{name}`.
 #[derive(Default)]
 pub struct CallbackStore {
-	inner: Mutex<HashMap<String, String>>,
+	inner: Mutex<HashMap<String, Entry>>,
+}
+
+struct Entry {
+	stored_at: Instant,
+	data: String,
 }
 
 impl CallbackStore {
 	pub fn store(&self, namespace: &str, name: &str, data: String) {
 		let key = format!("{namespace}/{name}");
-		self.inner.lock().unwrap().insert(key, data);
+		self.inner.lock().unwrap().insert(
+			key,
+			Entry {
+				stored_at: Instant::now(),
+				data,
+			},
+		);
 	}
 
 	pub fn take(&self, namespace: &str, name: &str) -> Option<String> {
 		let key = format!("{namespace}/{name}");
-		self.inner.lock().unwrap().remove(&key)
+		self.inner.lock().unwrap().remove(&key).map(|e| e.data)
+	}
+
+	/// Drop what nothing came back for, returning how many entries went.
+	///
+	/// A caller that posts a result the operator then has no reason to read
+	/// again leaves it here for the process's lifetime, which for the tens of
+	/// megabytes a reporting schema runs to is worth reclaiming.
+	pub fn sweep(&self, max_age: Duration) -> usize {
+		let mut inner = self.inner.lock().unwrap();
+		let before = inner.len();
+		inner.retain(|_, entry| entry.stored_at.elapsed() < max_age);
+		before - inner.len()
 	}
 }
 
@@ -85,6 +112,18 @@ mod tests {
 	use k8s_openapi::api::batch::v1::{JobSpec, JobStatus as K8sJobStatus};
 
 	use super::*;
+
+	/// A payload nobody came back for is what the sweep is for, and one that
+	/// has just arrived is one a reconcile is still on its way to take.
+	#[test]
+	fn a_payload_nothing_took_is_swept() {
+		let store = CallbackStore::default();
+		store.store("ns", "replica", "schema".to_string());
+
+		assert_eq!(store.sweep(Duration::from_secs(3600)), 0);
+		assert_eq!(store.sweep(Duration::ZERO), 1);
+		assert_eq!(store.take("ns", "replica"), None);
+	}
 
 	#[test]
 	fn classify_active_when_no_status() {
