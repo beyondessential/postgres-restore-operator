@@ -11,6 +11,7 @@
 use bestool_canopy::{
 	CanopyClient, CanopyTransport, TAILSCALE_URL,
 	bytes::Bytes,
+	connect_to,
 	http::{Method, Request, header::CONTENT_TYPE},
 	schema::{
 		BackupPurpose, IntentDescriptor, ProgressArgs, RestoreCapabilitiesArgs, RestoreCredentials,
@@ -113,7 +114,7 @@ async fn build_inner(cfg: &CanopyConfig) -> Result<CanopyClient> {
 	let tailscale_url: Url = TAILSCALE_URL
 		.parse()
 		.expect("bestool-canopy TAILSCALE_URL is a valid URL");
-	let inner = CanopyClient::with_urls(
+	let inner = connect_to(
 		cfg.base_url.clone(),
 		tailscale_url,
 		cfg.device_key_pem.as_deref(),
@@ -149,6 +150,17 @@ impl Client {
 		let Some(cfg) = cfg else { return Ok(None) };
 		let inner = build_inner(&cfg).await?;
 		Ok(Some(Self { inner }))
+	}
+
+	/// Mint a fresh client certificate from the device key. The certificate the
+	/// client builds at construction is short-lived, so a process outliving it
+	/// authenticates with an expired one and canopy's edge rejects every call.
+	pub async fn renew(&self) -> Result<()> {
+		self.inner
+			.transport()
+			.renew()
+			.await
+			.map_err(|err| Error::Canopy(format!("renew: {err}")))
 	}
 
 	/// Register the intent descriptors this consumer supports. Replaces the

@@ -1345,6 +1345,13 @@ spec:
                       them is what shows a migration that backfills heavily.
                     format: int64
                     type: integer
+                  error:
+                    description: |-
+                      Why it failed: tamanu's structured error where it records one, otherwise
+                      the tail of the job's log. Carries the row postgres refused, so that a
+                      deployment can be fixed before the upgrade is retried.
+                    nullable: true
+                    type: string
                   failedMigration:
                     description: |-
                       The migration that failed, when one did. Its absence is what makes the

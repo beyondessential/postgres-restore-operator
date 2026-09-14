@@ -1294,6 +1294,7 @@ mod tests {
 			migration_result: Some(crate::types::MigrationResult {
 				total_elapsed_seconds: 60,
 				failed_migration: Some("1710000000-addThing.js".into()),
+				error: None,
 				data_bytes_before: 1,
 				data_bytes_after: 1,
 				timings: Vec::new(),
@@ -1310,6 +1311,7 @@ mod tests {
 			migration_result: Some(crate::types::MigrationResult {
 				total_elapsed_seconds: 60,
 				failed_migration: None,
+				error: None,
 				data_bytes_before: 1,
 				data_bytes_after: 2,
 				timings: Vec::new(),

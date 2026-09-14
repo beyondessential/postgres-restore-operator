@@ -12,7 +12,7 @@ spec:
                 fsGroup: 999
             initContainers:
                 - name: create-bucket
-                  image: minio/mc:latest
+                  image: quay.io/minio/mc:latest
                   imagePullPolicy: IfNotPresent
                   command: ["/bin/sh", "-c"]
                   args:
@@ -41,6 +41,7 @@ spec:
                           gosu postgres psql -d postgres -c "CREATE DATABASE myapp"
                           gosu postgres psql -d myapp -c "CREATE TABLE test_data (id serial PRIMARY KEY, data text)"
                           gosu postgres psql -d myapp -c "INSERT INTO test_data (data) SELECT repeat('x', 1000) FROM generate_series(1, 1000)"
+                          gosu postgres psql -d myapp -c "CREATE SCHEMA reporting; CREATE VIEW reporting.test_data_v AS SELECT id, data FROM public.test_data"
                           echo "Application database 'myapp' created with test data"
 
                           gosu postgres pg_ctl -D /pgdata/16/main stop -w

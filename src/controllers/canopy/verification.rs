@@ -19,6 +19,7 @@ use uuid::Uuid;
 use crate::{
 	context::Context,
 	controllers::{canopy::labels, postgres},
+	error::Error,
 	types::{PostgresPhysicalReplica, PostgresPhysicalRestore, SchemaBuildResult},
 };
 
@@ -131,11 +132,20 @@ pub async fn report(
 	// run's credential requests.
 	let run_id = run_id_from_status(restore);
 
+	let (duration_sec, pg) = gather_health_details(ctx, replica, restore).await;
+	let (outcome, error) = verdict(outcome, error, pg.as_ref());
 	let replica_healthy = matches!(outcome, RunOutcome::Success);
 
-	// Gather health details; send None rather than an empty object when
-	// nothing was gathered (e.g. failure path, postgres unreachable).
-	let mut health = gather_health_details(ctx, replica, restore).await;
+	// Send None rather than an empty object when nothing was gathered (e.g.
+	// failure path, postgres unreachable).
+	let mut health = build_health_details(
+		duration_sec,
+		pg,
+		restore
+			.status
+			.as_ref()
+			.and_then(|s| s.schema_build_result.as_ref()),
+	);
 	// `url` semantic: for a replica exposed on the tailnet, attach a link to
 	// it so canopy can surface it to operators alongside the report.
 	if let Some(url) = exposed_replica_url(ctx, replica).await
@@ -163,7 +173,7 @@ pub async fn report(
 		.intent(intent.clone())
 		.snapshot_id(restore.spec.snapshot.clone())
 		.outcome(outcome_wire(outcome).to_string())
-		.maybe_error(error.map(str::to_string))
+		.maybe_error(error)
 		.replica_healthy(replica_healthy)
 		.maybe_postgres_version(postgres_version)
 		.observed_at(Timestamp::now().to_string())
@@ -305,6 +315,22 @@ fn outcome_wire(outcome: RunOutcome) -> &'static str {
 	}
 }
 
+/// A cluster holding only postgres' own databases restored no application data.
+fn verdict(
+	outcome: RunOutcome,
+	error: Option<&str>,
+	pg: Option<&PostgresHealth>,
+) -> (RunOutcome, Option<String>) {
+	let empty = pg.is_some_and(|pg| postgres::application_database(&pg.sizes).is_none());
+	if outcome == RunOutcome::Success && empty {
+		return (
+			RunOutcome::Failure,
+			Some(Error::NoApplicationDatabase.to_string()),
+		);
+	}
+	(outcome, error.map(str::to_string))
+}
+
 /// The tailnet URL of a replica exposed via the `url` semantic, or `None` if
 /// it isn't exposed or the MagicDNS suffix can't be resolved. The hostname is
 /// read from the Service's `tailscale.com/hostname` annotation the intent set,
@@ -319,7 +345,7 @@ async fn exposed_replica_url(ctx: &Context, replica: &PostgresPhysicalReplica) -
 	Some(crate::tailscale::replica_url(hostname, &suffix))
 }
 
-/// Best-effort gather of the `health_details` map (snake_case keys):
+/// Best-effort gather of the parts of the `health_details` map (snake_case keys):
 /// `{ sizes: {<db>: bytes}, fixes: {reindex, locale}, restore_duration_sec }`.
 ///
 /// `sizes` and `fixes` come from a single read-only connection to the
@@ -333,7 +359,7 @@ async fn gather_health_details(
 	ctx: &Context,
 	replica: &PostgresPhysicalReplica,
 	restore: &PostgresPhysicalRestore,
-) -> Value {
+) -> (Option<u64>, Option<PostgresHealth>) {
 	let duration_sec = restore
 		.status
 		.as_ref()
@@ -355,14 +381,7 @@ async fn gather_health_details(
 		}
 	};
 
-	build_health_details(
-		duration_sec,
-		pg,
-		restore
-			.status
-			.as_ref()
-			.and_then(|s| s.schema_build_result.as_ref()),
-	)
+	(duration_sec, pg)
 }
 
 /// Postgres-derived pieces of the health details: per-database sizes and
@@ -485,6 +504,7 @@ fn migration_args(
 			.target_version_id(target_version_id)
 			.total_elapsed_seconds(result.total_elapsed_seconds)
 			.maybe_failed_migration(result.failed_migration.clone())
+			.maybe_error(result.error.clone())
 			.data_bytes_before(result.data_bytes_before)
 			.data_bytes_after(result.data_bytes_after)
 			.timings(
@@ -680,6 +700,59 @@ mod tests {
 		assert!(v.get("schema_build").is_none());
 	}
 
+	fn pg_health(sizes: &[(&str, u64)]) -> PostgresHealth {
+		PostgresHealth {
+			sizes: sizes.iter().map(|(n, s)| ((*n).to_string(), *s)).collect(),
+			fixes: json!({}),
+		}
+	}
+
+	#[test]
+	fn a_restore_of_only_system_databases_is_reported_as_a_failure() {
+		// Postgres coming up proves nothing about a backup with no data in it.
+		let pg = pg_health(&[
+			("postgres", 8_000_000),
+			("template1", 8_000_000),
+			("template0", 8_000_000),
+		]);
+		let (outcome, error) = verdict(RunOutcome::Success, None, Some(&pg));
+		assert_eq!(outcome, RunOutcome::Failure);
+		assert_eq!(
+			error.as_deref(),
+			Some("restore contains no application database")
+		);
+	}
+
+	#[test]
+	fn a_restore_with_an_application_database_keeps_its_success() {
+		let pg = pg_health(&[("myapp", 1_872_782), ("postgres", 12_829)]);
+		assert_eq!(
+			verdict(RunOutcome::Success, None, Some(&pg)),
+			(RunOutcome::Success, None)
+		);
+	}
+
+	#[test]
+	fn a_failure_keeps_the_error_the_caller_named() {
+		// The caller's reason is the specific one; the sizes only add to it.
+		let pg = pg_health(&[("postgres", 8_000_000)]);
+		let (outcome, error) = verdict(
+			RunOutcome::Failure,
+			Some("kopia restore Job failed"),
+			Some(&pg),
+		);
+		assert_eq!(outcome, RunOutcome::Failure);
+		assert_eq!(error.as_deref(), Some("kopia restore Job failed"));
+	}
+
+	#[test]
+	fn an_unreachable_postgres_cannot_downgrade_a_success() {
+		assert_eq!(
+			verdict(RunOutcome::Success, None, None),
+			(RunOutcome::Success, None)
+		);
+	}
+
 	fn restore_with_run_id(run_id: Option<&str>) -> PostgresPhysicalRestore {
 		use k8s_openapi::api::core::v1::LocalObjectReference;
 		use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
@@ -732,6 +805,7 @@ mod tests {
 		crate::types::MigrationResult {
 			total_elapsed_seconds: 412,
 			failed_migration: None,
+			error: None,
 			data_bytes_before: 1_000,
 			data_bytes_after: 1_200,
 			timings: vec![
@@ -781,6 +855,33 @@ mod tests {
 			args.failed_migration.as_deref(),
 			Some("1721000001-addBar.js")
 		);
+	}
+
+	#[test]
+	fn migration_args_carries_the_cause_of_the_failure() {
+		// The file name says where it stopped; only this says what to fix.
+		let mut result = migration_result();
+		result.failed_migration = Some("1721000001-addBar.js".into());
+		result.error = Some(
+			"23505: duplicate key value violates unique constraint \"patients_email_key\" \
+			 [patients.email, patients_email_key] DETAIL: Key (email)=(a@example.org) already exists."
+				.into(),
+		);
+		let args = migration_args(&result, &target("55555555-5555-5555-5555-555555555555"))
+			.expect("built");
+
+		assert_eq!(args.error, result.error);
+	}
+
+	#[test]
+	fn migration_args_sends_no_error_for_a_test_that_passed() {
+		let args = migration_args(
+			&migration_result(),
+			&target("55555555-5555-5555-5555-555555555555"),
+		)
+		.expect("built");
+
+		assert_eq!(args.error, None);
 	}
 
 	#[test]

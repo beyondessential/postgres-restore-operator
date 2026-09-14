@@ -217,32 +217,29 @@ pub async fn discover_restore_database(
 		use_port_forward,
 	)
 	.await?;
-	let pg = &conn.client;
+	let sizes = list_database_sizes(&conn.client).await?;
 
-	let row = pg
-		.query_opt(
-			"SELECT datname FROM pg_database \
-			 WHERE datname NOT IN ('postgres', 'template0', 'template1') \
-			 ORDER BY pg_database_size(datname) DESC \
-			 LIMIT 1",
-			&[],
-		)
-		.await?;
-
-	match row {
-		Some(r) => {
-			let name: String = r.get(0);
+	match application_database(&sizes) {
+		Some(name) => {
 			debug!(
 				restore = restore_name,
 				database = %name,
 				"discovered main database in restore by size"
 			);
-			Ok(name)
+			Ok(name.to_string())
 		}
-		None => Err(Error::MissingField(
-			"no non-system databases found in restore".into(),
-		)),
+		None => Err(Error::NoApplicationDatabase),
 	}
+}
+
+/// The largest database postgres did not create itself. `None` means the
+/// cluster holds no application data at all.
+pub fn application_database(sizes: &[(String, u64)]) -> Option<&str> {
+	sizes
+		.iter()
+		.filter(|(name, _)| !matches!(name.as_str(), "postgres" | "template0" | "template1"))
+		.max_by_key(|(_, size)| *size)
+		.map(|(name, _)| name.as_str())
 }
 
 /// Query the on-disk size of the current database on an already-open
@@ -534,6 +531,28 @@ mod tests {
 	#[test]
 	fn quote_ident_with_quotes() {
 		assert_eq!(quote_ident("my\"schema"), "\"my\"\"schema\"");
+	}
+
+	fn sizes(pairs: &[(&str, u64)]) -> Vec<(String, u64)> {
+		pairs.iter().map(|(n, s)| ((*n).to_string(), *s)).collect()
+	}
+
+	#[test]
+	fn application_database_is_the_largest_one_postgres_did_not_create() {
+		// `postgres` outsizing the app database must not make it the answer.
+		let sizes = sizes(&[("postgres", 900), ("myapp", 500), ("scratch", 100)]);
+		assert_eq!(application_database(&sizes), Some("myapp"));
+	}
+
+	#[test]
+	fn a_cluster_of_only_system_databases_has_no_application_database() {
+		let sizes = sizes(&[
+			("postgres", 8_000_000),
+			("template1", 8_000_000),
+			("template0", 8_000_000),
+		]);
+		assert_eq!(application_database(&sizes), None);
+		assert_eq!(application_database(&[]), None);
 	}
 
 	#[test]

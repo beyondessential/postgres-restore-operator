@@ -196,8 +196,9 @@ jobs:
             rm -f "$archive"
           }
 
-          load_image minio/minio:latest
-          load_image minio/mc:latest
+          # minio publishes only to quay.io
+          load_image quay.io/minio/minio:latest
+          load_image quay.io/minio/mc:latest
           load_image kopia/kopia:0.22.3
           load_image postgres:16
           load_image postgres:16-alpine
