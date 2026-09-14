@@ -12,13 +12,13 @@ use std::{collections::BTreeMap, time::Duration};
 use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec},
-		core::v1::{Container, PodSpec, PodTemplateSpec, ResourceRequirements, Secret},
+		core::v1::{Container, Pod, PodSpec, PodTemplateSpec, ResourceRequirements, Secret},
 	},
 	apimachinery::pkg::api::resource::Quantity,
 };
 use kube::{
 	Api, ResourceExt,
-	api::{ObjectMeta, PostParams},
+	api::{ListParams, LogParams, ObjectMeta, PostParams},
 	runtime::controller::Action,
 };
 use tracing::{info, warn};
@@ -26,7 +26,7 @@ use tracing::{info, warn};
 use crate::{
 	context::Context,
 	controllers::jobs::{env_from_secret_name, env_literal},
-	error::Result,
+	error::{Error, Result},
 	placement::PodPlacement,
 	types::{
 		MigrationResult, MigrationTarget, MigrationTiming, PostgresPhysicalReplica,
@@ -175,7 +175,7 @@ pub async fn reconcile_migrating(
 	let replicas: Api<PostgresPhysicalReplica> = Api::namespaced(ctx.client.clone(), namespace);
 	let replica = replicas.get(&restore.spec.replica.name).await?;
 	let creds = credentials(ctx, &replica, namespace).await?;
-	let dbname = crate::controllers::postgres::discover_restore_database(
+	let dbname = match crate::controllers::postgres::discover_restore_database(
 		&ctx.client,
 		namespace,
 		name,
@@ -183,7 +183,23 @@ pub async fn reconcile_migrating(
 		&creds.1,
 		ctx.use_port_forward(),
 	)
-	.await?;
+	.await
+	{
+		Ok(dbname) => dbname,
+		// Nothing to migrate is a fact about the backup; retrying cannot change it.
+		Err(err @ Error::NoApplicationDatabase) => {
+			return super::fail_restore(
+				ctx,
+				namespace,
+				name,
+				&restore.spec.replica.name,
+				serde_json::json!({ "phase": "Failed" }),
+				&err.to_string(),
+			)
+			.await;
+		}
+		Err(err) => return Err(err),
+	};
 
 	let jobs: Api<Job> = Api::namespaced(ctx.client.clone(), namespace);
 	let job_name = migration_job_name(name);
@@ -245,6 +261,7 @@ pub async fn reconcile_migrating(
 		restore = name,
 		target = %target.version,
 		failed_migration = ?result.failed_migration,
+		error = ?result.error,
 		elapsed = result.total_elapsed_seconds,
 		"migration test finished"
 	);
@@ -277,6 +294,15 @@ fn is_droppable_schema(schema: &str) -> bool {
 	!matches!(schema, "public" | "information_schema") && !schema.starts_with("pg_")
 }
 
+/// Split the named schemas into those that may be dropped and those that are
+/// refused, so a replica naming only reserved schemas never opens a connection.
+fn partition_droppable(schemas: &[String]) -> (Vec<String>, Vec<String>) {
+	schemas
+		.iter()
+		.cloned()
+		.partition(|schema| is_droppable_schema(schema))
+}
+
 /// Drop the replica's `pre_migrate_drop_schemas` from the restore.
 ///
 /// A view over a table the migration alters blocks the DDL outright, so a
@@ -298,6 +324,18 @@ async fn drop_pre_migrate_schemas(
 		return Ok(());
 	}
 
+	let (droppable, refused) = partition_droppable(schemas);
+	if !refused.is_empty() {
+		warn!(
+			restore = restore_name,
+			schemas = ?refused,
+			"refusing to drop reserved schemas before migration"
+		);
+	}
+	if droppable.is_empty() {
+		return Ok(());
+	}
+
 	let conn = crate::controllers::postgres::connect_to_restore(
 		&ctx.client,
 		namespace,
@@ -308,18 +346,6 @@ async fn drop_pre_migrate_schemas(
 		ctx.use_port_forward(),
 	)
 	.await?;
-
-	let (droppable, refused): (Vec<String>, Vec<String>) = schemas
-		.iter()
-		.cloned()
-		.partition(|s| is_droppable_schema(s));
-	if !refused.is_empty() {
-		warn!(
-			restore = restore_name,
-			schemas = ?refused,
-			"refusing to drop reserved schemas before migration"
-		);
-	}
 
 	let present =
 		crate::controllers::postgres::existing_schemas_on(&conn.client, &droppable).await?;
@@ -405,6 +431,12 @@ async fn read_result(
 	baseline: Option<&str>,
 	job_failed: bool,
 ) -> Result<MigrationResult> {
+	let log = if job_failed {
+		migration_job_log(ctx, namespace, &migration_job_name(restore_name)).await
+	} else {
+		None
+	};
+
 	let conn = crate::controllers::postgres::connect_to_restore(
 		&ctx.client,
 		namespace,
@@ -446,19 +478,27 @@ async fn read_result(
 		return Ok(MigrationResult {
 			total_elapsed_seconds: 0,
 			failed_migration: job_failed.then(|| "unknown".to_string()),
+			error: job_failed
+				.then(|| migration_error(None, log.as_deref()))
+				.flatten(),
 			data_bytes_before: data_bytes_after,
 			data_bytes_after,
 			timings: Vec::new(),
 		});
 	};
 
-	Ok(result_from_batch(
+	let stats: Option<serde_json::Value> = row.get(2);
+	let mut result = result_from_batch(
 		row.get(0),
 		row.get(1),
-		row.get(2),
+		stats.clone(),
 		data_bytes_after,
 		job_failed,
-	))
+	);
+	result.error = job_failed
+		.then(|| migration_error(stats.as_ref(), log.as_deref()))
+		.flatten();
+	Ok(result)
 }
 
 /// Shape a `logs.migrations` batch row into the result canopy is sent.
@@ -521,15 +561,217 @@ pub(super) fn result_from_batch(
 				.map(str::to_owned)
 				.unwrap_or_else(|| "unknown".to_string())
 		}),
+		error: None,
 		data_bytes_before,
 		data_bytes_after,
 		timings,
 	}
 }
 
+/// The tail of the migrate container's log, as the pod still holds it.
+///
+/// Best effort: a log that cannot be read leaves the result without a cause and
+/// the reconcile carries on.
+async fn migration_job_log(ctx: &Context, namespace: &str, job_name: &str) -> Option<String> {
+	let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
+	let list = pods
+		.list(&ListParams::default().labels(&format!("job-name={job_name}")))
+		.await
+		.map_err(|e| warn!(job = job_name, error = %e, "listing migration job pods failed"))
+		.ok()?;
+	let pod = list.items.first()?;
+
+	pods.logs(
+		&pod.name_any(),
+		&LogParams {
+			container: Some(MIGRATION_CONTAINER.to_string()),
+			tail_lines: Some(200),
+			..Default::default()
+		},
+	)
+	.await
+	.map_err(|e| warn!(job = job_name, error = %e, "reading migration job log failed"))
+	.ok()
+}
+
+/// The cause of a failed migration: tamanu's own structured error where the
+/// version records one, otherwise the tail of the job's log.
+fn migration_error(stats: Option<&serde_json::Value>, log: Option<&str>) -> Option<String> {
+	if let Some(error) = stats.and_then(|stats| stats.get("error")) {
+		let field = |key: &str| {
+			error
+				.get(key)
+				.and_then(serde_json::Value::as_str)
+				.map(str::trim)
+				.filter(|value| !value.is_empty())
+		};
+
+		let head = match (field("code").or_else(|| field("name")), field("message")) {
+			(Some(label), Some(message)) => format!("{label}: {message}"),
+			(Some(label), None) => label.to_string(),
+			(None, Some(message)) => message.to_string(),
+			(None, None) => String::new(),
+		};
+
+		let mut context = Vec::new();
+		match (field("table"), field("column")) {
+			(Some(table), Some(column)) => context.push(format!("{table}.{column}")),
+			(Some(one), None) | (None, Some(one)) => context.push(one.to_string()),
+			(None, None) => {}
+		}
+		context.extend(field("constraint").map(str::to_owned));
+
+		let mut line = match (head.is_empty(), context.is_empty()) {
+			(false, false) => format!("{head} [{}]", context.join(", ")),
+			(false, true) => head,
+			(true, false) => format!("[{}]", context.join(", ")),
+			(true, true) => String::new(),
+		};
+		// Which row postgres refused, which is what a deployment has to fix before the
+		// upgrade is retried. The constraint name alone does not say.
+		for (label, value) in [("DETAIL", field("detail")), ("HINT", field("hint"))] {
+			if let Some(value) = value {
+				line.push_str(&format!(" {label}: {value}"));
+			}
+		}
+		if !line.is_empty() {
+			return Some(line.trim().to_string());
+		}
+	}
+
+	let tail = migration_log_tail(log?);
+	(!tail.is_empty()).then_some(tail)
+}
+
+/// The tail of a migration job's log, bounded so a status field stays readable.
+fn migration_log_tail(log: &str) -> String {
+	const KEEP_LINES: usize = 40;
+	const MAX_BYTES: usize = 2000;
+
+	let lines: Vec<&str> = log.lines().collect();
+	let tail = lines[lines.len().saturating_sub(KEEP_LINES)..].join("\n");
+	if tail.len() <= MAX_BYTES {
+		return tail;
+	}
+
+	let cut = (tail.len() - MAX_BYTES..tail.len())
+		.find(|at| tail.is_char_boundary(*at))
+		.unwrap_or(tail.len());
+	tail[cut..].to_string()
+}
+
+#[cfg(test)]
+mod error_tests {
+	use super::{migration_error, migration_log_tail};
+
+	#[test]
+	fn the_log_is_kept_whole() {
+		let log = concat!(
+			"running 1721000002-addBaz.ts\n",
+			"error: insert or update on table \"encounters\" violates foreign key constraint \"fk_patient\"\n",
+			"DETAIL:  Key (patient_id)=(abc-123) is not present in table \"patients\".\n",
+			"HINT:  add the patient first\n",
+		);
+
+		let out = migration_log_tail(log);
+
+		assert!(out.contains("violates foreign key constraint"), "{out}");
+		assert!(out.contains("Key (patient_id)=(abc-123)"), "{out}");
+		assert!(out.contains("HINT:  add the patient first"), "{out}");
+	}
+
+	#[test]
+	fn only_the_last_lines_are_kept() {
+		let log = (0..100)
+			.map(|i| format!("applying migration {i}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+
+		let out = migration_log_tail(&log);
+
+		assert!(out.starts_with("applying migration 60"), "{out}");
+		assert!(out.ends_with("applying migration 99"), "{out}");
+		assert!(!out.contains("applying migration 59"), "{out}");
+	}
+
+	#[test]
+	fn the_tail_is_capped() {
+		let log = (0..60)
+			.map(|i| format!("applying migration {i} {}", "x".repeat(200)))
+			.collect::<Vec<_>>()
+			.join("\n");
+
+		let out = migration_log_tail(&log);
+
+		assert!(out.len() <= 2000, "{} bytes", out.len());
+		assert!(out.ends_with("xxx"), "the end of the log is what is kept");
+	}
+
+	#[test]
+	fn an_empty_log_is_nothing() {
+		assert_eq!(migration_log_tail(""), "");
+	}
+
+	#[test]
+	fn structured_stats_render_as_one_line() {
+		let stats = serde_json::json!({
+			"error": {
+				"code": "23503",
+				"message": "insert or update violates foreign key constraint",
+				"detail": "Key (patient_id)=(abc-123) is not present in table \"patients\".",
+				"table": "encounters",
+				"column": "patient_id",
+				"constraint": "fk_patient",
+			},
+		});
+
+		assert_eq!(
+			migration_error(Some(&stats), Some("ERROR: something else")).as_deref(),
+			Some(
+				"23503: insert or update violates foreign key constraint [encounters.patient_id, fk_patient] DETAIL: Key (patient_id)=(abc-123) is not present in table \"patients\"."
+			),
+			"structured data wins over the log"
+		);
+	}
+
+	#[test]
+	fn structured_stats_omit_the_parts_tamanu_did_not_set() {
+		let stats = serde_json::json!({
+			"error": { "name": "QueryFailedError", "message": "relation does not exist" },
+		});
+
+		assert_eq!(
+			migration_error(Some(&stats), None).as_deref(),
+			Some("QueryFailedError: relation does not exist")
+		);
+	}
+
+	#[test]
+	fn the_log_stands_in_for_missing_stats() {
+		let log = concat!(
+			"running 1721000002-addBaz.ts\n",
+			"ERROR: relation \"patients\" does not exist\n",
+			"DETAIL:  Key (id)=(1) is not present\n",
+		);
+
+		let out = migration_error(None, Some(log)).expect("a failed job's log is the fallback");
+
+		assert!(
+			out.contains("relation \"patients\" does not exist"),
+			"{out}"
+		);
+		assert!(
+			out.contains("DETAIL:  Key (id)=(1) is not present"),
+			"{out}"
+		);
+		assert_eq!(migration_error(None, None), None);
+		assert_eq!(migration_error(None, Some("")), None);
+	}
+}
+
 #[cfg(test)]
 mod guard_tests {
-	use super::is_droppable_schema;
+	use super::{is_droppable_schema, partition_droppable};
 
 	#[test]
 	fn reserved_schemas_are_never_dropped() {
@@ -543,5 +785,33 @@ mod guard_tests {
 		for schema in ["reporting", "dbt", "analytics", "public_tupaia"] {
 			assert!(is_droppable_schema(schema), "{schema} should be droppable");
 		}
+	}
+
+	fn owned(schemas: &[&str]) -> Vec<String> {
+		schemas.iter().map(|s| s.to_string()).collect()
+	}
+
+	#[test]
+	fn a_mixed_list_keeps_the_droppable_and_reports_the_rest() {
+		let (droppable, refused) = partition_droppable(&owned(&["reporting", "public", "dbt"]));
+
+		assert_eq!(droppable, owned(&["reporting", "dbt"]));
+		assert_eq!(refused, owned(&["public"]));
+	}
+
+	#[test]
+	fn a_list_of_only_reserved_schemas_drops_nothing() {
+		let (droppable, refused) = partition_droppable(&owned(&["public", "pg_catalog"]));
+
+		assert!(droppable.is_empty(), "nothing left to connect for");
+		assert_eq!(refused, owned(&["public", "pg_catalog"]));
+	}
+
+	#[test]
+	fn the_default_is_droppable_on_its_own() {
+		let (droppable, refused) = partition_droppable(&owned(&["reporting"]));
+
+		assert_eq!(droppable, owned(&["reporting"]));
+		assert!(refused.is_empty());
 	}
 }

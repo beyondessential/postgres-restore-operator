@@ -81,7 +81,8 @@ pub mod params {
 	/// `text` — comma-separated schemas dropped from the restore before its
 	/// migration Job runs. Views over a table a migration alters block the DDL;
 	/// name here whatever a real upgrade of this deployment drops and
-	/// regenerates, so the test models the same starting state.
+	/// regenerates, so the test models the same starting state. An empty value
+	/// drops nothing.
 	pub const PRE_MIGRATE_DROP_SCHEMAS: &str = "pre_migrate_drop_schemas";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
@@ -125,6 +126,11 @@ pub mod params {
 const DEFAULT_ANALYTICS_MINIMUM_TTL_SECS: i64 = 7200;
 /// Default switchover grace for `analytics` replicas (2 minutes, in seconds).
 const DEFAULT_ANALYTICS_SWITCHOVER_GRACE_SECS: i64 = 120;
+/// Every tamanu deployment carries the reporting schema, and a real upgrade
+/// drops and regenerates it because its views over altered tables block the
+/// DDL. An `upgrade` replica that left this unset would fail on something the
+/// deployment it models never meets.
+const DEFAULT_UPGRADE_DROP_SCHEMAS: &str = "reporting";
 
 fn param(type_: ParamType, default: Option<Value>) -> ParamSpec {
 	ParamSpec::builder()
@@ -139,7 +145,7 @@ fn param(type_: ParamType, default: Option<Value>) -> ParamSpec {
 fn upgrade_param_schema() -> ParamSchema {
 	ParamSchema(HashMap::from([(
 		params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
-		param(ParamType::Text, None),
+		param(ParamType::Text, Some(json!(DEFAULT_UPGRADE_DROP_SCHEMAS))),
 	)]))
 }
 
@@ -787,13 +793,13 @@ mod tests {
 		// The version comes from the worklist entry, so the only thing an
 		// operator sets is what the migration starts from.
 		assert_eq!(upgrade_params.len(), 1);
-		assert_eq!(
-			upgrade_params
-				.get(params::PRE_MIGRATE_DROP_SCHEMAS)
-				.unwrap()
-				.type_,
-			ParamType::Text
-		);
+		let drop_schemas = upgrade_params
+			.get(params::PRE_MIGRATE_DROP_SCHEMAS)
+			.unwrap();
+		assert_eq!(drop_schemas.type_, ParamType::Text);
+		// A migration test that kept the reporting schema would fail on views a
+		// real upgrade drops first.
+		assert_eq!(drop_schemas.default, Some(json!("reporting")));
 		assert!(upgrade.description.is_some());
 
 		let analytics = &ds[2];
