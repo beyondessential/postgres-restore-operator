@@ -8,7 +8,7 @@
 //! pgro-specific logging / retry / cache concerns later.
 
 use bestool_canopy::{
-	CanopyClient, TAILSCALE_URL,
+	CanopyClient, TAILSCALE_URL, connect_to,
 	schema::{
 		BackupPurpose, IntentDescriptor, ProgressArgs, RestoreCapabilitiesArgs, RestoreCredentials,
 		RestoreCredentialsArgs, VerificationArgs, WorklistEntry,
@@ -110,7 +110,7 @@ async fn build_inner(cfg: &CanopyConfig) -> Result<CanopyClient> {
 	let tailscale_url: Url = TAILSCALE_URL
 		.parse()
 		.expect("bestool-canopy TAILSCALE_URL is a valid URL");
-	let inner = CanopyClient::with_urls(
+	let inner = connect_to(
 		cfg.base_url.clone(),
 		tailscale_url,
 		cfg.device_key_pem.as_deref(),
