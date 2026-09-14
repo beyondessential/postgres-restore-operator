@@ -475,7 +475,6 @@ fn migration_args(
 			.target_version_id(target_version_id)
 			.total_elapsed_seconds(result.total_elapsed_seconds)
 			.maybe_failed_migration(result.failed_migration.clone())
-			.maybe_error(result.error.clone())
 			.data_bytes_before(result.data_bytes_before)
 			.data_bytes_after(result.data_bytes_after)
 			.timings(
@@ -793,33 +792,6 @@ mod tests {
 			args.failed_migration.as_deref(),
 			Some("1721000001-addBar.js")
 		);
-	}
-
-	#[test]
-	fn migration_args_carries_the_cause_of_the_failure() {
-		// The file name says where it stopped; only this says what to fix.
-		let mut result = migration_result();
-		result.failed_migration = Some("1721000001-addBar.js".into());
-		result.error = Some(
-			"23505: duplicate key value violates unique constraint \"patients_email_key\" \
-			 [patients.email, patients_email_key] DETAIL: Key (email)=(a@example.org) already exists."
-				.into(),
-		);
-		let args = migration_args(&result, &target("55555555-5555-5555-5555-555555555555"))
-			.expect("built");
-
-		assert_eq!(args.error, result.error);
-	}
-
-	#[test]
-	fn migration_args_sends_no_error_for_a_test_that_passed() {
-		let args = migration_args(
-			&migration_result(),
-			&target("55555555-5555-5555-5555-555555555555"),
-		)
-		.expect("built");
-
-		assert_eq!(args.error, None);
 	}
 
 	#[test]
