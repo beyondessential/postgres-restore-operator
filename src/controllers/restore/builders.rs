@@ -1159,7 +1159,10 @@ SQLEOF
 /// execution, which would otherwise only have reached it via `PUBLIC` like
 /// everything else here. Roles restored from the source cluster have had
 /// their passwords nulled by this point, so none of them can authenticate to
-/// spend whatever `PUBLIC` privilege they might otherwise still see.
+/// spend whatever `PUBLIC` privilege they might otherwise still see. They do
+/// still run without authenticating: postgres performs a foreign key check as
+/// the referenced table's owner, so each owner is granted `USAGE` back on the
+/// schemas it owns relations in, once the `REASSIGN` below has settled ownership.
 ///
 /// `template1` is deliberately included in the database loop, not excluded:
 /// `CREATE DATABASE` with no explicit `TEMPLATE` copies `template1` byte for
@@ -1278,7 +1281,15 @@ SELECT format(
   )
   FROM pg_default_acl d LEFT JOIN pg_namespace n ON n.oid = d.defaclnamespace
  WHERE d.defaclobjtype IN ('r', 'S', 'f', 'T', 'n') \gexec
-{reassign_lines}{schema_grant_lines}SQLEOF
+{reassign_lines}-- Foreign key checks run as the referenced table's owner.
+SELECT format('GRANT USAGE ON SCHEMA %I TO %I', n.nspname, pg_get_userbyid(c.relowner))
+  FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+ WHERE c.relkind IN ('r', 'v', 'm', 'S', 'f', 'p')
+   AND n.nspname NOT IN ('pg_catalog', 'information_schema')
+   AND n.nspname NOT LIKE 'pg_toast%'
+   AND n.nspname NOT LIKE 'pg_temp%'
+ GROUP BY n.nspname, c.relowner \gexec
+{schema_grant_lines}SQLEOF
 done
 "#
 	)
