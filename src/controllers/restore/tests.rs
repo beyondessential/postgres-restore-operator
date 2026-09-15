@@ -3288,3 +3288,39 @@ fn each_extra_users_schemas_are_independent() {
 		"SELECT format('GRANT USAGE ON SCHEMA %I TO %I', n.nspname, :'pgro_extra_user_1') FROM unnest(string_to_array(:'pgro_extra_user_schemas_1', ','))"
 	));
 }
+
+/// A foreign key check runs as the referenced table's owner whether or not that
+/// role can log in, so revoking `PUBLIC`'s schema `USAGE` on its own would fail
+/// every foreign key check into a table that owner holds.
+#[test]
+fn lockdown_grants_schema_usage_back_to_relation_owners() {
+	let setup_auth = setup_auth_with_extra_users(vec![]);
+	let script = setup_auth.args.unwrap().remove(0);
+
+	let revoke_schema = script
+		.lines()
+		.position(|l| l.contains("SELECT format('REVOKE ALL ON SCHEMA %I FROM PUBLIC', nspname)"))
+		.expect("the schema revoke is present");
+	let reassign = script
+		.lines()
+		.position(|l| {
+			l.contains("SELECT format('REASSIGN OWNED BY %I TO postgres', :'analytics_username')")
+		})
+		.expect("the reassign step is present");
+	let owner_grant = script
+		.lines()
+		.position(|l| {
+			l.contains(
+				"SELECT format('GRANT USAGE ON SCHEMA %I TO %I', n.nspname, pg_get_userbyid(c.relowner))",
+			)
+		})
+		.expect("owners are granted schema usage back");
+	assert!(
+		revoke_schema < reassign && reassign < owner_grant,
+		"the owner grant must follow both the PUBLIC revoke and the ownership reassign"
+	);
+	assert!(
+		script.contains(" GROUP BY n.nspname, c.relowner \\gexec"),
+		"one grant per schema and owner"
+	);
+}
