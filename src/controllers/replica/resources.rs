@@ -65,30 +65,40 @@ impl SnapshotInfo {
 /// configured cap, where truncating would restore into a volume that fills
 /// partway through. A floor above the maximum is merely contradictory config
 /// and clamps instead.
+///
+/// `migrating` buys room for what a migration batch writes into the volume it
+/// restored into: table rewrites, index builds, and the rows every DML
+/// migration adds to the audit changelog.
 pub fn compute_storage_size(
 	snapshot_bytes: ParsedQuantity,
 	override_size: Option<&Quantity>,
 	maximum: &Quantity,
 	persistent_schemas: bool,
+	migrating: bool,
 	measured_schema_delta: Option<ParsedQuantity>,
 ) -> Result<Quantity> {
 	let max_pvc_size = ParsedQuantity::try_from(maximum.clone())
 		.unwrap_or_else(|_| ParsedQuantity::try_from("2Ti").unwrap());
 
-	let computed_size = if persistent_schemas {
+	let largest = |a: ParsedQuantity, b: ParsedQuantity| if a > b { a } else { b };
+
+	let mut overhead = if persistent_schemas {
 		// Persistent schemas are migrated into the restore PVC.
-		// Formula: snapshot + max(10% of snapshot, last measured delta) + 5Gi
+		// Formula: max(10% of snapshot, last measured delta) + 5Gi
 		let ten_percent = snapshot_bytes.clone() * Decimal::new(1, 1);
 		let measured = measured_schema_delta.unwrap_or_else(|| ParsedQuantity::from(Decimal::ZERO));
-		let overhead = if measured > ten_percent {
-			measured
-		} else {
-			ten_percent
-		};
-		snapshot_bytes + overhead + ParsedQuantity::try_from("5Gi").unwrap()
+		largest(measured, ten_percent) + ParsedQuantity::try_from("5Gi").unwrap()
 	} else {
-		snapshot_bytes * Decimal::new(11, 1) // 1.1x
+		snapshot_bytes.clone() * Decimal::new(1, 1)
 	};
+	if migrating {
+		// Formula: max(20% of snapshot, 10Gi). 20% of a small snapshot is a
+		// few hundred MB, which one table rewrite exhausts.
+		let twenty_percent = snapshot_bytes.clone() * Decimal::new(2, 1);
+		let minimum = ParsedQuantity::try_from("10Gi").unwrap();
+		overhead = largest(overhead, largest(twenty_percent, minimum));
+	}
+	let computed_size = snapshot_bytes + overhead;
 
 	// The maximum guards against a snapshot too large to fit — that's the case
 	// where truncating would restore into a volume that fills partway through.
@@ -451,6 +461,7 @@ impl PostgresPhysicalReplica {
 			self.spec.storage_size_override.as_ref(),
 			&self.spec.storage_size_maximum,
 			self.spec.persistent_schemas.is_some(),
+			self.spec.migrate_to.is_some(),
 			measured_schema_delta,
 		)?;
 

@@ -61,6 +61,7 @@ fn storage_size_override_does_not_cap_a_larger_snapshot() {
 		Some(&Quantity("50Gi".into())),
 		&Quantity("2Ti".into()),
 		false,
+		false,
 		None,
 	)
 	.expect("under the 2Ti maximum");
@@ -84,6 +85,7 @@ fn storage_size_override_is_a_floor_for_small_snapshots() {
 		Some(&Quantity("50Gi".into())),
 		&Quantity("2Ti".into()),
 		false,
+		false,
 		None,
 	)
 	.expect("under the 2Ti maximum");
@@ -106,6 +108,7 @@ fn floor_above_the_maximum_clamps_rather_than_failing() {
 		Some(&Quantity("50Gi".into())),
 		&Quantity("10Gi".into()),
 		false,
+		false,
 		None,
 	)
 	.expect("a floor over the cap clamps to the cap");
@@ -113,6 +116,52 @@ fn floor_above_the_maximum_clamps_rather_than_failing() {
 	assert_eq!(
 		ParsedQuantity::try_from(size).unwrap(),
 		ParsedQuantity::try_from("10Gi").unwrap()
+	);
+}
+
+/// A restore that runs a migration batch writes into its own volume: table
+/// rewrites, index builds and the audit changelog all land there. 1.1x is
+/// enough only for a replica that reads its snapshot back.
+#[test]
+fn a_migrating_restore_gets_more_headroom_than_a_read_only_one() {
+	const SNAPSHOT_BYTES: u64 = 119 * 1024 * 1024 * 1024;
+	let snapshot = || ParsedQuantity::from(Decimal::from(SNAPSHOT_BYTES));
+	let size = |migrating| {
+		compute_storage_size(
+			snapshot(),
+			Some(&Quantity("20Gi".into())),
+			&Quantity("2Ti".into()),
+			false,
+			migrating,
+			None,
+		)
+		.expect("under the 2Ti maximum")
+	};
+
+	let read_only = ParsedQuantity::try_from(size(false)).unwrap();
+	let migrating = ParsedQuantity::try_from(size(true)).unwrap();
+	assert!(
+		migrating > read_only,
+		"got {migrating:?} for a migrating restore vs {read_only:?} read-only"
+	);
+}
+
+/// 20% of a small snapshot is a few hundred MB, which a single table rewrite
+/// exhausts. The floor is what a small deployment's migration test runs in.
+#[test]
+fn migration_headroom_floors_at_10gi() {
+	let snapshot = ParsedQuantity::from(Decimal::from(2u64 * 1024 * 1024 * 1024));
+	let size = compute_storage_size(snapshot, None, &Quantity("2Ti".into()), false, true, None)
+		.expect("under the 2Ti maximum");
+
+	let gib = ParsedQuantity::try_from(size)
+		.unwrap()
+		.to_bytes_f64()
+		.expect("a computed size is a number of bytes")
+		/ (1u64 << 30) as f64;
+	assert!(
+		(11.9..12.1).contains(&gib),
+		"2Gi snapshot plus the 10Gi floor, got {gib}Gi"
 	);
 }
 
@@ -127,6 +176,7 @@ fn storage_size_maximum_still_rejects_an_oversized_snapshot() {
 		snapshot,
 		Some(&Quantity("50Gi".into())),
 		&Quantity("100Gi".into()),
+		false,
 		false,
 		None,
 	)

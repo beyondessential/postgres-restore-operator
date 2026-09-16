@@ -257,7 +257,7 @@ Deleting this resource will drop the restored database and prompt the Replica to
 | `replica` | `LocalObjectReference` | Yes | Reference to the parent `PostgresPhysicalReplica`. |
 | `snapshot` | `string` | Yes | Kopia snapshot ID to restore. |
 | `snapshotSize` | `Quantity` | Yes | Size of the snapshot from Kopia metadata. |
-| `storageSize` | `Quantity` | Yes | Calculated PVC size (snapshot size × 1.1). |
+| `storageSize` | `Quantity` | Yes | Calculated PVC size: snapshot size × 1.1, or snapshot + max(20% of snapshot, 10Gi) where the restore migrates, which writes table rewrites, index builds and audit changelog rows into the same volume. |
 | `migrateTo` | `MigrationTarget` | No | Copied from the parent replica: the Tamanu version whose schema migrations this restore should apply. Its presence is what sends the restore through `Migrating`. |
 | `builderImage` | `string` | No | Copied from the parent replica: the image that builds a reporting schema against this restore once it is migrated. |
 

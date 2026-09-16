@@ -68,8 +68,8 @@ mod semantics {
 /// one machine and differ only in the version they build for.
 pub const REPORTING_SCHEMA_INTENT: &str = "reporting-schema";
 
-/// Names of the parameters the `analytics` intent advertises. Shared between
-/// the descriptor (what canopy collects) and [`IntentConfig::to_replica_spec`]
+/// Names of the parameters the parametrised intents advertise. Shared between
+/// the descriptors (what canopy collects) and [`IntentConfig::to_replica_spec`]
 /// (what pgro reads back) so the two can't drift.
 pub mod params {
 	/// `duration` — minimum time between restores of this replica.
@@ -153,69 +153,13 @@ fn param(type_: ParamType, default: Option<Value>) -> ParamSpec {
 		.build()
 }
 
-/// The `upgrade` intent's parameter schema. Its version comes from the
-/// worklist entry, so the only thing an operator sets is the starting state
-/// the migration runs against.
-fn upgrade_param_schema() -> ParamSchema {
-	ParamSchema(HashMap::from([(
-		params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
-		param(ParamType::Text, Some(json!(DEFAULT_UPGRADE_DROP_SCHEMAS))),
-	)]))
-}
-
-/// The `reporting-schema` intent's parameter schema. Its version and group come
-/// from the worklist entry, so the only thing an operator sets is what runs the
-/// build, plus the starting state the migration runs against.
-fn reporting_schema_param_schema() -> ParamSchema {
-	ParamSchema(HashMap::from([
-		(
-			params::BUILDER_IMAGE.to_string(),
-			param(ParamType::Text, None),
-		),
-		(
-			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
-			param(ParamType::Text, None),
-		),
-	]))
-}
-
-/// The `analytics` intent's parameter schema (name → typed spec + default).
-fn analytics_param_schema() -> ParamSchema {
-	ParamSchema(HashMap::from([
-		(
-			params::MINIMUM_TTL.to_string(),
-			param(
-				ParamType::Duration,
-				Some(json!(DEFAULT_ANALYTICS_MINIMUM_TTL_SECS)),
-			),
-		),
-		(
-			params::SWITCHOVER_GRACE.to_string(),
-			param(
-				ParamType::Duration,
-				Some(json!(DEFAULT_ANALYTICS_SWITCHOVER_GRACE_SECS)),
-			),
-		),
+/// Sizing parameters every parametrised intent advertises: the escape hatches
+/// for a replica the snapshot-derived defaults get wrong.
+fn sizing_params() -> Vec<(String, ParamSpec)> {
+	vec![
 		(
 			params::STORAGE_SIZE_MAXIMUM.to_string(),
 			param(ParamType::Bytes, None),
-		),
-		(
-			params::PERSISTENT_SCHEMAS.to_string(),
-			param(ParamType::Text, None),
-		),
-		(params::MIGRATE_TO.to_string(), param(ParamType::Text, None)),
-		(
-			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
-			param(ParamType::Text, None),
-		),
-		(
-			params::EXPOSE.to_string(),
-			param(ParamType::Boolean, Some(json!(false))),
-		),
-		(
-			params::EXTRA_USERS.to_string(),
-			param(ParamType::Text, None),
 		),
 		(
 			params::MEMORY_REQUEST.to_string(),
@@ -238,6 +182,74 @@ fn analytics_param_schema() -> ParamSchema {
 			params::DEPLOYMENT_READY_TIMEOUT.to_string(),
 			param(ParamType::Duration, None),
 		),
+	]
+}
+
+/// The `upgrade` intent's parameter schema. Its version comes from the
+/// worklist entry, so what an operator sets is the starting state the
+/// migration runs against, plus the sizing escape hatches.
+fn upgrade_param_schema() -> ParamSchema {
+	let mut schema = HashMap::from([(
+		params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+		param(ParamType::Text, Some(json!(DEFAULT_UPGRADE_DROP_SCHEMAS))),
+	)]);
+	schema.extend(sizing_params());
+	ParamSchema(schema)
+}
+
+/// The `reporting-schema` intent's parameter schema. Its version and group come
+/// from the worklist entry, so what an operator sets is what runs the build and
+/// the starting state the migration runs against, plus the sizing escape
+/// hatches.
+fn reporting_schema_param_schema() -> ParamSchema {
+	let mut schema = HashMap::from([
+		(
+			params::BUILDER_IMAGE.to_string(),
+			param(ParamType::Text, None),
+		),
+		(
+			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+			param(ParamType::Text, None),
+		),
+	]);
+	schema.extend(sizing_params());
+	ParamSchema(schema)
+}
+
+/// The `analytics` intent's parameter schema (name → typed spec + default).
+fn analytics_param_schema() -> ParamSchema {
+	let mut schema = HashMap::from([
+		(
+			params::MINIMUM_TTL.to_string(),
+			param(
+				ParamType::Duration,
+				Some(json!(DEFAULT_ANALYTICS_MINIMUM_TTL_SECS)),
+			),
+		),
+		(
+			params::SWITCHOVER_GRACE.to_string(),
+			param(
+				ParamType::Duration,
+				Some(json!(DEFAULT_ANALYTICS_SWITCHOVER_GRACE_SECS)),
+			),
+		),
+		(
+			params::PERSISTENT_SCHEMAS.to_string(),
+			param(ParamType::Text, None),
+		),
+		(params::MIGRATE_TO.to_string(), param(ParamType::Text, None)),
+		(
+			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+			param(ParamType::Text, None),
+		),
+		(
+			params::EXPOSE.to_string(),
+			param(ParamType::Boolean, Some(json!(false))),
+		),
+		(
+			params::EXTRA_USERS.to_string(),
+			param(ParamType::Text, None),
+		),
 		(
 			params::REDACTION_MANIFEST_URL.to_string(),
 			param(ParamType::Text, None),
@@ -250,7 +262,9 @@ fn analytics_param_schema() -> ParamSchema {
 			params::REDACTION_VERSION_FALLBACK_TO_BASE.to_string(),
 			param(ParamType::Boolean, Some(json!(false))),
 		),
-	]))
+	]);
+	schema.extend(sizing_params());
+	ParamSchema(schema)
 }
 
 /// Build the replica's [`RedactionSpec`] from the canopy params, or `None`
@@ -896,13 +910,28 @@ mod tests {
 			.expect("upgrade advertises its starting-state params")
 			.0
 			.clone();
-		// The version comes from the worklist entry, so the only thing an
-		// operator sets is what the migration starts from.
-		assert_eq!(upgrade_params.len(), 1);
+		// The version comes from the worklist entry, so what an operator sets is
+		// what the migration starts from, plus the sizing escape hatches.
+		assert_eq!(upgrade_params.len(), 8);
 		let drop_schemas = upgrade_params
 			.get(params::PRE_MIGRATE_DROP_SCHEMAS)
 			.unwrap();
 		assert_eq!(drop_schemas.type_, ParamType::Text);
+		for (name, type_) in [
+			(params::STORAGE_SIZE_MAXIMUM, ParamType::Bytes),
+			(params::MEMORY_REQUEST, ParamType::Bytes),
+			(params::MEMORY_LIMIT, ParamType::Bytes),
+			(params::CPU_REQUEST, ParamType::Text),
+			(params::CPU_LIMIT, ParamType::Text),
+			(params::RESOURCES_MAXIMUM, ParamType::Bytes),
+			(params::DEPLOYMENT_READY_TIMEOUT, ParamType::Duration),
+		] {
+			let spec = upgrade_params
+				.get(name)
+				.unwrap_or_else(|| panic!("upgrade advertises {name}"));
+			assert_eq!(spec.type_, type_, "{name}");
+			assert!(spec.default.is_none(), "{name} derives its own default");
+		}
 		// A migration test that kept the reporting schema would fail on views a
 		// real upgrade drops first.
 		assert_eq!(drop_schemas.default, Some(json!("reporting")));
@@ -922,12 +951,17 @@ mod tests {
 			.expect("a build advertises what runs it")
 			.0
 			.clone();
-		// The version and group come from the worklist entry, so an operator
-		// sets only what runs the build and what it starts from.
-		assert_eq!(build_params.len(), 2);
+		// The version and group come from the worklist entry, so an operator sets
+		// what runs the build and what it starts from, plus the sizing escape
+		// hatches.
+		assert_eq!(build_params.len(), 9);
 		assert_eq!(
 			build_params.get(params::BUILDER_IMAGE).unwrap().type_,
 			ParamType::Text
+		);
+		assert_eq!(
+			build_params.get(params::RESOURCES_MAXIMUM).unwrap().type_,
+			ParamType::Bytes
 		);
 		assert!(build.description.is_some());
 
@@ -1115,6 +1149,40 @@ mod tests {
 			.unwrap()
 			.to_replica_spec(&entry("analytics", "site", json!({})), vec![]);
 		assert!(spec.shm_size_floor.is_none());
+	}
+
+	/// The sizing params are the escape hatch for a replica the snapshot-derived
+	/// defaults get wrong, and `upgrade` has no second chance: the restore is
+	/// torn down with its verdict.
+	#[test]
+	fn upgrade_sizing_params_reach_the_spec() {
+		let spec = config_for("upgrade").unwrap().to_replica_spec(
+			&entry(
+				"upgrade",
+				"site",
+				json!({
+					"memory_request": 17179869184i64,
+					"cpu_request": "1",
+					"resources_maximum": 68719476736i64,
+					"storage_size_maximum": 214748364800i64,
+					"deployment_ready_timeout": 7200,
+				}),
+			),
+			vec![],
+		);
+
+		let pinned = spec.resources.expect("params pin the resources");
+		let requests = pinned.requests.expect("pinned requests");
+		assert_eq!(requests.get("memory").unwrap().0, "17179869184");
+		assert_eq!(requests.get("cpu").unwrap().0, "1");
+		// Unset halves fall back to the intent floor rather than dropping out.
+		assert_eq!(
+			pinned.limits.expect("pinned limits").get("cpu").unwrap().0,
+			"2"
+		);
+		assert_eq!(spec.resources_maximum.unwrap().0, "68719476736");
+		assert_eq!(spec.storage_size_maximum.0, "214748364800");
+		assert!(spec.deployment_ready_timeout.is_some());
 	}
 
 	#[test]
