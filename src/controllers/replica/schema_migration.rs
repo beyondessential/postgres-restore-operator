@@ -291,6 +291,7 @@ mod tests {
 			spec: crate::types::PostgresPhysicalReplicaSpec {
 				pre_migrate_drop_schemas: None,
 				migrate_to: None,
+				builder_image: None,
 				kopia_secret_ref: Some(Default::default()),
 				canopy_source: None,
 				snapshot_filter: None,
