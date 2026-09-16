@@ -430,6 +430,9 @@ fn build_health_details(
 		if let Some(bytes) = build.schema_bytes {
 			block.insert("schema_bytes".into(), json!(bytes));
 		}
+		if !build.artifacts.is_empty() {
+			block.insert("artifacts".into(), json!(build.artifacts));
+		}
 		details.insert("schema_build".into(), Value::Object(block));
 	}
 	Value::Object(details)
@@ -681,6 +684,7 @@ mod tests {
 				error: Some("canopy did not take the schema in: timed out".to_string()),
 				total_elapsed_seconds: 1_712,
 				schema_bytes: Some(41_002_112),
+				artifacts: Vec::new(),
 			}),
 		);
 

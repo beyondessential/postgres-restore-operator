@@ -216,6 +216,11 @@ pub struct SchemaBuildResult {
 	/// Size of the schema the build emitted, where it emitted one.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub schema_bytes: Option<i64>,
+
+	/// The artifacts the build registered, of which the schema is one. Stored
+	/// as strings for the same reason `run_id` is.
+	#[serde(default, skip_serializing_if = "Vec::is_empty")]
+	pub artifacts: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]

@@ -238,13 +238,17 @@ impl Client {
 	/// This goes through the transport rather than a generated method, because
 	/// the generator emits path parameters only and JSON bodies only, and this
 	/// endpoint takes a query parameter and the artifact's bytes.
+	///
+	/// Answers the id canopy filed the artifact under, where the answer carries
+	/// one: a build reports the artifacts it registered, and this is the only
+	/// place their ids exist.
 	pub async fn register_reporting_schema(
 		&self,
 		version: &str,
 		group: Uuid,
 		run_id: Option<Uuid>,
 		sql: Bytes,
-	) -> Result<()> {
+	) -> Result<Option<Uuid>> {
 		if !is_path_safe_version(version) {
 			return Err(Error::Canopy(format!(
 				"{version:?} is not a version a schema can be registered against"
@@ -272,7 +276,7 @@ impl Client {
 			)));
 		}
 
-		Ok(())
+		Ok(registered_artifact_id(response.body()))
 	}
 }
 
@@ -286,6 +290,21 @@ fn registration_uri(version: &str, group: Uuid, run_id: Option<Uuid>) -> String 
 		uri.push_str(&format!("&run={run}"));
 	}
 	uri
+}
+
+/// The artifact id out of a registration's answer.
+///
+/// A registration canopy took is not undone by an answer this cannot read, so
+/// an unreadable body costs the report its id rather than failing the build.
+fn registered_artifact_id(body: &Bytes) -> Option<Uuid> {
+	#[derive(serde::Deserialize)]
+	struct Registered {
+		id: Uuid,
+	}
+
+	serde_json::from_slice::<Registered>(body)
+		.ok()
+		.map(|registered| registered.id)
 }
 
 /// Whether a version is safe to place in a request path.
@@ -415,6 +434,33 @@ mod tests {
 		assert_eq!(
 			uri,
 			format!("/artifacts/2.60.0/reporting-schema/any?group={GROUP}&run={run}")
+		);
+	}
+
+	/// The build reports the artifacts it registered, and canopy's answer to the
+	/// registration is the only place their ids appear.
+	#[test]
+	fn a_registration_answers_the_id_canopy_filed_it_under() {
+		let body = Bytes::from_static(
+			br#"{"id":"cccccccc-cccc-cccc-cccc-cccccccccccc","artifact_type":"reporting-schema"}"#,
+		);
+
+		assert_eq!(
+			registered_artifact_id(&body),
+			Some("cccccccc-cccc-cccc-cccc-cccccccccccc".parse().unwrap())
+		);
+	}
+
+	/// Canopy has taken the schema in by the time the answer is read, so an
+	/// answer this cannot parse costs the report an id rather than turning a
+	/// registration that worked into a failed build.
+	#[test]
+	fn an_unreadable_answer_is_not_a_failed_registration() {
+		assert_eq!(registered_artifact_id(&Bytes::from_static(b"")), None);
+		assert_eq!(registered_artifact_id(&Bytes::from_static(b"{}")), None);
+		assert_eq!(
+			registered_artifact_id(&Bytes::from_static(br#"{"id":"not-a-uuid"}"#)),
+			None
 		);
 	}
 

@@ -473,8 +473,11 @@ pub(super) async fn reconcile_schema_build(
 			// registration that failed on the way to canopy is answered while
 			// the schema is still held rather than recorded against a build
 			// that produced one.
-			let registration = match ctx.canopy.as_ref() {
-				None => Some("no canopy client to register the schema with".to_owned()),
+			let (registration, registered) = match ctx.canopy.as_ref() {
+				None => (
+					Some("no canopy client to register the schema with".to_owned()),
+					Vec::new(),
+				),
 				Some(canopy) => match canopy
 					.register_reporting_schema(
 						target,
@@ -484,7 +487,10 @@ pub(super) async fn reconcile_schema_build(
 					)
 					.await
 				{
-					Ok(()) => None,
+					Ok(artifact) => (
+						None,
+						artifact.map(|id| id.to_string()).into_iter().collect(),
+					),
 					Err(err) => {
 						let attempts = attempts_so_far(restore) + 1;
 						warn!(%target, %group, attempts, "registering the reporting schema failed: {err}");
@@ -496,13 +502,20 @@ pub(super) async fn reconcile_schema_build(
 							return Ok(false);
 						}
 
-						Some(format!("canopy did not take the schema in: {err}"))
+						(
+							Some(format!("canopy did not take the schema in: {err}")),
+							Vec::new(),
+						)
 					}
 				},
 			};
 
-			let result =
-				completed_build_result(Some(&sql), registration.as_deref(), build.elapsed_seconds);
+			let result = completed_build_result(
+				Some(&sql),
+				registration.as_deref(),
+				build.elapsed_seconds,
+				registered,
+			);
 			if let Err(err) =
 				record_schema_build(client, namespace, &restore_name, Some(&job_name), result).await
 			{
@@ -524,6 +537,7 @@ pub(super) async fn reconcile_schema_build(
 					error: Some("the build job failed".to_string()),
 					total_elapsed_seconds: build.elapsed_seconds,
 					schema_bytes: build.delivered_bytes,
+					artifacts: Vec::new(),
 				},
 			)
 			.await?;
@@ -664,7 +678,7 @@ async fn settle_empty(
 		namespace,
 		restore_name,
 		Some(job_name),
-		completed_build_result(None, None, elapsed_seconds),
+		completed_build_result(None, None, elapsed_seconds, Vec::new()),
 	)
 	.await?;
 	delete_build_job(client, namespace, job_name).await;
@@ -719,6 +733,7 @@ async fn settle_failed(
 			error: Some(error.to_owned()),
 			total_elapsed_seconds: 0,
 			schema_bytes: None,
+			artifacts: Vec::new(),
 		},
 	)
 	.await?;
@@ -833,6 +848,7 @@ fn completed_build_result(
 	sql: Option<&[u8]>,
 	registration: Option<&str>,
 	elapsed_seconds: i64,
+	artifacts: Vec<String>,
 ) -> SchemaBuildResult {
 	SchemaBuildResult {
 		built: sql.is_some() && registration.is_none(),
@@ -842,6 +858,7 @@ fn completed_build_result(
 		}),
 		total_elapsed_seconds: elapsed_seconds,
 		schema_bytes: sql.map(|s| s.len() as i64),
+		artifacts,
 	}
 }
 
@@ -1166,8 +1183,12 @@ mod tests {
 	/// A build whose callback delivered a schema is a build.
 	#[test]
 	fn a_schema_that_came_back_is_a_built_pair() {
-		let result =
-			completed_build_result(Some(b"CREATE VIEW reporting.x AS SELECT 1;"), None, 90);
+		let result = completed_build_result(
+			Some(b"CREATE VIEW reporting.x AS SELECT 1;"),
+			None,
+			90,
+			Vec::new(),
+		);
 
 		assert!(result.built);
 		assert_eq!(result.error, None);
@@ -1220,7 +1241,7 @@ mod tests {
 	/// as built and offers servers nothing.
 	#[test]
 	fn a_job_that_posted_no_schema_is_a_failed_build() {
-		let result = completed_build_result(None, None, 12);
+		let result = completed_build_result(None, None, 12, Vec::new());
 
 		assert!(!result.built);
 		assert_eq!(
@@ -1234,7 +1255,7 @@ mod tests {
 	/// silently reclassified as a failure.
 	#[test]
 	fn an_empty_schema_is_reported_as_it_was_posted() {
-		let result = completed_build_result(Some(b""), None, 1);
+		let result = completed_build_result(Some(b""), None, 1, Vec::new());
 
 		assert!(result.built);
 		assert_eq!(result.schema_bytes, Some(0));
@@ -1249,6 +1270,7 @@ mod tests {
 			Some(b"CREATE VIEW reporting.x AS SELECT 1;"),
 			Some("no canopy client to register the schema with"),
 			5,
+			Vec::new(),
 		);
 
 		assert!(!result.built);
@@ -1341,7 +1363,7 @@ mod tests {
 
 		let migrated = restore.status.take();
 		restore.status = Some(PostgresPhysicalRestoreStatus {
-			schema_build_result: Some(completed_build_result(None, None, 1)),
+			schema_build_result: Some(completed_build_result(None, None, 1, Vec::new())),
 			..migrated.expect("a migrated restore")
 		});
 		assert_eq!(
@@ -1361,6 +1383,7 @@ mod tests {
 			Some(b"CREATE VIEW reporting.x AS SELECT 1;"),
 			Some("canopy did not take the schema in"),
 			90,
+			Vec::new(),
 		);
 
 		assert!(!result.built);

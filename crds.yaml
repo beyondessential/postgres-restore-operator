@@ -1450,6 +1450,13 @@ spec:
                   restore that builds nothing.
                 nullable: true
                 properties:
+                  artifacts:
+                    description: |-
+                      The artifacts the build registered, of which the schema is one. Stored
+                      as strings for the same reason `run_id` is.
+                    items:
+                      type: string
+                    type: array
                   built:
                     description: |-
                       Whether a schema came out of the build. Its absence is what makes the
