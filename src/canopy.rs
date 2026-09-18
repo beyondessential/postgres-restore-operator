@@ -285,9 +285,9 @@ impl Client {
 /// Canopy authorises this exact path, and a build whose registration misses it
 /// reports a healthy restore and publishes nothing, so the drift is silent.
 fn registration_uri(version: &str, group: Uuid, run_id: Option<Uuid>) -> String {
-	let mut uri = format!("/artifacts/{version}/reporting-schema/any?group={group}");
+	let mut uri = format!("/artifacts/groups/{group}/{version}/reporting-schema/any");
 	if let Some(run) = run_id {
-		uri.push_str(&format!("&run={run}"));
+		uri.push_str(&format!("?run={run}"));
 	}
 	uri
 }
@@ -396,7 +396,7 @@ mod tests {
 
 	const GROUP: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
-	/// Canopy authorises `/artifacts/{version}/reporting-schema/any?group={group}`
+	/// Canopy authorises `/artifacts/groups/{group}/{version}/reporting-schema/any`
 	/// and nothing else. A build that posts anywhere near it publishes nothing
 	/// while still reporting a healthy restore, so the drift never surfaces as
 	/// a failure and this literal is the only thing holding it.
@@ -406,7 +406,7 @@ mod tests {
 
 		assert_eq!(
 			uri,
-			format!("/artifacts/2.60.0/reporting-schema/any?group={GROUP}")
+			format!("/artifacts/groups/{GROUP}/2.60.0/reporting-schema/any")
 		);
 	}
 
@@ -417,15 +417,15 @@ mod tests {
 	fn the_registration_names_an_exact_version() {
 		let uri = registration_uri("2.60.2", GROUP.parse().unwrap(), None);
 
-		assert!(uri.contains("/artifacts/2.60.2/"), "{uri}");
+		assert!(uri.contains("/2.60.2/reporting-schema/"), "{uri}");
 		assert!(
 			!uri.contains(".x"),
 			"a range would publish the wrong schema: {uri}"
 		);
 	}
 
-	/// The run correlates the artifact with the build that made it, and is
-	/// carried as a query parameter beside the group rather than replacing it.
+	/// The run correlates the artifact with the build that made it, and rides
+	/// the query beside the group the path names.
 	#[test]
 	fn a_run_is_carried_beside_the_group() {
 		let run = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -433,7 +433,7 @@ mod tests {
 
 		assert_eq!(
 			uri,
-			format!("/artifacts/2.60.0/reporting-schema/any?group={GROUP}&run={run}")
+			format!("/artifacts/groups/{GROUP}/2.60.0/reporting-schema/any?run={run}")
 		);
 	}
 
