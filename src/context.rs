@@ -42,11 +42,14 @@ pub struct Context {
 	/// `http://postgres-restore-operator.pgro-system.svc:9091`. Empty when
 	/// canopy is not configured.
 	pub canopy_broker_base_url: String,
-	/// Docker config JSON the schema build pulls its builder image with, from
-	/// `BUILDER_PULL_DOCKERCONFIG`. Unset where every builder image is public;
-	/// the build namespace is made per worklist entry and torn down with it, so
-	/// there is nowhere standing for an operator to have put this.
-	pub builder_pull_dockerconfig: Option<String>,
+	/// Namespace the operator runs in, where its own configuration Secrets live.
+	pub operator_namespace: String,
+	/// Name of the `kubernetes.io/dockerconfigjson` Secret in the operator's
+	/// namespace that the schema build pulls its builder image with, from
+	/// `BUILDER_PULL_SECRET`. Unset where every builder image is public. The
+	/// build namespace is made per worklist entry and torn down with it, so the
+	/// Secret is copied in at dispatch rather than placed there in advance.
+	pub builder_pull_secret: Option<String>,
 	/// Image reference for the pgro-canopy-proxy sidecar container. Set
 	/// by the operator startup from `CANOPY_PROXY_IMAGE`.
 	pub canopy_proxy_image: String,
@@ -108,7 +111,8 @@ impl Context {
 			http_client: reqwest::Client::new(),
 			canopy: None,
 			canopy_broker_base_url: String::new(),
-			builder_pull_dockerconfig: None,
+			operator_namespace: "default".to_string(),
+			builder_pull_secret: None,
 			canopy_proxy_image: DEFAULT_CANOPY_PROXY_IMAGE.to_string(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),

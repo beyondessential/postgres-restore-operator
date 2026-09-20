@@ -267,15 +267,13 @@ spec:
                       # operators can pin to a specific tag.
                       # - name: CANOPY_PROXY_IMAGE
                       #   value: ghcr.io/beyondessential/pgro-canopy-proxy:latest
-                      # Docker config the schema build pulls its builder image
-                      # with, where that image is private. The build namespace
-                      # is made per worklist entry and torn down with it, so
-                      # this is the only place the credential can come from.
-                      # - name: BUILDER_PULL_DOCKERCONFIG
-                      #   valueFrom:
-                      #     secretKeyRef:
-                      #       name: pgro-builder-pull
-                      #       key: .dockerconfigjson
+                      # Name of a kubernetes.io/dockerconfigjson Secret in the
+                      # operator's namespace that the schema build pulls its
+                      # builder image with, where that image is private. The
+                      # build namespace is made per worklist entry and torn
+                      # down with it, so the Secret is copied in at dispatch.
+                      # - name: BUILDER_PULL_SECRET
+                      #   value: pgro-builder-pull
                       # Path to the tailscale sidecar's LocalAPI socket
                       # (shared below via the tailscale-socket emptyDir),
                       # used to resolve the tailnet MagicDNS suffix for the

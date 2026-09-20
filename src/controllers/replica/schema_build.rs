@@ -148,40 +148,27 @@ struct SchemaBuildArgs<'a> {
 /// deployment repo already read their connection from `TAMANU_DL_DB_*`, so
 /// naming those is what lets a build run against a database it is handed rather
 /// than one it went looking for.
-/// Write the docker config the build pulls with into the build's namespace.
+/// Copy the Secret the build pulls its image with into the build's namespace.
 ///
-/// Answers the Secret's name, or `None` where no config is configured and the
-/// image is expected to be public. The namespace is torn down with the worklist
-/// entry, so this goes with it.
+/// Answers the copy's name, or `None` where no Secret is configured and the
+/// image is expected to be public. The source stays in the operator's
+/// namespace, so rotating it is one Secret and the next build takes it; the
+/// copy goes when the namespace is torn down with the worklist entry.
 async fn ensure_pull_secret(
 	client: &Client,
 	ctx: &Context,
 	namespace: &str,
 ) -> Result<Option<String>> {
-	let Some(config) = ctx.builder_pull_dockerconfig.as_deref() else {
+	let Some(source_name) = ctx.builder_pull_secret.as_deref() else {
 		return Ok(None);
 	};
 
-	let secret = Secret {
-		metadata: ObjectMeta {
-			name: Some(PULL_SECRET_NAME.to_string()),
-			namespace: Some(namespace.to_string()),
-			labels: Some(BTreeMap::from([(
-				canopy_labels::MANAGED_BY.to_string(),
-				canopy_labels::MANAGED_BY_VALUE.to_string(),
-			)])),
-			..Default::default()
-		},
-		type_: Some("kubernetes.io/dockerconfigjson".to_string()),
-		string_data: Some(BTreeMap::from([(
-			".dockerconfigjson".to_string(),
-			config.to_string(),
-		)])),
-		..Default::default()
-	};
+	let sources: Api<Secret> = Api::namespaced(client.clone(), &ctx.operator_namespace);
+	let source = sources.get(source_name).await?;
 
+	let copy = pull_secret_copy(&source, namespace);
 	let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
-	let mut value = serde_json::to_value(&secret)?;
+	let mut value = serde_json::to_value(&copy)?;
 	value["apiVersion"] = serde_json::json!("v1");
 	value["kind"] = serde_json::json!("Secret");
 	api.patch(
@@ -192,6 +179,27 @@ async fn ensure_pull_secret(
 	.await?;
 
 	Ok(Some(PULL_SECRET_NAME.to_string()))
+}
+
+/// The build namespace's copy of `source`: its type and data under
+/// [`PULL_SECRET_NAME`], and none of its metadata, which belongs to the
+/// namespace it came from.
+fn pull_secret_copy(source: &Secret, namespace: &str) -> Secret {
+	Secret {
+		metadata: ObjectMeta {
+			name: Some(PULL_SECRET_NAME.to_string()),
+			namespace: Some(namespace.to_string()),
+			labels: Some(BTreeMap::from([(
+				canopy_labels::MANAGED_BY.to_string(),
+				canopy_labels::MANAGED_BY_VALUE.to_string(),
+			)])),
+			..Default::default()
+		},
+		type_: source.type_.clone(),
+		data: source.data.clone(),
+		string_data: source.string_data.clone(),
+		..Default::default()
+	}
 }
 
 fn build_schema_build_job(
@@ -1020,6 +1028,42 @@ mod tests {
 			.map(|reference| reference.name)
 			.collect();
 		assert_eq!(names, vec![PULL_SECRET_NAME.to_string()]);
+	}
+
+	/// The copy is the source's type and data under the build's own name, and
+	/// none of the source's metadata: a resourceVersion or uid from another
+	/// namespace would make the apply fail, and its labels are not this one's.
+	#[test]
+	fn the_pull_secret_copy_carries_the_credential_and_nothing_else() {
+		let source: Secret = serde_json::from_value(serde_json::json!({
+			"metadata": {
+				"name": "pgro-builder-pull",
+				"namespace": "pgro-system",
+				"uid": "11111111-1111-1111-1111-111111111111",
+				"resourceVersion": "42",
+				"labels": { "team": "ops" },
+			},
+			"type": "kubernetes.io/dockerconfigjson",
+			"data": { ".dockerconfigjson": "eyJhdXRocyI6e319" },
+		}))
+		.expect("a secret");
+
+		let copy = pull_secret_copy(&source, "kamaka-1a2b3c4d");
+
+		assert_eq!(copy.metadata.name.as_deref(), Some(PULL_SECRET_NAME));
+		assert_eq!(copy.metadata.namespace.as_deref(), Some("kamaka-1a2b3c4d"));
+		assert!(copy.metadata.uid.is_none());
+		assert!(copy.metadata.resource_version.is_none());
+		assert_eq!(copy.type_, source.type_);
+		assert_eq!(copy.data, source.data);
+		assert_eq!(
+			copy.metadata
+				.labels
+				.unwrap()
+				.get(canopy_labels::MANAGED_BY)
+				.map(String::as_str),
+			Some(canopy_labels::MANAGED_BY_VALUE)
+		);
 	}
 
 	/// A public builder image needs no credentials, and naming a Secret that
