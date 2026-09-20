@@ -42,6 +42,11 @@ pub struct Context {
 	/// `http://postgres-restore-operator.pgro-system.svc:9091`. Empty when
 	/// canopy is not configured.
 	pub canopy_broker_base_url: String,
+	/// Docker config JSON the schema build pulls its builder image with, from
+	/// `BUILDER_PULL_DOCKERCONFIG`. Unset where every builder image is public;
+	/// the build namespace is made per worklist entry and torn down with it, so
+	/// there is nowhere standing for an operator to have put this.
+	pub builder_pull_dockerconfig: Option<String>,
 	/// Image reference for the pgro-canopy-proxy sidecar container. Set
 	/// by the operator startup from `CANOPY_PROXY_IMAGE`.
 	pub canopy_proxy_image: String,
@@ -103,6 +108,7 @@ impl Context {
 			http_client: reqwest::Client::new(),
 			canopy: None,
 			canopy_broker_base_url: String::new(),
+			builder_pull_dockerconfig: None,
 			canopy_proxy_image: DEFAULT_CANOPY_PROXY_IMAGE.to_string(),
 			snapshot_results: Arc::new(CallbackStore::default()),
 			schema_migration_results: Arc::new(CallbackStore::default()),

@@ -362,6 +362,9 @@ async fn main() -> anyhow::Result<()> {
 			warn!(error = %err, "canopy client not configured; running in legacy-only mode");
 			None
 		});
+	ctx.builder_pull_dockerconfig = std::env::var("BUILDER_PULL_DOCKERCONFIG")
+		.ok()
+		.filter(|config| !config.trim().is_empty());
 	ctx.canopy_proxy_image = std::env::var("CANOPY_PROXY_IMAGE")
 		.unwrap_or_else(|_| DEFAULT_CANOPY_PROXY_IMAGE.to_string());
 	// Path to the tailscale sidecar's LocalAPI socket (shared via an emptyDir),

@@ -17,8 +17,8 @@ use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec, JobStatus},
 		core::v1::{
-			Capabilities, Container, PodSpec, PodTemplateSpec, ResourceRequirements, Secret,
-			SecurityContext,
+			Capabilities, Container, LocalObjectReference, PodSpec, PodTemplateSpec,
+			ResourceRequirements, Secret, SecurityContext,
 		},
 	},
 	apimachinery::pkg::api::resource::Quantity,
@@ -45,6 +45,10 @@ use crate::{
 /// Ceiling on a build, after which the Job is killed and the pair records a
 /// failure. Without it a dbt run that cannot finish holds the switchover, and
 /// with it the whole restore, for as long as its pod lives.
+/// Secret the build pulls its image with, written into the build's namespace
+/// where one is configured.
+const PULL_SECRET_NAME: &str = "schema-build-pull";
+
 const BUILD_DEADLINE_SECONDS: i64 = 30 * 60;
 
 /// How long a finished build Job is left for an operator to read, and for the
@@ -134,6 +138,7 @@ struct SchemaBuildArgs<'a> {
 	group: &'a str,
 	callback_url: &'a str,
 	callback_token: &'a str,
+	pull_secret: Option<&'a str>,
 	placement: &'a PodPlacement,
 }
 
@@ -143,6 +148,52 @@ struct SchemaBuildArgs<'a> {
 /// deployment repo already read their connection from `TAMANU_DL_DB_*`, so
 /// naming those is what lets a build run against a database it is handed rather
 /// than one it went looking for.
+/// Write the docker config the build pulls with into the build's namespace.
+///
+/// Answers the Secret's name, or `None` where no config is configured and the
+/// image is expected to be public. The namespace is torn down with the worklist
+/// entry, so this goes with it.
+async fn ensure_pull_secret(
+	client: &Client,
+	ctx: &Context,
+	namespace: &str,
+) -> Result<Option<String>> {
+	let Some(config) = ctx.builder_pull_dockerconfig.as_deref() else {
+		return Ok(None);
+	};
+
+	let secret = Secret {
+		metadata: ObjectMeta {
+			name: Some(PULL_SECRET_NAME.to_string()),
+			namespace: Some(namespace.to_string()),
+			labels: Some(BTreeMap::from([(
+				canopy_labels::MANAGED_BY.to_string(),
+				canopy_labels::MANAGED_BY_VALUE.to_string(),
+			)])),
+			..Default::default()
+		},
+		type_: Some("kubernetes.io/dockerconfigjson".to_string()),
+		string_data: Some(BTreeMap::from([(
+			".dockerconfigjson".to_string(),
+			config.to_string(),
+		)])),
+		..Default::default()
+	};
+
+	let api: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let mut value = serde_json::to_value(&secret)?;
+	value["apiVersion"] = serde_json::json!("v1");
+	value["kind"] = serde_json::json!("Secret");
+	api.patch(
+		PULL_SECRET_NAME,
+		&PatchParams::apply("postgres-restore-operator").force(),
+		&Patch::Apply(&value),
+	)
+	.await?;
+
+	Ok(Some(PULL_SECRET_NAME.to_string()))
+}
+
 fn build_schema_build_job(
 	SchemaBuildArgs {
 		replica,
@@ -155,6 +206,7 @@ fn build_schema_build_job(
 		group,
 		callback_url,
 		callback_token,
+		pull_secret,
 		placement,
 	}: SchemaBuildArgs<'_>,
 ) -> Job {
@@ -201,6 +253,11 @@ fn build_schema_build_job(
 					// callback, and is the one image pgro does not choose, so
 					// it is given no way to reach the API it runs beside.
 					automount_service_account_token: Some(false),
+					image_pull_secrets: pull_secret.map(|name| {
+						vec![LocalObjectReference {
+							name: name.to_string(),
+						}]
+					}),
 					containers: vec![Container {
 						name: "build".to_string(),
 						image: Some(image.to_string()),
@@ -424,6 +481,13 @@ pub(super) async fn reconcile_schema_build(
 				}
 			};
 
+			let pull_secret = match ensure_pull_secret(client, ctx, namespace).await {
+				Ok(name) => name,
+				Err(err) => {
+					return retry_or_settle(client, namespace, restore, err).await;
+				}
+			};
+
 			let job = build_schema_build_job(SchemaBuildArgs {
 				replica,
 				namespace,
@@ -435,6 +499,7 @@ pub(super) async fn reconcile_schema_build(
 				group: &group.to_string(),
 				callback_url: &ctx.schema_build_callback_url(namespace, &replica_name, &token),
 				callback_token: &token,
+				pull_secret: pull_secret.as_deref(),
 				placement: &ctx.pod_placement(),
 			});
 			create_build_job(client, namespace, job).await?;
@@ -920,6 +985,10 @@ mod tests {
 	}
 
 	fn job() -> Job {
+		job_with_pull_secret(None)
+	}
+
+	fn job_with_pull_secret(pull_secret: Option<&str>) -> Job {
 		build_schema_build_job(SchemaBuildArgs {
 			replica: &replica(),
 			namespace: "pgro",
@@ -931,8 +1000,36 @@ mod tests {
 			group: "kamaka",
 			callback_url: "https://canopy.example/public/schema-callback/tok",
 			callback_token: "tok",
+			pull_secret,
 			placement: &PodPlacement::default(),
 		})
+	}
+
+	/// The builder image is the one image pgro does not choose, and a private
+	/// one is pulled with credentials only this Job carries: the namespace is
+	/// made per worklist entry, so nothing standing in it grants the pull.
+	#[test]
+	fn a_configured_pull_secret_reaches_the_build_job() {
+		let job = job_with_pull_secret(Some(PULL_SECRET_NAME));
+		let spec = job.spec.unwrap().template.spec.unwrap();
+
+		let names: Vec<String> = spec
+			.image_pull_secrets
+			.unwrap_or_default()
+			.into_iter()
+			.map(|reference| reference.name)
+			.collect();
+		assert_eq!(names, vec![PULL_SECRET_NAME.to_string()]);
+	}
+
+	/// A public builder image needs no credentials, and naming a Secret that
+	/// was never written would fail the pull rather than fall back to anonymous.
+	#[test]
+	fn a_public_image_names_no_pull_secret() {
+		let job = job();
+		let spec = job.spec.unwrap().template.spec.unwrap();
+
+		assert!(spec.image_pull_secrets.is_none());
 	}
 
 	fn env(job: &Job) -> BTreeMap<String, String> {
