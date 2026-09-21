@@ -7,7 +7,9 @@
 
 use std::collections::BTreeMap;
 
-use bestool_canopy::schema::{MigrationArgs, MigrationTimingArgs, RunOutcome, VerificationArgs};
+use bestool_canopy::schema::{
+	MigrationArgs, MigrationTimingArgs, ReportingSchemaArgs, RunOutcome, VerificationArgs,
+};
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Namespace, Secret};
 use kube::{Api, ResourceExt};
@@ -162,9 +164,11 @@ pub async fn report(
 	// Constructing it here means the field set is checked against canopy's
 	// spec at compile time; `health_details` stays free-form by design.
 	let migration = migration_for(&intent, restore);
+	let reporting_schema = reporting_schema_for(&intent, restore);
 
 	let args = VerificationArgs::builder()
 		.maybe_migration(migration)
+		.maybe_reporting_schema(reporting_schema)
 		.replica_id(replica_id)
 		.maybe_run_id(run_id)
 		.group(group)
@@ -481,6 +485,44 @@ async fn gather_from_postgres(
 /// replica may also migrate (its `migrate_to` param), but that is only to hand
 /// the operator an upgraded database to work against, not to verify a version,
 /// so its outcome is not reported.
+/// What the build produced, for a report under the reporting-schema intent.
+/// Absent on every other intent, and on a restore whose build has not settled.
+fn reporting_schema_for(
+	intent: &str,
+	restore: &PostgresPhysicalRestore,
+) -> Option<ReportingSchemaArgs> {
+	if intent != super::intent::REPORTING_SCHEMA_INTENT {
+		return None;
+	}
+	let result = restore.status.as_ref()?.schema_build_result.as_ref()?;
+	Some(reporting_schema_args(
+		result,
+		restore.spec.migrate_to.as_ref(),
+	))
+}
+
+/// Canopy settles the pair against this, and writes the build row from it. The
+/// free-form `health_details` block is for people reading the report; only this
+/// is read by the worklist.
+fn reporting_schema_args(
+	result: &SchemaBuildResult,
+	target: Option<&crate::types::MigrationTarget>,
+) -> ReportingSchemaArgs {
+	ReportingSchemaArgs::builder()
+		.artifacts(
+			result
+				.artifacts
+				.iter()
+				.filter_map(|id| Uuid::parse_str(id).ok())
+				.collect(),
+		)
+		.built(result.built)
+		.maybe_error(result.error.clone())
+		.maybe_target_version(target.map(|t| t.version.clone()))
+		.maybe_target_version_id(target.and_then(|t| Uuid::parse_str(&t.version_id).ok()))
+		.build()
+}
+
 fn migration_for(intent: &str, restore: &PostgresPhysicalRestore) -> Option<MigrationArgs> {
 	if intent != "upgrade" {
 		return None;
@@ -695,6 +737,66 @@ mod tests {
 			v["schema_build"]["error"],
 			json!("canopy did not take the schema in: timed out")
 		);
+	}
+
+	/// The typed report is what canopy settles the pair on: the artifacts the
+	/// build registered, whether a schema came out, and the version it was
+	/// built for, so a failed build is a recorded row rather than a pair the
+	/// worklist re-dispatches on every poll.
+	#[test]
+	fn a_settled_build_is_reported_as_the_typed_args() {
+		let target = crate::types::MigrationTarget {
+			version: "2.60.32".to_string(),
+			version_id: "22222222-2222-2222-2222-222222222222".to_string(),
+		};
+		let args = reporting_schema_args(
+			&SchemaBuildResult {
+				built: true,
+				error: None,
+				total_elapsed_seconds: 1_712,
+				schema_bytes: Some(41_002_112),
+				artifacts: vec![
+					"cccccccc-cccc-cccc-cccc-cccccccccccc".to_string(),
+					"not-an-id".to_string(),
+				],
+			},
+			Some(&target),
+		);
+
+		assert!(args.built);
+		assert_eq!(args.error, None);
+		assert_eq!(
+			args.artifacts,
+			vec![Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").unwrap()]
+		);
+		assert_eq!(args.target_version.as_deref(), Some("2.60.32"));
+		assert_eq!(
+			args.target_version_id,
+			Uuid::parse_str("22222222-2222-2222-2222-222222222222").ok()
+		);
+	}
+
+	/// A failed build still reports, carrying what went wrong and no artifacts.
+	#[test]
+	fn a_failed_build_is_reported_with_its_error() {
+		let args = reporting_schema_args(
+			&SchemaBuildResult {
+				built: false,
+				error: Some("canopy did not take the schema in: timed out".to_string()),
+				total_elapsed_seconds: 30,
+				schema_bytes: None,
+				artifacts: Vec::new(),
+			},
+			None,
+		);
+
+		assert!(!args.built);
+		assert_eq!(
+			args.error.as_deref(),
+			Some("canopy did not take the schema in: timed out")
+		);
+		assert!(args.artifacts.is_empty());
+		assert_eq!(args.target_version, None);
 	}
 
 	/// A restore that builds no schema carries no build block at all.
