@@ -196,9 +196,9 @@ jobs:
             rm -f "$archive"
           }
 
-          # minio publishes only to quay.io
-          load_image quay.io/minio/minio:latest
-          load_image quay.io/minio/mc:latest
+          # minio no longer publishes public images; bitnamilegacy carries its last builds
+          load_image bitnamilegacy/minio:latest
+          load_image bitnamilegacy/minio-client:latest
           load_image kopia/kopia:0.22.3
           load_image postgres:16
           load_image postgres:16-alpine

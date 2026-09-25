@@ -10,7 +10,7 @@ spec:
         spec:
             initContainers:
                 - name: create-bucket
-                  image: quay.io/minio/mc:latest
+                  image: bitnamilegacy/minio-client:latest
                   imagePullPolicy: IfNotPresent
                   command: ["/bin/sh", "-c"]
                   args:

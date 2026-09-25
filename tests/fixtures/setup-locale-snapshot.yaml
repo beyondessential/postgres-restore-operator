@@ -15,7 +15,7 @@ spec:
                 fsGroup: 999
             initContainers:
                 - name: create-bucket
-                  image: quay.io/minio/mc:latest
+                  image: bitnamilegacy/minio-client:latest
                   imagePullPolicy: IfNotPresent
                   command: ["/bin/sh", "-c"]
                   args:

@@ -21,7 +21,7 @@ spec:
         spec:
             containers:
                 - name: minio
-                  image: quay.io/minio/minio:latest
+                  image: bitnamilegacy/minio:latest
                   imagePullPolicy: IfNotPresent
                   command:
                       ["minio", "server", "/data", "--console-address", ":9001"]
