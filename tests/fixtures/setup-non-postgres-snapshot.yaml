@@ -10,14 +10,21 @@ spec:
         spec:
             initContainers:
                 - name: create-bucket
-                  image: quay.io/minio/mc:latest
+                  image: amazon/aws-cli:2.37.3
                   imagePullPolicy: IfNotPresent
                   command: ["/bin/sh", "-c"]
+                  env:
+                      - name: AWS_ACCESS_KEY_ID
+                        value: minioadmin
+                      - name: AWS_SECRET_ACCESS_KEY
+                        value: minioadmin
+                      - name: AWS_DEFAULT_REGION
+                        value: us-east-1
                   args:
                       - |
                           set -e
-                          mc alias set minio http://minio.minio.svc:9000 minioadmin minioadmin
-                          mc mb minio/non-postgres-bucket --ignore-existing
+                          S3="aws --endpoint-url http://minio.minio.svc:9000"
+                          $S3 s3api head-bucket --bucket non-postgres-bucket 2>/dev/null || $S3 s3 mb s3://non-postgres-bucket
                           echo "Bucket created"
             containers:
                 - name: create-snapshot
