@@ -21,19 +21,19 @@ spec:
         spec:
             containers:
                 - name: minio
-                  image: quay.io/minio/minio:latest
+                  image: rustfs/rustfs:1.0.0
                   imagePullPolicy: IfNotPresent
-                  command:
-                      ["minio", "server", "/data", "--console-address", ":9001"]
                   ports:
                       - containerPort: 9000
                         name: api
                       - containerPort: 9001
                         name: console
                   env:
-                      - name: MINIO_ROOT_USER
+                      - name: RUSTFS_ADDRESS
+                        value: ":9000"
+                      - name: RUSTFS_ACCESS_KEY
                         value: minioadmin
-                      - name: MINIO_ROOT_PASSWORD
+                      - name: RUSTFS_SECRET_KEY
                         value: minioadmin
                   readinessProbe:
                       httpGet:
