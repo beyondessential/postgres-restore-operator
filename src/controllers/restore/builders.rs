@@ -633,10 +633,10 @@ fi
 KOPIA_GLOBAL_FLAGS="--log-dir-max-files=20 --log-dir-max-age=24h"
 
 echo "Connecting to kopia repository..."
-# --content-cache-size-mb / --metadata-cache-size-mb are persisted to
-# the local config on connect, so subsequent operations inherit the
-# bound. Without them kopia's content cache grows unbounded and
-# eventually fills the cache PVC (observed across multiple replicas).
+# The cache size caps are persisted to the local config on connect, so
+# subsequent operations inherit them. The soft caps (-size-mb) alone let a
+# fast restore outrun eviction and fill the cache PVC, so the same values
+# are also set as hard caps (-size-limit-mb).
 kopia $KOPIA_GLOBAL_FLAGS repository connect s3 \
   --bucket="$KOPIA_BUCKET" \
   --region="$KOPIA_REGION" \
@@ -644,7 +644,9 @@ kopia $KOPIA_GLOBAL_FLAGS repository connect s3 \
   --secret-access-key="$AWS_SECRET_ACCESS_KEY" \
   --password="$KOPIA_PASSWORD" \
   --content-cache-size-mb="$KOPIA_CONTENT_CACHE_MB" \
+  --content-cache-size-limit-mb="$KOPIA_CONTENT_CACHE_MB" \
   --metadata-cache-size-mb="$KOPIA_METADATA_CACHE_MB" \
+  --metadata-cache-size-limit-mb="$KOPIA_METADATA_CACHE_MB" \
   $ENDPOINT_ARGS
 
 echo "Starting restore..."
