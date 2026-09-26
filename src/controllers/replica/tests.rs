@@ -675,3 +675,39 @@ fn snapshot_list_job_carries_the_placement_defaults() {
 		"b"
 	);
 }
+
+/// An `upgrade` replica migrates each restore to the next version in place,
+/// so it needs the same headroom as a persistent schema migration. Sized as a
+/// plain restore, a 77GB snapshot got an 80Gi volume with no room to migrate.
+#[test]
+fn a_replica_that_migrates_writes_into_its_restore() {
+	let mut migrating = make_replica(None, None);
+	migrating.spec.migrate_to = Some(MigrationTarget {
+		version: "2.64.2".into(),
+		version_id: "55555555-5555-5555-5555-555555555555".into(),
+	});
+
+	assert!(migrating.writes_into_restore());
+	assert!(make_replica(Some(vec!["reporting".into()]), None).writes_into_restore());
+	assert!(!make_replica(None, None).writes_into_restore());
+}
+
+#[test]
+fn a_restore_written_into_gets_headroom_beyond_the_plain_margin() {
+	let snapshot = ParsedQuantity::from(Decimal::from(77_400_000_000u64));
+	let size = |writes_into_restore| {
+		ParsedQuantity::try_from(
+			compute_storage_size(
+				snapshot.clone(),
+				None,
+				&Quantity("2Ti".into()),
+				writes_into_restore,
+				None,
+			)
+			.expect("under the 2Ti maximum"),
+		)
+		.unwrap()
+	};
+
+	assert!(size(true) >= size(false) + ParsedQuantity::try_from("5Gi").unwrap());
+}

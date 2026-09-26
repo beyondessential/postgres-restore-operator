@@ -69,14 +69,14 @@ pub fn compute_storage_size(
 	snapshot_bytes: ParsedQuantity,
 	override_size: Option<&Quantity>,
 	maximum: &Quantity,
-	persistent_schemas: bool,
+	writes_into_restore: bool,
 	measured_schema_delta: Option<ParsedQuantity>,
 ) -> Result<Quantity> {
 	let max_pvc_size = ParsedQuantity::try_from(maximum.clone())
 		.unwrap_or_else(|_| ParsedQuantity::try_from("2Ti").unwrap());
 
-	let computed_size = if persistent_schemas {
-		// Persistent schemas are migrated into the restore PVC.
+	let computed_size = if writes_into_restore {
+		// Persistent schemas or schema migrations are written into the restore PVC.
 		// Formula: snapshot + max(10% of snapshot, last measured delta) + 5Gi
 		let ten_percent = snapshot_bytes.clone() * Decimal::new(1, 1);
 		let measured = measured_schema_delta.unwrap_or_else(|| ParsedQuantity::from(Decimal::ZERO));
@@ -373,6 +373,12 @@ fi
 }
 
 impl PostgresPhysicalReplica {
+	/// Whether restores of this replica are written to after the restore, by a
+	/// persistent schema migration or a schema migration to a newer version.
+	pub fn writes_into_restore(&self) -> bool {
+		self.spec.persistent_schemas.is_some() || self.spec.migrate_to.is_some()
+	}
+
 	/// Create a new `PostgresPhysicalRestore` for this replica from the given
 	/// snapshot. Returns `Ok(true)` when a restore was created, `Ok(false)`
 	/// when creation was refused because the replica already has
@@ -450,7 +456,7 @@ impl PostgresPhysicalReplica {
 			snapshot.bytes(),
 			self.spec.storage_size_override.as_ref(),
 			&self.spec.storage_size_maximum,
-			self.spec.persistent_schemas.is_some(),
+			self.writes_into_restore(),
 			measured_schema_delta,
 		)?;
 

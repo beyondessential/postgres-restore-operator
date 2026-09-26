@@ -849,6 +849,14 @@ fn restore_job_passes_cache_caps_and_log_rotation() {
 		"connect command must cap metadata cache"
 	);
 	assert!(
+		script.contains("--content-cache-size-limit-mb=\"$KOPIA_CONTENT_CACHE_MB\""),
+		"connect command must hard-cap content cache, the soft cap alone overshoots"
+	);
+	assert!(
+		script.contains("--metadata-cache-size-limit-mb=\"$KOPIA_METADATA_CACHE_MB\""),
+		"connect command must hard-cap metadata cache"
+	);
+	assert!(
 		script.contains("--log-dir-max-files=20"),
 		"kopia invocations must rotate CLI logs by file count"
 	);
