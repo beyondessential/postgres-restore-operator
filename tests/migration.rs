@@ -1,7 +1,8 @@
 use k8s_openapi::api::{batch::v1::Job, core::v1::Secret};
 use kube::{Api, api::PostParams};
-use postgres_restore_operator::types::{
-	MigrationTarget, PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase,
+use postgres_restore_operator::{
+	controllers::canopy::intent::DEFAULT_UPGRADE_PRE_MIGRATE_SQL,
+	types::{MigrationTarget, PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase},
 };
 use tokio::time::{sleep, timeout};
 
@@ -51,6 +52,7 @@ async fn migration_target_drives_a_migration_job() {
 	// which is the shape that blocks a migration's DDL on a real deployment.
 	replica.spec.pre_migrate_drop_schemas =
 		Some(vec!["reporting".to_string(), "public".to_string()]);
+	replica.spec.pre_migrate_sql = Some(DEFAULT_UPGRADE_PRE_MIGRATE_SQL.to_string());
 	replica.metadata.namespace = Some(ns.into());
 	replicas
 		.create(&PostParams::default(), &replica)

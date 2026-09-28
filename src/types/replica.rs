@@ -188,6 +188,11 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub pre_migrate_drop_schemas: Option<Vec<String>>,
 
+	/// SQL run against the restore after the schema drops and before its
+	/// migration Job, for starting-state changes a schema drop can't express.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub pre_migrate_sql: Option<String>,
+
 	/// Tamanu version whose schema migrations each restore should apply once
 	/// healthy, from canopy's worklist entry. Present only while canopy names a
 	/// target; each restore snapshots it into its own spec at creation so a

@@ -94,6 +94,10 @@ pub mod params {
 	/// regenerates, so the test models the same starting state. An empty value
 	/// drops nothing.
 	pub const PRE_MIGRATE_DROP_SCHEMAS: &str = "pre_migrate_drop_schemas";
+	/// `text` — SQL run against the restore after the schema drops and before
+	/// its migration Job, for starting-state changes a drop can't express. An
+	/// empty value runs nothing.
+	pub const PRE_MIGRATE_SQL: &str = "pre_migrate_sql";
 	/// `boolean` — expose the replica on the tailnet and report its URL.
 	pub const EXPOSE: &str = "expose";
 	/// `text` — comma-separated extra read-only `LOGIN` roles to provision
@@ -146,6 +150,26 @@ const DEFAULT_ANALYTICS_SWITCHOVER_GRACE_SECS: i64 = 120;
 /// deployment it models never meets.
 const DEFAULT_UPGRADE_DROP_SCHEMAS: &str = "reporting";
 
+/// Tamanu's upgrade refuses to start when a live `S1:` encrypted value in these
+/// tables doesn't decrypt with the configured key, and the migration Job only
+/// has the default key. Soft-deleting them lets the test run without the
+/// source deployment's key; the restore is discarded afterwards.
+pub const DEFAULT_UPGRADE_PRE_MIGRATE_SQL: &str = r#"DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['local_system_secrets', 'local_system_facts'] LOOP
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = t AND column_name = 'deleted_at'
+    ) THEN
+      EXECUTE format(
+        'UPDATE public.%I SET deleted_at = now() WHERE deleted_at IS NULL AND value ~ %L',
+        t, '^S1:[^:]*:[^:]*$'
+      );
+    END IF;
+  END LOOP;
+END $$;"#;
+
 fn param(type_: ParamType, default: Option<Value>) -> ParamSpec {
 	ParamSpec::builder()
 		.type_(type_)
@@ -157,10 +181,19 @@ fn param(type_: ParamType, default: Option<Value>) -> ParamSpec {
 /// worklist entry, so the only thing an operator sets is the starting state
 /// the migration runs against.
 fn upgrade_param_schema() -> ParamSchema {
-	ParamSchema(HashMap::from([(
-		params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
-		param(ParamType::Text, Some(json!(DEFAULT_UPGRADE_DROP_SCHEMAS))),
-	)]))
+	ParamSchema(HashMap::from([
+		(
+			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+			param(ParamType::Text, Some(json!(DEFAULT_UPGRADE_DROP_SCHEMAS))),
+		),
+		(
+			params::PRE_MIGRATE_SQL.to_string(),
+			param(
+				ParamType::Text,
+				Some(json!(DEFAULT_UPGRADE_PRE_MIGRATE_SQL)),
+			),
+		),
+	]))
 }
 
 /// The `reporting-schema` intent's parameter schema. Its version and group come
@@ -174,6 +207,10 @@ fn reporting_schema_param_schema() -> ParamSchema {
 		),
 		(
 			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+			param(ParamType::Text, None),
+		),
+		(
+			params::PRE_MIGRATE_SQL.to_string(),
 			param(ParamType::Text, None),
 		),
 	]))
@@ -207,6 +244,10 @@ fn analytics_param_schema() -> ParamSchema {
 		(params::MIGRATE_TO.to_string(), param(ParamType::Text, None)),
 		(
 			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
+			param(ParamType::Text, None),
+		),
+		(
+			params::PRE_MIGRATE_SQL.to_string(),
 			param(ParamType::Text, None),
 		),
 		(
@@ -578,6 +619,10 @@ impl IntentConfig {
 		let pre_migrate_drop_schemas = param_str(p, params::PRE_MIGRATE_DROP_SCHEMAS)
 			.map(parse_comma_list)
 			.filter(|schemas| !schemas.is_empty());
+		let pre_migrate_sql = param_str(p, params::PRE_MIGRATE_SQL)
+			.map(str::trim)
+			.filter(|sql| !sql.is_empty())
+			.map(str::to_owned);
 		let extra_users = param_str(p, params::EXTRA_USERS)
 			.map(parse_extra_users)
 			.unwrap_or_default();
@@ -656,6 +701,7 @@ impl IntentConfig {
 			notifications,
 			persistent_schemas,
 			pre_migrate_drop_schemas,
+			pre_migrate_sql,
 			migrate_to,
 			builder_image,
 			redaction: redaction_spec(p),
@@ -802,6 +848,28 @@ mod tests {
 	}
 
 	#[test]
+	fn pre_migrate_sql_reaches_the_replica_spec() {
+		let spec = config_for("upgrade").unwrap().to_replica_spec(
+			&entry(
+				"upgrade",
+				"site",
+				json!({ "pre_migrate_sql": " SELECT 1; " }),
+			),
+			vec![],
+		);
+		assert_eq!(spec.pre_migrate_sql.as_deref(), Some("SELECT 1;"));
+	}
+
+	#[test]
+	fn empty_pre_migrate_sql_runs_nothing() {
+		let spec = config_for("upgrade").unwrap().to_replica_spec(
+			&entry("upgrade", "site", json!({ "pre_migrate_sql": "  " })),
+			vec![],
+		);
+		assert!(spec.pre_migrate_sql.is_none());
+	}
+
+	#[test]
 	fn builder_image_param_reaches_the_replica_spec() {
 		let cfg = config_for("reporting-schema").expect("reporting-schema is a supported intent");
 		let spec = cfg.to_replica_spec(
@@ -898,7 +966,13 @@ mod tests {
 			.clone();
 		// The version comes from the worklist entry, so the only thing an
 		// operator sets is what the migration starts from.
-		assert_eq!(upgrade_params.len(), 1);
+		assert_eq!(upgrade_params.len(), 2);
+		// Tamanu's upgrade refuses a database whose secrets the Job's key can't
+		// read, so the default hides them.
+		assert_eq!(
+			upgrade_params.get(params::PRE_MIGRATE_SQL).unwrap().default,
+			Some(json!(DEFAULT_UPGRADE_PRE_MIGRATE_SQL))
+		);
 		let drop_schemas = upgrade_params
 			.get(params::PRE_MIGRATE_DROP_SCHEMAS)
 			.unwrap();
@@ -924,7 +998,7 @@ mod tests {
 			.clone();
 		// The version and group come from the worklist entry, so an operator
 		// sets only what runs the build and what it starts from.
-		assert_eq!(build_params.len(), 2);
+		assert_eq!(build_params.len(), 3);
 		assert_eq!(
 			build_params.get(params::BUILDER_IMAGE).unwrap().type_,
 			ParamType::Text
@@ -1001,10 +1075,14 @@ mod tests {
 			params.get(params::PRE_MIGRATE_DROP_SCHEMAS).unwrap().type_,
 			ParamType::Text
 		);
+		assert_eq!(
+			params.get(params::PRE_MIGRATE_SQL).unwrap().type_,
+			ParamType::Text
+		);
 		// Only the params pgro actually acts on are advertised.
 		assert_eq!(
 			params.len(),
-			17,
+			18,
 			"advertising a param pgro doesn't read, or dropping one it does"
 		);
 		assert!(params.get("anonymise").is_none());

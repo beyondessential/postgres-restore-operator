@@ -20,6 +20,7 @@ fn deployment_uses_affinity_not_node_selector() {
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
 			pre_migrate_drop_schemas: None,
+			pre_migrate_sql: None,
 			migrate_to: None,
 			builder_image: None,
 			kopia_secret_ref: Some(SecretReference {
@@ -124,6 +125,7 @@ fn test_restore_and_replica() -> (PostgresPhysicalRestore, PostgresPhysicalRepli
 		"test-replica",
 		PostgresPhysicalReplicaSpec {
 			pre_migrate_drop_schemas: None,
+			pre_migrate_sql: None,
 			migrate_to: None,
 			builder_image: None,
 			kopia_secret_ref: Some(SecretReference {

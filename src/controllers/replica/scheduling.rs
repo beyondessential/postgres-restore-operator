@@ -319,6 +319,7 @@ mod tests {
 			},
 			spec: PostgresPhysicalReplicaSpec {
 				pre_migrate_drop_schemas: None,
+				pre_migrate_sql: None,
 				migrate_to: None,
 				builder_image: None,
 				kopia_secret_ref: Some(SecretReference {
