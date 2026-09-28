@@ -121,6 +121,27 @@ async fn migration_target_drives_a_migration_job() {
 	.await
 	.unwrap_or_else(|_| panic!("timed out waiting for migration job {job_name}"));
 
+	println!("--- checking the source deployment's encrypted secrets were hidden");
+	let live_secrets = kubectl_exec(
+		ns,
+		&format!("deployment/{restore_name}"),
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-tAc",
+			"SELECT key FROM local_system_secrets WHERE deleted_at IS NULL ORDER BY key",
+		],
+	)
+	.await;
+	assert_eq!(
+		live_secrets.trim(),
+		"plain",
+		"only the encrypted value should be soft-deleted before the job runs"
+	);
+
 	assert_eq!(
 		job.spec.as_ref().unwrap().backoff_limit,
 		Some(0),

@@ -221,6 +221,7 @@ pub async fn reconcile_migrating(
 				.await?;
 			}
 			drop_pre_migrate_schemas(ctx, &replica, name, namespace, &creds, &dbname).await?;
+			hide_source_secrets(ctx, name, namespace, &creds, &dbname).await?;
 			info!(
 				restore = name,
 				target = %target.version,
@@ -359,6 +360,54 @@ async fn drop_pre_migrate_schemas(
 		"dropping schemas before migration"
 	);
 	crate::controllers::postgres::drop_schemas_on(&conn.client, &present).await
+}
+
+/// Soft-deletes the values the source deployment encrypted with its own key file.
+///
+/// Tamanu's upgrade refuses to start when a live encrypted value in these tables
+/// doesn't decrypt with the configured key, and the migration Job only has the
+/// default key. The restore is discarded after the test, so nothing reads them.
+pub(crate) const HIDE_SOURCE_SECRETS_SQL: &str = r#"
+DO $$
+DECLARE t text;
+BEGIN
+  FOREACH t IN ARRAY ARRAY['local_system_secrets', 'local_system_facts'] LOOP
+    IF EXISTS (
+      SELECT 1 FROM information_schema.columns
+      WHERE table_schema = 'public' AND table_name = t AND column_name = 'deleted_at'
+    ) THEN
+      EXECUTE format(
+        'UPDATE public.%I SET deleted_at = now() WHERE deleted_at IS NULL AND value ~ %L',
+        t, '^S1:[^:]*:[^:]*$'
+      );
+    END IF;
+  END LOOP;
+END $$;
+"#;
+
+async fn hide_source_secrets(
+	ctx: &Context,
+	restore_name: &str,
+	namespace: &str,
+	creds: &(String, String),
+	dbname: &str,
+) -> Result<()> {
+	let conn = crate::controllers::postgres::connect_to_restore(
+		&ctx.client,
+		namespace,
+		restore_name,
+		dbname,
+		&creds.0,
+		&creds.1,
+		ctx.use_port_forward(),
+	)
+	.await?;
+	conn.client.batch_execute(HIDE_SOURCE_SECRETS_SQL).await?;
+	info!(
+		restore = restore_name,
+		"hid the source deployment's encrypted secrets before migration"
+	);
+	Ok(())
 }
 
 async fn credentials(
