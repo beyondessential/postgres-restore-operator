@@ -751,6 +751,12 @@ spec:
                   type: string
                 nullable: true
                 type: array
+              preMigrateSql:
+                description: |-
+                  SQL run against the restore after the schema drops and before its
+                  migration Job, for starting-state changes a schema drop can't express.
+                nullable: true
+                type: string
               readOnly:
                 default: true
                 description: Set database to read-only mode

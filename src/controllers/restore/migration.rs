@@ -221,6 +221,7 @@ pub async fn reconcile_migrating(
 				.await?;
 			}
 			drop_pre_migrate_schemas(ctx, &replica, name, namespace, &creds, &dbname).await?;
+			run_pre_migrate_sql(ctx, &replica, name, namespace, &creds, &dbname).await?;
 			info!(
 				restore = name,
 				target = %target.version,
@@ -359,6 +360,35 @@ async fn drop_pre_migrate_schemas(
 		"dropping schemas before migration"
 	);
 	crate::controllers::postgres::drop_schemas_on(&conn.client, &present).await
+}
+
+/// Run the replica's `pre_migrate_sql` against the restore. Recorded on the
+/// replica rather than known here, so what a deployment's upgrade needs from
+/// its starting state stays with the intent that describes that deployment.
+async fn run_pre_migrate_sql(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	restore_name: &str,
+	namespace: &str,
+	creds: &(String, String),
+	dbname: &str,
+) -> Result<()> {
+	let Some(sql) = replica.spec.pre_migrate_sql.as_deref() else {
+		return Ok(());
+	};
+	let conn = crate::controllers::postgres::connect_to_restore(
+		&ctx.client,
+		namespace,
+		restore_name,
+		dbname,
+		&creds.0,
+		&creds.1,
+		ctx.use_port_forward(),
+	)
+	.await?;
+	info!(restore = restore_name, "running pre-migrate SQL");
+	conn.client.batch_execute(sql).await?;
+	Ok(())
 }
 
 async fn credentials(

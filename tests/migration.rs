@@ -1,7 +1,8 @@
 use k8s_openapi::api::{batch::v1::Job, core::v1::Secret};
 use kube::{Api, api::PostParams};
-use postgres_restore_operator::types::{
-	MigrationTarget, PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase,
+use postgres_restore_operator::{
+	controllers::canopy::intent::DEFAULT_UPGRADE_PRE_MIGRATE_SQL,
+	types::{MigrationTarget, PostgresPhysicalReplica, PostgresPhysicalRestore, RestorePhase},
 };
 use tokio::time::{sleep, timeout};
 
@@ -51,6 +52,7 @@ async fn migration_target_drives_a_migration_job() {
 	// which is the shape that blocks a migration's DDL on a real deployment.
 	replica.spec.pre_migrate_drop_schemas =
 		Some(vec!["reporting".to_string(), "public".to_string()]);
+	replica.spec.pre_migrate_sql = Some(DEFAULT_UPGRADE_PRE_MIGRATE_SQL.to_string());
 	replica.metadata.namespace = Some(ns.into());
 	replicas
 		.create(&PostParams::default(), &replica)
@@ -120,6 +122,27 @@ async fn migration_target_drives_a_migration_job() {
 	})
 	.await
 	.unwrap_or_else(|_| panic!("timed out waiting for migration job {job_name}"));
+
+	println!("--- checking the source deployment's encrypted secrets were hidden");
+	let live_secrets = kubectl_exec(
+		ns,
+		&format!("deployment/{restore_name}"),
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"myapp",
+			"-tAc",
+			"SELECT key FROM local_system_secrets WHERE deleted_at IS NULL ORDER BY key",
+		],
+	)
+	.await;
+	assert_eq!(
+		live_secrets.trim(),
+		"plain",
+		"only the encrypted value should be soft-deleted before the job runs"
+	);
 
 	assert_eq!(
 		job.spec.as_ref().unwrap().backoff_limit,
