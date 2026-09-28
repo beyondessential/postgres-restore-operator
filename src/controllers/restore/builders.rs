@@ -105,7 +105,7 @@ PGDATA=/pgdata/pgdata
 
 echo "Resetting analytics user password via single-user mode..."
 echo "ALTER ROLE ${ANALYTICS_USERNAME} WITH PASSWORD '${ANALYTICS_PASSWORD}';" \
-  | postgres --single -D "$PGDATA" postgres
+  | postgres --single -c shared_buffers=32MB -D "$PGDATA" postgres
 
 echo "Credential reset complete."
 "#
@@ -1751,7 +1751,7 @@ postgres_single_or_resetwal() {{
   local logfile
   logfile=$(mktemp)
   set +e
-  echo "$sql_input" | postgres --single -D "$PGDATA" postgres > "$logfile" 2>&1
+  echo "$sql_input" | postgres --single -c shared_buffers=32MB -D "$PGDATA" postgres > "$logfile" 2>&1
   local rc=$?
   set -e
   cat "$logfile"
@@ -1766,7 +1766,7 @@ postgres_single_or_resetwal() {{
     pg_resetwal -f "$PGDATA"
     touch /pgdata/needs-reindex-all
     touch /pgdata/fix-reset-wal
-    echo "$sql_input" | postgres --single -D "$PGDATA" postgres
+    echo "$sql_input" | postgres --single -c shared_buffers=32MB -D "$PGDATA" postgres
     return $?
   fi
 
@@ -1774,7 +1774,7 @@ postgres_single_or_resetwal() {{
   rm -f "$logfile"
   logfile=$(mktemp)
   set +e
-  echo "$sql_input" | postgres --single -D "$PGDATA" postgres > "$logfile" 2>&1
+  echo "$sql_input" | postgres --single -c shared_buffers=32MB -D "$PGDATA" postgres > "$logfile" 2>&1
   rc=$?
   set -e
   cat "$logfile"
@@ -1788,7 +1788,7 @@ postgres_single_or_resetwal() {{
   pg_resetwal -f "$PGDATA"
   touch /pgdata/needs-reindex-all
   touch /pgdata/fix-reset-wal
-  echo "$sql_input" | postgres --single -D "$PGDATA" postgres
+  echo "$sql_input" | postgres --single -c shared_buffers=32MB -D "$PGDATA" postgres
 }}
 
 echo "Fixing database locales incompatible with this OS (single-user mode)..."

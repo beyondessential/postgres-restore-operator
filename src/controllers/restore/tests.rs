@@ -1427,6 +1427,54 @@ $LOCALE_REWRITE""#
 }
 
 #[test]
+fn single_user_postgres_overrides_shared_buffers() {
+	// The init containers run under a 256Mi limit, while postgresql.conf carries the main
+	// container's shared_buffers, which is gigabytes on a large restore.
+	let (mut restore, replica) = test_restore_and_replica();
+	restore.status = Some(PostgresPhysicalRestoreStatus {
+		postgres_version: Some("16".to_string()),
+		..Default::default()
+	});
+	let reset_job = super::build_credential_reset_job(
+		&restore,
+		&replica,
+		"cred-reset",
+		"default",
+		&PodPlacement::default(),
+	)
+	.unwrap();
+	let reset_container = &reset_job.spec.unwrap().template.spec.unwrap().containers[0];
+	let reset_script = reset_container
+		.command
+		.iter()
+		.chain(reset_container.args.iter())
+		.flatten()
+		.cloned()
+		.collect::<Vec<_>>()
+		.join("\n");
+
+	for (what, script) in [
+		("setup-auth", setup_auth_script()),
+		("credential reset", reset_script),
+	] {
+		let invocations: Vec<&str> = script
+			.lines()
+			.filter(|line| line.contains("| postgres --single"))
+			.collect();
+		assert!(
+			!invocations.is_empty(),
+			"{what}: expected a postgres --single invocation"
+		);
+		for line in invocations {
+			assert!(
+				line.contains("postgres --single -c shared_buffers=32MB "),
+				"{what}: single-user postgres must cap shared_buffers: {line}"
+			);
+		}
+	}
+}
+
+#[test]
 fn deployment_init_script_records_locale_fix_from_sticky_flag() {
 	// `fixes.locale` must be driven by a flag file the rewrite touches, the
 	// same way reset_wal and recreated_pg_wal are. The previous shell
