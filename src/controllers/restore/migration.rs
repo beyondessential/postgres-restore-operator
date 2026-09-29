@@ -674,20 +674,67 @@ fn migration_error(stats: Option<&serde_json::Value>, log: Option<&str>) -> Opti
 }
 
 /// The tail of a migration job's log, bounded so a status field stays readable.
+///
+/// A thrown error prints its message first and the failing SQL after it, so a
+/// long statement pushes the message out of the tail. The first line naming an
+/// error is kept ahead of the tail when the tail doesn't already hold it.
 fn migration_log_tail(log: &str) -> String {
 	const KEEP_LINES: usize = 40;
 	const MAX_BYTES: usize = 2000;
+	const MAX_HEADLINE_BYTES: usize = 500;
 
 	let lines: Vec<&str> = log.lines().collect();
-	let tail = lines[lines.len().saturating_sub(KEEP_LINES)..].join("\n");
-	if tail.len() <= MAX_BYTES {
-		return tail;
-	}
+	let tail_start = lines.len().saturating_sub(KEEP_LINES);
+	let tail = lines[tail_start..].join("\n");
 
-	let cut = (tail.len() - MAX_BYTES..tail.len())
-		.find(|at| tail.is_char_boundary(*at))
-		.unwrap_or(tail.len());
-	tail[cut..].to_string()
+	let headline = lines
+		.iter()
+		.position(|line| is_error_headline(line))
+		.filter(|&at| at < tail_start || tail.len() > MAX_BYTES)
+		.map(|at| truncate_to(lines[at].trim(), MAX_HEADLINE_BYTES));
+
+	let budget = match &headline {
+		Some(headline) => MAX_BYTES.saturating_sub(headline.len() + "\n…\n".len()),
+		None => MAX_BYTES,
+	};
+	let kept = if tail.len() <= budget {
+		tail.as_str()
+	} else {
+		let cut = (tail.len() - budget..tail.len())
+			.find(|at| tail.is_char_boundary(*at))
+			.unwrap_or(tail.len());
+		&tail[cut..]
+	};
+
+	match headline {
+		Some(headline) if !kept.contains(headline.as_str()) => format!("{headline}\n…\n{kept}"),
+		_ => kept.to_string(),
+	}
+}
+
+fn is_error_headline(line: &str) -> bool {
+	let line = line.trim_start();
+	[
+		"Error:",
+		"ERROR:",
+		"error:",
+		"Error [",
+		"DatabaseError",
+		"SequelizeDatabaseError",
+	]
+	.iter()
+	.any(|marker| line.starts_with(marker) || line.contains(&format!(" {marker}")))
+}
+
+fn truncate_to(text: &str, max_bytes: usize) -> String {
+	if text.len() <= max_bytes {
+		return text.to_string();
+	}
+	let end = (0..=max_bytes)
+		.rev()
+		.find(|at| text.is_char_boundary(*at))
+		.unwrap_or(0);
+	text[..end].to_string()
 }
 
 #[cfg(test)]
@@ -735,6 +782,42 @@ mod error_tests {
 
 		assert!(out.len() <= 2000, "{} bytes", out.len());
 		assert!(out.ends_with("xxx"), "the end of the log is what is kept");
+	}
+
+	#[test]
+	fn the_error_survives_a_long_statement_after_it() {
+		let mut log = String::from(
+			"info: Applying migration: 1781222400001-makeIdDeterministic\n\
+			 error: DatabaseError [SequelizeDatabaseError]: index \"idx_example\" does not exist\n\
+			 \x20   at Query.run (query.js:50:25)\n",
+		);
+		for i in 0..60 {
+			log.push_str(&format!(
+				"  sql: 'INSERT INTO logs.changes line {i} {}',\n",
+				"x".repeat(80)
+			));
+		}
+
+		let out = migration_log_tail(&log);
+
+		assert!(out.len() <= 2000, "{} bytes", out.len());
+		assert!(
+			out.starts_with(
+				"error: DatabaseError [SequelizeDatabaseError]: index \"idx_example\" does not exist"
+			),
+			"{out}"
+		);
+		assert!(
+			out.contains("line 59"),
+			"the end of the log is still kept: {out}"
+		);
+	}
+
+	#[test]
+	fn a_headline_already_in_the_tail_is_not_repeated() {
+		let log = "running 1-foo\nError: boom\nat x\n";
+
+		assert_eq!(migration_log_tail(log), log.trim_end());
 	}
 
 	#[test]
