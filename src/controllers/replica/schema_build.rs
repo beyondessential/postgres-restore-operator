@@ -421,6 +421,9 @@ fn job_elapsed_seconds(status: &JobStatus) -> i64 {
 /// Build the reporting schema against the migrated restore, returning whether
 /// the switchover may proceed.
 ///
+/// Recording a result answers false: the caller reports from the `restore` it
+/// read before the record, so the report waits for the next pass to read it.
+///
 /// A build that fails does not hold the switchover: the replica was sound, and
 /// what failed is the schema, which canopy grades on its own. The result is
 /// recorded either way so the report carries it.
@@ -597,7 +600,7 @@ pub(super) async fn reconcile_schema_build(
 			}
 
 			delete_build_job(client, namespace, &job_name).await;
-			Ok(true)
+			Ok(false)
 		}
 		BuildOutcome::Failed => {
 			record_schema_build(
@@ -618,7 +621,7 @@ pub(super) async fn reconcile_schema_build(
 			// megabytes in a store nothing else empties.
 			ctx.schema_build_results.take(namespace, &replica_name);
 			delete_build_job(client, namespace, &job_name).await;
-			Ok(true)
+			Ok(false)
 		}
 	}
 }
@@ -755,7 +758,7 @@ async fn settle_empty(
 	)
 	.await?;
 	delete_build_job(client, namespace, job_name).await;
-	Ok(true)
+	Ok(false)
 }
 
 /// What a build recorded when the replica names no group it could be built or
@@ -810,7 +813,7 @@ async fn settle_failed(
 		},
 	)
 	.await?;
-	Ok(true)
+	Ok(false)
 }
 
 /// The database inside the restore a build runs against.
