@@ -145,7 +145,11 @@ fn extract_pod_placement(cm: &ConfigMap) -> PodPlacement {
 			.and_then(|d| d.get(key))
 			.map_or("", String::as_str)
 	};
-	PodPlacement::parse(get("nodeSelector"), get("podAnnotations"))
+	PodPlacement::parse(
+		get("nodeSelector"),
+		get("podAnnotations"),
+		get("tolerations"),
+	)
 }
 
 /// The live-config slots on [`Context`] that the ConfigMap watcher writes.
@@ -198,6 +202,7 @@ impl ConfigTargets {
 			info!(
 				node_selector = ?new_placement.node_selector,
 				pod_annotations = ?new_placement.annotations,
+				tolerations = ?new_placement.tolerations,
 				"pod_placement updated from ConfigMap"
 			);
 			*placement = new_placement;
@@ -344,13 +349,15 @@ async fn main() -> anyhow::Result<()> {
 	);
 	if pod_placement.is_empty() {
 		warn!(
-			"no nodeSelector or podAnnotations in ConfigMap {CONFIGMAP_NAME}: created pods carry no \
+			"no nodeSelector, podAnnotations, or tolerations in ConfigMap {CONFIGMAP_NAME}: created \
+			 pods carry no \
 			 placement intent and land wherever the cluster's default lands them"
 		);
 	} else {
 		info!(
 			node_selector = ?pod_placement.node_selector,
 			pod_annotations = ?pod_placement.annotations,
+			tolerations = ?pod_placement.tolerations,
 			"pod placement defaults configured"
 		);
 	}
@@ -1245,9 +1252,14 @@ mod tests {
 		let cm = configmap(Some(&[
 			("nodeSelector", "bes.node.purpose=workload"),
 			("podAnnotations", "karpenter.sh/do-not-disrupt=true"),
+			("tolerations", "bes.node.group=db-replica:NoSchedule"),
 			("kopiaImage", "kopia/kopia:1.2.3"),
 		]));
 		let placement = extract_pod_placement(&cm);
+		assert_eq!(
+			placement.tolerations[0].value.as_deref(),
+			Some("db-replica")
+		);
 		assert_eq!(
 			placement.node_selector.get("bes.node.purpose").unwrap(),
 			"workload"
@@ -1261,7 +1273,7 @@ mod tests {
 		);
 	}
 
-	/// A ConfigMap that sets other keys but neither placement key, and one with
+	/// A ConfigMap that sets other keys but no placement key, and one with
 	/// no `data` at all, must both leave pods exactly as they were before
 	/// placement was configurable.
 	#[test]
@@ -1284,6 +1296,12 @@ mod tests {
 			extract_pod_placement(&configmap(Some(&[("podAnnotations", "a=b")])));
 		assert!(annotations_only.node_selector.is_empty());
 		assert_eq!(annotations_only.annotations.len(), 1);
+
+		let tolerations_only =
+			extract_pod_placement(&configmap(Some(&[("tolerations", "a:NoSchedule")])));
+		assert!(tolerations_only.node_selector.is_empty());
+		assert!(tolerations_only.annotations.is_empty());
+		assert_eq!(tolerations_only.tolerations.len(), 1);
 	}
 
 	/// An unreadable ConfigMap must not leave the operator guessing: the

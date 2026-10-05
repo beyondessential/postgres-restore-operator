@@ -431,7 +431,7 @@ mod tests {
 	#[test]
 	fn migration_job_carries_the_placement_defaults() {
 		let replica = make_replica(vec!["dbt"]);
-		let placement = PodPlacement::parse("bes.node.purpose=workload", "a=b");
+		let placement = PodPlacement::parse("bes.node.purpose=workload", "a=b", "");
 		let job = build_schema_migration_job(
 			&replica,
 			"test-ns",
