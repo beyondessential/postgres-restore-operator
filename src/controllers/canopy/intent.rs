@@ -514,9 +514,13 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 		}),
 		"analytics" => Some(IntentConfig {
 			// No CPU limit: dbt runs are bursty and a ceiling only buys CFS
-			// throttling. The request is raised to match, so the guarantee is
-			// higher than the old 500m even though the ceiling is gone.
-			resources_floor: Some(resources("2", "2Gi", None, "8Gi")),
+			// throttling. The request is sized for an idle query replica, which
+			// sits at a few hundredths of a core between bursts; it drives
+			// instance selection, so a whole-core request buys a node several
+			// times the replica's size. Bursts draw on the node's spare CPU,
+			// and a replica with sustained load raises its request through the
+			// `cpu_request` parameter.
+			resources_floor: Some(resources("500m", "2Gi", None, "8Gi")),
 			read_only: true,
 			minimum_ttl: Some(TimeSpan(
 				Span::new().seconds(DEFAULT_ANALYTICS_MINIMUM_TTL_SECS),
@@ -537,8 +541,9 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 		}),
 		"reporting-schema" => Some(IntentConfig {
 			// Throwaway like `verify`, but the workload is a dbt build rather
-			// than a migration, so it takes analytics' CPU shape: bursty, and a
-			// ceiling only buys CFS throttling.
+			// than a migration: bursty, and a ceiling only buys CFS throttling.
+			// Unlike an analytics replica it is busy for its whole short life,
+			// so the request reserves whole cores.
 			resources_floor: Some(resources("2", "2Gi", None, "8Gi")),
 			read_only: true,
 			minimum_ttl: None,
@@ -1174,7 +1179,7 @@ mod tests {
 		let requests = floor.requests.expect("floor sets requests");
 		let limits = floor.limits.expect("floor sets limits");
 
-		assert_eq!(requests.get("cpu").expect("cpu request").0, "2");
+		assert_eq!(requests.get("cpu").expect("cpu request").0, "500m");
 		assert_eq!(requests.get("memory").expect("memory request").0, "2Gi");
 		assert_eq!(limits.get("memory").expect("memory limit").0, "8Gi");
 		assert!(
