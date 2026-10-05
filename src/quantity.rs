@@ -89,9 +89,8 @@ const SNAPSHOT_MEMORY_RATIO: f64 = 0.10;
 /// `[floor, cap]`. Returns `None` if any input fails to parse, so callers can
 /// fall back rather than silently sizing off a bogus value.
 ///
-/// Request equals limit, which makes the postgres container Guaranteed QoS. The
-/// request is the only figure the cluster acts on: the scheduler bin-packs on
-/// it, Karpenter picks an instance type from it and decides whether a node is
+/// Memory request equals limit. The request is the only figure the cluster acts
+/// on: the scheduler bin-packs on it, Karpenter picks an instance type from it and decides whether a node is
 /// underutilised by it, and the kubelet orders eviction by it. Declaring less
 /// than the derived limit doesn't reserve headroom, it just hides the pod's real
 /// size from every one of those decisions: a database that asks for a fraction
@@ -265,8 +264,8 @@ mod tests {
 		assert_eq!(limit_bytes(&scaled), 64.0 * (1u64 << 30) as f64);
 	}
 
-	/// Request equals limit, so the pod is Guaranteed QoS and every scheduling
-	/// decision made from the request — instance selection, bin-packing,
+	/// Request equals limit, so every scheduling decision made from the memory
+	/// request — instance selection, bin-packing,
 	/// consolidation, eviction order — sees the pod's real size. Understating it
 	/// gets the pod placed on a node that cannot satisfy its own limit and then
 	/// consolidated away as spare capacity.

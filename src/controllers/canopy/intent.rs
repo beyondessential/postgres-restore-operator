@@ -323,7 +323,7 @@ fn redaction_spec(p: &Map<String, Value>) -> Option<RedactionSpec> {
 /// CPU params override the floor's CPU, which the deployment builder carries
 /// over unchanged, so a CPU-only override leaves memory derived from the
 /// snapshot. Memory params pin memory outright; one given alone sets both
-/// request and limit, keeping the pod Guaranteed as the derived sizing does.
+/// request and limit, matching the derived sizing.
 // spec: INT#analytics-resource-sizing
 fn resolve_resources(
 	p: &Map<String, Value>,
