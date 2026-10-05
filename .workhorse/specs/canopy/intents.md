@@ -54,6 +54,23 @@ supports it.
 - [ ] `reporting-schema` opts into `check`, `once`, `migrate`, and
   `reporting-schema`.
 
+## Analytics resource sizing
+
+An analytics replica's postgres pod is sized from its snapshot unless the operator
+pins it, and the parameters that pin it touch only the resource they name.
+
+- [ ] Postgres memory is derived from the snapshot size, floored by the intent's
+  memory floor and capped by `resources_maximum`, and is requested and limited at
+  the same value.
+- [ ] The CPU request comes from the intent's floor, a fraction of a core sized for
+  an idle query replica. No CPU limit is set, so bursts draw on the node's spare
+  CPU.
+- [ ] `cpu_request` and `cpu_limit` set the postgres CPU request and limit. Setting
+  either leaves memory derived from the snapshot.
+- [ ] `memory_request` and `memory_limit` pin postgres memory, replacing the
+  snapshot-derived value. Setting only one of them pins both request and limit to
+  that value.
+
 ## Migrating a restore to a target version
 
 A restore can apply a target version's schema migrations once its database is

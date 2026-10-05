@@ -317,36 +317,49 @@ fn redaction_spec(p: &Map<String, Value>) -> Option<RedactionSpec> {
 	})
 }
 
-/// Build a pinned `resources` from the canopy params, or `None` when the
-/// operator declared none of them — in which case the deployment builder
-/// derives memory from the snapshot size instead.
+/// Resolve the canopy resource params into the replica's `resources` pin and
+/// `resourcesFloor`, returned in that order.
 ///
-/// A partially-specified pin falls back to `floor` for the fields the operator
-/// left out, so setting only `memory_limit` doesn't silently drop CPU.
-fn pinned_resources(
+/// CPU params override the floor's CPU, which the deployment builder carries
+/// over unchanged, so a CPU-only override leaves memory derived from the
+/// snapshot. Memory params pin memory outright; one given alone sets both
+/// request and limit, matching the derived sizing.
+// spec: INT#analytics-resource-sizing
+fn resolve_resources(
 	p: &Map<String, Value>,
 	floor: Option<&ResourceRequirements>,
-) -> Option<ResourceRequirements> {
+) -> (Option<ResourceRequirements>, Option<ResourceRequirements>) {
 	let bytes = |name: &str| param_i64(p, name).map(|b| Quantity(b.to_string()));
 	let text = |name: &str| param_str(p, name).map(|s| Quantity(s.to_string()));
 
-	let memory_request = bytes(params::MEMORY_REQUEST);
-	let memory_limit = bytes(params::MEMORY_LIMIT);
-	let cpu_request = text(params::CPU_REQUEST);
-	let cpu_limit = text(params::CPU_LIMIT);
-	if memory_request.is_none()
-		&& memory_limit.is_none()
-		&& cpu_request.is_none()
-		&& cpu_limit.is_none()
-	{
-		return None;
+	let mut floor = floor.cloned();
+	let set_cpu = |side: &mut Option<BTreeMap<String, Quantity>>, cpu: Quantity| {
+		side.get_or_insert_with(BTreeMap::new)
+			.insert("cpu".to_string(), cpu);
+	};
+	if let Some(cpu) = text(params::CPU_REQUEST) {
+		set_cpu(
+			&mut floor.get_or_insert_with(Default::default).requests,
+			cpu,
+		);
+	}
+	if let Some(cpu) = text(params::CPU_LIMIT) {
+		set_cpu(&mut floor.get_or_insert_with(Default::default).limits, cpu);
 	}
 
-	let from_floor = |which: fn(&ResourceRequirements) -> &Option<BTreeMap<String, Quantity>>,
-	                  key: &str| {
+	let memory_request = bytes(params::MEMORY_REQUEST);
+	let memory_limit = bytes(params::MEMORY_LIMIT);
+	if memory_request.is_none() && memory_limit.is_none() {
+		return (None, floor);
+	}
+	let memory_request = memory_request.or_else(|| memory_limit.clone());
+	let memory_limit = memory_limit.or_else(|| memory_request.clone());
+
+	let floor_cpu = |which: fn(&ResourceRequirements) -> &Option<BTreeMap<String, Quantity>>| {
 		floor
+			.as_ref()
 			.and_then(|f| which(f).as_ref())
-			.and_then(|m| m.get(key))
+			.and_then(|m| m.get("cpu"))
 			.cloned()
 	};
 	let entries = |cpu: Option<Quantity>, memory: Option<Quantity>| {
@@ -357,17 +370,12 @@ fn pinned_resources(
 		(!map.is_empty()).then_some(map)
 	};
 
-	Some(ResourceRequirements {
-		requests: entries(
-			cpu_request.or_else(|| from_floor(|r| &r.requests, "cpu")),
-			memory_request.or_else(|| from_floor(|r| &r.requests, "memory")),
-		),
-		limits: entries(
-			cpu_limit.or_else(|| from_floor(|r| &r.limits, "cpu")),
-			memory_limit.or_else(|| from_floor(|r| &r.limits, "memory")),
-		),
+	let pinned = ResourceRequirements {
+		requests: entries(floor_cpu(|r| &r.requests), memory_request),
+		limits: entries(floor_cpu(|r| &r.limits), memory_limit),
 		..Default::default()
-	})
+	};
+	(Some(pinned), floor)
 }
 
 /// The intent descriptors pgro advertises to canopy at startup. Canopy stores
@@ -514,9 +522,13 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 		}),
 		"analytics" => Some(IntentConfig {
 			// No CPU limit: dbt runs are bursty and a ceiling only buys CFS
-			// throttling. The request is raised to match, so the guarantee is
-			// higher than the old 500m even though the ceiling is gone.
-			resources_floor: Some(resources("2", "2Gi", None, "8Gi")),
+			// throttling. The request is sized for an idle query replica, which
+			// sits at a few hundredths of a core between bursts; it drives
+			// instance selection, so a whole-core request buys a node several
+			// times the replica's size. Bursts draw on the node's spare CPU,
+			// and a replica with sustained load raises its request through the
+			// `cpu_request` parameter.
+			resources_floor: Some(resources("500m", "2Gi", None, "8Gi")),
 			read_only: true,
 			minimum_ttl: Some(TimeSpan(
 				Span::new().seconds(DEFAULT_ANALYTICS_MINIMUM_TTL_SECS),
@@ -537,8 +549,9 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 		}),
 		"reporting-schema" => Some(IntentConfig {
 			// Throwaway like `verify`, but the workload is a dbt build rather
-			// than a migration, so it takes analytics' CPU shape: bursty, and a
-			// ceiling only buys CFS throttling.
+			// than a migration: bursty, and a ceiling only buys CFS throttling.
+			// Unlike an analytics replica it is busy for its whole short life,
+			// so the request reserves whole cores.
 			resources_floor: Some(resources("2", "2Gi", None, "8Gi")),
 			read_only: true,
 			minimum_ttl: None,
@@ -656,10 +669,8 @@ impl IntentConfig {
 			.filter(|s| !s.is_empty())
 			.map(str::to_owned);
 
-		// Resources are pinned only when the operator declared at least one of
-		// them in canopy; otherwise they stay unset and the deployment builder
-		// derives memory from the snapshot size, floored by `resources_floor`.
-		let pinned_resources = pinned_resources(p, self.resources_floor.as_ref());
+		let (pinned_resources, resources_floor) =
+			resolve_resources(p, self.resources_floor.as_ref());
 		let resources_maximum = param_i64(p, params::RESOURCES_MAXIMUM)
 			.map(|bytes| Quantity(bytes.to_string()))
 			.unwrap_or_else(|| self.resources_maximum.clone());
@@ -687,7 +698,7 @@ impl IntentConfig {
 			storage_class: None,
 			storage_size_override: Some(self.storage_size_override.clone()),
 			resources: pinned_resources,
-			resources_floor: self.resources_floor.clone(),
+			resources_floor,
 			resources_maximum: Some(resources_maximum),
 			deployment_ready_timeout,
 			shm_size_floor: self.shm_size_floor.clone(),
@@ -1161,6 +1172,86 @@ mod tests {
 		assert!(config_for("").is_none());
 	}
 
+	fn analytics_spec(params: Value) -> PostgresPhysicalReplicaSpec {
+		config_for("analytics")
+			.unwrap()
+			.to_replica_spec(&entry("analytics", "site", params), vec![])
+	}
+
+	fn quantity(side: &Option<BTreeMap<String, Quantity>>, key: &str) -> Option<String> {
+		side.as_ref().and_then(|m| m.get(key)).map(|q| q.0.clone())
+	}
+
+	#[test]
+	fn no_resource_params_leave_sizing_to_the_snapshot() {
+		let spec = analytics_spec(json!({}));
+		assert!(spec.resources.is_none());
+		assert_eq!(
+			spec.resources_floor,
+			config_for("analytics").unwrap().resources_floor
+		);
+	}
+
+	/// Pinning CPU must not take memory with it: the snapshot-derived size and
+	/// its request == limit shape survive a CPU-only override.
+	#[test]
+	fn cpu_params_alone_override_the_floor_and_keep_memory_derived() {
+		let spec = analytics_spec(json!({ "cpu_request": "1", "cpu_limit": "4" }));
+		assert!(
+			spec.resources.is_none(),
+			"a CPU-only override must not pin memory"
+		);
+		let floor = spec.resources_floor.expect("floor kept");
+		assert_eq!(quantity(&floor.requests, "cpu").as_deref(), Some("1"));
+		assert_eq!(quantity(&floor.limits, "cpu").as_deref(), Some("4"));
+		assert_eq!(quantity(&floor.limits, "memory").as_deref(), Some("8Gi"));
+	}
+
+	#[test]
+	fn one_memory_param_pins_request_and_limit_together() {
+		for key in ["memory_request", "memory_limit"] {
+			let resources = analytics_spec(json!({ key: 4294967296_i64 }))
+				.resources
+				.unwrap_or_else(|| panic!("{key} pins resources"));
+			assert_eq!(
+				quantity(&resources.requests, "memory").as_deref(),
+				Some("4294967296"),
+				"{key}"
+			);
+			assert_eq!(
+				quantity(&resources.limits, "memory").as_deref(),
+				Some("4294967296"),
+				"{key}"
+			);
+			assert_eq!(
+				quantity(&resources.requests, "cpu").as_deref(),
+				Some("500m"),
+				"{key}: CPU comes from the floor"
+			);
+		}
+	}
+
+	#[test]
+	fn memory_pin_carries_a_cpu_override() {
+		let resources = analytics_spec(json!({
+			"memory_request": 2147483648_i64,
+			"memory_limit": 4294967296_i64,
+			"cpu_request": "1",
+		}))
+		.resources
+		.expect("memory params pin");
+		assert_eq!(quantity(&resources.requests, "cpu").as_deref(), Some("1"));
+		assert_eq!(
+			quantity(&resources.requests, "memory").as_deref(),
+			Some("2147483648")
+		);
+		assert_eq!(
+			quantity(&resources.limits, "memory").as_deref(),
+			Some("4294967296")
+		);
+		assert_eq!(quantity(&resources.limits, "cpu"), None);
+	}
+
 	/// A CPU limit on a database only throttles bursty analytical queries; the
 	/// request is what reserves the share. Memory carries both, and
 	/// `scale_memory_for_snapshot` sets them equal, so the floor's memory limit
@@ -1174,7 +1265,7 @@ mod tests {
 		let requests = floor.requests.expect("floor sets requests");
 		let limits = floor.limits.expect("floor sets limits");
 
-		assert_eq!(requests.get("cpu").expect("cpu request").0, "2");
+		assert_eq!(requests.get("cpu").expect("cpu request").0, "500m");
 		assert_eq!(requests.get("memory").expect("memory request").0, "2Gi");
 		assert_eq!(limits.get("memory").expect("memory limit").0, "8Gi");
 		assert!(

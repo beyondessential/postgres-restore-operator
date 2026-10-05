@@ -643,7 +643,7 @@ fn uncovered_snapshot_is_created() {
 #[test]
 fn snapshot_list_job_carries_the_placement_defaults() {
 	let replica = snapshot_list_test_replica();
-	let placement = PodPlacement::parse("bes.node.purpose=workload", "a=b");
+	let placement = PodPlacement::parse("bes.node.purpose=workload", "a=b", "");
 	let job = build_snapshot_list_job(
 		&replica,
 		"test-snap",

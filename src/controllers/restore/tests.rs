@@ -2399,6 +2399,7 @@ fn every_builder_stamps_the_placement_defaults() {
 	let placement = PodPlacement::parse(
 		"bes.node.purpose=workload",
 		"karpenter.sh/do-not-disrupt=true",
+		"bes.node.group=db-replica:NoSchedule",
 	);
 	let (mut restore, replica) = test_restore_and_replica();
 	restore.status = Some(PostgresPhysicalRestoreStatus {
@@ -2490,6 +2491,20 @@ fn every_builder_stamps_the_placement_defaults() {
 				.map(String::as_str),
 			Some("true"),
 			"{what} must carry the configured pod annotations"
+		);
+
+		let tolerations = template
+			.spec
+			.as_ref()
+			.and_then(|s| s.tolerations.as_ref())
+			.unwrap_or_else(|| panic!("{what} must carry the configured tolerations"));
+		assert!(
+			tolerations
+				.iter()
+				.any(|t| t.key.as_deref() == Some("bes.node.group")
+					&& t.value.as_deref() == Some("db-replica")
+					&& t.effect.as_deref() == Some("NoSchedule")),
+			"{what} must tolerate the configured taint"
 		);
 	}
 }

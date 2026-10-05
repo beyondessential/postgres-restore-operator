@@ -13,18 +13,24 @@
 
 use std::collections::BTreeMap;
 
-use k8s_openapi::api::{apps::v1::Deployment, batch::v1::Job, core::v1::PodTemplateSpec};
+use k8s_openapi::api::{
+	apps::v1::Deployment,
+	batch::v1::Job,
+	core::v1::{PodTemplateSpec, Toleration},
+};
 use kube::api::ObjectMeta;
 use tracing::warn;
 
 /// Scheduling defaults stamped onto every pod template the operator builds.
 ///
-/// Empty in both fields is the no-op default, which is what an operator with no
+/// Empty in every field is the no-op default, which is what an operator with no
 /// ConfigMap entries gets — the pre-existing behaviour.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+// spec: PLACE
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct PodPlacement {
 	pub node_selector: BTreeMap<String, String>,
 	pub annotations: BTreeMap<String, String>,
+	pub tolerations: Vec<Toleration>,
 }
 
 /// Parse the `key=value,key=value` form used by the operator ConfigMap.
@@ -52,17 +58,60 @@ fn parse_pairs(raw: &str, field: &str) -> BTreeMap<String, String> {
 		.collect()
 }
 
+const TAINT_EFFECTS: [&str; 3] = ["NoSchedule", "PreferNoSchedule", "NoExecute"];
+
+/// Parse the `key=value:Effect,key:Effect` form used by the operator ConfigMap,
+/// mirroring `kubectl taint` syntax. `key=value` tolerates that exact taint;
+/// a bare `key` tolerates the key with any value. Malformed entries are skipped
+/// for the same reason as in [`parse_pairs`].
+fn parse_tolerations(raw: &str) -> Vec<Toleration> {
+	raw.split(',')
+		.map(str::trim)
+		.filter(|entry| !entry.is_empty())
+		.filter_map(|entry| {
+			let parsed = entry.rsplit_once(':').and_then(|(taint, effect)| {
+				let effect = effect.trim();
+				if !TAINT_EFFECTS.contains(&effect) {
+					return None;
+				}
+				let (key, value) = match taint.split_once('=') {
+					Some((k, v)) => (k.trim(), Some(v.trim())),
+					None => (taint.trim(), None),
+				};
+				if key.is_empty() || value.is_some_and(str::is_empty) {
+					return None;
+				}
+				Some(Toleration {
+					key: Some(key.to_string()),
+					operator: Some(if value.is_some() { "Equal" } else { "Exists" }.to_string()),
+					value: value.map(str::to_string),
+					effect: Some(effect.to_string()),
+					toleration_seconds: None,
+				})
+			});
+			if parsed.is_none() {
+				warn!(
+					field = "tolerations",
+					entry, "ignoring malformed toleration in ConfigMap"
+				);
+			}
+			parsed
+		})
+		.collect()
+}
+
 impl PodPlacement {
 	/// Build from the raw ConfigMap strings.
-	pub fn parse(node_selector: &str, annotations: &str) -> Self {
+	pub fn parse(node_selector: &str, annotations: &str, tolerations: &str) -> Self {
 		Self {
 			node_selector: parse_pairs(node_selector, "nodeSelector"),
 			annotations: parse_pairs(annotations, "podAnnotations"),
+			tolerations: parse_tolerations(tolerations),
 		}
 	}
 
 	pub fn is_empty(&self) -> bool {
-		self.node_selector.is_empty() && self.annotations.is_empty()
+		self.node_selector.is_empty() && self.annotations.is_empty() && self.tolerations.is_empty()
 	}
 
 	/// Stamp the defaults onto a pod template.
@@ -90,6 +139,16 @@ impl PodPlacement {
 				annotations.entry(k.clone()).or_insert_with(|| v.clone());
 			}
 		}
+
+		if !self.tolerations.is_empty() {
+			let spec = template.spec.get_or_insert_with(Default::default);
+			let tolerations = spec.tolerations.get_or_insert_with(Default::default);
+			for toleration in &self.tolerations {
+				if !tolerations.contains(toleration) {
+					tolerations.push(toleration.clone());
+				}
+			}
+		}
 	}
 
 	/// Stamp the defaults onto a Job's pod template.
@@ -112,7 +171,17 @@ mod tests {
 	use super::*;
 
 	fn placement(selector: &str, annotations: &str) -> PodPlacement {
-		PodPlacement::parse(selector, annotations)
+		PodPlacement::parse(selector, annotations, "")
+	}
+
+	fn toleration(key: &str, value: Option<&str>, effect: &str) -> Toleration {
+		Toleration {
+			key: Some(key.to_string()),
+			operator: Some(if value.is_some() { "Equal" } else { "Exists" }.to_string()),
+			value: value.map(str::to_string),
+			effect: Some(effect.to_string()),
+			toleration_seconds: None,
+		}
 	}
 
 	#[test]
@@ -251,5 +320,67 @@ mod tests {
 		let mut template = PodTemplateSpec::default();
 		PodPlacement::default().apply(&mut template);
 		assert_eq!(template, PodTemplateSpec::default());
+	}
+
+	#[test]
+	fn parses_value_and_exists_tolerations() {
+		let p = PodPlacement::parse(
+			"",
+			"",
+			"bes.node.group=db-replica:NoSchedule, spotInstance:PreferNoSchedule",
+		);
+		assert_eq!(
+			p.tolerations,
+			vec![
+				toleration("bes.node.group", Some("db-replica"), "NoSchedule"),
+				toleration("spotInstance", None, "PreferNoSchedule"),
+			]
+		);
+		assert!(!p.is_empty());
+	}
+
+	#[test]
+	fn malformed_tolerations_are_skipped_not_fatal() {
+		let p = PodPlacement::parse(
+			"",
+			"",
+			"good=yes:NoExecute,noeffect=x,bad=x:Sometimes,=x:NoSchedule,k=:NoSchedule,:NoSchedule",
+		);
+		assert_eq!(
+			p.tolerations,
+			vec![toleration("good", Some("yes"), "NoExecute")]
+		);
+	}
+
+	#[test]
+	fn appends_tolerations_without_duplicating() {
+		let p = PodPlacement::parse("", "", "a=b:NoSchedule,c:NoExecute");
+		let existing = Toleration {
+			key: Some("node.kubernetes.io/not-ready".to_string()),
+			operator: Some("Exists".to_string()),
+			effect: Some("NoExecute".to_string()),
+			toleration_seconds: Some(300),
+			..Default::default()
+		};
+		let mut template = PodTemplateSpec {
+			spec: Some(k8s_openapi::api::core::v1::PodSpec {
+				tolerations: Some(vec![
+					existing.clone(),
+					toleration("a", Some("b"), "NoSchedule"),
+				]),
+				..Default::default()
+			}),
+			..Default::default()
+		};
+		p.apply(&mut template);
+
+		assert_eq!(
+			template.spec.unwrap().tolerations.unwrap(),
+			vec![
+				existing,
+				toleration("a", Some("b"), "NoSchedule"),
+				toleration("c", None, "NoExecute"),
+			]
+		);
 	}
 }

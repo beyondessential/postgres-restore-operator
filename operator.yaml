@@ -165,11 +165,20 @@ metadata:
 #     restore Job is mid-flight; it does not prevent spot interruption or
 #     node expiry.
 #
+#   tolerations: ""
+#     Tolerations added to every created pod, comma-separated, in `kubectl
+#     taint` syntax: `key=value:Effect` tolerates that exact taint, `key:Effect`
+#     tolerates the key with any value. A toleration the pod already carries
+#     is not duplicated. Needed to opt the operator's pods into a dedicated or
+#     spot node pool, since Karpenter does not launch a node whose taints a
+#     pending pod doesn't tolerate, even `PreferNoSchedule` ones.
+#
 # Example:
 #
 #   data:
-#       nodeSelector: "bes.node.purpose=workload"
+#       nodeSelector: "bes.node.group=db-replica"
 #       podAnnotations: "karpenter.sh/do-not-disrupt=true"
+#       tolerations: "bes.node.group=db-replica:NoSchedule,spotInstance=true:PreferNoSchedule"
 data: {}
 ---
 apiVersion: v1
