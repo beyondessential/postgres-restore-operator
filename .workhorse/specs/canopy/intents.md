@@ -70,6 +70,9 @@ pins it, and the parameters that pin it touch only the resource they name.
 - [ ] `memory_request` and `memory_limit` pin postgres memory, replacing the
   snapshot-derived value. Setting only one of them pins both request and limit to
   that value.
+- [ ] A sizing change reaches the replica's running postgres pod as soon as the
+  replica's spec carries it, restarting the pod, without waiting for the next
+  restore.
 
 ## Migrating a restore to a target version
 

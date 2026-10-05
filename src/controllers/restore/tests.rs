@@ -7,7 +7,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 
-use kube::ResourceExt;
+use kube::{ResourceExt, runtime::reflector::ObjectRef};
 
 use super::builders::{
 	build_deployment, build_restore_job, build_version_detect_job, resolve_postgres_resources,
@@ -3400,4 +3400,47 @@ fn lockdown_grants_schema_usage_back_to_relation_owners() {
 		script.contains(" GROUP BY n.nspname, c.relowner \\gexec"),
 		"one grant per schema and owner"
 	);
+}
+
+#[test]
+fn restores_of_replica_matches_name_and_namespace() {
+	let (mut restore, mut replica) = test_restore_and_replica();
+	replica.metadata.namespace = Some("site-a".to_string());
+	restore.metadata.namespace = Some("site-a".to_string());
+
+	let mut other_ns = restore.clone();
+	other_ns.metadata.name = Some("other-ns".to_string());
+	other_ns.metadata.namespace = Some("site-b".to_string());
+
+	let mut other_replica = restore.clone();
+	other_replica.metadata.name = Some("other-replica".to_string());
+	other_replica.spec.replica.name = "another-replica".to_string();
+
+	let refs = super::restores_of_replica([&restore, &other_ns, &other_replica], &replica);
+	assert_eq!(refs, vec![ObjectRef::from_obj(&restore)]);
+}
+
+/// Status writes don't bump the generation, so only a spec change (or a
+/// replica not seen before) passes; a deleted replica is forgotten.
+#[test]
+fn generation_gate_passes_spec_changes_only() {
+	let (_, mut replica) = test_restore_and_replica();
+	replica.metadata.namespace = Some("site-a".to_string());
+	replica.metadata.generation = Some(3);
+	let gate = super::GenerationGate::default();
+
+	assert!(gate.changed(&replica), "first sighting");
+	assert!(
+		!gate.changed(&replica),
+		"same generation, e.g. a status write"
+	);
+	replica.metadata.generation = Some(4);
+	assert!(gate.changed(&replica), "spec change");
+
+	replica.metadata.deletion_timestamp = Some(
+		k8s_openapi::apimachinery::pkg::apis::meta::v1::Time(jiff::Timestamp::now()),
+	);
+	assert!(!gate.changed(&replica), "deleting");
+	replica.metadata.deletion_timestamp = None;
+	assert!(gate.changed(&replica), "forgotten after deletion");
 }

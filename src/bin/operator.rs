@@ -648,7 +648,24 @@ async fn main() -> anyhow::Result<()> {
 			}
 		});
 
-	let restore_controller = Controller::new(restore_api, Config::default())
+	// Requeue a replica's restores when its spec changes. The gate passes only
+	// generation bumps, so the replica's own frequent status writes don't fan
+	// out into restore reconciles.
+	let restore_controller = Controller::new(restore_api, Config::default());
+	let restore_store = restore_controller.store();
+	let replica_generations = controllers::restore::GenerationGate::default();
+	let restore_controller = restore_controller
+		.watches(
+			Api::<PostgresPhysicalReplica>::all(client.clone()),
+			Config::default(),
+			move |replica| {
+				if !replica_generations.changed(&replica) {
+					return Vec::new();
+				}
+				let restores = restore_store.state();
+				controllers::restore::restores_of_replica(restores.iter().map(|r| &**r), &replica)
+			},
+		)
 		.run(
 			|obj, ctx| controllers::catching_panics(controllers::restore::reconcile(obj, ctx)),
 			controllers::restore::error_policy,
