@@ -90,12 +90,13 @@ const SNAPSHOT_MEMORY_RATIO: f64 = 0.10;
 /// fall back rather than silently sizing off a bogus value.
 ///
 /// Memory request equals limit. The request is the only figure the cluster acts
-/// on: the scheduler bin-packs on it, Karpenter picks an instance type from it and decides whether a node is
-/// underutilised by it, and the kubelet orders eviction by it. Declaring less
-/// than the derived limit doesn't reserve headroom, it just hides the pod's real
-/// size from every one of those decisions: a database that asks for a fraction
-/// of its own limit gets scheduled onto a node too small to satisfy that limit,
-/// and is then consolidated away as spare capacity while serving traffic.
+/// on: the scheduler bin-packs on it, Karpenter picks an instance type from it
+/// and decides whether a node is underutilised by it, and the kubelet orders
+/// eviction by it. Declaring less than the derived limit doesn't reserve
+/// headroom, it just hides the pod's real size from every one of those
+/// decisions: a database that asks for a fraction of its own limit gets
+/// scheduled onto a node too small to satisfy that limit, and is then
+/// consolidated away as spare capacity while serving traffic.
 ///
 /// Sets only memory; CPU is left to the caller (see [`SNAPSHOT_MEMORY_RATIO`]).
 pub fn scale_memory_for_snapshot(
