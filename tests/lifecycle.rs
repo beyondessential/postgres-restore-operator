@@ -10,7 +10,7 @@ use k8s_openapi::{
 };
 use kube::{
 	Api,
-	api::{ListParams, ObjectMeta, PostParams},
+	api::{ListParams, ObjectMeta, Patch, PatchParams, PostParams},
 };
 use postgres_restore_operator::types::{
 	PostgresPhysicalReplica, PostgresPhysicalRestore, ReplicaPhase, RestorePhase,
@@ -151,6 +151,44 @@ async fn full_restore_lifecycle() {
 	assert!(restore_status.activated_at.is_some());
 	assert!(restore_status.pvc.is_some());
 	assert!(restore_status.deployment.is_some());
+
+	// A replica spec change must reach the running Deployment on the restore's
+	// next reconcile, triggered by the change itself, not the periodic requeue
+	// (300s for an Active restore), so the bound sits well under it.
+	println!("--- changing the replica spec and waiting for the Deployment to follow");
+	replicas
+		.patch(
+			"lifecycle-replica",
+			&PatchParams::default(),
+			&Patch::Merge(serde_json::json!({
+				"spec": { "podAnnotations": { "pgro.bes.au/test-spec-change": "1" } }
+			})),
+		)
+		.await
+		.expect("failed to patch replica spec");
+	tokio::time::timeout(Duration::from_secs(60), async {
+		loop {
+			let deploy = deployments
+				.get(&restore_name)
+				.await
+				.expect("Deployment disappeared");
+			let annotations = deploy
+				.spec
+				.and_then(|s| s.template.metadata)
+				.and_then(|m| m.annotations)
+				.unwrap_or_default();
+			if annotations
+				.get("pgro.bes.au/test-spec-change")
+				.map(String::as_str)
+				== Some("1")
+			{
+				return;
+			}
+			tokio::time::sleep(POLL_INTERVAL).await;
+		}
+	})
+	.await
+	.expect("replica spec change did not reach the running Deployment within 60s");
 
 	println!("--- all assertions passed, cleaning up");
 	cleanup_namespace(&client, ns, &["lifecycle-replica"]).await;

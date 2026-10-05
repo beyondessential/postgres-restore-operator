@@ -1,4 +1,8 @@
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+	collections::{BTreeMap, HashMap},
+	sync::{Arc, Mutex},
+	time::Duration,
+};
 
 use jiff::Timestamp;
 use k8s_openapi::{
@@ -18,6 +22,7 @@ use kube::{
 	runtime::{
 		controller::Action,
 		events::{Event, EventType},
+		reflector::ObjectRef,
 	},
 };
 use tracing::{debug, info, warn};
@@ -359,6 +364,42 @@ pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>)
 			// Nothing to do, waiting for cleanup or manual intervention
 			Ok(Action::requeue(Duration::from_secs(300)))
 		}
+	}
+}
+
+/// The restores belonging to `replica`, for requeueing them when its spec
+/// changes. Every restore phase that owns a running pod re-applies its
+/// Deployment from the live replica spec, so a spec change (a canopy-asserted
+/// resource floor, say) reaches running pods on the next reconcile rather than
+/// waiting out the periodic requeue.
+pub fn restores_of_replica<'a>(
+	restores: impl IntoIterator<Item = &'a PostgresPhysicalRestore>,
+	replica: &PostgresPhysicalReplica,
+) -> Vec<ObjectRef<PostgresPhysicalRestore>> {
+	let replica_ns = replica.namespace();
+	restores
+		.into_iter()
+		.filter(|r| r.namespace() == replica_ns && r.spec.replica.name == replica.name_any())
+		.map(ObjectRef::from_obj)
+		.collect()
+}
+
+/// Remembers the last `metadata.generation` seen per replica, so a watch on
+/// replicas can react to spec changes alone: status writes leave the generation
+/// alone. A replica seen for the first time counts as changed.
+#[derive(Debug, Default)]
+pub struct GenerationGate(Mutex<HashMap<ObjectRef<PostgresPhysicalReplica>, i64>>);
+
+impl GenerationGate {
+	pub fn changed(&self, replica: &PostgresPhysicalReplica) -> bool {
+		let key = ObjectRef::from_obj(replica);
+		let mut seen = self.0.lock().unwrap_or_else(|e| e.into_inner());
+		if replica.metadata.deletion_timestamp.is_some() {
+			seen.remove(&key);
+			return false;
+		}
+		let generation = replica.metadata.generation.unwrap_or_default();
+		seen.insert(key, generation) != Some(generation)
 	}
 }
 
