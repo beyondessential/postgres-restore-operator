@@ -152,15 +152,14 @@ const DEFAULT_UPGRADE_DROP_SCHEMAS: &str = "reporting";
 
 /// Tamanu's upgrade refuses to start when a live `S1:` encrypted value in these
 /// tables doesn't decrypt with the configured key, and the migration Job only
-/// has the default key. Tamanu's `forget_server_identity()` clears those along
-/// with the facts that would point the copy at the source's central; snapshots
-/// from before it shipped get the encrypted values soft-deleted instead.
+/// has the default key, so those are soft-deleted. Tamanu's
+/// `forget_server_identity()`, where the snapshot has it, also clears the
+/// plaintext facts that would point the copy at the source's central.
 pub const DEFAULT_UPGRADE_PRE_MIGRATE_SQL: &str = r#"DO $$
 DECLARE t text;
 BEGIN
   IF to_regprocedure('public.forget_server_identity()') IS NOT NULL THEN
     PERFORM public.forget_server_identity();
-    RETURN;
   END IF;
   FOREACH t IN ARRAY ARRAY['local_system_secrets', 'local_system_facts'] LOOP
     IF EXISTS (
@@ -886,15 +885,16 @@ mod tests {
 	}
 
 	#[test]
-	fn upgrade_default_prefers_tamanus_own_identity_removal() {
-		let forget = DEFAULT_UPGRADE_PRE_MIGRATE_SQL
-			.find("PERFORM public.forget_server_identity();")
-			.expect("the default calls Tamanu's function when the snapshot has it");
-		let fallback = DEFAULT_UPGRADE_PRE_MIGRATE_SQL
-			.find("SET deleted_at = now()")
-			.expect("older snapshots still get their encrypted values hidden");
-		assert!(forget < fallback);
-		assert!(DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("RETURN;"));
+	fn upgrade_default_forgets_identity_and_hides_secrets() {
+		assert!(
+			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("PERFORM public.forget_server_identity();"),
+			"the default calls Tamanu's function when the snapshot has it"
+		);
+		assert!(
+			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("SET deleted_at = now()"),
+			"the encrypted values the job's key can't read are always hidden"
+		);
+		assert!(!DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("RETURN;"));
 	}
 
 	#[test]
