@@ -1109,6 +1109,39 @@ fn deployment_init_script_sets_shared_buffers() {
 /// already exists or not, so a name colliding with a role in the source
 /// cluster doesn't keep production's attributes and grants.
 #[test]
+fn tamanu_identity_is_scrubbed_before_anything_connects() {
+	let script = setup_auth_script();
+
+	for expected in [
+		"PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d \"$db\" -v ON_ERROR_STOP=1 << 'SQLEOF'",
+		" WHERE key IN ('syncHost', 'syncEmail', 'syncPassword', 'facilityIds', 'deviceId', 'deviceKey', 'metaServerId');",
+		" WHERE key IN ('syncPassword', 'deviceKey');",
+	] {
+		assert!(
+			script.contains(expected),
+			"missing from the scrub: {expected}"
+		);
+	}
+
+	let scrub = script
+		.lines()
+		.position(|l| l.contains("Removing Tamanu sync and device identity"))
+		.expect("the scrub runs");
+	let temp_start = script
+		.lines()
+		.position(|l| l.contains("pg_ctl -D \"$PGDATA\" -o \"-c listen_addresses=''"))
+		.expect("the temporary postgres starts");
+	let restore_info = script
+		.lines()
+		.position(|l| l.contains("Writing restore metadata"))
+		.expect("restore metadata is written");
+	assert!(
+		temp_start < scrub && scrub < restore_info,
+		"the scrub must run on the socket-only postgres, before the restore is marked done"
+	);
+}
+
+#[test]
 fn analytics_role_is_normalised_on_every_restore() {
 	let setup_auth = setup_auth_with_extra_users(vec![]);
 	let script = setup_auth.args.unwrap().remove(0);

@@ -1297,6 +1297,27 @@ done
 	)
 }
 
+/// Removes the sync host, sync credentials and device identity a Tamanu server
+/// keeps in its own database, so nothing started against a restore can sync or
+/// report status as the source server. Runs here rather than from the operator
+/// because a read-only replica's only operator-held role can't write.
+const TAMANU_IDENTITY_SCRUB_BLOCK: &str = r#"echo "Removing Tamanu sync and device identity, in every connectable database..."
+for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+  PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d "$db" -v ON_ERROR_STOP=1 << 'SQLEOF'
+SELECT to_regclass('public.local_system_facts') IS NOT NULL AS pgro_has_facts,
+       to_regclass('public.local_system_secrets') IS NOT NULL AS pgro_has_secrets \gset
+\if :pgro_has_facts
+DELETE FROM public.local_system_facts
+ WHERE key IN ('syncHost', 'syncEmail', 'syncPassword', 'facilityIds', 'deviceId', 'deviceKey', 'metaServerId');
+\endif
+\if :pgro_has_secrets
+DELETE FROM public.local_system_secrets
+ WHERE key IN ('syncPassword', 'deviceKey');
+\endif
+SQLEOF
+done
+"#;
+
 /// CRD-path Deployment builder. Fills the shared `PostgresDeploymentInputs`
 /// from the restore + replica CRs and delegates to
 /// [`build_postgres_deployment_with`].
@@ -1905,6 +1926,7 @@ echo "Detected PG major version: $PG_MAJOR"
 {analytics_reset_block}
 {extra_users_block}
 {lockdown_block}
+{TAMANU_IDENTITY_SCRUB_BLOCK}
 if [ "$PG_MAJOR" -ge 14 ] && [ "{read_only}" = "true" ]; then
   # PG >= 14 read-only: granular read role keeps the surface area minimal.
   # It doesn't cover function execution, which the lockdown above just closed
