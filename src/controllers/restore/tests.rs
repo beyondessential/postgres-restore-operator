@@ -1105,15 +1105,13 @@ fn deployment_init_script_sets_shared_buffers() {
 	);
 }
 
-/// The analytics role is reset to a known state on every restore, whether it
-/// already exists or not, so a name colliding with a role in the source
-/// cluster doesn't keep production's attributes and grants.
 #[test]
 fn tamanu_identity_is_scrubbed_before_anything_connects() {
 	let script = setup_auth_script();
 
 	for expected in [
 		"PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d \"$db\" -v ON_ERROR_STOP=1 << 'SQLEOF'",
+		"SELECT public.forget_server_identity();",
 		" WHERE key IN ('syncHost', 'syncEmail', 'syncPassword', 'facilityIds', 'deviceId', 'deviceKey', 'metaServerId');",
 		" WHERE key IN ('syncPassword', 'deviceKey');",
 	] {
@@ -1141,6 +1139,9 @@ fn tamanu_identity_is_scrubbed_before_anything_connects() {
 	);
 }
 
+/// The analytics role is reset to a known state on every restore, whether it
+/// already exists or not, so a name colliding with a role in the source
+/// cluster doesn't keep production's attributes and grants.
 #[test]
 fn analytics_role_is_normalised_on_every_restore() {
 	let setup_auth = setup_auth_with_extra_users(vec![]);

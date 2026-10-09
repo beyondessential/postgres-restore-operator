@@ -1301,11 +1301,18 @@ done
 /// keeps in its own database, so nothing started against a restore can sync or
 /// report status as the source server. Runs here rather than from the operator
 /// because a read-only replica's only operator-held role can't write.
+///
+/// Tamanu's own `forget_server_identity()` owns the key list; the inline
+/// deletes cover snapshots taken before that function shipped.
 const TAMANU_IDENTITY_SCRUB_BLOCK: &str = r#"echo "Removing Tamanu sync and device identity, in every connectable database..."
 for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
   PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d "$db" -v ON_ERROR_STOP=1 << 'SQLEOF'
-SELECT to_regclass('public.local_system_facts') IS NOT NULL AS pgro_has_facts,
+SELECT to_regprocedure('public.forget_server_identity()') IS NOT NULL AS pgro_has_forget,
+       to_regclass('public.local_system_facts') IS NOT NULL AS pgro_has_facts,
        to_regclass('public.local_system_secrets') IS NOT NULL AS pgro_has_secrets \gset
+\if :pgro_has_forget
+SELECT public.forget_server_identity();
+\else
 \if :pgro_has_facts
 DELETE FROM public.local_system_facts
  WHERE key IN ('syncHost', 'syncEmail', 'syncPassword', 'facilityIds', 'deviceId', 'deviceKey', 'metaServerId');
@@ -1313,6 +1320,7 @@ DELETE FROM public.local_system_facts
 \if :pgro_has_secrets
 DELETE FROM public.local_system_secrets
  WHERE key IN ('syncPassword', 'deviceKey');
+\endif
 \endif
 SQLEOF
 done
