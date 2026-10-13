@@ -154,11 +154,13 @@ const DEFAULT_UPGRADE_DROP_SCHEMAS: &str = "reporting";
 /// tables doesn't decrypt with the configured key, and the migration Job only
 /// has the default key, so those are soft-deleted. Tamanu's
 /// `forget_server_identity()`, where the snapshot has it, also clears the
-/// plaintext facts that would point the copy at the source's central.
+/// plaintext facts that would point the copy at the source's central; it runs
+/// only once the transaction declares the database a copy.
 pub const DEFAULT_UPGRADE_PRE_MIGRATE_SQL: &str = r#"DO $$
 DECLARE t text;
 BEGIN
   IF to_regprocedure('public.forget_server_identity()') IS NOT NULL THEN
+    PERFORM set_config('tamanu.this_is_a_copy', 'true', true);
     PERFORM public.forget_server_identity();
   END IF;
   FOREACH t IN ARRAY ARRAY['local_system_secrets', 'local_system_facts'] LOOP
@@ -889,6 +891,12 @@ mod tests {
 		assert!(
 			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("PERFORM public.forget_server_identity();"),
 			"the default calls Tamanu's function when the snapshot has it"
+		);
+		assert!(
+			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains(
+				"PERFORM set_config('tamanu.this_is_a_copy', 'true', true);\n    PERFORM public.forget_server_identity();"
+			),
+			"the function refuses unless the same transaction declares a copy"
 		);
 		assert!(
 			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("SET deleted_at = now()"),
