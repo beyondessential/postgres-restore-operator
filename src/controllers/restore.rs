@@ -367,7 +367,7 @@ pub async fn reconcile(restore: Arc<PostgresPhysicalRestore>, ctx: Arc<Context>)
 	}
 }
 
-/// The restores belonging to `replica`, for requeueing them when its spec
+/// The restores belonging to `replica`, for requeuing them when its spec
 /// changes. Every restore phase that owns a running pod re-applies its
 /// Deployment from the live replica spec, so a spec change (a canopy-asserted
 /// resource floor, say) reaches running pods on the next reconcile rather than
