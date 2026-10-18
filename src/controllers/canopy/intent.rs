@@ -557,7 +557,7 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 			// Throwaway like `verify`, but the workload is a dbt build rather
 			// than a migration: bursty, and a ceiling only buys CFS throttling.
 			// The request must fit a 2 vCPU replica node with its daemonsets;
-			// the build bursts into the rest of the node, which it has alone.
+			// the build bursts above it into whatever CPU the node has spare.
 			resources_floor: Some(resources("500m", "2Gi", None, "8Gi")),
 			read_only: true,
 			minimum_ttl: None,
