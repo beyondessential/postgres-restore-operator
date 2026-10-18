@@ -556,9 +556,9 @@ pub fn config_for(intent: &str) -> Option<IntentConfig> {
 		"reporting-schema" => Some(IntentConfig {
 			// Throwaway like `verify`, but the workload is a dbt build rather
 			// than a migration: bursty, and a ceiling only buys CFS throttling.
-			// Unlike an analytics replica it is busy for its whole short life,
-			// so the request reserves whole cores.
-			resources_floor: Some(resources("2", "2Gi", None, "8Gi")),
+			// The request must fit a 2 vCPU replica node with its daemonsets;
+			// the build bursts into the rest of the node, which it has alone.
+			resources_floor: Some(resources("500m", "2Gi", None, "8Gi")),
 			read_only: true,
 			minimum_ttl: None,
 			switchover_grace_period: TimeSpan(Span::new().minutes(5)),
@@ -939,6 +939,15 @@ mod tests {
 				"a blank image leaves the replica building nothing, not building with an empty image"
 			);
 		}
+	}
+
+	#[test]
+	fn reporting_schema_floor_fits_a_two_vcpu_replica_node() {
+		let floor = config_for("reporting-schema")
+			.and_then(|cfg| cfg.resources_floor)
+			.expect("reporting-schema has a floor");
+		assert_eq!(quantity(&floor.requests, "cpu").as_deref(), Some("500m"));
+		assert_eq!(quantity(&floor.limits, "cpu"), None);
 	}
 
 	#[test]
