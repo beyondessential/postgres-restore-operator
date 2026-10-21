@@ -2693,7 +2693,7 @@ fn collation_branch_runs_alongside_the_reindex_branches() {
 	let script = postgres_container_script();
 
 	let locale_branch = script
-		.find("elif [ -f /pgdata/needs-reindex ]; then")
+		.find("if [ -f /pgdata/needs-reindex ]; then")
 		.expect("locale reindex branch still present");
 	let collation_branch = script
 		.find("if [ -f /pgdata/needs-collation-refresh ]; then")
@@ -3443,4 +3443,173 @@ fn generation_gate_passes_spec_changes_only() {
 	assert!(!gate.changed(&replica), "deleting");
 	replica.metadata.deletion_timestamp = None;
 	assert!(gate.changed(&replica), "forgotten after deletion");
+}
+
+/// Readiness waits on the locale flag, so a restore that also needs the full
+/// post-pg_resetwal rebuild must clear that flag before starting it, or
+/// readiness waits on REINDEX DATABASE over every index in every database.
+#[test]
+fn locale_reindex_clears_its_flag_before_the_full_rebuild() {
+	let script = postgres_container_script();
+
+	let locale_done = script
+		.find("rm -f /pgdata/needs-reindex\n")
+		.expect("locale branch clears its flag");
+	let full_rebuild = script
+		.find(r#"-c "REINDEX DATABASE CONCURRENTLY"#)
+		.expect("full rebuild command present");
+	assert!(
+		locale_done < full_rebuild,
+		"needs-reindex must be cleared before REINDEX DATABASE starts"
+	);
+	assert_eq!(
+		script.matches("rm -f /pgdata/needs-reindex\n").count(),
+		1,
+		"only the locale branch may clear the readiness flag"
+	);
+}
+
+/// The operator waits on the locale reindex as the analytics user, which on a
+/// read-only replica cannot see other roles' rows in
+/// pg_stat_progress_create_index. The function hands it the counters, only to
+/// it, and only while the flag the readiness probe checks is still there.
+#[test]
+fn setup_auth_exposes_locale_reindex_progress_to_the_analytics_user() {
+	let script = setup_auth_script();
+
+	let function = script
+		.find("CREATE OR REPLACE FUNCTION _pgro.locale_reindex_progress() RETURNS text")
+		.expect("progress function is created");
+	let body = &script[function..];
+	assert!(body.contains("SECURITY DEFINER"));
+	assert!(body.contains("SET search_path = pg_catalog"));
+	assert!(
+		body.contains("pg_stat_file('/pgdata/needs-reindex', true)"),
+		"the answer must follow the readiness probe's flag, not the broader stage"
+	);
+	assert!(script.contains("REVOKE ALL ON FUNCTION _pgro.locale_reindex_progress() FROM PUBLIC;"));
+	assert!(script.contains(
+		"GRANT EXECUTE ON FUNCTION _pgro.locale_reindex_progress() TO ${ANALYTICS_USERNAME};"
+	));
+	// The heredoc is unquoted, so a bare `$pgro$` would be expanded by the
+	// shell and leave postgres an unterminated body.
+	assert!(script.contains(r"AS \$pgro\$"));
+	assert!(!script.contains(" $pgro$"));
+	let gate = script[..function]
+		.rfind(r#"if [ "$PG_MAJOR" -ge 12 ]; then"#)
+		.expect("pg_stat_progress_create_index needs PG 12");
+	assert!(gate < function);
+}
+
+mod reindex_watch {
+	use jiff::{SignedDuration, Timestamp};
+
+	use super::super::reindex_watch::{
+		OBSERVE_INTERVAL, STALL_TIMEOUT, Verdict, Watch, past_budget,
+	};
+
+	fn progress(value: &str) -> Option<String> {
+		Some(value.to_string())
+	}
+
+	fn at(minutes: i64) -> Timestamp {
+		Timestamp::UNIX_EPOCH + SignedDuration::from_mins(minutes)
+	}
+
+	fn past_stall() -> Timestamp {
+		at(0) + STALL_TIMEOUT + SignedDuration::from_secs(1)
+	}
+
+	/// A large reindex outlasts any fixed budget; as long as its counters
+	/// keep moving it is waited on, however long that takes.
+	#[test]
+	fn moving_progress_never_stalls() {
+		let mut watch = Watch::record(None, progress("1:16384:building:0:0"), at(0));
+		for minute in 1..=600 {
+			watch = Watch::record(
+				Some(&watch),
+				progress(&format!("1:16384:building:{minute}:0")),
+				at(minute),
+			);
+			assert_eq!(watch.verdict(at(minute)), Verdict::Wait);
+		}
+	}
+
+	#[test]
+	fn unchanged_progress_fails_after_the_stall_timeout() {
+		let first = Watch::record(None, progress("1:16384:sorting:5:0"), at(0));
+		let same = Watch::record(Some(&first), progress("1:16384:sorting:5:0"), at(29));
+		assert_eq!(same.verdict(at(29)), Verdict::Wait);
+
+		let still = Watch::record(Some(&same), progress("1:16384:sorting:5:0"), past_stall());
+		assert_eq!(still.verdict(past_stall()), Verdict::Stalled);
+	}
+
+	/// One failed look mid-wait must not throw away hours of a reindex that
+	/// was moving; it reads as no change and the stall clock decides.
+	#[test]
+	fn a_failed_observation_reads_as_no_change() {
+		let moving = Watch::record(None, progress("1:16384:building:9:0"), at(0));
+		let blip = Watch::unobserved(&moving, at(5));
+		assert_eq!(blip.verdict(at(5)), Verdict::Wait);
+		assert!(!blip.needs_observation(at(5)));
+
+		let still_failing = Watch::unobserved(&blip, past_stall());
+		assert_eq!(still_failing.verdict(past_stall()), Verdict::Stalled);
+	}
+
+	#[test]
+	fn no_pending_locale_reindex_is_not_waited_on() {
+		let watch = Watch::record(None, None, at(0));
+		assert_eq!(watch.verdict(at(0)), Verdict::NotReindexing);
+	}
+
+	#[test]
+	fn postgres_is_asked_at_most_once_per_interval() {
+		let watch = Watch::record(None, progress("x"), at(0));
+		assert!(!watch.needs_observation(at(0) + OBSERVE_INTERVAL - SignedDuration::from_secs(1)));
+		assert!(watch.needs_observation(at(0) + OBSERVE_INTERVAL));
+	}
+
+	/// A restore deleted mid-wait never reaches Ready or Failed, so its entry
+	/// has to age out; a live wait refreshes far more often than that.
+	#[test]
+	fn unvisited_watches_are_abandoned() {
+		let watch = Watch::record(None, progress("x"), at(0));
+		assert!(!watch.is_abandoned(at(0) + OBSERVE_INTERVAL * 2));
+		assert!(watch.is_abandoned(at(11)));
+	}
+
+	#[test]
+	fn past_budget_waits_only_on_a_moving_reindex() {
+		let elapsed = SignedDuration::from_secs(9000);
+		let budget = SignedDuration::from_secs(3000);
+		assert_eq!(past_budget(elapsed, budget, Some(Verdict::Wait)), None);
+		assert!(past_budget(elapsed, budget, Some(Verdict::NotReindexing)).is_some());
+		assert!(
+			past_budget(elapsed, budget, None).is_some(),
+			"an explicit timeout is not extended"
+		);
+	}
+
+	/// After a long wait the budget is the wrong number to report; the
+	/// message has to say how long it actually waited and why it gave up.
+	#[test]
+	fn past_budget_reports_the_actual_wait() {
+		let message = past_budget(
+			SignedDuration::from_secs(9000),
+			SignedDuration::from_secs(3000),
+			Some(Verdict::Stalled),
+		)
+		.unwrap();
+		assert!(
+			message.contains("9000s after restore completion"),
+			"{message}"
+		);
+		assert!(message.contains("budget 3000s"), "{message}");
+		assert!(
+			message.contains(&format!("no progress for {}s", STALL_TIMEOUT.as_secs())),
+			"{message}"
+		);
+	}
 }

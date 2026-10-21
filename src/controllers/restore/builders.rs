@@ -2003,6 +2003,28 @@ GRANT USAGE ON SCHEMA _pgro TO ${{ANALYTICS_USERNAME}};
 GRANT SELECT, UPDATE ON _pgro.restore_info TO ${{ANALYTICS_USERNAME}};
 SQLEOF
 
+# The locale reindex holds readiness and can outlast any fixed deadline on a
+# large database, so the operator waits on it for as long as it keeps moving.
+# Only it: the other reindexes run with the replica already serving, so the
+# answer is keyed on the flag the readiness probe checks, not on the stage.
+# NULL means no locale reindex is pending. Progress comes from
+# pg_stat_progress_create_index, whose rows for other roles' backends only
+# superusers and pg_read_all_stats can see; this hands the analytics user the
+# counters and nothing else.
+if [ "$PG_MAJOR" -ge 12 ]; then
+psql -U postgres -d postgres << SQLEOF
+CREATE OR REPLACE FUNCTION _pgro.locale_reindex_progress() RETURNS text
+LANGUAGE sql SECURITY DEFINER SET search_path = pg_catalog AS \$pgro\$
+  SELECT CASE WHEN (pg_stat_file('/pgdata/needs-reindex', true)).modification IS NOT NULL THEN
+    (SELECT coalesce(string_agg(concat_ws(':', pid, index_relid, phase, blocks_done, tuples_done, lockers_done, partitions_done), ',' ORDER BY pid), '')
+     FROM pg_stat_progress_create_index)
+  END
+\$pgro\$;
+REVOKE ALL ON FUNCTION _pgro.locale_reindex_progress() FROM PUBLIC;
+GRANT EXECUTE ON FUNCTION _pgro.locale_reindex_progress() TO ${{ANALYTICS_USERNAME}};
+SQLEOF
+fi
+
 echo "Stopping temporary postgres..."
 pg_ctl -D "$PGDATA" -w stop
 
@@ -2181,6 +2203,43 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ] || [ -f /pgd
     # left it. Ask for a writable session per connection; the setting stays
     # on for everyone else.
     PGOPTIONS='-c default_transaction_read_only=off' psql -U postgres -d postgres -c "UPDATE _pgro.restore_info SET stage = 'reindexing', last_transition_time = now() WHERE id = 1;"
+    # The locale branch goes first and on its own: readiness waits on
+    # needs-reindex, and a restore that also needs the full rebuild below
+    # would otherwise hold readiness until every index in every database had
+    # been rebuilt. REINDEX DATABASE then rebuilds the collation-dependent
+    # indexes a second time, but after the replica is already serving.
+    if [ -f /pgdata/needs-reindex ]; then
+      for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
+        # Only the database default collation (OID 100) is what the locale
+        # rewrite changed, so only indexes ordered by it are invalidated.
+        # `attcollation <> 0` also matches catalog indexes over `name`
+        # columns, which carry the C collation (950) and are unaffected —
+        # and REINDEX INDEX CONCURRENTLY cannot touch a system catalog, so
+        # including them produced dozens of swallowed errors per database
+        # that read like progress.
+        INDEXES=$(psql -U postgres -d "$db" -At -c "
+          SELECT DISTINCT indexrelid::regclass::text
+          FROM pg_index i
+          JOIN pg_attribute a ON a.attrelid = i.indexrelid
+          WHERE a.attcollation = 100 AND i.indisvalid;
+        ")
+        COUNT=$(echo "$INDEXES" | grep -c . || true)
+        echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
+        N=0
+        echo "$INDEXES" | while IFS= read -r idx; do
+          [ -z "$idx" ] && continue
+          N=$((N + 1))
+          echo "  [$N/$COUNT] $db: $idx"
+          if [ "$PG_MAJOR" -ge 14 ]; then
+            psql -U postgres -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 || true
+          else
+            psql -U postgres -d "$db" -c "REINDEX INDEX $idx;" 2>&1 || true
+          fi
+        done
+      done
+      rm -f /pgdata/needs-reindex
+    fi
+
     # needs-reindex-all (pg_resetwal aftermath) can leave torn pages in
     # ANY index, not just collation-dependent ones. We tried a "smart
     # pass" using the amcheck contrib extension (scan each btree, queue
@@ -2224,39 +2283,6 @@ if [ -f /pgdata/needs-reindex ] || [ -f /pgdata/needs-reindex-all ] || [ -f /pgd
         fi
       done
       rm -f /pgdata/needs-reindex-all
-      # needs-reindex (collation-dependent only) is a strict subset of
-      # what we just did, so clear it too.
-      rm -f /pgdata/needs-reindex
-    elif [ -f /pgdata/needs-reindex ]; then
-      for db in $(psql -U postgres -d postgres -At -c "SELECT datname FROM pg_database WHERE datallowconn AND datname <> 'template0'"); do
-        # Only the database default collation (OID 100) is what the locale
-        # rewrite changed, so only indexes ordered by it are invalidated.
-        # `attcollation <> 0` also matches catalog indexes over `name`
-        # columns, which carry the C collation (950) and are unaffected —
-        # and REINDEX INDEX CONCURRENTLY cannot touch a system catalog, so
-        # including them produced dozens of swallowed errors per database
-        # that read like progress.
-        INDEXES=$(psql -U postgres -d "$db" -At -c "
-          SELECT DISTINCT indexrelid::regclass::text
-          FROM pg_index i
-          JOIN pg_attribute a ON a.attrelid = i.indexrelid
-          WHERE a.attcollation = 100 AND i.indisvalid;
-        ")
-        COUNT=$(echo "$INDEXES" | grep -c . || true)
-        echo "Reindex after locale change: $db ($COUNT collation-dependent indexes)"
-        N=0
-        echo "$INDEXES" | while IFS= read -r idx; do
-          [ -z "$idx" ] && continue
-          N=$((N + 1))
-          echo "  [$N/$COUNT] $db: $idx"
-          if [ "$PG_MAJOR" -ge 14 ]; then
-            psql -U postgres -d "$db" -c "REINDEX INDEX CONCURRENTLY $idx;" 2>&1 || true
-          else
-            psql -U postgres -d "$db" -c "REINDEX INDEX $idx;" 2>&1 || true
-          fi
-        done
-      done
-      rm -f /pgdata/needs-reindex
     fi
 
     # Indexes ordered by a collation whose recorded version no longer matches

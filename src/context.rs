@@ -1,7 +1,7 @@
 use std::{
-	collections::HashSet,
+	collections::{HashMap, HashSet},
 	sync::{
-		Arc, RwLock,
+		Arc, Mutex, RwLock,
 		atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering},
 	},
 };
@@ -10,7 +10,11 @@ use jiff::Timestamp;
 use kube::Client;
 use kube::runtime::events::{Recorder, Reporter};
 
-use crate::{controllers::jobs::CallbackStore, metrics::Metrics, placement::PodPlacement};
+use crate::{
+	controllers::{jobs::CallbackStore, restore::reindex_watch::Watch},
+	metrics::Metrics,
+	placement::PodPlacement,
+};
 
 pub const DEFAULT_KOPIA_IMAGE: &str = "kopia/kopia:0.22.3";
 pub const DEFAULT_DEPLOYMENT_READY_TIMEOUT_SECS: u64 = 30 * 60;
@@ -75,6 +79,10 @@ pub struct Context {
 	/// var so it can be raised for replicas with large data dirs (slower
 	/// WAL replay) without needing a code release.
 	pub deployment_ready_timeout_secs: u64,
+	/// Startup reindex progress of restores past their readiness budget, keyed
+	/// by `{namespace}/{restore}`. Losing it on restart only restarts the
+	/// stall clock.
+	pub reindex_watches: Arc<Mutex<HashMap<String, Watch>>>,
 	/// Unix timestamp of the last successful entry into a reconcile function.
 	/// Used by `/livez` to detect a stuck reconciliation loop.
 	pub last_reconcile: Arc<AtomicI64>,
@@ -120,6 +128,7 @@ impl Context {
 			canopy_stats: Arc::new(CallbackStore::default()),
 			callback_base_url,
 			deployment_ready_timeout_secs,
+			reindex_watches: Arc::new(Mutex::new(HashMap::new())),
 			last_reconcile: Arc::new(AtomicI64::new(Timestamp::now().as_second())),
 			tailscaled_socket: None,
 			magic_dns_suffix: Arc::new(tokio::sync::RwLock::new(None)),

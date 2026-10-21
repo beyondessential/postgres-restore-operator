@@ -391,7 +391,7 @@ async fn run_pre_migrate_sql(
 	Ok(())
 }
 
-async fn credentials(
+pub(super) async fn credentials(
 	ctx: &Context,
 	replica: &PostgresPhysicalReplica,
 	namespace: &str,

@@ -164,6 +164,36 @@ async fn locale_rewrite_is_recorded_and_reindexed() {
 		"/pgdata/needs-reindex must be cleared by the reindex before the replica serves traffic"
 	);
 
+	// The operator waits out a long reindex by watching its progress as the
+	// analytics user, which can only do so through this function.
+	println!("--- checking reindex progress is readable as the analytics user");
+	let (callable, progress, stderr) = try_kubectl_exec(
+		ns,
+		&deploy,
+		&[
+			"psql",
+			"-U",
+			"analytics",
+			"-d",
+			"postgres",
+			"-At",
+			"-v",
+			"ON_ERROR_STOP=1",
+			"-c",
+			"SELECT _pgro.locale_reindex_progress()",
+		],
+	)
+	.await;
+	assert!(
+		callable,
+		"the analytics user must be able to call _pgro.locale_reindex_progress(): {stderr}"
+	);
+	assert_eq!(
+		progress.trim(),
+		"",
+		"with the locale flag cleared there is no reindex for the operator to wait on"
+	);
+
 	println!("--- checking the data survived the rewrite");
 	let count = kubectl_exec(
 		ns,
