@@ -469,6 +469,7 @@ async fn read_result(
 			MIGRATION_CONTAINER,
 		)
 		.await
+		.map(|log| crate::controllers::jobs::redact(&log, std::slice::from_ref(&creds.1)))
 	} else {
 		None
 	};

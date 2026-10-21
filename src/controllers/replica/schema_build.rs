@@ -608,7 +608,10 @@ pub(super) async fn reconcile_schema_build(
 			// Read before the Job is deleted, which takes its pod and the only
 			// record of why the build failed.
 			let log = jobs::container_log(client, namespace, &job_name, BUILD_CONTAINER).await;
-			let secrets = build_secrets(client, namespace, replica).await;
+			let secrets = match log {
+				Some(_) => build_secrets(client, namespace, replica).await,
+				None => Some(Vec::new()),
+			};
 			record_schema_build(
 				client,
 				namespace,
@@ -616,7 +619,7 @@ pub(super) async fn reconcile_schema_build(
 				Some(&job_name),
 				SchemaBuildResult {
 					built: false,
-					error: Some(build_failure(log.as_deref(), &secrets)),
+					error: Some(build_failure(log.as_deref(), secrets.as_deref())),
 					total_elapsed_seconds: build.elapsed_seconds,
 					schema_bytes: build.delivered_bytes,
 					artifacts: Vec::new(),
@@ -633,49 +636,46 @@ pub(super) async fn reconcile_schema_build(
 }
 
 /// The values the build pod is handed that its log must not carry into the
-/// result: the database password and the callback token. Best effort, as the
-/// log itself is.
+/// result: the database password and the callback token. `None` when either
+/// could not be read, so the log is withheld rather than recorded unmasked.
 async fn build_secrets(
 	client: &Client,
 	namespace: &str,
 	replica: &PostgresPhysicalReplica,
-) -> Vec<String> {
-	let mut secrets = Vec::new();
-
+) -> Option<Vec<String>> {
 	let creds: Api<Secret> = Api::namespaced(client.clone(), namespace);
-	match creds.get(&replica.creds_secret_name()).await {
-		Ok(secret) => secrets.extend(postgres::read_secret_field(&secret, "password").ok()),
-		Err(err) => {
-			warn!(replica = %replica.name_any(), "reading the build credentials failed: {err}")
-		}
-	}
+	let password = creds
+		.get(&replica.creds_secret_name())
+		.await
+		.map_err(
+			|err| warn!(replica = %replica.name_any(), "reading the build credentials failed: {err}"),
+		)
+		.ok()
+		.and_then(|secret| postgres::read_secret_field(&secret, "password").ok())?;
 
-	match build_token(client, namespace, &replica.name_any()).await {
-		Ok(token) => secrets.extend(token),
-		Err(err) => warn!(replica = %replica.name_any(), "reading the build token failed: {err}"),
-	}
+	let token = build_token(client, namespace, &replica.name_any())
+		.await
+		.map_err(
+			|err| warn!(replica = %replica.name_any(), "reading the build token failed: {err}"),
+		)
+		.ok()?;
 
-	secrets
+	Some(std::iter::once(password).chain(token).collect())
 }
 
 const BUILD_FAILED: &str = "the build job failed";
 
-/// What a failed build records: the tail of its log, with colour codes
-/// stripped and every given secret masked, so canopy shows why it failed.
-fn build_failure(log: Option<&str>, secrets: &[String]) -> String {
+/// What a failed build records: the tail of its log, masked, so canopy shows
+/// why it failed. With no secrets to mask by, the log is left out.
+fn build_failure(log: Option<&str>, secrets: Option<&[String]>) -> String {
 	let Some(log) = log else {
 		return BUILD_FAILED.to_string();
 	};
+	let Some(secrets) = secrets else {
+		return format!("{BUILD_FAILED} (log withheld: its secrets could not be read to mask it)");
+	};
 
-	let mut log = String::from_utf8_lossy(&strip_ansi_escapes::strip(log)).into_owned();
-	for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-		let encoded =
-			percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC)
-				.to_string();
-		log = log
-			.replace(secret.as_str(), "[redacted]")
-			.replace(&encoded, "[redacted]");
-	}
+	let log = jobs::redact(log, secrets);
 
 	let tail = jobs::log_tail(&log);
 	if tail.is_empty() {
@@ -1607,7 +1607,7 @@ mod tests {
 			"\x1b[91mError: the build failed\x1b[0m\n",
 		);
 
-		let error = build_failure(Some(log), &[]);
+		let error = build_failure(Some(log), Some(&[]));
 
 		assert!(
 			error.starts_with("the build job failed:\nRunning: dbt run"),
@@ -1630,11 +1630,11 @@ mod tests {
 
 		let error = build_failure(
 			Some(log),
-			&[
+			Some(&[
 				"hunter2-long".to_string(),
 				"tok-123".to_string(),
 				String::new(),
-			],
+			]),
 		);
 
 		assert!(!error.contains("hunter2-long"), "{error}");
@@ -1648,15 +1648,34 @@ mod tests {
 
 	#[test]
 	fn a_failed_build_masks_a_url_encoded_secret() {
-		let log = "connecting to postgresql://analytics:p%40ss%2Fw0rd@kamaka-restore:5432/tamanu\n";
+		let log = concat!(
+			"connecting to postgresql://analytics:p%40ss%2Fw0rd@kamaka-restore:5432/tamanu\n",
+			"connecting to postgresql://analytics:p-s.s%2Fw0rd@kamaka-restore:5432/tamanu\n",
+		);
 
-		let error = build_failure(Some(log), &["p@ss/w0rd".to_string()]);
+		let error = build_failure(
+			Some(log),
+			Some(&["p@ss/w0rd".to_string(), "p-s.s/w0rd".to_string()]),
+		);
 
 		assert!(!error.contains("p%40ss"), "{error}");
-		assert!(
-			error.contains("analytics:[redacted]@kamaka-restore"),
+		assert!(!error.contains("p-s.s"), "{error}");
+		assert_eq!(
+			error.matches("analytics:[redacted]@kamaka-restore").count(),
+			2,
 			"{error}"
 		);
+	}
+
+	#[test]
+	fn a_failed_build_log_is_withheld_without_its_secrets() {
+		let error = build_failure(
+			Some("connecting to postgresql://analytics:hunter2@x\n"),
+			None,
+		);
+
+		assert!(!error.contains("hunter2"), "{error}");
+		assert!(error.starts_with("the build job failed"), "{error}");
 	}
 
 	#[test]
@@ -1666,7 +1685,7 @@ mod tests {
 			.collect::<Vec<_>>()
 			.join("\n");
 
-		let error = build_failure(Some(&log), &[]);
+		let error = build_failure(Some(&log), Some(&[]));
 
 		assert!(error.len() <= 2000 + "the build job failed:\n".len());
 		assert!(error.ends_with("xxx"), "the end of the log is kept");
@@ -1674,7 +1693,7 @@ mod tests {
 
 	#[test]
 	fn a_failed_build_without_a_log_says_only_that() {
-		assert_eq!(build_failure(None, &[]), "the build job failed");
-		assert_eq!(build_failure(Some("\n"), &[]), "the build job failed");
+		assert_eq!(build_failure(None, Some(&[])), "the build job failed");
+		assert_eq!(build_failure(Some("\n"), Some(&[])), "the build job failed");
 	}
 }

@@ -124,7 +124,11 @@ pub async fn container_log(
 ) -> Option<String> {
 	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
 	let list = pods
-		.list(&ListParams::default().labels(&format!("job-name={job_name}")))
+		.list(
+			&ListParams::default()
+				.labels(&format!("job-name={job_name}"))
+				.limit(1),
+		)
 		.await
 		.map_err(|e| warn!(job = job_name, error = %e, "listing job pods failed"))
 		.ok()?;
@@ -142,6 +146,37 @@ pub async fn container_log(
 	.map_err(|e| warn!(job = job_name, error = %e, "reading job log failed"))
 	.ok()
 }
+
+/// The last part of a Job's log, colour codes stripped and every given secret
+/// masked, raw and in the forms a URL carries it, before any of it is recorded.
+pub fn redact(log: &str, secrets: &[String]) -> String {
+	let mut start = log.len().saturating_sub(REDACT_WINDOW);
+	while !log.is_char_boundary(start) {
+		start += 1;
+	}
+	let mut log = String::from_utf8_lossy(&strip_ansi_escapes::strip(&log[start..])).into_owned();
+	for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+		log = log.replace(secret.as_str(), REDACTED);
+		for set in [percent_encoding::NON_ALPHANUMERIC, URL_COMPONENT] {
+			let encoded = percent_encoding::utf8_percent_encode(secret, set).to_string();
+			log = log.replace(&encoded, REDACTED);
+		}
+	}
+	log
+}
+
+const REDACTED: &str = "[redacted]";
+
+/// Comfortably more than [`log_tail`] keeps, so a secret straddling its cut is
+/// still masked.
+const REDACT_WINDOW: usize = 64 * 1024;
+
+/// What URL encoders leave alone: RFC 3986's unreserved characters.
+const URL_COMPONENT: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+	.remove(b'-')
+	.remove(b'.')
+	.remove(b'_')
+	.remove(b'~');
 
 /// The tail of a failed Job's log, bounded so a status field stays readable.
 ///
