@@ -374,7 +374,7 @@ mod tests {
 
 #[cfg(test)]
 mod log_tail_tests {
-	use super::log_tail;
+	use super::{log_tail, redact};
 
 	#[test]
 	fn the_log_is_kept_whole() {
@@ -475,5 +475,29 @@ mod log_tail_tests {
 	#[test]
 	fn an_empty_log_is_nothing() {
 		assert_eq!(log_tail(""), "");
+	}
+
+	#[test]
+	fn a_migration_log_has_the_password_masked_and_the_error_kept() {
+		let log = concat!(
+			"connecting to postgresql://tamanu:p@ss.w0rd@kamaka-restore:5432/tamanu\n",
+			"retrying postgresql://tamanu:p%40ss.w0rd@kamaka-restore:5432/tamanu\n",
+			"error: insert or update on table \"encounters\" violates foreign key constraint \"fk_patient\"\n",
+			"DETAIL:  Key (patient_id)=(abc-123) is not present in table \"patients\".\n",
+		);
+
+		let masked = redact(log, &["p@ss.w0rd".to_string()]);
+
+		assert!(!masked.contains("p@ss"), "{masked}");
+		assert!(!masked.contains("p%40ss"), "{masked}");
+		assert_eq!(
+			masked.matches("tamanu:[redacted]@kamaka-restore").count(),
+			2,
+			"{masked}"
+		);
+		assert!(
+			masked.contains("DETAIL:  Key (patient_id)=(abc-123)"),
+			"the postgres error stays whole: {masked}"
+		);
 	}
 }

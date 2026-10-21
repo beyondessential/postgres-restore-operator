@@ -644,22 +644,26 @@ async fn build_secrets(
 	replica: &PostgresPhysicalReplica,
 ) -> Option<Vec<String>> {
 	let creds: Api<Secret> = Api::namespaced(client.clone(), namespace);
-	let password = creds
+	let creds = creds
 		.get(&replica.creds_secret_name())
 		.await
-		.map_err(
-			|err| warn!(replica = %replica.name_any(), "reading the build credentials failed: {err}"),
-		)
-		.ok()
-		.and_then(|secret| postgres::read_secret_field(&secret, "password").ok())?;
+		.map_err(Error::Kube);
+	let token = build_token(client, namespace, &replica.name_any()).await;
+	secrets_to_mask(creds, token, &replica.name_any())
+}
 
-	let token = build_token(client, namespace, &replica.name_any())
-		.await
-		.map_err(
-			|err| warn!(replica = %replica.name_any(), "reading the build token failed: {err}"),
-		)
+fn secrets_to_mask(
+	creds: Result<Secret>,
+	token: Result<Option<String>>,
+	replica: &str,
+) -> Option<Vec<String>> {
+	let password = creds
+		.and_then(|secret| postgres::read_secret_field(&secret, "password"))
+		.map_err(|err| warn!(replica, "reading the build password failed: {err}"))
 		.ok()?;
-
+	let token = token
+		.map_err(|err| warn!(replica, "reading the build token failed: {err}"))
+		.ok()?;
 	Some(std::iter::once(password).chain(token).collect())
 }
 
@@ -1695,5 +1699,69 @@ mod tests {
 	fn a_failed_build_without_a_log_says_only_that() {
 		assert_eq!(build_failure(None, Some(&[])), "the build job failed");
 		assert_eq!(build_failure(Some("\n"), Some(&[])), "the build job failed");
+	}
+
+	fn creds_with(data: &[(&str, &str)]) -> Secret {
+		Secret {
+			data: Some(
+				data.iter()
+					.map(|(key, value)| {
+						(
+							key.to_string(),
+							k8s_openapi::ByteString(value.as_bytes().to_vec()),
+						)
+					})
+					.collect(),
+			),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn the_password_and_token_are_masked() {
+		let secrets = secrets_to_mask(
+			Ok(creds_with(&[("password", "hunter2")])),
+			Ok(Some("tok-123".to_string())),
+			"kamaka",
+		);
+
+		assert_eq!(
+			secrets,
+			Some(vec!["hunter2".to_string(), "tok-123".to_string()])
+		);
+	}
+
+	#[test]
+	fn a_build_with_no_token_masks_the_password_alone() {
+		let secrets = secrets_to_mask(
+			Ok(creds_with(&[("password", "hunter2")])),
+			Ok(None),
+			"kamaka",
+		);
+
+		assert_eq!(secrets, Some(vec!["hunter2".to_string()]));
+	}
+
+	#[test]
+	fn an_unreadable_secret_withholds_the_log() {
+		let missing_secret = secrets_to_mask(
+			Err(Error::MissingField("no such secret".to_string())),
+			Ok(Some("tok-123".to_string())),
+			"kamaka",
+		);
+		let missing_password = secrets_to_mask(
+			Ok(creds_with(&[("username", "analytics")])),
+			Ok(Some("tok-123".to_string())),
+			"kamaka",
+		);
+		let unreadable_token = secrets_to_mask(
+			Ok(creds_with(&[("password", "hunter2")])),
+			Err(Error::MissingField("no such job".to_string())),
+			"kamaka",
+		);
+
+		assert_eq!(missing_secret, None, "creds secret unreadable");
+		assert_eq!(missing_password, None, "password key missing");
+		assert_eq!(unreadable_token, None, "token unreadable");
 	}
 }
