@@ -669,7 +669,12 @@ fn build_failure(log: Option<&str>, secrets: &[String]) -> String {
 
 	let mut log = String::from_utf8_lossy(&strip_ansi_escapes::strip(log)).into_owned();
 	for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
-		log = log.replace(secret.as_str(), "[redacted]");
+		let encoded =
+			percent_encoding::utf8_percent_encode(secret, percent_encoding::NON_ALPHANUMERIC)
+				.to_string();
+		log = log
+			.replace(secret.as_str(), "[redacted]")
+			.replace(&encoded, "[redacted]");
 	}
 
 	let tail = jobs::log_tail(&log);
@@ -1639,6 +1644,19 @@ mod tests {
 			"{error}"
 		);
 		assert!(error.contains("kamaka/[redacted] answered 403"), "{error}");
+	}
+
+	#[test]
+	fn a_failed_build_masks_a_url_encoded_secret() {
+		let log = "connecting to postgresql://analytics:p%40ss%2Fw0rd@kamaka-restore:5432/tamanu\n";
+
+		let error = build_failure(Some(log), &["p@ss/w0rd".to_string()]);
+
+		assert!(!error.contains("p%40ss"), "{error}");
+		assert!(
+			error.contains("analytics:[redacted]@kamaka-restore"),
+			"{error}"
+		);
 	}
 
 	#[test]

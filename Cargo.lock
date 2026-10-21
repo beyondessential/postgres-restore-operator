@@ -3378,6 +3378,7 @@ dependencies = [
  "kube",
  "kube_quantity",
  "mimalloc",
+ "percent-encoding",
  "prometheus",
  "rand 0.10.3",
  "reqwest",

@@ -191,6 +191,10 @@ fn is_error_headline(line: &str) -> bool {
 		"Error [",
 		"DatabaseError",
 		"SequelizeDatabaseError",
+		"Database Error in",
+		"Compilation Error in",
+		"Runtime Error in",
+		"Failure in model",
 	]
 	.iter()
 	.any(|marker| line.starts_with(marker) || line.contains(&format!(" {marker}")))
@@ -406,6 +410,23 @@ mod log_tail_tests {
 		assert!(
 			out.contains("line 59"),
 			"the end of the log is still kept: {out}"
+		);
+	}
+
+	#[test]
+	fn a_dbt_model_failure_survives_truncation() {
+		let mut log = String::from(
+			"Database Error in model ds__encounters (models/datasets/ds__encounters.sql)\n",
+		);
+		for i in 0..200 {
+			log.push_str(&format!("dbt line {i} {}\n", "x".repeat(80)));
+		}
+
+		let out = log_tail(&log);
+
+		assert!(
+			out.starts_with("Database Error in model ds__encounters"),
+			"{out}"
 		);
 	}
 
