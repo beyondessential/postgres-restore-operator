@@ -6,8 +6,13 @@ use std::{
 
 use k8s_openapi::api::{
 	batch::v1::Job,
-	core::v1::{EnvVar, EnvVarSource, SecretKeySelector},
+	core::v1::{EnvVar, EnvVarSource, Pod, SecretKeySelector},
 };
+use kube::{
+	Api, Client, ResourceExt,
+	api::{ListParams, LogParams},
+};
+use tracing::warn;
 
 /// Status of a Kubernetes Job.
 #[derive(Debug)]
@@ -105,6 +110,101 @@ pub fn env_literal(name: &str, value: &str) -> EnvVar {
 		value: Some(value.to_string()),
 		..Default::default()
 	}
+}
+
+/// The tail of a Job container's log, as its pod still holds it.
+///
+/// Best effort: a log that cannot be read leaves the caller without a cause and
+/// the reconcile carries on.
+pub async fn container_log(
+	client: &Client,
+	namespace: &str,
+	job_name: &str,
+	container: &str,
+) -> Option<String> {
+	let pods: Api<Pod> = Api::namespaced(client.clone(), namespace);
+	let list = pods
+		.list(&ListParams::default().labels(&format!("job-name={job_name}")))
+		.await
+		.map_err(|e| warn!(job = job_name, error = %e, "listing job pods failed"))
+		.ok()?;
+	let pod = list.items.first()?;
+
+	pods.logs(
+		&pod.name_any(),
+		&LogParams {
+			container: Some(container.to_string()),
+			tail_lines: Some(200),
+			..Default::default()
+		},
+	)
+	.await
+	.map_err(|e| warn!(job = job_name, error = %e, "reading job log failed"))
+	.ok()
+}
+
+/// The tail of a failed Job's log, bounded so a status field stays readable.
+///
+/// A thrown error prints its message first and the failing SQL after it, so a
+/// long statement pushes the message out of the tail. The first line naming an
+/// error is kept ahead of the tail when the tail doesn't already hold it.
+pub fn log_tail(log: &str) -> String {
+	const KEEP_LINES: usize = 40;
+	const MAX_BYTES: usize = 2000;
+	const MAX_HEADLINE_BYTES: usize = 500;
+
+	let lines: Vec<&str> = log.lines().collect();
+	let tail_start = lines.len().saturating_sub(KEEP_LINES);
+	let tail = lines[tail_start..].join("\n");
+
+	let headline = lines
+		.iter()
+		.position(|line| is_error_headline(line))
+		.filter(|&at| at < tail_start || tail.len() > MAX_BYTES)
+		.map(|at| truncate_to(lines[at].trim(), MAX_HEADLINE_BYTES));
+
+	let budget = match &headline {
+		Some(headline) => MAX_BYTES.saturating_sub(headline.len() + "\n…\n".len()),
+		None => MAX_BYTES,
+	};
+	let kept = if tail.len() <= budget {
+		tail.as_str()
+	} else {
+		let cut = (tail.len() - budget..tail.len())
+			.find(|at| tail.is_char_boundary(*at))
+			.unwrap_or(tail.len());
+		&tail[cut..]
+	};
+
+	match headline {
+		Some(headline) if !kept.contains(headline.as_str()) => format!("{headline}\n…\n{kept}"),
+		_ => kept.to_string(),
+	}
+}
+
+fn is_error_headline(line: &str) -> bool {
+	let line = line.trim_start();
+	[
+		"Error:",
+		"ERROR:",
+		"error:",
+		"Error [",
+		"DatabaseError",
+		"SequelizeDatabaseError",
+	]
+	.iter()
+	.any(|marker| line.starts_with(marker) || line.contains(&format!(" {marker}")))
+}
+
+fn truncate_to(text: &str, max_bytes: usize) -> String {
+	if text.len() <= max_bytes {
+		return text.to_string();
+	}
+	let end = (0..=max_bytes)
+		.rev()
+		.find(|at| text.is_char_boundary(*at))
+		.unwrap_or(0);
+	text[..end].to_string()
 }
 
 #[cfg(test)]
@@ -230,5 +330,94 @@ mod tests {
 		assert_eq!(env.name, "HOST");
 		assert_eq!(env.value.as_deref(), Some("localhost"));
 		assert!(env.value_from.is_none());
+	}
+}
+
+#[cfg(test)]
+mod log_tail_tests {
+	use super::log_tail;
+
+	#[test]
+	fn the_log_is_kept_whole() {
+		let log = concat!(
+			"running 1721000002-addBaz.ts\n",
+			"error: insert or update on table \"encounters\" violates foreign key constraint \"fk_patient\"\n",
+			"DETAIL:  Key (patient_id)=(abc-123) is not present in table \"patients\".\n",
+			"HINT:  add the patient first\n",
+		);
+
+		let out = log_tail(log);
+
+		assert!(out.contains("violates foreign key constraint"), "{out}");
+		assert!(out.contains("Key (patient_id)=(abc-123)"), "{out}");
+		assert!(out.contains("HINT:  add the patient first"), "{out}");
+	}
+
+	#[test]
+	fn only_the_last_lines_are_kept() {
+		let log = (0..100)
+			.map(|i| format!("applying migration {i}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+
+		let out = log_tail(&log);
+
+		assert!(out.starts_with("applying migration 60"), "{out}");
+		assert!(out.ends_with("applying migration 99"), "{out}");
+		assert!(!out.contains("applying migration 59"), "{out}");
+	}
+
+	#[test]
+	fn the_tail_is_capped() {
+		let log = (0..60)
+			.map(|i| format!("applying migration {i} {}", "x".repeat(200)))
+			.collect::<Vec<_>>()
+			.join("\n");
+
+		let out = log_tail(&log);
+
+		assert!(out.len() <= 2000, "{} bytes", out.len());
+		assert!(out.ends_with("xxx"), "the end of the log is what is kept");
+	}
+
+	#[test]
+	fn the_error_survives_a_long_statement_after_it() {
+		let mut log = String::from(
+			"info: Applying migration: 1781222400001-makeIdDeterministic\n\
+			 error: DatabaseError [SequelizeDatabaseError]: index \"idx_example\" does not exist\n\
+			 \x20   at Query.run (query.js:50:25)\n",
+		);
+		for i in 0..60 {
+			log.push_str(&format!(
+				"  sql: 'INSERT INTO logs.changes line {i} {}',\n",
+				"x".repeat(80)
+			));
+		}
+
+		let out = log_tail(&log);
+
+		assert!(out.len() <= 2000, "{} bytes", out.len());
+		assert!(
+			out.starts_with(
+				"error: DatabaseError [SequelizeDatabaseError]: index \"idx_example\" does not exist"
+			),
+			"{out}"
+		);
+		assert!(
+			out.contains("line 59"),
+			"the end of the log is still kept: {out}"
+		);
+	}
+
+	#[test]
+	fn a_headline_already_in_the_tail_is_not_repeated() {
+		let log = "running 1-foo\nError: boom\nat x\n";
+
+		assert_eq!(log_tail(log), log.trim_end());
+	}
+
+	#[test]
+	fn an_empty_log_is_nothing() {
+		assert_eq!(log_tail(""), "");
 	}
 }

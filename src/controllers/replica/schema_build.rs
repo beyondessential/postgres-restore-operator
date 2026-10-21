@@ -51,6 +51,8 @@ const PULL_SECRET_NAME: &str = "schema-build-pull";
 
 const BUILD_DEADLINE_SECONDS: i64 = 30 * 60;
 
+const BUILD_CONTAINER: &str = "build";
+
 /// How long a finished build Job is left for an operator to read, and for the
 /// reconcile that records it to read its receipt. An operator that was down
 /// while it expired reads no receipt and builds again.
@@ -267,7 +269,7 @@ fn build_schema_build_job(
 						}]
 					}),
 					containers: vec![Container {
-						name: "build".to_string(),
+						name: BUILD_CONTAINER.to_string(),
 						image: Some(image.to_string()),
 						security_context: Some(SecurityContext {
 							allow_privilege_escalation: Some(false),
@@ -603,6 +605,10 @@ pub(super) async fn reconcile_schema_build(
 			Ok(false)
 		}
 		BuildOutcome::Failed => {
+			// Read before the Job is deleted, which takes its pod and the only
+			// record of why the build failed.
+			let log = jobs::container_log(client, namespace, &job_name, BUILD_CONTAINER).await;
+			let secrets = build_secrets(client, namespace, replica).await;
 			record_schema_build(
 				client,
 				namespace,
@@ -610,7 +616,7 @@ pub(super) async fn reconcile_schema_build(
 				Some(&job_name),
 				SchemaBuildResult {
 					built: false,
-					error: Some("the build job failed".to_string()),
+					error: Some(build_failure(log.as_deref(), &secrets)),
 					total_elapsed_seconds: build.elapsed_seconds,
 					schema_bytes: build.delivered_bytes,
 					artifacts: Vec::new(),
@@ -623,6 +629,54 @@ pub(super) async fn reconcile_schema_build(
 			delete_build_job(client, namespace, &job_name).await;
 			Ok(false)
 		}
+	}
+}
+
+/// The values the build pod is handed that its log must not carry into the
+/// result: the database password and the callback token. Best effort, as the
+/// log itself is.
+async fn build_secrets(
+	client: &Client,
+	namespace: &str,
+	replica: &PostgresPhysicalReplica,
+) -> Vec<String> {
+	let mut secrets = Vec::new();
+
+	let creds: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	match creds.get(&replica.creds_secret_name()).await {
+		Ok(secret) => secrets.extend(postgres::read_secret_field(&secret, "password").ok()),
+		Err(err) => {
+			warn!(replica = %replica.name_any(), "reading the build credentials failed: {err}")
+		}
+	}
+
+	match build_token(client, namespace, &replica.name_any()).await {
+		Ok(token) => secrets.extend(token),
+		Err(err) => warn!(replica = %replica.name_any(), "reading the build token failed: {err}"),
+	}
+
+	secrets
+}
+
+const BUILD_FAILED: &str = "the build job failed";
+
+/// What a failed build records: the tail of its log, with colour codes
+/// stripped and every given secret masked, so canopy shows why it failed.
+fn build_failure(log: Option<&str>, secrets: &[String]) -> String {
+	let Some(log) = log else {
+		return BUILD_FAILED.to_string();
+	};
+
+	let mut log = String::from_utf8_lossy(&strip_ansi_escapes::strip(log)).into_owned();
+	for secret in secrets.iter().filter(|secret| !secret.is_empty()) {
+		log = log.replace(secret.as_str(), "[redacted]");
+	}
+
+	let tail = jobs::log_tail(&log);
+	if tail.is_empty() {
+		BUILD_FAILED.to_string()
+	} else {
+		format!("{BUILD_FAILED}:\n{tail}")
 	}
 }
 
@@ -1536,5 +1590,73 @@ mod tests {
 			Some("canopy did not take the schema in")
 		);
 		assert_eq!(result.schema_bytes, Some(36));
+	}
+
+	#[test]
+	fn a_failed_build_carries_the_end_of_its_log() {
+		let log = concat!(
+			"\x1b[94mRunning: dbt run --profiles-dir config --target replica\x1b[0m\n",
+			"Database Error in model ds__encounters (models/datasets/ds__encounters.sql)\n",
+			"  column \"triage_score\" does not exist\n",
+			"Done. PASS=277 WARN=0 ERROR=6 SKIP=0 TOTAL=283\n",
+			"\x1b[91mError: the build failed\x1b[0m\n",
+		);
+
+		let error = build_failure(Some(log), &[]);
+
+		assert!(
+			error.starts_with("the build job failed:\nRunning: dbt run"),
+			"{error}"
+		);
+		assert!(error.contains("column \"triage_score\" does not exist"));
+		assert!(error.ends_with("Error: the build failed"), "{error}");
+		assert!(
+			!error.contains('\x1b'),
+			"colour codes are stripped: {error}"
+		);
+	}
+
+	#[test]
+	fn a_failed_build_masks_what_it_was_handed() {
+		let log = concat!(
+			"connecting to postgresql://analytics:hunter2-long@kamaka-restore:5432/tamanu\n",
+			"POST /api/v1/schema-build-results/pgro/kamaka/tok-123 answered 403\n",
+		);
+
+		let error = build_failure(
+			Some(log),
+			&[
+				"hunter2-long".to_string(),
+				"tok-123".to_string(),
+				String::new(),
+			],
+		);
+
+		assert!(!error.contains("hunter2-long"), "{error}");
+		assert!(!error.contains("tok-123"), "{error}");
+		assert!(
+			error.contains("analytics:[redacted]@kamaka-restore"),
+			"{error}"
+		);
+		assert!(error.contains("kamaka/[redacted] answered 403"), "{error}");
+	}
+
+	#[test]
+	fn a_failed_build_log_is_bounded() {
+		let log = (0..500)
+			.map(|i| format!("dbt line {i} {}", "x".repeat(100)))
+			.collect::<Vec<_>>()
+			.join("\n");
+
+		let error = build_failure(Some(&log), &[]);
+
+		assert!(error.len() <= 2000 + "the build job failed:\n".len());
+		assert!(error.ends_with("xxx"), "the end of the log is kept");
+	}
+
+	#[test]
+	fn a_failed_build_without_a_log_says_only_that() {
+		assert_eq!(build_failure(None, &[]), "the build job failed");
+		assert_eq!(build_failure(Some("\n"), &[]), "the build job failed");
 	}
 }
