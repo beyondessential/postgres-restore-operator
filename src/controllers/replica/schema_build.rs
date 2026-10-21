@@ -51,6 +51,8 @@ const PULL_SECRET_NAME: &str = "schema-build-pull";
 
 const BUILD_DEADLINE_SECONDS: i64 = 30 * 60;
 
+const BUILD_CONTAINER: &str = "build";
+
 /// How long a finished build Job is left for an operator to read, and for the
 /// reconcile that records it to read its receipt. An operator that was down
 /// while it expired reads no receipt and builds again.
@@ -267,7 +269,7 @@ fn build_schema_build_job(
 						}]
 					}),
 					containers: vec![Container {
-						name: "build".to_string(),
+						name: BUILD_CONTAINER.to_string(),
 						image: Some(image.to_string()),
 						security_context: Some(SecurityContext {
 							allow_privilege_escalation: Some(false),
@@ -603,6 +605,13 @@ pub(super) async fn reconcile_schema_build(
 			Ok(false)
 		}
 		BuildOutcome::Failed => {
+			// Read before the Job is deleted, which takes its pod and the only
+			// record of why the build failed.
+			let log = jobs::container_log(client, namespace, &job_name, BUILD_CONTAINER).await;
+			let secrets = match log {
+				Some(_) => build_secrets(client, namespace, replica).await,
+				None => Some(Vec::new()),
+			};
 			record_schema_build(
 				client,
 				namespace,
@@ -610,7 +619,7 @@ pub(super) async fn reconcile_schema_build(
 				Some(&job_name),
 				SchemaBuildResult {
 					built: false,
-					error: Some("the build job failed".to_string()),
+					error: Some(build_failure(log.as_deref(), secrets.as_deref())),
 					total_elapsed_seconds: build.elapsed_seconds,
 					schema_bytes: build.delivered_bytes,
 					artifacts: Vec::new(),
@@ -623,6 +632,60 @@ pub(super) async fn reconcile_schema_build(
 			delete_build_job(client, namespace, &job_name).await;
 			Ok(false)
 		}
+	}
+}
+
+/// The values the build pod is handed that its log must not carry into the
+/// result: the database password and the callback token. `None` when either
+/// could not be read, so the log is withheld rather than recorded unmasked.
+async fn build_secrets(
+	client: &Client,
+	namespace: &str,
+	replica: &PostgresPhysicalReplica,
+) -> Option<Vec<String>> {
+	let creds: Api<Secret> = Api::namespaced(client.clone(), namespace);
+	let creds = creds
+		.get(&replica.creds_secret_name())
+		.await
+		.map_err(Error::Kube);
+	let token = build_token(client, namespace, &replica.name_any()).await;
+	secrets_to_mask(creds, token, &replica.name_any())
+}
+
+fn secrets_to_mask(
+	creds: Result<Secret>,
+	token: Result<Option<String>>,
+	replica: &str,
+) -> Option<Vec<String>> {
+	let password = creds
+		.and_then(|secret| postgres::read_secret_field(&secret, "password"))
+		.map_err(|err| warn!(replica, "reading the build password failed: {err}"))
+		.ok()?;
+	let token = token
+		.map_err(|err| warn!(replica, "reading the build token failed: {err}"))
+		.ok()?;
+	Some(std::iter::once(password).chain(token).collect())
+}
+
+const BUILD_FAILED: &str = "the build job failed";
+
+/// What a failed build records: the tail of its log, masked, so canopy shows
+/// why it failed. With no secrets to mask by, the log is left out.
+fn build_failure(log: Option<&str>, secrets: Option<&[String]>) -> String {
+	let Some(log) = log else {
+		return BUILD_FAILED.to_string();
+	};
+	let Some(secrets) = secrets else {
+		return format!("{BUILD_FAILED} (log withheld: its secrets could not be read to mask it)");
+	};
+
+	let log = jobs::redact(log, secrets);
+
+	let tail = jobs::log_tail(&log);
+	if tail.is_empty() {
+		BUILD_FAILED.to_string()
+	} else {
+		format!("{BUILD_FAILED}:\n{tail}")
 	}
 }
 
@@ -1536,5 +1599,169 @@ mod tests {
 			Some("canopy did not take the schema in")
 		);
 		assert_eq!(result.schema_bytes, Some(36));
+	}
+
+	#[test]
+	fn a_failed_build_carries_the_end_of_its_log() {
+		let log = concat!(
+			"\x1b[94mRunning: dbt run --profiles-dir config --target replica\x1b[0m\n",
+			"Database Error in model ds__encounters (models/datasets/ds__encounters.sql)\n",
+			"  column \"triage_score\" does not exist\n",
+			"Done. PASS=277 WARN=0 ERROR=6 SKIP=0 TOTAL=283\n",
+			"\x1b[91mError: the build failed\x1b[0m\n",
+		);
+
+		let error = build_failure(Some(log), Some(&[]));
+
+		assert!(
+			error.starts_with("the build job failed:\nRunning: dbt run"),
+			"{error}"
+		);
+		assert!(error.contains("column \"triage_score\" does not exist"));
+		assert!(error.ends_with("Error: the build failed"), "{error}");
+		assert!(
+			!error.contains('\x1b'),
+			"colour codes are stripped: {error}"
+		);
+	}
+
+	#[test]
+	fn a_failed_build_masks_what_it_was_handed() {
+		let log = concat!(
+			"connecting to postgresql://analytics:hunter2-long@kamaka-restore:5432/tamanu\n",
+			"POST /api/v1/schema-build-results/pgro/kamaka/tok-123 answered 403\n",
+		);
+
+		let error = build_failure(
+			Some(log),
+			Some(&[
+				"hunter2-long".to_string(),
+				"tok-123".to_string(),
+				String::new(),
+			]),
+		);
+
+		assert!(!error.contains("hunter2-long"), "{error}");
+		assert!(!error.contains("tok-123"), "{error}");
+		assert!(
+			error.contains("analytics:[redacted]@kamaka-restore"),
+			"{error}"
+		);
+		assert!(error.contains("kamaka/[redacted] answered 403"), "{error}");
+	}
+
+	#[test]
+	fn a_failed_build_masks_a_url_encoded_secret() {
+		let log = concat!(
+			"connecting to postgresql://analytics:p%40ss%2Fw0rd@kamaka-restore:5432/tamanu\n",
+			"connecting to postgresql://analytics:p-s.s%2Fw0rd@kamaka-restore:5432/tamanu\n",
+		);
+
+		let error = build_failure(
+			Some(log),
+			Some(&["p@ss/w0rd".to_string(), "p-s.s/w0rd".to_string()]),
+		);
+
+		assert!(!error.contains("p%40ss"), "{error}");
+		assert!(!error.contains("p-s.s"), "{error}");
+		assert_eq!(
+			error.matches("analytics:[redacted]@kamaka-restore").count(),
+			2,
+			"{error}"
+		);
+	}
+
+	#[test]
+	fn a_failed_build_log_is_withheld_without_its_secrets() {
+		let error = build_failure(
+			Some("connecting to postgresql://analytics:hunter2@x\n"),
+			None,
+		);
+
+		assert!(!error.contains("hunter2"), "{error}");
+		assert!(error.starts_with("the build job failed"), "{error}");
+	}
+
+	#[test]
+	fn a_failed_build_log_is_bounded() {
+		let log = (0..500)
+			.map(|i| format!("dbt line {i} {}", "x".repeat(100)))
+			.collect::<Vec<_>>()
+			.join("\n");
+
+		let error = build_failure(Some(&log), Some(&[]));
+
+		assert!(error.len() <= 2000 + "the build job failed:\n".len());
+		assert!(error.ends_with("xxx"), "the end of the log is kept");
+	}
+
+	#[test]
+	fn a_failed_build_without_a_log_says_only_that() {
+		assert_eq!(build_failure(None, Some(&[])), "the build job failed");
+		assert_eq!(build_failure(Some("\n"), Some(&[])), "the build job failed");
+	}
+
+	fn creds_with(data: &[(&str, &str)]) -> Secret {
+		Secret {
+			data: Some(
+				data.iter()
+					.map(|(key, value)| {
+						(
+							key.to_string(),
+							k8s_openapi::ByteString(value.as_bytes().to_vec()),
+						)
+					})
+					.collect(),
+			),
+			..Default::default()
+		}
+	}
+
+	#[test]
+	fn the_password_and_token_are_masked() {
+		let secrets = secrets_to_mask(
+			Ok(creds_with(&[("password", "hunter2")])),
+			Ok(Some("tok-123".to_string())),
+			"kamaka",
+		);
+
+		assert_eq!(
+			secrets,
+			Some(vec!["hunter2".to_string(), "tok-123".to_string()])
+		);
+	}
+
+	#[test]
+	fn a_build_with_no_token_masks_the_password_alone() {
+		let secrets = secrets_to_mask(
+			Ok(creds_with(&[("password", "hunter2")])),
+			Ok(None),
+			"kamaka",
+		);
+
+		assert_eq!(secrets, Some(vec!["hunter2".to_string()]));
+	}
+
+	#[test]
+	fn an_unreadable_secret_withholds_the_log() {
+		let missing_secret = secrets_to_mask(
+			Err(Error::MissingField("no such secret".to_string())),
+			Ok(Some("tok-123".to_string())),
+			"kamaka",
+		);
+		let missing_password = secrets_to_mask(
+			Ok(creds_with(&[("username", "analytics")])),
+			Ok(Some("tok-123".to_string())),
+			"kamaka",
+		);
+		let unreadable_token = secrets_to_mask(
+			Ok(creds_with(&[("password", "hunter2")])),
+			Err(Error::MissingField("no such job".to_string())),
+			"kamaka",
+		);
+
+		assert_eq!(missing_secret, None, "creds secret unreadable");
+		assert_eq!(missing_password, None, "password key missing");
+		assert_eq!(unreadable_token, None, "token unreadable");
 	}
 }

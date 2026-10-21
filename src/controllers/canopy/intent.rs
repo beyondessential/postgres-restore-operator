@@ -146,9 +146,9 @@ const DEFAULT_ANALYTICS_MINIMUM_TTL_SECS: i64 = 7200;
 const DEFAULT_ANALYTICS_SWITCHOVER_GRACE_SECS: i64 = 120;
 /// Every tamanu deployment carries the reporting schema, and a real upgrade
 /// drops and regenerates it because its views over altered tables block the
-/// DDL. An `upgrade` replica that left this unset would fail on something the
+/// DDL. A migrating replica that left this unset would fail on something the
 /// deployment it models never meets.
-const DEFAULT_UPGRADE_DROP_SCHEMAS: &str = "reporting";
+const DEFAULT_PRE_MIGRATE_DROP_SCHEMAS: &str = "reporting";
 
 /// Tamanu's upgrade refuses to start when a live `S1:` encrypted value in these
 /// tables doesn't decrypt with the configured key, and the migration Job only
@@ -156,7 +156,7 @@ const DEFAULT_UPGRADE_DROP_SCHEMAS: &str = "reporting";
 /// `forget_server_identity()`, where the snapshot has it, also clears the
 /// plaintext facts that would point the copy at the source's central; it runs
 /// only once the transaction declares the database a copy.
-pub const DEFAULT_UPGRADE_PRE_MIGRATE_SQL: &str = r#"DO $$
+pub const DEFAULT_PRE_MIGRATE_SQL: &str = r#"DO $$
 DECLARE t text;
 BEGIN
   IF to_regprocedure('public.forget_server_identity()') IS NOT NULL THEN
@@ -190,14 +190,14 @@ fn upgrade_param_schema() -> ParamSchema {
 	ParamSchema(HashMap::from([
 		(
 			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
-			param(ParamType::Text, Some(json!(DEFAULT_UPGRADE_DROP_SCHEMAS))),
+			param(
+				ParamType::Text,
+				Some(json!(DEFAULT_PRE_MIGRATE_DROP_SCHEMAS)),
+			),
 		),
 		(
 			params::PRE_MIGRATE_SQL.to_string(),
-			param(
-				ParamType::Text,
-				Some(json!(DEFAULT_UPGRADE_PRE_MIGRATE_SQL)),
-			),
+			param(ParamType::Text, Some(json!(DEFAULT_PRE_MIGRATE_SQL))),
 		),
 	]))
 }
@@ -213,11 +213,14 @@ fn reporting_schema_param_schema() -> ParamSchema {
 		),
 		(
 			params::PRE_MIGRATE_DROP_SCHEMAS.to_string(),
-			param(ParamType::Text, None),
+			param(
+				ParamType::Text,
+				Some(json!(DEFAULT_PRE_MIGRATE_DROP_SCHEMAS)),
+			),
 		),
 		(
 			params::PRE_MIGRATE_SQL.to_string(),
-			param(ParamType::Text, None),
+			param(ParamType::Text, Some(json!(DEFAULT_PRE_MIGRATE_SQL))),
 		),
 	]))
 }
@@ -839,7 +842,7 @@ mod tests {
 
 	#[test]
 	fn pre_migrate_drop_schemas_parses_on_every_migrating_intent() {
-		for intent in ["analytics", "upgrade"] {
+		for intent in ["analytics", "upgrade", "reporting-schema"] {
 			let spec = config_for(intent).unwrap().to_replica_spec(
 				&entry(
 					intent,
@@ -889,20 +892,20 @@ mod tests {
 	#[test]
 	fn upgrade_default_forgets_identity_and_hides_secrets() {
 		assert!(
-			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("PERFORM public.forget_server_identity();"),
+			DEFAULT_PRE_MIGRATE_SQL.contains("PERFORM public.forget_server_identity();"),
 			"the default calls Tamanu's function when the snapshot has it"
 		);
 		assert!(
-			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains(
+			DEFAULT_PRE_MIGRATE_SQL.contains(
 				"PERFORM set_config('tamanu.this_is_a_copy', 'true', true);\n    PERFORM public.forget_server_identity();"
 			),
 			"the function refuses unless the same transaction declares a copy"
 		);
 		assert!(
-			DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("SET deleted_at = now()"),
+			DEFAULT_PRE_MIGRATE_SQL.contains("SET deleted_at = now()"),
 			"the encrypted values the job's key can't read are always hidden"
 		);
-		assert!(!DEFAULT_UPGRADE_PRE_MIGRATE_SQL.contains("RETURN;"));
+		assert!(!DEFAULT_PRE_MIGRATE_SQL.contains("RETURN;"));
 	}
 
 	#[test]
@@ -1016,7 +1019,7 @@ mod tests {
 		// read, so the default hides them.
 		assert_eq!(
 			upgrade_params.get(params::PRE_MIGRATE_SQL).unwrap().default,
-			Some(json!(DEFAULT_UPGRADE_PRE_MIGRATE_SQL))
+			Some(json!(DEFAULT_PRE_MIGRATE_SQL))
 		);
 		let drop_schemas = upgrade_params
 			.get(params::PRE_MIGRATE_DROP_SCHEMAS)
@@ -1047,6 +1050,19 @@ mod tests {
 		assert_eq!(
 			build_params.get(params::BUILDER_IMAGE).unwrap().type_,
 			ParamType::Text
+		);
+		// A build restores a real site, carrying its reporting views and its
+		// encrypted secrets, and migrates it just as an upgrade test does.
+		assert_eq!(
+			build_params.get(params::PRE_MIGRATE_SQL).unwrap().default,
+			upgrade_params.get(params::PRE_MIGRATE_SQL).unwrap().default,
+		);
+		assert_eq!(
+			build_params
+				.get(params::PRE_MIGRATE_DROP_SCHEMAS)
+				.unwrap()
+				.default,
+			Some(json!("reporting"))
 		);
 		assert!(build.description.is_some());
 

@@ -12,13 +12,13 @@ use std::{collections::BTreeMap, time::Duration};
 use k8s_openapi::{
 	api::{
 		batch::v1::{Job, JobSpec},
-		core::v1::{Container, Pod, PodSpec, PodTemplateSpec, ResourceRequirements, Secret},
+		core::v1::{Container, PodSpec, PodTemplateSpec, ResourceRequirements, Secret},
 	},
 	apimachinery::pkg::api::resource::Quantity,
 };
 use kube::{
 	Api, ResourceExt,
-	api::{ListParams, LogParams, ObjectMeta, PostParams},
+	api::{ObjectMeta, PostParams},
 	runtime::controller::Action,
 };
 use tracing::{info, warn};
@@ -462,7 +462,14 @@ async fn read_result(
 	job_failed: bool,
 ) -> Result<MigrationResult> {
 	let log = if job_failed {
-		migration_job_log(ctx, namespace, &migration_job_name(restore_name)).await
+		crate::controllers::jobs::container_log(
+			&ctx.client,
+			namespace,
+			&migration_job_name(restore_name),
+			MIGRATION_CONTAINER,
+		)
+		.await
+		.map(|log| crate::controllers::jobs::redact(&log, std::slice::from_ref(&creds.1)))
 	} else {
 		None
 	};
@@ -598,32 +605,6 @@ pub(super) fn result_from_batch(
 	}
 }
 
-/// The tail of the migrate container's log, as the pod still holds it.
-///
-/// Best effort: a log that cannot be read leaves the result without a cause and
-/// the reconcile carries on.
-async fn migration_job_log(ctx: &Context, namespace: &str, job_name: &str) -> Option<String> {
-	let pods: Api<Pod> = Api::namespaced(ctx.client.clone(), namespace);
-	let list = pods
-		.list(&ListParams::default().labels(&format!("job-name={job_name}")))
-		.await
-		.map_err(|e| warn!(job = job_name, error = %e, "listing migration job pods failed"))
-		.ok()?;
-	let pod = list.items.first()?;
-
-	pods.logs(
-		&pod.name_any(),
-		&LogParams {
-			container: Some(MIGRATION_CONTAINER.to_string()),
-			tail_lines: Some(200),
-			..Default::default()
-		},
-	)
-	.await
-	.map_err(|e| warn!(job = job_name, error = %e, "reading migration job log failed"))
-	.ok()
-}
-
 /// The cause of a failed migration: tamanu's own structured error where the
 /// version records one, otherwise the tail of the job's log.
 fn migration_error(stats: Option<&serde_json::Value>, log: Option<&str>) -> Option<String> {
@@ -669,161 +650,13 @@ fn migration_error(stats: Option<&serde_json::Value>, log: Option<&str>) -> Opti
 		}
 	}
 
-	let tail = migration_log_tail(log?);
+	let tail = crate::controllers::jobs::log_tail(log?);
 	(!tail.is_empty()).then_some(tail)
-}
-
-/// The tail of a migration job's log, bounded so a status field stays readable.
-///
-/// A thrown error prints its message first and the failing SQL after it, so a
-/// long statement pushes the message out of the tail. The first line naming an
-/// error is kept ahead of the tail when the tail doesn't already hold it.
-fn migration_log_tail(log: &str) -> String {
-	const KEEP_LINES: usize = 40;
-	const MAX_BYTES: usize = 2000;
-	const MAX_HEADLINE_BYTES: usize = 500;
-
-	let lines: Vec<&str> = log.lines().collect();
-	let tail_start = lines.len().saturating_sub(KEEP_LINES);
-	let tail = lines[tail_start..].join("\n");
-
-	let headline = lines
-		.iter()
-		.position(|line| is_error_headline(line))
-		.filter(|&at| at < tail_start || tail.len() > MAX_BYTES)
-		.map(|at| truncate_to(lines[at].trim(), MAX_HEADLINE_BYTES));
-
-	let budget = match &headline {
-		Some(headline) => MAX_BYTES.saturating_sub(headline.len() + "\n…\n".len()),
-		None => MAX_BYTES,
-	};
-	let kept = if tail.len() <= budget {
-		tail.as_str()
-	} else {
-		let cut = (tail.len() - budget..tail.len())
-			.find(|at| tail.is_char_boundary(*at))
-			.unwrap_or(tail.len());
-		&tail[cut..]
-	};
-
-	match headline {
-		Some(headline) if !kept.contains(headline.as_str()) => format!("{headline}\n…\n{kept}"),
-		_ => kept.to_string(),
-	}
-}
-
-fn is_error_headline(line: &str) -> bool {
-	let line = line.trim_start();
-	[
-		"Error:",
-		"ERROR:",
-		"error:",
-		"Error [",
-		"DatabaseError",
-		"SequelizeDatabaseError",
-	]
-	.iter()
-	.any(|marker| line.starts_with(marker) || line.contains(&format!(" {marker}")))
-}
-
-fn truncate_to(text: &str, max_bytes: usize) -> String {
-	if text.len() <= max_bytes {
-		return text.to_string();
-	}
-	let end = (0..=max_bytes)
-		.rev()
-		.find(|at| text.is_char_boundary(*at))
-		.unwrap_or(0);
-	text[..end].to_string()
 }
 
 #[cfg(test)]
 mod error_tests {
-	use super::{migration_error, migration_log_tail};
-
-	#[test]
-	fn the_log_is_kept_whole() {
-		let log = concat!(
-			"running 1721000002-addBaz.ts\n",
-			"error: insert or update on table \"encounters\" violates foreign key constraint \"fk_patient\"\n",
-			"DETAIL:  Key (patient_id)=(abc-123) is not present in table \"patients\".\n",
-			"HINT:  add the patient first\n",
-		);
-
-		let out = migration_log_tail(log);
-
-		assert!(out.contains("violates foreign key constraint"), "{out}");
-		assert!(out.contains("Key (patient_id)=(abc-123)"), "{out}");
-		assert!(out.contains("HINT:  add the patient first"), "{out}");
-	}
-
-	#[test]
-	fn only_the_last_lines_are_kept() {
-		let log = (0..100)
-			.map(|i| format!("applying migration {i}"))
-			.collect::<Vec<_>>()
-			.join("\n");
-
-		let out = migration_log_tail(&log);
-
-		assert!(out.starts_with("applying migration 60"), "{out}");
-		assert!(out.ends_with("applying migration 99"), "{out}");
-		assert!(!out.contains("applying migration 59"), "{out}");
-	}
-
-	#[test]
-	fn the_tail_is_capped() {
-		let log = (0..60)
-			.map(|i| format!("applying migration {i} {}", "x".repeat(200)))
-			.collect::<Vec<_>>()
-			.join("\n");
-
-		let out = migration_log_tail(&log);
-
-		assert!(out.len() <= 2000, "{} bytes", out.len());
-		assert!(out.ends_with("xxx"), "the end of the log is what is kept");
-	}
-
-	#[test]
-	fn the_error_survives_a_long_statement_after_it() {
-		let mut log = String::from(
-			"info: Applying migration: 1781222400001-makeIdDeterministic\n\
-			 error: DatabaseError [SequelizeDatabaseError]: index \"idx_example\" does not exist\n\
-			 \x20   at Query.run (query.js:50:25)\n",
-		);
-		for i in 0..60 {
-			log.push_str(&format!(
-				"  sql: 'INSERT INTO logs.changes line {i} {}',\n",
-				"x".repeat(80)
-			));
-		}
-
-		let out = migration_log_tail(&log);
-
-		assert!(out.len() <= 2000, "{} bytes", out.len());
-		assert!(
-			out.starts_with(
-				"error: DatabaseError [SequelizeDatabaseError]: index \"idx_example\" does not exist"
-			),
-			"{out}"
-		);
-		assert!(
-			out.contains("line 59"),
-			"the end of the log is still kept: {out}"
-		);
-	}
-
-	#[test]
-	fn a_headline_already_in_the_tail_is_not_repeated() {
-		let log = "running 1-foo\nError: boom\nat x\n";
-
-		assert_eq!(migration_log_tail(log), log.trim_end());
-	}
-
-	#[test]
-	fn an_empty_log_is_nothing() {
-		assert_eq!(migration_log_tail(""), "");
-	}
+	use super::migration_error;
 
 	#[test]
 	fn structured_stats_render_as_one_line() {
