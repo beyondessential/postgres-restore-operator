@@ -37,6 +37,7 @@ use crate::{
 
 pub mod builders;
 mod migration;
+pub(crate) mod reindex_watch;
 
 pub(crate) use builders::{build_credential_reset_job, credential_reset_job_name};
 
@@ -976,6 +977,8 @@ async fn reconcile_ready(
 		.unwrap_or(0);
 
 	if ready_replicas > 0 {
+		forget_reindex_watch(ctx, namespace, name);
+
 		// A migration target means the database has to be migrated before it
 		// counts as verified: the point is to prove the version's migrations
 		// survive this data, and canopy reads the verdict off the report that
@@ -1042,11 +1045,30 @@ async fn reconcile_ready(
 			&restore.spec.snapshot_size,
 			ctx.deployment_ready_timeout_secs,
 		);
-		let timeout_secs = timeout.as_secs();
 		if elapsed > timeout {
+			// A locale reindex holds readiness for as long as it takes, which on
+			// a large database has no useful upper bound. Past the budget, keep
+			// waiting while it is still moving. An explicit timeout stays the
+			// last word.
+			let verdict = if replica.spec.deployment_ready_timeout.is_none() {
+				Some(reindex_verdict(ctx, &replica, name, namespace).await)
+			} else {
+				None
+			};
+			let Some(message) = reindex_watch::past_budget(elapsed, timeout, verdict) else {
+				debug!(
+					restore = name,
+					"deployment held by a locale reindex that is still progressing"
+				);
+				return Ok(Action::requeue(Duration::from_secs(10)));
+			};
+			forget_reindex_watch(ctx, namespace, name);
 			warn!(
 				restore = name,
-				timeout_secs, "deployment not ready within configured timeout, marking as Failed"
+				elapsed_secs = elapsed.as_secs(),
+				timeout_secs = timeout.as_secs(),
+				?verdict,
+				"deployment not ready within configured timeout, marking as Failed"
 			);
 			return fail_restore(
 				ctx,
@@ -1054,16 +1076,89 @@ async fn reconcile_ready(
 				name,
 				replica_name,
 				serde_json::json!({ "phase": "Failed" }),
-				&format!(
-					"postgres Deployment did not become Ready within {timeout_secs}s of \
-					 restore completion"
-				),
+				&message,
 			)
 			.await;
 		}
 	}
 
 	Ok(Action::requeue(Duration::from_secs(10)))
+}
+
+fn reindex_watch_key(namespace: &str, restore_name: &str) -> String {
+	format!("{namespace}/{restore_name}")
+}
+
+fn forget_reindex_watch(ctx: &Context, namespace: &str, restore_name: &str) {
+	ctx.reindex_watches
+		.lock()
+		.unwrap_or_else(|e| e.into_inner())
+		.remove(&reindex_watch_key(namespace, restore_name));
+}
+
+/// Whether a restore past its readiness budget is held by a locale reindex
+/// that is still making progress. Postgres is asked at most once per
+/// [`reindex_watch::OBSERVE_INTERVAL`]; in between, the last answer stands.
+/// A failed ask counts as no change once there is an answer to fall back on;
+/// before that, as not reindexing.
+async fn reindex_verdict(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	restore_name: &str,
+	namespace: &str,
+) -> reindex_watch::Verdict {
+	let key = reindex_watch_key(namespace, restore_name);
+	let now = Timestamp::now();
+	let previous = ctx
+		.reindex_watches
+		.lock()
+		.unwrap_or_else(|e| e.into_inner())
+		.get(&key)
+		.cloned();
+	if let Some(previous) = &previous
+		&& !previous.needs_observation(now)
+	{
+		return previous.verdict(now);
+	}
+
+	let watch = match observe_locale_reindex(ctx, replica, restore_name, namespace).await {
+		Ok(progress) => reindex_watch::Watch::record(previous.as_ref(), progress, now),
+		Err(err) => {
+			warn!(restore = restore_name, error = %err, "could not read locale reindex progress");
+			match &previous {
+				Some(previous) => reindex_watch::Watch::unobserved(previous, now),
+				None => return reindex_watch::Verdict::NotReindexing,
+			}
+		}
+	};
+	let verdict = watch.verdict(now);
+	let mut watches = ctx
+		.reindex_watches
+		.lock()
+		.unwrap_or_else(|e| e.into_inner());
+	watches.retain(|_, w| !w.is_abandoned(now));
+	watches.insert(key, watch);
+	verdict
+}
+
+async fn observe_locale_reindex(
+	ctx: &Context,
+	replica: &PostgresPhysicalReplica,
+	restore_name: &str,
+	namespace: &str,
+) -> Result<Option<String>> {
+	let (user, password) = migration::credentials(ctx, replica, namespace).await?;
+	let conn = super::postgres::connect_to_restore(
+		&ctx.client,
+		namespace,
+		restore_name,
+		"postgres",
+		&user,
+		&password,
+		ctx.use_port_forward(),
+	)
+	.await?;
+	super::postgres::read_locale_reindex_progress(&conn.client).await
 }
 
 pub(crate) fn restore_owner_reference(restore: &PostgresPhysicalRestore) -> OwnerReference {

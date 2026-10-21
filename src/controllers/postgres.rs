@@ -25,6 +25,12 @@ const KEEPALIVE_IDLE: Duration = Duration::from_secs(60);
 const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(10);
 const KEEPALIVE_RETRIES: u32 = 3;
 
+/// Bound on establishing the TCP connection only, not on anything run over
+/// it. An in-cluster connect completes in milliseconds; one that doesn't is a
+/// pod IP that has gone away, which otherwise holds the reconcile for the
+/// kernel's ~2 minutes of SYN retries.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 fn set_tcp_keepalive(stream: &TcpStream) -> Result<()> {
 	let ka = TcpKeepalive::new()
 		.with_time(KEEPALIVE_IDLE)
@@ -87,8 +93,14 @@ async fn connect_via_tcp(
 	password: &str,
 ) -> Result<PgConnection> {
 	let addr = format!("{host}:{port}");
-	let stream = TcpStream::connect(&addr)
+	let stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(&addr))
 		.await
+		.map_err(|_| {
+			Error::MissingField(format!(
+				"timed out connecting to {addr} after {}s",
+				CONNECT_TIMEOUT.as_secs()
+			))
+		})?
 		.map_err(|e| Error::MissingField(format!("failed to connect to {addr}: {e}")))?;
 	set_tcp_keepalive(&stream)?;
 
@@ -170,15 +182,17 @@ pub async fn connect_to_restore(
 	password: &str,
 	use_port_forward: bool,
 ) -> Result<PgConnection> {
-	let label_selector = format!("pgro.bes.au/restore={restore_name}");
+	// The restore's Jobs (kopia restore, credential reset, version detect,
+	// migration) carry the restore label too, and none of them serve 5432.
+	let label_selector = format!("pgro.bes.au/restore={restore_name},!job-name");
 
 	if use_port_forward {
 		let pod_name = find_pod_by_label(client, namespace, &label_selector).await?;
-		info!(pod = %pod_name, "connecting to restore database via port-forward");
+		debug!(pod = %pod_name, "connecting to restore database via port-forward");
 		connect_via_port_forward(client, namespace, &pod_name, dbname, user, password).await
 	} else {
 		let pod_ip = find_pod_ip_by_label(client, namespace, &label_selector).await?;
-		info!(ip = %pod_ip, restore = %restore_name, "connecting to restore database via TCP");
+		debug!(ip = %pod_ip, restore = %restore_name, "connecting to restore database via TCP");
 		connect_via_tcp(&pod_ip, 5432, dbname, user, password).await
 	}
 }
@@ -296,6 +310,27 @@ pub async fn read_restore_fixes(pg: &tokio_postgres::Client) -> Result<serde_jso
 		None => return Ok(serde_json::json!({})),
 	};
 	Ok(serde_json::from_str(&text).unwrap_or_else(|_| serde_json::json!({})))
+}
+
+/// Progress of the locale reindex the readiness probe waits on, as an opaque
+/// string that changes whenever the rebuild moves. `None` when no such reindex
+/// is pending, or the restore predates `_pgro.locale_reindex_progress()`.
+/// Runs on an already-open connection to the `postgres` database.
+pub async fn read_locale_reindex_progress(pg: &tokio_postgres::Client) -> Result<Option<String>> {
+	let has_function: bool = pg
+		.query_one(
+			"SELECT to_regprocedure('_pgro.locale_reindex_progress()') IS NOT NULL",
+			&[],
+		)
+		.await?
+		.get(0);
+	if !has_function {
+		return Ok(None);
+	}
+	Ok(pg
+		.query_one("SELECT _pgro.locale_reindex_progress()", &[])
+		.await?
+		.get(0))
 }
 
 /// Flip `_pgro.restore_info.stage` to `outgoing` on a restore the Service has

@@ -130,7 +130,10 @@ pub struct PostgresPhysicalReplicaSpec {
 	/// How long to wait for the restore's postgres Deployment to become Ready
 	/// before failing the restore. Unset derives a budget from the snapshot
 	/// size (a larger data dir needs longer to open and replay WAL), floored
-	/// at the operator-wide `DEPLOYMENT_READY_TIMEOUT_SECS`.
+	/// at the operator-wide `DEPLOYMENT_READY_TIMEOUT_SECS`. A derived budget
+	/// is not enforced while a startup reindex (after a locale rewrite) is
+	/// still making progress; the restore fails once that reindex has made
+	/// none for 30 minutes.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub deployment_ready_timeout: Option<TimeSpan>,
 
