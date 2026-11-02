@@ -293,6 +293,7 @@ mod tests {
 				pre_migrate_sql: None,
 				migrate_to: None,
 				builder_image: None,
+				rank: None,
 				kopia_secret_ref: Some(Default::default()),
 				canopy_source: None,
 				snapshot_filter: None,

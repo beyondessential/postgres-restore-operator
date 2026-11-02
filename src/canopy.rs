@@ -246,6 +246,7 @@ impl Client {
 		&self,
 		version: &str,
 		group: Uuid,
+		rank: &str,
 		run_id: Option<Uuid>,
 		sql: Bytes,
 	) -> Result<Option<Uuid>> {
@@ -254,8 +255,16 @@ impl Client {
 				"{version:?} is not a version a schema can be registered against"
 			)));
 		}
+		// The environment is a path segment canopy authorises against, and it
+		// reaches here as free-form text from the replica spec, so it is held
+		// to the spellings canopy knows rather than passed through.
+		if !is_known_rank(rank) {
+			return Err(Error::Canopy(format!(
+				"{rank:?} is not an environment a schema can be registered against"
+			)));
+		}
 
-		let uri = registration_uri(version, group, run_id);
+		let uri = registration_uri(version, group, rank, run_id);
 
 		let request = Request::builder()
 			.method(Method::POST)
@@ -284,12 +293,21 @@ impl Client {
 ///
 /// Canopy authorises this exact path, and a build whose registration misses it
 /// reports a healthy restore and publishes nothing, so the drift is silent.
-fn registration_uri(version: &str, group: Uuid, run_id: Option<Uuid>) -> String {
-	let mut uri = format!("/artifacts/groups/{group}/{version}/reporting-schema/any");
+fn registration_uri(version: &str, group: Uuid, rank: &str, run_id: Option<Uuid>) -> String {
+	let mut uri = format!("/artifacts/groups/{group}/{rank}/{version}/reporting-schema/any");
 	if let Some(run) = run_id {
 		uri.push_str(&format!("?run={run}"));
 	}
 	uri
+}
+
+/// Whether an environment is one canopy names.
+///
+/// The list is canopy's `ServerRank`. A spelling it does not know is refused
+/// here rather than reaching the path, where it would be a segment canopy
+/// authorises nothing for.
+fn is_known_rank(rank: &str) -> bool {
+	matches!(rank, "production" | "clone" | "demo" | "test" | "dev")
 }
 
 /// The artifact id out of a registration's answer.
@@ -396,18 +414,43 @@ mod tests {
 
 	const GROUP: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 
-	/// Canopy authorises `/artifacts/groups/{group}/{version}/reporting-schema/any`
-	/// and nothing else. A build that posts anywhere near it publishes nothing
+	/// Canopy authorises
+	/// `/artifacts/groups/{group}/{rank}/{version}/reporting-schema/any` and
+	/// nothing else. A build that posts anywhere near it publishes nothing
 	/// while still reporting a healthy restore, so the drift never surfaces as
 	/// a failure and this literal is the only thing holding it.
 	#[test]
 	fn a_schema_is_registered_at_the_path_canopy_authorises() {
-		let uri = registration_uri("2.60.0", GROUP.parse().unwrap(), None);
+		let uri = registration_uri("2.60.0", GROUP.parse().unwrap(), "production", None);
 
 		assert_eq!(
 			uri,
-			format!("/artifacts/groups/{GROUP}/2.60.0/reporting-schema/any")
+			format!("/artifacts/groups/{GROUP}/production/2.60.0/reporting-schema/any")
 		);
+	}
+
+	/// The environment is what keeps a group's schemas apart, so two of them on
+	/// one version register as two artifacts rather than one replacing the
+	/// other.
+	#[test]
+	fn two_environments_on_one_version_register_apart() {
+		let group: Uuid = GROUP.parse().unwrap();
+
+		assert_ne!(
+			registration_uri("2.60.0", group, "production", None),
+			registration_uri("2.60.0", group, "demo", None)
+		);
+	}
+
+	/// An environment canopy does not name is refused before it reaches the
+	/// path, where it would be a segment canopy authorises nothing for.
+	#[test]
+	fn an_unknown_environment_is_not_a_path_segment() {
+		assert!(is_known_rank("production"));
+		assert!(is_known_rank("demo"));
+		assert!(!is_known_rank("staging"));
+		assert!(!is_known_rank("../production"));
+		assert!(!is_known_rank(""));
 	}
 
 	/// The exact version, never a range: a schema follows the migrations one
@@ -415,7 +458,7 @@ mod tests {
 	/// patch of the same minor describes.
 	#[test]
 	fn the_registration_names_an_exact_version() {
-		let uri = registration_uri("2.60.2", GROUP.parse().unwrap(), None);
+		let uri = registration_uri("2.60.2", GROUP.parse().unwrap(), "production", None);
 
 		assert!(uri.contains("/2.60.2/reporting-schema/"), "{uri}");
 		assert!(
@@ -429,11 +472,16 @@ mod tests {
 	#[test]
 	fn a_run_is_carried_beside_the_group() {
 		let run = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
-		let uri = registration_uri("2.60.0", GROUP.parse().unwrap(), Some(run.parse().unwrap()));
+		let uri = registration_uri(
+			"2.60.0",
+			GROUP.parse().unwrap(),
+			"production",
+			Some(run.parse().unwrap()),
+		);
 
 		assert_eq!(
 			uri,
-			format!("/artifacts/groups/{GROUP}/2.60.0/reporting-schema/any?run={run}")
+			format!("/artifacts/groups/{GROUP}/production/2.60.0/reporting-schema/any?run={run}")
 		);
 	}
 

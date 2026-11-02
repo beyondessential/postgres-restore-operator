@@ -678,6 +678,12 @@ impl IntentConfig {
 			.filter(|s| !s.is_empty())
 			.map(str::to_owned);
 
+		// Canopy names the environment on a reporting-schema entry, since the
+		// schema is registered against it. Taken from the entry alone: it is
+		// not an operator's to set, and a wrong one publishes an environment's
+		// schema to another's machines.
+		let rank = entry.rank.as_ref().map(ToString::to_string);
+
 		let (pinned_resources, resources_floor) =
 			resolve_resources(p, self.resources_floor.as_ref());
 		let resources_maximum = param_i64(p, params::RESOURCES_MAXIMUM)
@@ -724,6 +730,7 @@ impl IntentConfig {
 			pre_migrate_sql,
 			migrate_to,
 			builder_image,
+			rank,
 			redaction: redaction_spec(p),
 			storage_size_maximum,
 		}

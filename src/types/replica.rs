@@ -210,6 +210,14 @@ pub struct PostgresPhysicalReplicaSpec {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub builder_image: Option<String>,
 
+	/// Environment within the group the schema is built for, from canopy's
+	/// worklist entry. A schema follows the configuration of the database it
+	/// was built from, and a group's environments hold different
+	/// configuration, so this is what the schema is registered against.
+	/// Snapshotted per restore alongside `migrate_to`, for the same reason.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rank: Option<String>,
+
 	/// Maximum allowed size for the restore PVC. The restore will fail if the
 	/// computed size exceeds this limit. Defaults to 2Ti.
 	#[serde(default = "default_storage_size_maximum")]

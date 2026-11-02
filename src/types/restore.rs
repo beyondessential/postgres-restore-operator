@@ -54,6 +54,12 @@ pub struct PostgresPhysicalRestoreSpec {
 	/// restore switches over without building anything.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub builder_image: Option<String>,
+
+	/// Environment within the group the schema this restore builds is for.
+	/// Snapshotted from the replica so an environment that moves mid-restore
+	/// doesn't change what this restore published, as `migrate_to` is.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rank: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema, Default)]

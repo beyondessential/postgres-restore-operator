@@ -441,18 +441,22 @@ pub(super) async fn reconcile_schema_build(
 	let restore_name = restore.name_any();
 	let job_name = build_job_name(&replica_name);
 
-	let (image, target, group) = match build_to_do(replica, restore) {
+	let (image, target, group, rank) = match build_to_do(replica, restore) {
 		BuildToDo::Build {
 			image,
 			target,
 			group,
-		} => (image, target, group),
+			rank,
+		} => (image, target, group, rank),
 		BuildToDo::NoTarget => {
 			warn!(replica = %replica_name, "reporting-schema replica has no target version; skipping build");
 			return Ok(true);
 		}
 		BuildToDo::NoGroup => {
 			return settle_failed(client, namespace, &restore_name, NO_GROUP).await;
+		}
+		BuildToDo::NoRank => {
+			return settle_failed(client, namespace, &restore_name, NO_RANK).await;
 		}
 		BuildToDo::Unmigrated => {
 			return settle_failed(client, namespace, &restore_name, UNMIGRATED).await;
@@ -560,6 +564,7 @@ pub(super) async fn reconcile_schema_build(
 					.register_reporting_schema(
 						target,
 						group,
+						rank,
 						crate::controllers::canopy::verification::run_id_from_status(restore),
 						sql.clone(),
 					)
@@ -826,6 +831,9 @@ async fn settle_empty(
 
 /// What a build recorded when the replica names no group it could be built or
 /// registered for.
+/// Why a build that names no environment settles as failed.
+const NO_RANK: &str = "the replica names no environment, and a schema is registered against one";
+
 const NO_GROUP: &str = "the replica names no group to register the schema for";
 
 /// What a build records when the restore never reached the version the schema
@@ -914,11 +922,13 @@ enum BuildToDo<'a> {
 	NoTarget,
 	NoImage,
 	NoGroup,
+	NoRank,
 	Unmigrated,
 	Build {
 		image: &'a str,
 		target: &'a str,
 		group: Uuid,
+		rank: &'a str,
 	},
 }
 
@@ -954,10 +964,18 @@ fn build_to_do<'a>(
 		return BuildToDo::NoGroup;
 	};
 
+	// A schema is registered against an environment, so one that names none
+	// has nowhere to publish: better to settle it as failed than to publish
+	// the environment's schema to the whole group.
+	let Some(rank) = restore.spec.rank.as_deref().filter(|r| !r.is_empty()) else {
+		return BuildToDo::NoRank;
+	};
+
 	BuildToDo::Build {
 		image,
 		target: &target.version,
 		group,
+		rank,
 	}
 }
 
@@ -1559,12 +1577,18 @@ mod tests {
 			group: group.into(),
 			r#type: "tamanu-postgres".into(),
 		});
+		// A schema is registered against an environment, so a restore naming
+		// none has nothing to build for.
+		assert_eq!(build_to_do(&replica, &restore), BuildToDo::NoRank);
+
+		restore.spec.rank = Some("production".into());
 		assert_eq!(
 			build_to_do(&replica, &restore),
 			BuildToDo::Build {
 				image: "builder:1",
 				target: "2.60.0",
 				group: group.parse().unwrap(),
+				rank: "production",
 			}
 		);
 

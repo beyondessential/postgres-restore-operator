@@ -478,6 +478,7 @@ impl PostgresPhysicalReplica {
 				// must not change under it if canopy's plan moves mid-restore.
 				migrate_to: self.spec.migrate_to.clone(),
 				builder_image: self.spec.builder_image.clone(),
+				rank: self.spec.rank.clone(),
 			},
 		);
 
