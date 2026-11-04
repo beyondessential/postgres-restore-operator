@@ -116,7 +116,7 @@ async fn build_inner(cfg: &CanopyConfig) -> Result<CanopyClient> {
 		.expect("bestool-canopy TAILSCALE_URL is a valid URL");
 	let inner = connect_to(
 		cfg.base_url.clone(),
-		tailscale_url,
+		Some(tailscale_url),
 		cfg.device_key_pem.as_deref(),
 		make_builder,
 	)

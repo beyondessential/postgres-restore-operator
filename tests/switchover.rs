@@ -129,6 +129,7 @@ async fn second_restore_and_switchover() {
 		PostgresPhysicalRestoreSpec {
 			migrate_to: None,
 			builder_image: None,
+			rank: None,
 			replica: LocalObjectReference {
 				name: "switchover-replica".into(),
 			},
