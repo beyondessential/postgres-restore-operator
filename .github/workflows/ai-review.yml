@@ -3,11 +3,15 @@ on:
   pull_request:
     types: [opened, reopened, edited]
 
-permissions:
-  contents: read
-  pull-requests: write
-
 jobs:
   review:
-    uses: beyondessential/review-hero/.github/workflows/review.yml@main
+    permissions:
+      contents: read
+      pull-requests: write
+      id-token: write
+    uses: beyondessential/review-hero/.github/workflows/review.yml@v1
+    with:
+      findings-url: https://workhorse.bes.au/api/review-hero/rounds
+      per-issue-comments: standalone
+      summary-comment: standalone
     secrets: inherit
