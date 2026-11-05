@@ -129,9 +129,9 @@ dependencies = [
 
 [[package]]
 name = "algae-cli"
-version = "1.1.12"
+version = "1.1.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff56841bf329bc2e4b08c7120e128fa17e0607201c1cef739bf44710d2706886"
+checksum = "1dc09b97fc3739e2747b30b94b7149641b9c284bd3282eb47e87d0f31264943b"
 dependencies = [
  "age",
  "age-core",
@@ -492,9 +492,9 @@ checksum = "32637268377fc7b10a8c6d51de3e7fba1ce5dd371a96e342b34e6078db558e7f"
 
 [[package]]
 name = "bes-canopy-api"
-version = "1.0.2"
+version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9ac482b69e522e01ed55663672be96d790626eb636743d31d9b18e1678af9143"
+checksum = "e7328e61bc85b703838443adcb42e0475191606d0afbd58b260e4f607c0551e7"
 dependencies = [
  "async-trait",
  "bon",
@@ -510,9 +510,9 @@ dependencies = [
 
 [[package]]
 name = "bestool-canopy"
-version = "0.7.14"
+version = "0.7.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "44015fb99eac97fbef64615325572441560f99b6ba9e9b4a153d5cbd9ae6936e"
+checksum = "42fe53b7cc7a7e4db7ffeb00dd6b6fb0665acbad395fe72e43330340dd9a5fff"
 dependencies = [
  "algae-cli",
  "async-trait",
