@@ -760,6 +760,15 @@ spec:
                   migration Job, for starting-state changes a schema drop can't express.
                 nullable: true
                 type: string
+              rank:
+                description: |-
+                  Environment within the group the schema is built for, from canopy's
+                  worklist entry. A schema follows the configuration of the database it
+                  was built from, and a group's environments hold different
+                  configuration, so this is what the schema is registered against.
+                  Snapshotted per restore alongside `migrate_to`, for the same reason.
+                nullable: true
+                type: string
               readOnly:
                 default: true
                 description: Set database to read-only mode
@@ -1233,6 +1242,13 @@ spec:
                 - version
                 - versionId
                 type: object
+              rank:
+                description: |-
+                  Environment within the group the schema this restore builds is for.
+                  Snapshotted from the replica so an environment that moves mid-restore
+                  doesn't change what this restore published, as `migrate_to` is.
+                nullable: true
+                type: string
               replica:
                 description: Reference to parent PostgresPhysicalReplica
                 properties:

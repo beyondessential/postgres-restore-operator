@@ -153,6 +153,7 @@ fn make_replica(
 			pre_migrate_sql: None,
 			migrate_to: None,
 			builder_image: None,
+			rank: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
@@ -433,6 +434,7 @@ fn snapshot_list_test_replica() -> PostgresPhysicalReplica {
 			pre_migrate_sql: None,
 			migrate_to: None,
 			builder_image: None,
+			rank: None,
 			kopia_secret_ref: Some(SecretReference {
 				name: Some("creds".into()),
 				namespace: None,
@@ -514,6 +516,7 @@ fn make_restore(snapshot: &str, phase: Option<RestorePhase>) -> PostgresPhysical
 		spec: PostgresPhysicalRestoreSpec {
 			migrate_to: None,
 			builder_image: None,
+			rank: None,
 			replica: k8s_openapi::api::core::v1::LocalObjectReference {
 				name: "test".into(),
 			},
