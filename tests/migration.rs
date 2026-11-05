@@ -134,14 +134,14 @@ async fn migration_target_drives_a_migration_job() {
 			"-d",
 			"myapp",
 			"-tAc",
-			"SELECT key FROM local_system_secrets WHERE deleted_at IS NULL ORDER BY key",
+			"SELECT key FROM local_system_secrets ORDER BY key",
 		],
 	)
 	.await;
 	assert_eq!(
 		live_secrets.trim(),
 		"plain",
-		"only the encrypted value should be soft-deleted before the job runs"
+		"only the encrypted value should be deleted before the job runs"
 	);
 
 	assert_eq!(
