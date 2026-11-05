@@ -152,8 +152,9 @@ const DEFAULT_PRE_MIGRATE_DROP_SCHEMAS: &str = "reporting";
 
 /// Tamanu's upgrade refuses to start when a live `S1:` encrypted value in these
 /// tables doesn't decrypt with the configured key, and the migration Job only
-/// has the default key, so those are soft-deleted. Tamanu's
-/// `forget_server_identity()`, where the snapshot has it, also clears the
+/// has the default key, so those are deleted. A soft delete isn't enough: the
+/// upgrade sees no live device key and inserts one under the same unique key.
+/// Tamanu's `forget_server_identity()`, where the snapshot has it, also clears the
 /// plaintext facts that would point the copy at the source's central; it runs
 /// only once the transaction declares the database a copy.
 pub const DEFAULT_PRE_MIGRATE_SQL: &str = r#"DO $$
@@ -164,12 +165,9 @@ BEGIN
     PERFORM public.forget_server_identity();
   END IF;
   FOREACH t IN ARRAY ARRAY['local_system_secrets', 'local_system_facts'] LOOP
-    IF EXISTS (
-      SELECT 1 FROM information_schema.columns
-      WHERE table_schema = 'public' AND table_name = t AND column_name = 'deleted_at'
-    ) THEN
+    IF to_regclass(format('public.%I', t)) IS NOT NULL THEN
       EXECUTE format(
-        'UPDATE public.%I SET deleted_at = now() WHERE deleted_at IS NULL AND value ~ %L',
+        'DELETE FROM public.%I WHERE value ~ %L',
         t, '^S1:[^:]*:[^:]*$'
       );
     END IF;
@@ -909,8 +907,8 @@ mod tests {
 			"the function refuses unless the same transaction declares a copy"
 		);
 		assert!(
-			DEFAULT_PRE_MIGRATE_SQL.contains("SET deleted_at = now()"),
-			"the encrypted values the job's key can't read are always hidden"
+			DEFAULT_PRE_MIGRATE_SQL.contains("DELETE FROM public.%I WHERE value ~ %L"),
+			"the encrypted values the job's key can't read are always removed"
 		);
 		assert!(!DEFAULT_PRE_MIGRATE_SQL.contains("RETURN;"));
 	}
