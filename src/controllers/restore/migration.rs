@@ -29,8 +29,8 @@ use crate::{
 	error::{Error, Result},
 	placement::PodPlacement,
 	types::{
-		MigrationResult, MigrationTarget, MigrationTiming, PostgresPhysicalReplica,
-		PostgresPhysicalRestore,
+		LookupRebuildTiming, MigrationResult, MigrationTarget, MigrationTiming,
+		PostgresPhysicalReplica, PostgresPhysicalRestore,
 	},
 };
 
@@ -521,6 +521,8 @@ async fn read_result(
 			data_bytes_before: data_bytes_after,
 			data_bytes_after,
 			timings: Vec::new(),
+			lookup_rebuild_elapsed_seconds: None,
+			lookup_rebuild_timings: Vec::new(),
 		});
 	};
 
@@ -535,7 +537,100 @@ async fn read_result(
 	result.error = job_failed
 		.then(|| migration_error(stats.as_ref(), log.as_deref()))
 		.flatten();
+
+	// The rebuild is extra detail on a result that stands without it, so a
+	// failed read is reported and the result sent anyway.
+	match latest_lookup_rebuild(&conn.client, baseline).await {
+		Ok(Some(info)) => {
+			let (elapsed, timings) = lookup_rebuild_from_debug_log(&info);
+			result.lookup_rebuild_elapsed_seconds = elapsed;
+			result.lookup_rebuild_timings = timings;
+		}
+		Ok(None) => {}
+		Err(err) => warn!(
+			restore = restore_name,
+			error = %err,
+			"reading the lookup rebuild off the replica failed"
+		),
+	}
 	Ok(result)
+}
+
+/// The `info` of the newest sync lookup rebuild after `baseline`.
+///
+/// `tamanu upgrade` rebuilds the lookup once the migrations apply, and records
+/// each rebuild as a `logs.debug_logs` row. Rows at or before the baseline are
+/// the source deployment's own, restored along with the data.
+async fn latest_lookup_rebuild(
+	client: &tokio_postgres::Client,
+	baseline: Option<&str>,
+) -> Result<Option<serde_json::Value>> {
+	let table_exists: bool = client
+		.query_one("SELECT to_regclass('logs.debug_logs') IS NOT NULL", &[])
+		.await?
+		.get(0);
+	if !table_exists {
+		return Ok(None);
+	}
+
+	Ok(client
+		.query_opt(
+			"SELECT info::jsonb
+			 FROM logs.debug_logs
+			 WHERE type = 'syncLookupUpdate'
+			   AND info->>'startedAt' IS NOT NULL
+			   AND ($1::text IS NULL OR (info->>'startedAt')::timestamptz > $1::text::timestamptz)
+			 ORDER BY (info->>'startedAt')::timestamptz DESC
+			 LIMIT 1",
+			&[&baseline],
+		)
+		.await?
+		.map(|row| row.get(0)))
+}
+
+/// Shape a lookup rebuild's debug log `info` into its total and its steps.
+///
+/// Every version records `startedAt` and `completedAt`. Versions that time the
+/// rebuild add `modelTimings`, one entry per model that did work, and the
+/// durations of the two passes that follow it.
+pub(super) fn lookup_rebuild_from_debug_log(
+	info: &serde_json::Value,
+) -> (Option<i64>, Vec<LookupRebuildTiming>) {
+	let at = |key: &str| {
+		info.get(key)
+			.and_then(serde_json::Value::as_str)?
+			.parse::<jiff::Timestamp>()
+			.ok()
+	};
+	let elapsed = at("startedAt")
+		.zip(at("completedAt"))
+		.map(|(started, completed)| completed.duration_since(started).as_secs());
+
+	let seconds = |ms: Option<i64>| ms.map(|ms| ms / 1000);
+	let mut steps: Vec<LookupRebuildTiming> = info
+		.get("modelTimings")
+		.and_then(serde_json::Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(|model| {
+			Some(LookupRebuildTiming {
+				name: model.get("model")?.as_str()?.to_owned(),
+				rows: model.get("rows").and_then(serde_json::Value::as_i64),
+				elapsed_seconds: seconds(model.get("durationMs")?.as_i64())?,
+			})
+		})
+		.collect();
+	let pass = |name: &str, duration_key: &str, rows_key: Option<&str>| {
+		Some(LookupRebuildTiming {
+			name: name.to_owned(),
+			rows: rows_key.and_then(|key| info.get(key)?.as_i64()),
+			elapsed_seconds: seconds(info.get(duration_key)?.as_i64())?,
+		})
+	};
+	steps.extend(pass("flagged patients", "flaggedPatientsDurationMs", None));
+	steps.extend(pass("self-heal", "selfHealDurationMs", Some("healedCount")));
+
+	(elapsed, steps)
 }
 
 /// Shape a `logs.migrations` batch row into the result canopy is sent.
@@ -602,6 +697,8 @@ pub(super) fn result_from_batch(
 		data_bytes_before,
 		data_bytes_after,
 		timings,
+		lookup_rebuild_elapsed_seconds: None,
+		lookup_rebuild_timings: Vec::new(),
 	}
 }
 
@@ -759,5 +856,66 @@ mod guard_tests {
 
 		assert_eq!(droppable, owned(&["reporting"]));
 		assert!(refused.is_empty());
+	}
+}
+
+#[cfg(test)]
+mod lookup_rebuild_tests {
+	use super::lookup_rebuild_from_debug_log;
+	use crate::types::LookupRebuildTiming;
+
+	fn step(name: &str, rows: Option<i64>, elapsed_seconds: i64) -> LookupRebuildTiming {
+		LookupRebuildTiming {
+			name: name.into(),
+			rows,
+			elapsed_seconds,
+		}
+	}
+
+	#[test]
+	fn a_timed_rebuild_reports_its_models_then_its_passes() {
+		let info = serde_json::json!({
+			"startedAt": "2026-11-06T00:38:17.100Z",
+			"completedAt": "2026-11-06T01:09:40.000Z",
+			"modelTimings": [
+				{ "model": "encounters", "rows": 341744, "durationMs": 298000 },
+				{ "model": "lab_tests", "rows": 833049, "durationMs": 489500 },
+			],
+			"flaggedPatientsDurationMs": 1200,
+			"healedCount": 52,
+			"selfHealDurationMs": 840000,
+		});
+
+		let (elapsed, steps) = lookup_rebuild_from_debug_log(&info);
+
+		assert_eq!(elapsed, Some(1882));
+		assert_eq!(
+			steps,
+			vec![
+				step("encounters", Some(341744), 298),
+				step("lab_tests", Some(833049), 489),
+				step("flagged patients", None, 1),
+				step("self-heal", Some(52), 840),
+			]
+		);
+	}
+
+	#[test]
+	fn an_untimed_rebuild_reports_only_its_total() {
+		let info = serde_json::json!({
+			"startedAt": "2026-11-06T00:38:17.100Z",
+			"completedAt": "2026-11-06T00:40:17.100Z",
+			"changesCount": 10,
+			"healedCount": 0,
+		});
+
+		assert_eq!(lookup_rebuild_from_debug_log(&info), (Some(120), vec![]));
+	}
+
+	#[test]
+	fn a_rebuild_that_never_finished_has_no_total() {
+		let info = serde_json::json!({ "startedAt": "2026-11-06T00:38:17.100Z" });
+
+		assert_eq!(lookup_rebuild_from_debug_log(&info), (None, vec![]));
 	}
 }

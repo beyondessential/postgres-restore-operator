@@ -1545,6 +1545,8 @@ mod tests {
 				data_bytes_before: 1,
 				data_bytes_after: 1,
 				timings: Vec::new(),
+				lookup_rebuild_elapsed_seconds: None,
+				lookup_rebuild_timings: Vec::new(),
 			}),
 			..Default::default()
 		});
@@ -1562,6 +1564,8 @@ mod tests {
 				data_bytes_before: 1,
 				data_bytes_after: 2,
 				timings: Vec::new(),
+				lookup_rebuild_elapsed_seconds: None,
+				lookup_rebuild_timings: Vec::new(),
 			}),
 			..Default::default()
 		});

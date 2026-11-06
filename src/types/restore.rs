@@ -193,6 +193,26 @@ pub struct MigrationResult {
 	/// One entry per migration that ran, in the order they ran.
 	#[serde(default)]
 	pub timings: Vec<MigrationTiming>,
+
+	/// Whole seconds the sync lookup rebuild after the migrations took, where
+	/// the version recorded one.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub lookup_rebuild_elapsed_seconds: Option<i64>,
+
+	/// Each step of that rebuild which did work, in the order they ran. Empty
+	/// for versions that record only the total.
+	#[serde(default)]
+	pub lookup_rebuild_timings: Vec<LookupRebuildTiming>,
+}
+
+/// How long one step of the sync lookup rebuild took.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct LookupRebuildTiming {
+	pub name: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub rows: Option<i64>,
+	pub elapsed_seconds: i64,
 }
 
 /// How long one migration took.
