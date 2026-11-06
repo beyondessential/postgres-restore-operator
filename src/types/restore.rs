@@ -209,7 +209,10 @@ pub struct MigrationResult {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct LookupRebuildTiming {
+	/// The model, or `flagged patients` / `self-heal` for the passes after them.
 	pub name: String,
+	/// Lookup rows the step wrote; for `self-heal`, the flagged rows it repaired.
+	/// Absent where tamanu does not count them.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub rows: Option<i64>,
 	pub elapsed_seconds: i64,

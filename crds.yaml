@@ -1403,8 +1403,12 @@ spec:
                           format: int64
                           type: integer
                         name:
+                          description: The model, or `flagged patients` / `self-heal` for the passes after them.
                           type: string
                         rows:
+                          description: |-
+                            Lookup rows the step wrote; for `self-heal`, the flagged rows it repaired.
+                            Absent where tamanu does not count them.
                           format: int64
                           nullable: true
                           type: integer

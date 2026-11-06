@@ -606,7 +606,7 @@ async fn latest_lookup_rebuild(
 /// Every version records `startedAt` and `completedAt`. Versions that time the
 /// rebuild add `modelTimings`, one entry per model that did work, and the
 /// durations of the two passes that follow it.
-pub(super) fn lookup_rebuild_from_debug_log(
+fn lookup_rebuild_from_debug_log(
 	info: &serde_json::Value,
 ) -> (Option<i64>, Vec<LookupRebuildTiming>) {
 	let at = |key: &str| {
