@@ -256,20 +256,7 @@ pub async fn reconcile_migrating(
 		.status
 		.as_ref()
 		.and_then(|status| status.migration_baseline.as_deref());
-	let mut result =
-		read_result(ctx, name, namespace, &creds, &dbname, baseline, failed > 0).await?;
-	if let Some(job_created) = job.metadata.creation_timestamp.as_ref().map(|t| t.0) {
-		read_lookup_rebuild(
-			ctx,
-			name,
-			namespace,
-			&creds,
-			&dbname,
-			job_created,
-			&mut result,
-		)
-		.await;
-	}
+	let result = read_result(ctx, name, namespace, &creds, &dbname, baseline, &job).await?;
 
 	info!(
 		restore = name,
@@ -472,8 +459,9 @@ async fn read_result(
 	creds: &(String, String),
 	dbname: &str,
 	baseline: Option<&str>,
-	job_failed: bool,
+	job: &Job,
 ) -> Result<MigrationResult> {
+	let job_failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0;
 	let log = if job_failed {
 		crate::controllers::jobs::container_log(
 			&ctx.client,
@@ -551,50 +539,30 @@ async fn read_result(
 		.then(|| migration_error(stats.as_ref(), log.as_deref()))
 		.flatten();
 
+	// The rebuild is extra detail on a result that stands without it, so a
+	// failed read is reported and the result sent anyway.
+	if let Some(job_created) = job.metadata.creation_timestamp.as_ref().map(|t| t.0) {
+		match latest_lookup_rebuild(&conn.client, job_created - JOB_CLOCK_SLACK).await {
+			Ok(Some(info)) => {
+				let (elapsed, timings) = lookup_rebuild_from_debug_log(&info);
+				result.lookup_rebuild_elapsed_seconds = elapsed;
+				result.lookup_rebuild_timings = timings;
+			}
+			Ok(None) => {}
+			Err(err) => warn!(
+				restore = restore_name,
+				error = %err,
+				"reading the lookup rebuild off the replica failed"
+			),
+		}
+	}
 	Ok(result)
 }
 
-/// Add the sync lookup rebuild the Job ran to `result`, where it recorded one.
-///
-/// The rebuild is extra detail on a result that stands without it, so a failed
-/// read is reported and the result sent anyway.
-async fn read_lookup_rebuild(
-	ctx: &Context,
-	restore_name: &str,
-	namespace: &str,
-	creds: &(String, String),
-	dbname: &str,
-	job_created: jiff::Timestamp,
-	result: &mut MigrationResult,
-) {
-	let info = async {
-		let conn = crate::controllers::postgres::connect_to_restore(
-			&ctx.client,
-			namespace,
-			restore_name,
-			dbname,
-			&creds.0,
-			&creds.1,
-			ctx.use_port_forward(),
-		)
-		.await?;
-		latest_lookup_rebuild(&conn.client, job_created).await
-	}
-	.await;
-	match info {
-		Ok(Some(info)) => {
-			let (elapsed, timings) = lookup_rebuild_from_debug_log(&info);
-			result.lookup_rebuild_elapsed_seconds = elapsed;
-			result.lookup_rebuild_timings = timings;
-		}
-		Ok(None) => {}
-		Err(err) => warn!(
-			restore = restore_name,
-			error = %err,
-			"reading the lookup rebuild off the replica failed"
-		),
-	}
-}
+/// How far the migration Job's pod clock may trail the API server's, which
+/// stamps the Job's creation. The source deployment's own rebuilds stop at its
+/// snapshot, which the restore puts well before this.
+const JOB_CLOCK_SLACK: jiff::SignedDuration = jiff::SignedDuration::from_mins(5);
 
 /// The `info` of the newest sync lookup rebuild started after `since`.
 ///
