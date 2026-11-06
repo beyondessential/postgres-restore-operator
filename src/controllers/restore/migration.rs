@@ -256,7 +256,20 @@ pub async fn reconcile_migrating(
 		.status
 		.as_ref()
 		.and_then(|status| status.migration_baseline.as_deref());
-	let result = read_result(ctx, name, namespace, &creds, &dbname, baseline, failed > 0).await?;
+	let mut result =
+		read_result(ctx, name, namespace, &creds, &dbname, baseline, failed > 0).await?;
+	if let Some(job_created) = job.metadata.creation_timestamp.as_ref().map(|t| t.0) {
+		read_lookup_rebuild(
+			ctx,
+			name,
+			namespace,
+			&creds,
+			&dbname,
+			job_created,
+			&mut result,
+		)
+		.await;
+	}
 
 	info!(
 		restore = name,
@@ -538,9 +551,37 @@ async fn read_result(
 		.then(|| migration_error(stats.as_ref(), log.as_deref()))
 		.flatten();
 
-	// The rebuild is extra detail on a result that stands without it, so a
-	// failed read is reported and the result sent anyway.
-	match latest_lookup_rebuild(&conn.client, baseline).await {
+	Ok(result)
+}
+
+/// Add the sync lookup rebuild the Job ran to `result`, where it recorded one.
+///
+/// The rebuild is extra detail on a result that stands without it, so a failed
+/// read is reported and the result sent anyway.
+async fn read_lookup_rebuild(
+	ctx: &Context,
+	restore_name: &str,
+	namespace: &str,
+	creds: &(String, String),
+	dbname: &str,
+	job_created: jiff::Timestamp,
+	result: &mut MigrationResult,
+) {
+	let info = async {
+		let conn = crate::controllers::postgres::connect_to_restore(
+			&ctx.client,
+			namespace,
+			restore_name,
+			dbname,
+			&creds.0,
+			&creds.1,
+			ctx.use_port_forward(),
+		)
+		.await?;
+		latest_lookup_rebuild(&conn.client, job_created).await
+	}
+	.await;
+	match info {
 		Ok(Some(info)) => {
 			let (elapsed, timings) = lookup_rebuild_from_debug_log(&info);
 			result.lookup_rebuild_elapsed_seconds = elapsed;
@@ -553,18 +594,23 @@ async fn read_result(
 			"reading the lookup rebuild off the replica failed"
 		),
 	}
-	Ok(result)
 }
 
-/// The `info` of the newest sync lookup rebuild after `baseline`.
+/// The `info` of the newest sync lookup rebuild started after `since`.
 ///
 /// `tamanu upgrade` rebuilds the lookup once the migrations apply, and records
-/// each rebuild as a `logs.debug_logs` row. Rows at or before the baseline are
-/// the source deployment's own, restored along with the data.
+/// each rebuild as a `logs.debug_logs` row. The source deployment wrote one
+/// every few seconds right up to the snapshot, so only a row started after the
+/// migration Job was created is the Job's own.
+///
+/// Tamanu writes `startedAt` with `Date.toISOString`, a fixed-width UTC form,
+/// so comparing it as text orders it in time, and a row holding anything else
+/// cannot fail the read the way a cast would.
 async fn latest_lookup_rebuild(
 	client: &tokio_postgres::Client,
-	baseline: Option<&str>,
+	since: jiff::Timestamp,
 ) -> Result<Option<serde_json::Value>> {
+	let since = since.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
 	let table_exists: bool = client
 		.query_one("SELECT to_regclass('logs.debug_logs') IS NOT NULL", &[])
 		.await?
@@ -578,11 +624,10 @@ async fn latest_lookup_rebuild(
 			"SELECT info::jsonb
 			 FROM logs.debug_logs
 			 WHERE type = 'syncLookupUpdate'
-			   AND info->>'startedAt' IS NOT NULL
-			   AND ($1::text IS NULL OR (info->>'startedAt')::timestamptz > $1::text::timestamptz)
-			 ORDER BY (info->>'startedAt')::timestamptz DESC
+			   AND info->>'startedAt' > $1
+			 ORDER BY info->>'startedAt' DESC
 			 LIMIT 1",
-			&[&baseline],
+			&[&since],
 		)
 		.await?
 		.map(|row| row.get(0)))
@@ -604,7 +649,7 @@ pub(super) fn lookup_rebuild_from_debug_log(
 	};
 	let elapsed = at("startedAt")
 		.zip(at("completedAt"))
-		.map(|(started, completed)| completed.duration_since(started).as_secs());
+		.map(|(started, completed)| completed.duration_since(started).as_secs().max(0));
 
 	let seconds = |ms: Option<i64>| ms.map(|ms| ms / 1000);
 	let mut steps: Vec<LookupRebuildTiming> = info
@@ -910,6 +955,16 @@ mod lookup_rebuild_tests {
 		});
 
 		assert_eq!(lookup_rebuild_from_debug_log(&info), (Some(120), vec![]));
+	}
+
+	#[test]
+	fn a_skewed_clock_reports_no_negative_total() {
+		let info = serde_json::json!({
+			"startedAt": "2026-11-06T00:40:00.000Z",
+			"completedAt": "2026-11-06T00:39:00.000Z",
+		});
+
+		assert_eq!(lookup_rebuild_from_debug_log(&info).0, Some(0));
 	}
 
 	#[test]
