@@ -8,7 +8,8 @@
 use std::collections::BTreeMap;
 
 use bestool_canopy::schema::{
-	MigrationArgs, MigrationTimingArgs, ReportingSchemaArgs, RunOutcome, VerificationArgs,
+	MigrationArgs, MigrationTimingArgs, PostMigrationTimingArgs, ReportingSchemaArgs, RunOutcome,
+	VerificationArgs,
 };
 use jiff::Timestamp;
 use k8s_openapi::api::core::v1::{Namespace, Secret};
@@ -564,6 +565,20 @@ fn migration_args(
 					})
 					.collect::<Vec<_>>(),
 			)
+			.maybe_post_migration_elapsed_seconds(result.lookup_rebuild_elapsed_seconds)
+			.post_migration_timings(
+				result
+					.lookup_rebuild_timings
+					.iter()
+					.map(|t| {
+						PostMigrationTimingArgs::builder()
+							.name(t.name.clone())
+							.maybe_rows(t.rows)
+							.elapsed_seconds(t.elapsed_seconds)
+							.build()
+					})
+					.collect::<Vec<_>>(),
+			)
 			.build(),
 	)
 }
@@ -925,6 +940,12 @@ mod tests {
 					elapsed_seconds: 12,
 				},
 			],
+			lookup_rebuild_elapsed_seconds: Some(1860),
+			lookup_rebuild_timings: vec![crate::types::LookupRebuildTiming {
+				name: "encounters".into(),
+				rows: Some(341_744),
+				elapsed_seconds: 298,
+			}],
 		}
 	}
 
@@ -950,6 +971,9 @@ mod tests {
 		let names: Vec<_> = args.timings.iter().map(|t| t.name.as_str()).collect();
 		assert_eq!(names, ["1721000000-addFoo.js", "1721000001-addBar.js"]);
 		assert_eq!(args.timings[0].elapsed_seconds, 400);
+		assert_eq!(args.post_migration_elapsed_seconds, Some(1860));
+		assert_eq!(args.post_migration_timings.len(), 1);
+		assert_eq!(args.post_migration_timings[0].rows, Some(341_744));
 	}
 
 	#[test]

@@ -29,8 +29,8 @@ use crate::{
 	error::{Error, Result},
 	placement::PodPlacement,
 	types::{
-		MigrationResult, MigrationTarget, MigrationTiming, PostgresPhysicalReplica,
-		PostgresPhysicalRestore,
+		LookupRebuildTiming, MigrationResult, MigrationTarget, MigrationTiming,
+		PostgresPhysicalReplica, PostgresPhysicalRestore,
 	},
 };
 
@@ -256,7 +256,7 @@ pub async fn reconcile_migrating(
 		.status
 		.as_ref()
 		.and_then(|status| status.migration_baseline.as_deref());
-	let result = read_result(ctx, name, namespace, &creds, &dbname, baseline, failed > 0).await?;
+	let result = read_result(ctx, name, namespace, &creds, &dbname, baseline, &job).await?;
 
 	info!(
 		restore = name,
@@ -459,8 +459,9 @@ async fn read_result(
 	creds: &(String, String),
 	dbname: &str,
 	baseline: Option<&str>,
-	job_failed: bool,
+	job: &Job,
 ) -> Result<MigrationResult> {
+	let job_failed = job.status.as_ref().and_then(|s| s.failed).unwrap_or(0) > 0;
 	let log = if job_failed {
 		crate::controllers::jobs::container_log(
 			&ctx.client,
@@ -521,6 +522,8 @@ async fn read_result(
 			data_bytes_before: data_bytes_after,
 			data_bytes_after,
 			timings: Vec::new(),
+			lookup_rebuild_elapsed_seconds: None,
+			lookup_rebuild_timings: Vec::new(),
 		});
 	};
 
@@ -535,7 +538,112 @@ async fn read_result(
 	result.error = job_failed
 		.then(|| migration_error(stats.as_ref(), log.as_deref()))
 		.flatten();
+
+	// The rebuild is extra detail on a result that stands without it, so a
+	// failed read is reported and the result sent anyway.
+	if let Some(job_created) = job.metadata.creation_timestamp.as_ref().map(|t| t.0) {
+		match latest_lookup_rebuild(&conn.client, job_created - JOB_CLOCK_SLACK).await {
+			Ok(Some(info)) => {
+				let (elapsed, timings) = lookup_rebuild_from_debug_log(&info);
+				result.lookup_rebuild_elapsed_seconds = elapsed;
+				result.lookup_rebuild_timings = timings;
+			}
+			Ok(None) => {}
+			Err(err) => warn!(
+				restore = restore_name,
+				error = %err,
+				"reading the lookup rebuild off the replica failed"
+			),
+		}
+	}
 	Ok(result)
+}
+
+/// How far the migration Job's pod clock may trail the API server's, which
+/// stamps the Job's creation. The source deployment's own rebuilds stop at its
+/// snapshot, which the restore puts well before this.
+const JOB_CLOCK_SLACK: jiff::SignedDuration = jiff::SignedDuration::from_mins(5);
+
+/// The `info` of the newest sync lookup rebuild started after `since`.
+///
+/// `tamanu upgrade` rebuilds the lookup once the migrations apply, and records
+/// each rebuild as a `logs.debug_logs` row. The source deployment wrote one
+/// every few seconds right up to the snapshot, so only a row started after the
+/// migration Job was created is the Job's own.
+///
+/// Tamanu writes `startedAt` with `Date.toISOString`, a fixed-width UTC form,
+/// so comparing it as text orders it in time, and a row holding anything else
+/// cannot fail the read the way a cast would.
+async fn latest_lookup_rebuild(
+	client: &tokio_postgres::Client,
+	since: jiff::Timestamp,
+) -> Result<Option<serde_json::Value>> {
+	let since = since.strftime("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+	let table_exists: bool = client
+		.query_one("SELECT to_regclass('logs.debug_logs') IS NOT NULL", &[])
+		.await?
+		.get(0);
+	if !table_exists {
+		return Ok(None);
+	}
+
+	Ok(client
+		.query_opt(
+			"SELECT info::jsonb
+			 FROM logs.debug_logs
+			 WHERE type = 'syncLookupUpdate'
+			   AND info->>'startedAt' > $1
+			 ORDER BY info->>'startedAt' DESC
+			 LIMIT 1",
+			&[&since],
+		)
+		.await?
+		.map(|row| row.get(0)))
+}
+
+/// Shape a lookup rebuild's debug log `info` into its total and its steps.
+///
+/// Every version records `startedAt` and `completedAt`. Versions that time the
+/// rebuild add `modelTimings`, one entry per model that did work, and the
+/// durations of the two passes that follow it.
+fn lookup_rebuild_from_debug_log(
+	info: &serde_json::Value,
+) -> (Option<i64>, Vec<LookupRebuildTiming>) {
+	let at = |key: &str| {
+		info.get(key)
+			.and_then(serde_json::Value::as_str)?
+			.parse::<jiff::Timestamp>()
+			.ok()
+	};
+	let elapsed = at("startedAt")
+		.zip(at("completedAt"))
+		.map(|(started, completed)| completed.duration_since(started).as_secs().max(0));
+
+	let seconds = |ms: Option<i64>| ms.map(|ms| ms / 1000);
+	let mut steps: Vec<LookupRebuildTiming> = info
+		.get("modelTimings")
+		.and_then(serde_json::Value::as_array)
+		.into_iter()
+		.flatten()
+		.filter_map(|model| {
+			Some(LookupRebuildTiming {
+				name: format!("sync lookup: {}", model.get("model")?.as_str()?),
+				rows: model.get("rows").and_then(serde_json::Value::as_i64),
+				elapsed_seconds: seconds(model.get("durationMs")?.as_i64())?,
+			})
+		})
+		.collect();
+	let pass = |name: &str, duration_key: &str, rows_key: Option<&str>| {
+		Some(LookupRebuildTiming {
+			name: format!("sync lookup: {name}"),
+			rows: rows_key.and_then(|key| info.get(key)?.as_i64()),
+			elapsed_seconds: seconds(info.get(duration_key)?.as_i64())?,
+		})
+	};
+	steps.extend(pass("flagged patients", "flaggedPatientsDurationMs", None));
+	steps.extend(pass("self-heal", "selfHealDurationMs", Some("healedCount")));
+
+	(elapsed, steps)
 }
 
 /// Shape a `logs.migrations` batch row into the result canopy is sent.
@@ -602,6 +710,8 @@ pub(super) fn result_from_batch(
 		data_bytes_before,
 		data_bytes_after,
 		timings,
+		lookup_rebuild_elapsed_seconds: None,
+		lookup_rebuild_timings: Vec::new(),
 	}
 }
 
@@ -759,5 +869,76 @@ mod guard_tests {
 
 		assert_eq!(droppable, owned(&["reporting"]));
 		assert!(refused.is_empty());
+	}
+}
+
+#[cfg(test)]
+mod lookup_rebuild_tests {
+	use super::lookup_rebuild_from_debug_log;
+	use crate::types::LookupRebuildTiming;
+
+	fn step(name: &str, rows: Option<i64>, elapsed_seconds: i64) -> LookupRebuildTiming {
+		LookupRebuildTiming {
+			name: name.into(),
+			rows,
+			elapsed_seconds,
+		}
+	}
+
+	#[test]
+	fn a_timed_rebuild_reports_its_models_then_its_passes() {
+		let info = serde_json::json!({
+			"startedAt": "2026-11-06T00:38:17.100Z",
+			"completedAt": "2026-11-06T01:09:40.000Z",
+			"modelTimings": [
+				{ "model": "encounters", "rows": 341744, "durationMs": 298000 },
+				{ "model": "lab_tests", "rows": 833049, "durationMs": 489500 },
+			],
+			"flaggedPatientsDurationMs": 1200,
+			"healedCount": 52,
+			"selfHealDurationMs": 840000,
+		});
+
+		let (elapsed, steps) = lookup_rebuild_from_debug_log(&info);
+
+		assert_eq!(elapsed, Some(1882));
+		assert_eq!(
+			steps,
+			vec![
+				step("sync lookup: encounters", Some(341744), 298),
+				step("sync lookup: lab_tests", Some(833049), 489),
+				step("sync lookup: flagged patients", None, 1),
+				step("sync lookup: self-heal", Some(52), 840),
+			]
+		);
+	}
+
+	#[test]
+	fn an_untimed_rebuild_reports_only_its_total() {
+		let info = serde_json::json!({
+			"startedAt": "2026-11-06T00:38:17.100Z",
+			"completedAt": "2026-11-06T00:40:17.100Z",
+			"changesCount": 10,
+			"healedCount": 0,
+		});
+
+		assert_eq!(lookup_rebuild_from_debug_log(&info), (Some(120), vec![]));
+	}
+
+	#[test]
+	fn a_skewed_clock_reports_no_negative_total() {
+		let info = serde_json::json!({
+			"startedAt": "2026-11-06T00:40:00.000Z",
+			"completedAt": "2026-11-06T00:39:00.000Z",
+		});
+
+		assert_eq!(lookup_rebuild_from_debug_log(&info).0, Some(0));
+	}
+
+	#[test]
+	fn a_rebuild_that_never_finished_has_no_total() {
+		let info = serde_json::json!({ "startedAt": "2026-11-06T00:38:17.100Z" });
+
+		assert_eq!(lookup_rebuild_from_debug_log(&info), (None, vec![]));
 	}
 }

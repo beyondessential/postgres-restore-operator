@@ -1384,6 +1384,39 @@ spec:
                       exit code.
                     nullable: true
                     type: string
+                  lookupRebuildElapsedSeconds:
+                    description: |-
+                      Whole seconds the sync lookup rebuild after the migrations took, where
+                      the version recorded one.
+                    format: int64
+                    nullable: true
+                    type: integer
+                  lookupRebuildTimings:
+                    default: []
+                    description: |-
+                      Each step of that rebuild which did work, in the order they ran. Empty
+                      for versions that record only the total.
+                    items:
+                      description: How long one step of the sync lookup rebuild took.
+                      properties:
+                        elapsedSeconds:
+                          format: int64
+                          type: integer
+                        name:
+                          description: The model, or `flagged patients` / `self-heal` for the passes after them.
+                          type: string
+                        rows:
+                          description: |-
+                            Lookup rows the step wrote; for `self-heal`, the flagged rows it repaired.
+                            Absent where tamanu does not count them.
+                          format: int64
+                          nullable: true
+                          type: integer
+                      required:
+                      - elapsedSeconds
+                      - name
+                      type: object
+                    type: array
                   timings:
                     default: []
                     description: One entry per migration that ran, in the order they ran.
