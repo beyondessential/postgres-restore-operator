@@ -627,7 +627,7 @@ fn lookup_rebuild_from_debug_log(
 		.flatten()
 		.filter_map(|model| {
 			Some(LookupRebuildTiming {
-				name: model.get("model")?.as_str()?.to_owned(),
+				name: format!("sync lookup: {}", model.get("model")?.as_str()?),
 				rows: model.get("rows").and_then(serde_json::Value::as_i64),
 				elapsed_seconds: seconds(model.get("durationMs")?.as_i64())?,
 			})
@@ -635,7 +635,7 @@ fn lookup_rebuild_from_debug_log(
 		.collect();
 	let pass = |name: &str, duration_key: &str, rows_key: Option<&str>| {
 		Some(LookupRebuildTiming {
-			name: name.to_owned(),
+			name: format!("sync lookup: {name}"),
 			rows: rows_key.and_then(|key| info.get(key)?.as_i64()),
 			elapsed_seconds: seconds(info.get(duration_key)?.as_i64())?,
 		})
@@ -905,10 +905,10 @@ mod lookup_rebuild_tests {
 		assert_eq!(
 			steps,
 			vec![
-				step("encounters", Some(341744), 298),
-				step("lab_tests", Some(833049), 489),
-				step("flagged patients", None, 1),
-				step("self-heal", Some(52), 840),
+				step("sync lookup: encounters", Some(341744), 298),
+				step("sync lookup: lab_tests", Some(833049), 489),
+				step("sync lookup: flagged patients", None, 1),
+				step("sync lookup: self-heal", Some(52), 840),
 			]
 		);
 	}
