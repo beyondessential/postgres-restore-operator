@@ -1,3 +1,6 @@
+> [!CAUTION]
+> Project has moved to the [canopy monorepo](https://github.com/beyondessential/canopy).
+
 # pgro — PostgreSQL Restore Operator
 
 Monitors a Kopia backup repository for "physical" backups of PostgreSQL databases and restores them regularly within a Kubernetes cluster.
